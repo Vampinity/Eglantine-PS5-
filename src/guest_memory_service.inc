@@ -255,6 +255,10 @@ constexpr std::uint64_t SwapBackInPerTick = 8;   // more reads back than this in
 constexpr std::uint32_t SwapMostPlaces = 4096;   // 8 GiB of file
 constexpr std::size_t SwapAges = 8;
 std::atomic<int> swap_mode{0};                   // 0 off, 1 measure, 2 file, 3 packed in memory
+// Slots that ever went out (core dma_pusher.cpp, EDEN_NX2_JUNK_TRACE, asks through
+// eden_guest_swap_address_state): one bit a slot, 16384 slots cover a 32 GiB range.
+constexpr std::size_t SwapEverOutSlots = 16384;
+std::atomic<std::uint64_t> swap_ever_out[SwapEverOutSlots / 64]{};
 std::atomic<std::uint32_t> swap_tick{SwapRearmTicks + 1};
 std::uint32_t swap_cold_ticks = 15;
 bool swap_all_pools = false;
@@ -664,6 +668,34 @@ bool SwapWrite(const void* from, std::uint32_t place) noexcept {
 // of about a millisecond and no drive. A slot that packs worse than a quarter MiB, or finds no block
 // for its bytes, is armed anew and looked at again when it is cold again. The swapper is one thread,
 // so the packing buffer is one, static (2 MiB of flexible memory).
+//
+// EDEN_GUEST_SWAP_PACK_IN_PLACE=1 (off unless asked for): the packed bytes go to the front of the
+// slot's own block and the block's tail goes back, so no block is asked of the pool. Run 161 (Ocarina,
+// hand play) reached the first 3D frame with the pool at 0 MiB for ten seconds: three ticks found no
+// block for the packed bytes and 900 MiB of cold slots waited. Asked once, at the first packed slot,
+// as EDEN_CRAM_FINE_IN_PLACE asks: a block's second half is released on its own, then its first (run
+// 126 saw the console take a tail back, 1,162 slots). A refusal leaves the switch off for the session.
+std::atomic<int> pack_in_place{0}; // 0 not asked yet, 1 on, 2 off
+std::atomic<std::uint64_t> packed_in_place{0}, pack_tail_refused{0};
+bool PackInPlace() noexcept {
+    const int state = pack_in_place.load(std::memory_order_relaxed);
+    if (state != 0) return state == 1;
+    const char* wanted = std::getenv("EDEN_GUEST_SWAP_PACK_IN_PLACE");
+    if (wanted == nullptr || wanted[0] != '1') {
+        pack_in_place.store(2, std::memory_order_relaxed);
+        return false;
+    }
+    std::int64_t block = -1;
+    if (eden_direct_low(SparseSlot, SparseSlot, 12, &block) != 0) return false; // no block now: asked again later
+    const int tail = sceKernelReleaseDirectMemory(block + SparseSlot / 2, SparseSlot / 2);
+    if (sceKernelReleaseDirectMemory(block, tail == 0 ? SparseSlot / 2 : SparseSlot) != 0) std::abort();
+    pack_in_place.store(tail == 0 ? 1 : 2, std::memory_order_relaxed);
+    char line[128];
+    const int length = std::snprintf(line, sizeof(line), "EDEN_SWAP_PACK_IN_PLACE %s: a block's tail %s (result %d)\n",
+                                     tail == 0 ? "on" : "off", tail == 0 ? "went back on its own" : "was refused", tail);
+    if (length > 0) Report(line);
+    return tail == 0;
+}
 bool PackOut(SparseRange& range, std::size_t slot) noexcept {
     static char packed[LZ4_COMPRESSBOUND(SparseSlot)];
     LockSlot(range, slot);
@@ -682,6 +714,36 @@ bool PackOut(SparseRange& range, std::size_t slot) noexcept {
     const bool worth = kept + PackMinGainPages <= FinePages;
     std::int64_t block = -1;
     void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
+    if (worth && PackInPlace()) {
+        // The slot's own block keeps the packed bytes in its first `kept` pages. The tail goes back
+        // first, while the packed copy holds every byte: a refusal leaves the block whole and the slot
+        // armed, nothing lost. Then the front is written through a view, as MakeFine writes a block.
+        const std::int64_t whole = range.physical[slot];
+        if (munmap(reinterpret_cast<void*>(at), SparseSlot) != 0) std::abort();
+        void* again = reinterpret_cast<void*>(at);
+        if (sceKernelReserveVirtualRange(&again, SparseSlot, MAP_FIXED, SparseSlot) != 0 || again != reinterpret_cast<void*>(at))
+            std::abort();
+        if (sceKernelReleaseDirectMemory(whole + std::int64_t(kept * FinePage), SparseSlot - kept * FinePage) != 0) {
+            if (!MapSlot(at, PROT_READ, whole)) std::abort();
+            if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_NONE) != 0) std::abort();
+            range.swap[slot] = swap_tick.load(std::memory_order_relaxed);
+            pack_tail_refused.fetch_add(1, std::memory_order_relaxed);
+            swap_counters.failures.fetch_add(1, std::memory_order_relaxed);
+            UnlockSlot(range, slot, SlotProbe);
+            return false;
+        }
+        if (sceKernelMapDirectMemory(&view, kept * FinePage, PROT_READ | PROT_WRITE, 0, whole, FinePage) != 0) std::abort();
+        std::memcpy(view, packed, static_cast<std::size_t>(size));
+        if (munmap(view, kept * FinePage) != 0) std::abort();
+        range.swap[slot] = static_cast<std::uint32_t>(size);
+        guest_committed.fetch_sub(SparseSlot - kept * FinePage, std::memory_order_relaxed);
+        packed_pages_held.fetch_add(kept, std::memory_order_relaxed);
+        packed_in_place.fetch_add(1, std::memory_order_relaxed);
+        swap_counters.out.fetch_add(1, std::memory_order_relaxed);
+        swap_counters.out_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+        UnlockSlot(range, slot, SlotOut);
+        return true;
+    }
     if (!worth || eden_direct_low(kept * FinePage, FinePage, 12, &block) != 0 ||
         sceKernelMapDirectMemory(&view, kept * FinePage, PROT_READ | PROT_WRITE, 0, block, FinePage) != 0) {
         if (block >= 0) (void)sceKernelReleaseDirectMemory(block, kept * FinePage);
@@ -1346,7 +1408,10 @@ void SwapTick(SparseRange& range, std::size_t& hand, std::vector<std::pair<std::
     std::sort(cold.begin(), cold.end());
     const std::uint64_t failed = swap_counters.failures.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < cold.size() && i < SwapOutPerTick; ++i)
-        if (!SwapOut(range, cold[i].second) && swap_counters.failures.load(std::memory_order_relaxed) != failed) {
+        if (SwapOut(range, cold[i].second)) {
+            if (cold[i].second < SwapEverOutSlots)
+                swap_ever_out[cold[i].second / 64].fetch_or(std::uint64_t{1} << (cold[i].second % 64), std::memory_order_relaxed);
+        } else if (swap_counters.failures.load(std::memory_order_relaxed) != failed) {
             if (mode == 3) break; // no block for the packed bytes now: the next tick asks again
             // A drive that is full or gone: what is out stays readable, nothing more goes.
             swap_mode.store(1, std::memory_order_relaxed);
@@ -1506,9 +1571,12 @@ void SwapReport(SparseRange& range) noexcept {
     if (length > 0) Report(line);
     if (swap_mode.load(std::memory_order_relaxed) == 3) {
         char pack[160];
-        const int packed_length = std::snprintf(pack, sizeof(pack), "EDEN_SWAP_PACK slots=%zu held=%zuMiB not_worth=%llu\n",
+        const int packed_length = std::snprintf(pack, sizeof(pack),
+                                                "EDEN_SWAP_PACK slots=%zu held=%zuMiB not_worth=%llu in_place=%llu tail_refused=%llu\n",
                                                 out, packed_pages_held.load(std::memory_order_relaxed) * FinePage >> 20,
-                                                (unsigned long long)pack_not_worth.load(std::memory_order_relaxed));
+                                                (unsigned long long)pack_not_worth.load(std::memory_order_relaxed),
+                                                (unsigned long long)packed_in_place.load(std::memory_order_relaxed),
+                                                (unsigned long long)pack_tail_refused.load(std::memory_order_relaxed));
         if (packed_length > 0) Report(pack);
     }
 }
@@ -2147,6 +2215,8 @@ void ServiceStart(SparseRange& range) noexcept {
     }
 #endif
     packed_pages_held.store(0, std::memory_order_relaxed);
+    packed_in_place.store(0, std::memory_order_relaxed);
+    pack_tail_refused.store(0, std::memory_order_relaxed);
     pack_not_worth.store(0, std::memory_order_relaxed);
     if (swap_mode.load(std::memory_order_relaxed) != 0) {
         for (auto* counter : {&swap_counters.armed, &swap_counters.touched, &swap_counters.out, &swap_counters.in,
@@ -2236,6 +2306,22 @@ extern "C" bool eden_guest_swap_active(void) noexcept {
 extern "C" void eden_guest_swap_pool(std::uint64_t offset, std::uint64_t bytes) noexcept {
     swap_pool_first.store((offset + SparseSlot - 1) / SparseSlot, std::memory_order_relaxed);
     swap_pool_end.store((offset + bytes) / SparseSlot, std::memory_order_relaxed);
+}
+
+// The slot behind a host address of the guest's memory (core dma_pusher.cpp, EDEN_NX2_JUNK_TRACE):
+// its state, and in *ever_out whether it ever went out. -1 for an address outside the guest's
+// range or with no service running.
+extern "C" int eden_guest_swap_address_state(const void* host, int* ever_out) noexcept {
+    if (ever_out != nullptr) *ever_out = 0;
+    SparseRange* const range = guest_range.load(std::memory_order_acquire);
+    if (range == nullptr || range->state == nullptr) return -1;
+    const auto at = reinterpret_cast<std::uintptr_t>(host);
+    const std::uintptr_t begin = range->begin.load(std::memory_order_relaxed);
+    if (at < begin || at >= range->end) return -1;
+    const std::size_t slot = (at - begin) / SparseSlot;
+    if (ever_out != nullptr && slot < SwapEverOutSlots)
+        *ever_out = static_cast<int>((swap_ever_out[slot / 64].load(std::memory_order_relaxed) >> (slot % 64)) & 1);
+    return SlotState(*range, slot);
 }
 
 // The report now, for a burst of writes that falls between two of the scanner's (headless/performance.cpp).

@@ -1,0 +1,116 @@
+From c62114ea9e4313d432adebeafcc376cd413671b4 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 00:03:54 +0100
+Subject: [PATCH] texture_cache: EDEN_NX2_TC_KEEP_ASYNC keeps CPU-decoded
+ images resident and retries a decode that found no memory
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_TC_KEEP_ASYNC is set.
+
+Three of Ocarina of Time's textures are decoded on the CPU, off the GPU thread (AsynchronousDecode:
+ASTC whose RGBA8 scratch would pass EDEN_NX2_GPU_TRANSCODE_MIB): the 6144x6144 ASTC 5x5 ground
+texture and the two 1365x1365x90 arrays. A new one is zero-filled, black, until the worker threads
+have decoded it, seconds later. On the console the pool's largest free block sits under
+EDEN_NX2_TC_POOL_CRITICAL_MIB for the whole walk, so the collector runs as past critical and evicts
+anything unused for 10 frames, CostlyLoad or not: the four runs 147, 155, 161 and 162 made these
+textures new 14 to 21 times each, and 2 to 10 of those decodes were dropped for want of a heap block
+(the decode needs a 32 MiB input copy, a 48 MiB output and a 151 MiB RGBA8 scratch for level 0,
+single blocks that come from the pool above 32 MiB), after which the texture stayed black until the
+game wrote it again. Robin sees the floor appear slowly.
+
+EDEN_NX2_TC_KEEP_ASYNC=<frames>: such an image is left alone by RunGarbageCollector in every mode
+and by CollectForBuffer, until it has gone unused for EDEN_NX2_TC_OLD_AGE frames (1800); and a
+decode that failed for memory is queued again <frames> later (at least 60): the image stays marked
+as decoding meanwhile, then it is marked written again and its next use uploads it, which queues the
+decode. Logs "No memory to decode the image at ...: tried again in N frames". Cost: the three
+textures stay resident (up to 487 MiB, which they are most of the time anyway); a retry copies the
+input again. Unset, nothing changes. Not built, not run.
+---
+ src/video_core/texture_cache/texture_cache.h  | 38 +++++++++++++++++++
+ .../texture_cache/texture_cache_base.h        |  1 +
+ 2 files changed, 39 insertions(+)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 1b289f3d45..05f90ccb4a 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -46,6 +46,21 @@ namespace VideoCommon {
+     return enabled;
+ }
+ 
++/// EDEN_NX2_TC_KEEP_ASYNC=<frames> (unset or 0: off, as before): an image the CPU decodes
++/// asynchronously (AsynchronousDecode: Ocarina of Time's 6144x6144 ground texture and its two
++/// 1365x1365x90 arrays, seconds of decoding each, black meanwhile) is left alone by the collectors
++/// until it has gone unused for EDEN_NX2_TC_OLD_AGE frames, in every mode; on the console the
++/// pool-pressure collector made each of them new 5 to 7 times a walk. A decode that failed for
++/// memory is tried again this many frames later (at least 60) instead of leaving the texture black.
++[[nodiscard]] inline u64 KeepAsyncDecodedFrames() {
++    static const u64 frames = [] {
++        const char* const value = std::getenv("EDEN_NX2_TC_KEEP_ASYNC");
++        const u64 asked = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
++        return asked == 0 ? 0 : (std::max)(asked, u64{60});
++    }();
++    return frames;
++}
++
+ using Tegra::Texture::TICEntry;
+ using Tegra::Texture::TSCEntry;
+ using VideoCore::Surface::GetFormatType;
+@@ -196,6 +211,8 @@ void TextureCache<P>::RunGarbageCollector() {
+         }
+         const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+         if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
++            (KeepAsyncDecodedFrames() != 0 && !evict_old_costly &&
++             True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
+             (!high_priority_mode && must_download)) {
+             return false;
+         }
+@@ -325,6 +342,8 @@ void TextureCache<P>::CollectForBuffer(u64 wanted) {
+     lru_cache.ForEachItemBelow(frame_tick - MIN_AGE, [&](ImageId image_id) {
+         const Image& image = slot_images[image_id];
+         if (True(image.flags & ImageFlagBits::IsDecoding) ||
++            (KeepAsyncDecodedFrames() != 0 &&
++             True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
+             (IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap))) {
+             return false;
+         }
+@@ -2916,6 +2935,25 @@ void TextureCache<P>::TickAsyncDecode() {
+         }
+         Image& image = slot_images[async_decode->image_id];
+         if (async_decode->failed) {
++            if (const u64 retry_frames = KeepAsyncDecodedFrames(); retry_frames != 0) {
++                // EDEN_NX2_TC_KEEP_ASYNC: the pool was short of a block for the decode's buffers
++                // (one of up to 151 MiB); a while later it may have one. The image stays marked as
++                // decoding meanwhile, so the collector leaves it, then it is marked written again
++                // and its next use uploads it, which queues the decode once more.
++                if (async_decode->retry_frame == 0) {
++                    async_decode->retry_frame = frame_tick + retry_frames;
++                    LOG_WARNING(HW_GPU, "No memory to decode the image at {:#x}: tried again in {} frames",
++                                image.gpu_addr, retry_frames);
++                }
++                if (frame_tick < async_decode->retry_frame) {
++                    ++i;
++                    continue;
++                }
++                image.flags &= ~ImageFlagBits::IsDecoding;
++                image.flags |= ImageFlagBits::CpuModified;
++                i = async_decodes.erase(i);
++                continue;
++            }
+             // Nothing to upload. The image keeps its clear until the guest writes it again; left
+             // marked as decoding, the collector could never free it.
+             LOG_ERROR(HW_GPU, "No memory to decode the image at {:#x}, dropped", image.gpu_addr);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 5504ee1c9c..0696447935 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -79,6 +79,7 @@ struct AsyncDecodeContext {
+     std::mutex mutex;
+     std::atomic_bool complete;
+     std::atomic_bool failed{}; ///< No memory for the decode: set before complete, nothing to upload.
++    u64 retry_frame{}; ///< EDEN_NX2_TC_KEEP_ASYNC: a failed decode is queued again at this frame.
+     bool cancelled{}; ///< The image was deleted meanwhile: drop the result (GPU thread only).
+     size_t next_copy{}; ///< A large image uploads over several frames: the next copy...
+     s32 next_layer{};   ///< ...and the next layer of it (GPU thread only).
+-- 
+2.54.0
+

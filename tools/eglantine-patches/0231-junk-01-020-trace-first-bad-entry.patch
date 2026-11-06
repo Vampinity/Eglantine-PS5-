@@ -1,0 +1,142 @@
+From f69d31dd5606f85b4cc99d346c8ec99670789f7e Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Fri, 6 Nov 2026 23:45:25 +0100
+Subject: [PATCH] dma_pusher: EDEN_NX2_JUNK_TRACE logs what fed the first bad
+ command entry (junk-01)
+
+Runs 149 and 162 (Ocarina on the PS5) ended minutes in with the command stream parsed as junk:
+unknown engines, puller methods 1 to 0x21, macros with garbage parameters, an upload of 71 PB.
+Run 162's dump shows entry 3579 ending with three of the four words of method 0x3d1 and entry
+3580, a fresh stream, read one word off as the fourth. With EDEN_NX2_JUNK_TRACE=1 the pusher
+keeps, per entry, what it started from (a method the entry before left unfinished and how many
+words it still wanted, a resume after an acquire, which read fed the words: the copy taken at
+submit, a safe read, the GPU-written copy or memory) and DumpCurrentEntry logs one JUNK_TRACE
+line: the entry, the bad word and its address, those facts, how many words of the entry differ
+between the submit copy and memory now, and the guest memory service's state of the slot behind
+the bad word with whether it ever went out (eden_guest_swap_address_state, weak: absent on other
+ports). Unset: nothing changes.
+---
+ src/video_core/dma_pusher.cpp | 57 +++++++++++++++++++++++++++++++++++
+ src/video_core/dma_pusher.h   | 17 +++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index fcdd939643..0901032f55 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -25,6 +25,10 @@
+ #include "video_core/nx2.h"
+ #include "video_core/rasterizer_interface.h"
+ 
++// PS5 port (EDEN_NX2_JUNK_TRACE): the guest memory service's state of the slot behind a host
++// address, and whether that slot ever went out to the file or a packed block. Absent elsewhere.
++extern "C" int eden_guest_swap_address_state(const void* host, int* ever_out) noexcept __attribute__((weak));
++
+ namespace Tegra {
+ 
+ constexpr u32 MacroRegistersStart = 0xE00;
+@@ -289,6 +293,16 @@ bool DmaPusher::Step() {
+                                !gpu_written &&
+                                !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
+                                                                           header.size * sizeof(u32)));
++        if (JunkTraceEnabled()) {
++            // What this entry starts from: a method the entry before left unfinished takes this
++            // entry's first words as its data (the Switch 2 split-method rule), and a resumed
++            // entry reads memory again.
++            entry_trace.carried_method = dma_state.method;
++            entry_trace.carried_count = dma_state.method_count;
++            entry_trace.resumed_offset = static_cast<u32>(command_resume_offset);
++            entry_trace.gpu_written = gpu_written;
++            entry_trace.source = submitted ? 0 : use_safe ? 1 : 3;
++        }
+         if (submitted) {
+             const std::span<const CommandHeader> commands{
+                 command_list.submitted_words.data() +
+@@ -305,6 +319,7 @@ bool DmaPusher::Step() {
+         } else if (!ListDrainFull() &&
+                    ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
+             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
++            entry_trace.source = 2;
+             RecordParsedEntry(header, commands);
+             command_resume_offset +=
+                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+@@ -867,6 +882,48 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
+     if (dma_pushbuffer.empty()) {
+         return;
+     }
++    if (JunkTraceEnabled() && dma_pushbuffer_subindex < dma_pushbuffer.front().command_lists.size()) {
++        // The first bad entry: which word the parser was on, where its words came from, what the
++        // entry before carried into it, whether the copy taken at submit still matches memory, and
++        // the guest memory service's view of the page (the slot armed, out, or never swapped).
++        const CommandList& list = dma_pushbuffer.front();
++        const CommandListHeader& header = list.command_lists[dma_pushbuffer_subindex];
++        const u64 bad_word = dma_state.dma_word_offset / sizeof(u32);
++        const GPUVAddr bad_address = header.addr + dma_state.dma_word_offset;
++        const bool has_snapshot = dma_pushbuffer_subindex < list.submitted_offsets.size() &&
++                                  size_t{list.submitted_offsets[dma_pushbuffer_subindex]} + header.size <=
++                                      list.submitted_words.size();
++        u32 differ = 0;
++        s64 first_differing = -1;
++        if (has_snapshot) {
++            std::vector<u32> now(header.size);
++            memory_manager.ReadBlockUnsafe(header.addr, now.data(), now.size() * sizeof(u32));
++            const CommandHeader* then = list.submitted_words.data() + list.submitted_offsets[dma_pushbuffer_subindex];
++            for (size_t j = 0; j < now.size(); ++j) {
++                if (now[j] != then[j].argument) {
++                    if (first_differing < 0) first_differing = static_cast<s64>(j);
++                    ++differ;
++                }
++            }
++        }
++        int ever_out = 0;
++        int slot_state = -2;
++        if (eden_guest_swap_address_state) {
++            const u8* const host = memory_manager.GetPointer<u8>(bad_address);
++            slot_state = host != nullptr ? eden_guest_swap_address_state(host, &ever_out) : -3;
++        }
++        LOG_WARNING(HW_GPU,
++                    "JUNK_TRACE entry {} of {} at {:#x}+{:#x} words: bad word {} at {:#x}; words from {} "
++                    "(0 submitted copy, 1 safe read, 2 GPU-written copy, 3 memory), resumed at word {}, "
++                    "carried from the entry before: method {:#x} wanting {} more words, GPU-written {}; "
++                    "submit copy {}: {} words differ from memory now, first at word {}; guest slot state {} "
++                    "(0 zero 1 own 2 shared 3 fine 4 armed 5 out, -1 outside, -2 no service, -3 unmapped), "
++                    "ever swapped {}",
++                    dma_pushbuffer_subindex, list.command_lists.size(), header.addr.Value(), header.size.Value(),
++                    bad_word, bad_address, entry_trace.source, entry_trace.resumed_offset,
++                    entry_trace.carried_method, entry_trace.carried_count, entry_trace.gpu_written,
++                    has_snapshot ? "kept" : "none", differ, first_differing, slot_state, ever_out);
++    }
+     const auto& lists = dma_pushbuffer.front().command_lists;
+     const size_t first = dma_pushbuffer_subindex >= 2 ? dma_pushbuffer_subindex - 2 : 0;
+     for (size_t i = first; i <= dma_pushbuffer_subindex && i < lists.size(); ++i) {
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index 6167f2150f..e3a58cb7ff 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -288,6 +288,23 @@ public:
+     std::vector<ParkedMethod> parked_methods;
+     GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
+ 
++    // EDEN_NX2_JUNK_TRACE=1: what fed the entry being parsed, logged by DumpCurrentEntry at the
++    // first unknown method (where the stream had turned to junk in runs 149 and 162).
++    struct EntryTrace {
++        u32 carried_method{}; ///< dma_state.method when the entry began
++        u32 carried_count{};  ///< words a method of the entry before still wanted (split method)
++        u32 resumed_offset{}; ///< command_resume_offset when the entry began (after an acquire)
++        u8 source{};          ///< 0 submitted copy, 1 safe read, 2 GPU-written copy, 3 memory
++        bool gpu_written{};
++    } entry_trace{};
++    static bool JunkTraceEnabled() {
++        static const bool enabled = [] {
++            const char* value = std::getenv("EDEN_NX2_JUNK_TRACE");
++            return value != nullptr && value[0] == '1';
++        }();
++        return enabled;
++    }
++
+     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
+     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
+ 
+-- 
+2.54.0
+

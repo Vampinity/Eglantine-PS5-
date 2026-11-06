@@ -964,8 +964,19 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
     // A step that stopped half way goes on from the blocks it has (the JIT asks again).
     for (std::size_t piece = range.pieces - offset / LargePage; piece < CodePieces; ++piece) {
         std::int64_t physical = -1;
-        if (eden_direct_low(LargePage, LargePage, 12, &physical) != 0 && !TakeHostReserveBlock(&physical))
-            return false;
+        if (eden_direct_low(LargePage, LargePage, 12, &physical) != 0 && !TakeHostReserveBlock(&physical)) {
+            // EDEN_JIT_RESERVE_LEND=1 (off unless asked for): a piece the pool refuses ends the
+            // session ("the console has no memory for its next part": run 161, 20 MiB left while
+            // the guest's reserve held 256 MiB at its floor; TakeHostReserveBlock lends only above
+            // half the reserve, which a short pool never has). The reserve gives a block above its
+            // floor back to the pool, as it does for a refused buffer, and the pool is asked once
+            // more: a piece is one 2 MiB block, so any lent block serves. EDEN_GUEST_RESERVE_FLOOR
+            // sets what may go.
+            static const bool lend = std::getenv("EDEN_JIT_RESERVE_LEND") != nullptr && std::getenv("EDEN_JIT_RESERVE_LEND")[0] == '1';
+            if (!lend || eden_guest_reserve_lend(LargePage) == 0 || eden_direct_low(LargePage, LargePage, 12, &physical) != 0)
+                return false;
+            std::fputs("EDEN_JIT_MEMORY a piece the pool refused came from the guest's reserve\n", stderr);
+        }
         void* const piece_writable = static_cast<char*>(writable) + piece * LargePage;
         void* const piece_executable = static_cast<char*>(executable) + piece * LargePage;
         void* at = piece_writable;
