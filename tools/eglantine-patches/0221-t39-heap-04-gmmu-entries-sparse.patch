@@ -1,0 +1,98 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0342-heap-04-gmmu-entries-sparse.patch
+
+Source: 0342-heap-04-gmmu-entries-sparse.patch
+Moved by hand: only its include hunk moved (the array include it expected came from the dropped 0145)
+
+Core patch: tools/eglantine-patches, next free number after 0181 (0184 if in order).
+
+Tegra::MemoryManager::entries holds 2 bits for each 4 KiB page of the GPU's address space. Run 61's log
+says "No VA split given; small pages up to 0xc000000000": 40 bits, so entries is a vector of 64 MiB, one
+of the heap's large blocks, nearly all zero. It is read and written in GetEntry and SetEntry only.
+
+Unset: nothing changes, the same vector. EDEN_GMMU_SPARSE=1 (any value, 0 too) leaves it empty and keeps
+the states in a SparseLargeVector like big_page_table_dev beside it: a 2 MiB slot is taken at the first
+state written in its 32 GiB of addresses, and a write that changes nothing takes none.
+Saving: 64 MiB less 2 MiB for each 32 GiB touched; the number of slots is not known, guess 48+ MiB
+(`tables` in EDEN_POOL_LEDGER shows it: 2 MiB more for each slot).
+The price: a first mapping in a new 32 GiB with no block left ends the session
+("EDEN_SPARSE_TABLES commit failed"), as for the guest page table.
+
+clang -fsyntax-only with Boost 1.90 passes (x86-64 host). Host test of these two functions on the real
+SparseLargeVector (its mmap path, not the console's): 3 million writes read back as with the vector, and
+a free write over 1 GiB of nothing wrote nothing. Not compiled for the console, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index ecb7b2331e..ddbc5b779e 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <array>
+ #include <vector>
+ 
+@@ -57,7 +58,16 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager&
+     big_page_table_dev.ResizeAndClear(big_page_table_size);
+     big_entries.resize(big_page_table_size / 32, 0);
+     big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
+-    entries.resize(page_table_size / 32, 0);
++    // Two bits for each 4 KiB page: 64 MiB for the 40 bits Switch 2 titles ask for, one large block
++    // of the heap with nearly all of it zero. EDEN_GMMU_SPARSE=1 keeps them in a sparse table: a
++    // 2 MiB slot (32 GiB of addresses) is taken at the first state written there, and a first
++    // write with no memory left ends the session, as it does for the other sparse tables.
++    use_sparse_entries = std::getenv("EDEN_GMMU_SPARSE") != nullptr;
++    if (use_sparse_entries) {
++        sparse_entries.ResizeAndClear(page_table_size / 32);
++    } else {
++        entries.resize(page_table_size / 32, 0);
++    }
+ }
+ 
+ MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPUVAddr split_address_, u64 big_page_bits_, u64 page_bits_)
+@@ -78,7 +88,7 @@ MemoryManager::EntryType MemoryManager::GetEntry(size_t position, bool is_big_pa
+         return static_cast<EntryType>((entry_mask >> (2 * sub_index)) & 0x03ULL);
+     } else {
+         position = position >> page_bits;
+-        const u64 entry_mask = entries[position / 32];
++        const u64 entry_mask = use_sparse_entries ? sparse_entries[position / 32] : entries[position / 32];
+         const size_t sub_index = position % 32;
+         return static_cast<EntryType>((entry_mask >> (2 * sub_index)) & 0x03ULL);
+     }
+@@ -93,10 +103,15 @@ void MemoryManager::SetEntry(size_t position, MemoryManager::EntryType entry, bo
+             (~(3ULL << sub_index * 2) & entry_mask) | (static_cast<u64>(entry) << sub_index * 2);
+     } else {
+         position = position >> page_bits;
+-        const u64 entry_mask = entries[position / 32];
++        const u64 entry_mask = use_sparse_entries ? sparse_entries[position / 32] : entries[position / 32];
+         const size_t sub_index = position % 32;
+-        entries[position / 32] =
+-            (~(3ULL << sub_index * 2) & entry_mask) | (static_cast<u64>(entry) << sub_index * 2);
++        const u64 value = (~(3ULL << sub_index * 2) & entry_mask) | (static_cast<u64>(entry) << sub_index * 2);
++        if (!use_sparse_entries) {
++            entries[position / 32] = value;
++        } else if (value != entry_mask) {
++            // An unchanged word takes no slot: an unmap where nothing was mapped needs no memory.
++            sparse_entries.Set(position / 32, value);
++        }
+     }
+ }
+ 
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index e966e9628c..108d12fadf 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -237,6 +237,9 @@ private:
+     };
+ 
+     std::vector<u64> entries;
++    /// EDEN_GMMU_SPARSE=1: the page states are here and `entries` stays empty.
++    Common::SparseLargeVector<u64> sparse_entries;
++    bool use_sparse_entries{};
+     std::vector<u64> big_entries;
+ 
+     GPUVAddr PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, EntryType entry_type);

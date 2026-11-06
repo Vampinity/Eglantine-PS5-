@@ -1,0 +1,53 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0302-mesh-guard.patch
+
+Source: 0302-mesh-guard.patch
+Core patch, after 0301. Off with EDEN_NX2_MESH_AS_COMPUTE unset: nothing here runs then.
+
+0301's vkCmdDrawIndirect is a draw site 0200 could not know: with EDEN_NX2_PIPELINE_FAIL_SOFT=1 it
+now drops the draw when the bound graphics pipeline failed to build, like the other sites.
+
+Also: MakeMeshComputePipelines runs on a pipeline worker and RecordMeshComputePasses does not wait
+for it. It made the mesh pipeline first, so a draw in that window saw mesh_pipeline set and
+task_pipeline empty and ran the mesh pass with no task pass or table. The mesh pipeline is now made
+last, so a set mesh_pipeline means the others are there, also when a later build throws.
+
+Found by reading only. Not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 3c029a2280..6463a36100 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -1305,11 +1305,13 @@ void GraphicsPipeline::MakeMeshComputePipelines() {
+         };
+         return device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+     };
+-    mesh_pipeline = make(mesh_compute->mesh, true);
++    // The mesh pipeline last: this runs on a worker, RecordMeshComputePasses does not wait for it,
++    // and it takes a set mesh_pipeline to mean the draw's other pipelines are there too.
+     if (mesh_compute->task) {
+         task_pipeline = make(mesh_compute->task, true);
+         scan_pipeline = make(mesh_compute->scan, false);
+     }
++    mesh_pipeline = make(mesh_compute->mesh, true);
+ }
+ 
+ // Records the draw's compute passes (mesh_compute_layout.h) before its render pass: the scratch
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 511926b2d2..461e1c54c2 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -983,7 +983,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+                                 num_instances);
+                 }
+             }
+-            scheduler.Record([draw = mesh_compute_draw](vk::CommandBuffer cmdbuf) {
++            scheduler.Record([this, draw = mesh_compute_draw](vk::CommandBuffer cmdbuf) {
++                if (scheduler.GraphicsPipelineMissing()) {
++                    return;
++                }
+                 cmdbuf.DrawIndirect(draw.buffer, draw.offset, 1, sizeof(VkDrawIndirectCommand));
+             });
+             return;

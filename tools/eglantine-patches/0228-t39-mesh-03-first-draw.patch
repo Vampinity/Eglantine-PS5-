@@ -1,0 +1,377 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0425-mesh-03-first-draw.patch
+
+Source: 0425-mesh-03-first-draw.patch
+Apply after core16 + frontend 0182-0410 + mesh-02-next-step.patch.
+Generated with OpenAI Codex; local draft, no human sign-off or submission.
+
+Merge mesh/task rescaling and render area into the compute push block,
+keeping scratch byte offsets. Push scale and extent before dispatch.
+Include guest resources in both dependencies and serialize scratch reuse
+across draws on the existing queue. Match indirect access with its stage
+between task and scan. No new allocation or enable switch: the existing
+EDEN_NX2_MESH_AS_COMPUTE=1 remains off by default.
+
+The emitter harness checks block count and byte offsets. Original scaled
+modules fail spirv-val with VUID-06674; patched task/mesh plain/scaled and
+readback modules pass for Vulkan 1.3. Changed C++ units pass host syntax
+checks. Full CMake/PS5 builds and GPU draws were not tested. Task overflow,
+instances, indirect guest draws and omitted outputs remain separate work.
+ .../backend/spirv/emit_spirv_mesh.cpp              |   3 +-
+ .../backend/spirv/spirv_emit_context.cpp           |  36 ++++++-
+ src/tests/CMakeLists.txt                           |  14 +++
+ src/tests/video_core/mesh_compute_push.cpp         | 118 +++++++++++++++++++++
+ .../renderer_vulkan/vk_graphics_pipeline.cpp       |  46 +++++---
+ .../renderer_vulkan/vk_graphics_pipeline.h         |   3 +-
+ 6 files changed, 197 insertions(+), 23 deletions(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+index 084caa9a7a..de8148d7d5 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+@@ -132,9 +132,10 @@ bool MeshBounds() {
+ // (emit_spirv_mesh_readback.cpp) draws them as a triangle list.
+ 
+ Id PushMember(EmitContext& ctx, u32 member) {
++    // Rescaling and render area occupy the first four members of the shared block.
+     return ctx.OpLoad(ctx.U32[1],
+                       ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
+-                                        ctx.mesh_push_constants, ctx.Const(member)));
++                                        ctx.mesh_push_constants, ctx.Const(member + 4)));
+ }
+ 
+ Id ScratchWord(EmitContext& ctx, Id base, Id word) {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 4bd5c38930..1af2cdee3d 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1368,6 +1368,9 @@ void EmitContext::DefineRescalingInput(const Info& info) {
+ }
+ 
+ void EmitContext::DefineRescalingInputPushConstant() {
++    if (mesh_compute) {
++        return; // Defined with the mesh address and counts in DefineMeshCompute.
++    }
+     boost::container::static_vector<Id, 3> members{};
+     u32 member_index{0};
+ 
+@@ -1424,6 +1427,9 @@ void EmitContext::DefineRescalingInputUniformConstant() {
+ }
+ 
+ void EmitContext::DefineRenderArea(const Info& info) {
++    if (mesh_compute) {
++        return; // The shared push block already contains this member.
++    }
+     if (!info.uses_render_area) {
+         return;
+     }
+@@ -1977,18 +1983,40 @@ void EmitContext::DefineMeshCompute() {
+         AddExtension("SPV_KHR_physical_storage_buffer");
+     }
+     SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
+-    const std::array<Id, 5> members{U32[1], U32[1], U32[1], U32[1], U32[1]};
++    // Vulkan allows one statically used push block per entry point (VUID-06674).
++    // Place render area after rescaling; preserve the mesh address/count byte offsets.
++    rescaling_textures_type = TypeArray(U32[1], Const(4u));
++    rescaling_images_type = TypeArray(U32[1], Const(NUM_IMAGE_SCALING_WORDS));
++    Decorate(rescaling_textures_type, spv::Decoration::ArrayStride, 4u);
++    Decorate(rescaling_images_type, spv::Decoration::ArrayStride, 4u);
++    rescaling_textures_member_index = 0;
++    rescaling_images_member_index = 1;
++    rescaling_downfactor_member_index = 2;
++    render_are_member_index = 3;
++    const std::array<Id, 9> members{rescaling_textures_type, rescaling_images_type, F32[1],
++                                    F32[4], U32[1], U32[1], U32[1], U32[1], U32[1]};
+     const Id block{TypeStruct(std::span(members.data(), members.size()))};
+     Decorate(block, spv::Decoration::Block);
+-    Name(block, "MeshComputeLayout");
++    Name(block, "MeshComputePush");
++    MemberDecorate(block, 0, spv::Decoration::Offset,
++                   static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
++    MemberDecorate(block, 1, spv::Decoration::Offset,
++                   static_cast<u32>(offsetof(RescalingLayout, rescaling_images)));
++    MemberDecorate(block, 2, spv::Decoration::Offset,
++                   static_cast<u32>(offsetof(RescalingLayout, down_factor)));
++    MemberDecorate(block, 3, spv::Decoration::Offset,
++                   static_cast<u32>(sizeof(RescalingLayout)));
+     static constexpr std::array<const char*, 5> names{"scratch_low", "scratch_high", "tasks", "groups",
+                                                       "group_corners"};
+     for (u32 member = 0; member < names.size(); ++member) {
+-        MemberDecorate(block, member, spv::Decoration::Offset, MESH_COMPUTE_PUSH_OFFSET + 4 * member);
+-        MemberName(block, member, names[member]);
++        MemberDecorate(block, member + 4, spv::Decoration::Offset,
++                       MESH_COMPUTE_PUSH_OFFSET + 4 * member);
++        MemberName(block, member + 4, names[member]);
+     }
+     mesh_push_constants = AddGlobalVariable(TypePointer(spv::StorageClass::PushConstant, block),
+                                             spv::StorageClass::PushConstant);
++    rescaling_push_constants = mesh_push_constants;
++    render_area_push_constant = mesh_push_constants;
+     Name(mesh_push_constants, "mesh_push_constants");
+     if (profile.supported_spirv >= 0x00010400) {
+         interfaces.push_back(mesh_push_constants);
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 788607798d..0aac823e4a 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -68,3 +68,17 @@ if (NOT MSVC)
+         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
+         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>)
+ endif()
++
++# Exercise the actual emitter with live mesh/task rescaling reads.
++add_executable(mesh_compute_push_test video_core/mesh_compute_push.cpp)
++target_link_libraries(mesh_compute_push_test PRIVATE shader_recompiler)
++add_test(NAME mesh_compute_push COMMAND mesh_compute_push_test)
++find_program(SPIRV_VAL_EXECUTABLE spirv-val)
++if (SPIRV_VAL_EXECUTABLE)
++    foreach(module task_plain task_scaled mesh_plain mesh_scaled mesh_readback)
++        add_test(NAME mesh_compute_push_${module}
++            COMMAND "${SPIRV_VAL_EXECUTABLE}" --target-env vulkan1.3
++                    "${CMAKE_CURRENT_BINARY_DIR}/${module}.spv")
++        set_tests_properties(mesh_compute_push_${module} PROPERTIES DEPENDS mesh_compute_push)
++    endforeach()
++endif()
+diff --git a/src/tests/video_core/mesh_compute_push.cpp b/src/tests/video_core/mesh_compute_push.cpp
+new file mode 100644
+index 0000000000..86325a37c9
+--- /dev/null
++++ b/src/tests/video_core/mesh_compute_push.cpp
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// CMake target mesh_compute_push_test; CTest also validates each output when spirv-val
++// is installed. No GPU or native mesh extension is needed.
++#include <array>
++#include <cstdio>
++#include <fstream>
++#include <map>
++#include <stdexcept>
++#include <string>
++
++#include "shader_recompiler/backend/spirv/emit_spirv.h"
++#include "shader_recompiler/backend/spirv/emit_spirv_mesh_readback.h"
++#include "shader_recompiler/backend/spirv/mesh_compute_layout.h"
++#include "shader_recompiler/frontend/ir/basic_block.h"
++#include "shader_recompiler/frontend/ir/ir_emitter.h"
++
++using namespace Shader;
++
++int main() {
++    for (const Stage stage : {Stage::Task, Stage::Mesh}) {
++        for (const bool scaled : {false, true}) {
++            ObjectPool<IR::Inst> pool;
++            IR::Block block{pool};
++            IR::IREmitter ir{block};
++            ir.Prologue();
++            if (scaled) {
++                // Keep every push read live through a guest output, in both stages.
++                ir.IsbeWriteAttribute(ir.Imm32(0), ir.BitCast<IR::U32>(ir.ResolutionDownFactor()));
++                ir.IsbeWriteAttribute(ir.Imm32(4),
++                    IR::U32{ir.Select(ir.IsTextureScaled(ir.Imm32(0)), ir.Imm32(1), ir.Imm32(0))});
++                ir.IsbeWriteAttribute(ir.Imm32(8),
++                    IR::U32{ir.Select(ir.IsImageScaled(ir.Imm32(0)), ir.Imm32(1), ir.Imm32(0))});
++                ir.IsbeWriteAttribute(ir.Imm32(12), ir.BitCast<IR::U32>(ir.RenderAreaWidth()));
++            }
++            ir.Epilogue();
++            IR::Program program;
++            program.stage = stage;
++            program.workgroup_size = {32, 1, 1};
++            program.blocks = {&block};
++            program.post_order_blocks = {&block};
++            program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
++                                   {{}, IR::AbstractSyntaxNode::Type::Return}};
++            program.info.uses_workgroup_id = true;
++            program.info.uses_local_invocation_id = true;
++            program.info.is_task = stage == Stage::Task;
++            program.info.is_mesh = stage == Stage::Mesh;
++            program.info.uses_rescaling_uniform = scaled;
++            program.info.uses_render_area = scaled;
++            program.mesh.payload_words = 32;
++            program.mesh.max_vertices = 3;
++            program.mesh.max_primitives = 1;
++            program.mesh.topology = 4;
++            program.mesh.vertex_lines = {
++                static_cast<u32>(IR::Attribute::PositionX),
++                static_cast<u32>(IR::Attribute::PositionY),
++                static_cast<u32>(IR::Attribute::PositionZ),
++                static_cast<u32>(IR::Attribute::PositionW),
++            };
++            Profile profile{};
++            profile.supported_spirv = 0x00010600;
++            profile.support_int64 = true;
++            profile.unified_descriptor_binding = true;
++            RuntimeInfo runtime{};
++            runtime.mesh_as_compute = true;
++            Backend::Bindings bindings{};
++            const auto code = Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
++            u32 push_variables{};
++            u32 push_struct{};
++            std::map<u32, u32> pointer_types;
++            std::map<std::pair<u32, u32>, u32> offsets;
++            for (size_t pos = 5; pos < code.size();) {
++                const u32 words = code[pos] >> 16;
++                if (words == 0 || pos + words > code.size()) {
++                    throw std::runtime_error("Malformed SPIR-V");
++                }
++                const u32 op = code[pos] & 0xffff;
++                if (op == 32 && words == 4 && code[pos + 2] == 9) {
++                    pointer_types[code[pos + 1]] = code[pos + 3]; // OpTypePointer
++                }
++                if (op == 72 && words == 5 && code[pos + 3] == 35) {
++                    offsets[{code[pos + 1], code[pos + 2]}] = code[pos + 4]; // Offset
++                }
++                if (op == 59 && words >= 4 && code[pos + 3] == 9) {
++                    ++push_variables; // OpVariable, PushConstant
++                    push_struct = pointer_types.at(code[pos + 1]);
++                }
++                pos += words;
++            }
++            if (push_variables != 1) {
++                throw std::runtime_error("Expected one shared push block");
++            }
++            constexpr std::array<u32, 9> expected_offsets{0, 16, 24, 32, 48, 52, 56, 60, 64};
++            for (u32 member = 0; member < expected_offsets.size(); ++member) {
++                if (offsets.at({push_struct, member}) != expected_offsets[member]) {
++                    throw std::runtime_error("Push block ABI changed");
++                }
++            }
++            const std::string name = std::string{stage == Stage::Task ? "task" : "mesh"} +
++                                     (scaled ? "_scaled.spv" : "_plain.spv");
++            std::ofstream file{name, std::ios::binary};
++            file.write(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
++            if (!file) {
++                throw std::runtime_error("Cannot write SPIR-V");
++            }
++            std::printf("%s: one push block, ABI checked\n", name.c_str());
++            if (stage == Stage::Mesh && !scaled) {
++                const auto readback = Backend::SPIRV::EmitMeshReadbackVertex(profile, runtime,
++                                                                           program.mesh);
++                std::ofstream vertex{"mesh_readback.spv", std::ios::binary};
++                vertex.write(reinterpret_cast<const char*>(readback.data()),
++                             readback.size() * sizeof(u32));
++                if (!vertex) {
++                    throw std::runtime_error("Cannot write readback SPIR-V");
++                }
++            }
++        }
++    }
++}
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 4cd6f8bf29..84051314ee 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -729,7 +729,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+ 
+     if (RunsMeshAsCompute() &&
+         !RecordMeshComputePasses(descriptor_data, descriptor_buffer_offset, descriptor_buffer_chunk,
+-                                 rescaling)) {
++                                 rescaling, render_area)) {
+         return false;
+     }
+     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+@@ -1342,7 +1342,8 @@ void GraphicsPipeline::MakeMeshComputePipelines() {
+ bool GraphicsPipeline::RecordMeshComputePasses(const void* descriptor_data,
+                                                VkDeviceSize descriptor_buffer_offset,
+                                                u32 descriptor_buffer_chunk,
+-                                               const RescalingPushConstant& rescaling) {
++                                               const RescalingPushConstant& rescaling,
++                                               const RenderAreaPushConstant& render_area) {
+     using namespace Shader::Backend::SPIRV;
+     mesh_compute_draw = {};
+     if (!mesh_scratch || !mesh_scratch->IsValid() || !mesh_pipeline) {
+@@ -1406,22 +1407,25 @@ bool GraphicsPipeline::RecordMeshComputePasses(const void* descriptor_data,
+         .group_corners = 3 * mesh.max_primitives,
+         .padding = {},
+     };
++    const f32 down_factor{texture_cache.IsRescaling()
++                              ? Settings::values.resolution_info.down_factor : 1.0f};
+     scheduler.RequestOutsideRenderPassOperationContext();
+     scheduler.Record([this, descriptor_data, descriptor_buffer_offset, descriptor_buffer_chunk, push,
+-                      has_task, rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
++                      has_task, down_factor, rescaling_data = rescaling.Data(),
++                      uses_render_area = render_area.uses_render_area,
++                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+         const VkBuffer scratch{mesh_scratch->Handle()};
+-        // The last draw's reads of the region come before this draw's writes; the header is cleared.
++        // Cover guest resources as well as scratch, including earlier fragment/attachment and
++        // transfer writes. All prior readers finish before this draw overwrites shared storage.
++        // The scheduler submits these commands to one queue; this also spans command buffers.
+         static constexpr VkMemoryBarrier reuse_barrier{
+             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+             .pNext = nullptr,
+-            .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+-                             VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+-                             VK_ACCESS_SHADER_WRITE_BIT,
++            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT |
++                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+         };
+-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+-                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+-                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                0, reuse_barrier);
+         cmdbuf.FillBuffer(scratch, 0, MESH_SCRATCH_HEADER_WORDS * sizeof(u32), 0);
+@@ -1454,20 +1458,28 @@ bool GraphicsPipeline::RecordMeshComputePasses(const void* descriptor_data,
+         }
+         cmdbuf.PushConstants(*pipeline_layout, push_constant_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                              sizeof(rescaling_data), rescaling_data.data());
++        cmdbuf.PushConstants(*pipeline_layout, push_constant_stages,
++                             RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(down_factor), &down_factor);
++        if (uses_render_area) {
++            cmdbuf.PushConstants(*pipeline_layout, push_constant_stages, sizeof(RescalingLayout),
++                                 sizeof(render_area_data), &render_area_data);
++        }
+         cmdbuf.PushConstants(*pipeline_layout, push_constant_stages, MESH_COMPUTE_PUSH_OFFSET,
+                              sizeof(push), &push);
+         static constexpr VkMemoryBarrier pass_barrier{
+             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+             .pNext = nullptr,
+             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+-                             VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
++            .dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
++                             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+         };
+         if (has_task) {
+             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *task_pipeline);
+             cmdbuf.Dispatch(push.tasks, 1, 1);
+             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, pass_barrier);
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
++                                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
++                                   0, pass_barrier);
+             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *scan_pipeline);
+             cmdbuf.Dispatch(1, 1, 1);
+             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+@@ -1484,11 +1496,11 @@ bool GraphicsPipeline::RecordMeshComputePasses(const void* descriptor_data,
+             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+             .pNext = nullptr,
+             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
++            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+         };
++        // Publish guest SSBO/image writes to fragment reads and later transfers too.
+         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+-                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                0, read_barrier);
+     });
+     mesh_compute_draw = {.recorded = true, .buffer = mesh_scratch->Handle(), .offset = 0};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 9735e9f36d..e01f3b9138 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -201,7 +201,8 @@ private:
+     void MakePipeline(VkRenderPass render_pass);
+     void MakeMeshComputePipelines();
+     bool RecordMeshComputePasses(const void* descriptor_data, VkDeviceSize descriptor_buffer_offset,
+-                                 u32 descriptor_buffer_chunk, const RescalingPushConstant& rescaling);
++                                 u32 descriptor_buffer_chunk, const RescalingPushConstant& rescaling,
++                                 const RenderAreaPushConstant& render_area);
+ 
+     void Validate();
+ 

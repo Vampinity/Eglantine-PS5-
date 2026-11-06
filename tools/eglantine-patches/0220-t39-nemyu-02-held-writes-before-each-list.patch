@@ -1,0 +1,144 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0339-nemyu-02-held-writes-before-each-list.patch
+
+Source: 0339-nemyu-02-held-writes-before-each-list.patch
+Moved by hand: the held writes go through upstream's batched OnCacheInvalidations; declarations placed beside upstream's ForEachPendingCpuWrite
+
+gpu: EDEN_NX2_HELD_WRITES=1 applies held-back CPU writes before each command list
+
+Port of part of Nemyu 3d49423c (Uesleizito Zin, gitlab.com/nemyu-emulator/nemyu, branch nemyu, tag
+nemyu-v0.1.4), itself from PokeDinner c3be47da94 (Franseven, git.eden-emu.dev/Franseven/
+PokeDinner-a-Eglantine-Fork), from Eden-NS2 15b48a6615. GPL-3.0-or-later, as the core.
+
+A guest CPU write to a page the GPU has written waits in the dirty-memory managers until the GPU
+thread applies it. Here that is at fences and a few other points, none tied to a list. The guest
+makes the write before it submits the list that may read it, so that list could run on the older
+bytes. 0083 says Ocarina writes onto such pages about 230 times a second, and mapped bindings make
+more pages GPU-written, so more writes wait.
+
+Changed from the source: off unless EDEN_NX2_HELD_WRITES=1; Nemyu has it on. OnCachedWrite is left
+out: 0083 already sends the CPU's bytes into the buffer from WriteMemory, so the fence's
+OnCacheInvalidation does what OnCachedWrite was added for. A log line counts the writes this path
+applies, because that count is the test: if it stays near 0 the fault is not ours.
+
+Nemyu: 21.1 ms with it, 23.2 without, one run each, its author calls that noise. Expect no speed
+from this. It is a correctness change. Whether it changes any picture is a guess.
+
+On the split the apply runs on the back, in the ring ahead of the list, as every other cache call
+does. No new gathering thread: Gather stays on the GPU thread or the back, so the race fixed by
+Lichii #138 (7e1d645557) does not arise.
+
+Limit, as in the source: this runs where a list is submitted. A list parked on a semaphore acquire
+resumes through Scheduler::ResumePending without it, so writes the guest made while the list waited
+still land at the next fence. Unset, the split queues nothing (GPU::HeldWritesOn, added for next18).
+
+Core patch. Nothing here has run on a console.
+
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index abe02457b7..f6863aaa7d 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -69,6 +69,17 @@ u64 Nx2GpuTimeDivisor() {
+     }();
+     return divisor;
+ }
++
++// EDEN_NX2_HELD_WRITES=1: guest CPU writes to GPU-written memory wait in the dirty-memory managers
++// until the GPU thread applies them, otherwise only at the next fence. The guest makes them before
++// it submits the list that may read them, so that list could run on the older bytes.
++bool HeldWritesBeforeLists() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_HELD_WRITES");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
+ } // Anonymous namespace
+ 
+ struct GPU::Impl {
+@@ -140,6 +151,32 @@ struct GPU::Impl {
+         }
+     }
+ 
++    /// Applies held-back guest CPU writes before a submitted list runs. Called by the thread that
++    /// owns the caches: the GPU thread, or the split's back.
++    void ApplyHeldWritesBeforeList() {
++        if (!HeldWritesBeforeLists()) {
++            return;
++        }
++        static u64 count{};
++        static u64 bytes{};
++        static u64 next_log{1};
++        std::vector<std::pair<DAddr, u64>> writes;
++        std::function<void(PAddr, size_t)> callback_writes([&writes](PAddr address, size_t size) {
++            writes.emplace_back(address, size);
++            ++count;
++            bytes += size;
++        });
++        system.GatherGPUDirtyMemory(callback_writes);
++        if (!writes.empty()) {
++            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
++        }
++        if (count >= next_log) {
++            next_log = count * 2;
++            LOG_INFO(HW_GPU, "CPU writes applied before a command list: {} so far, {} KiB", count,
++                     bytes >> 10);
++        }
++    }
++
+     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+             manager.ForEachPending(callback);
+@@ -492,6 +529,14 @@ void GPU::InvalidateGPUCache() {
+     impl->InvalidateGPUCache();
+ }
+ 
++void GPU::ApplyHeldWritesBeforeList() {
++    impl->ApplyHeldWritesBeforeList();
++}
++
++bool GPU::HeldWritesOn() const {
++    return HeldWritesBeforeLists();
++}
++
+ void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+     impl->ForEachPendingCpuWrite(callback);
+ }
+diff --git a/src/video_core/gpu.h b/src/video_core/gpu.h
+index d88a716a98..830003d3f9 100644
+--- a/src/video_core/gpu.h
++++ b/src/video_core/gpu.h
+@@ -148,6 +148,10 @@ public:
+     void FlushCommands();
+     /// Synchronizes CPU writes with Host GPU memory.
+     void InvalidateGPUCache();
++    /// Applies held-back guest CPU writes before a submitted list runs (EDEN_NX2_HELD_WRITES=1).
++    void ApplyHeldWritesBeforeList();
++    /// Whether EDEN_NX2_HELD_WRITES=1, so that the split queues nothing without it.
++    [[nodiscard]] bool HeldWritesOn() const;
+     /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
+     /// applied yet.
+     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 238a5c0215..ee3dcab237 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -103,6 +103,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
+                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                     Profile::Scope scope{Profile::Zone::Push};
++                    // Ahead of anything the list queues.
++                    if (system.GPU().HeldWritesOn()) {
++                        split.Defer([gpu = &system.GPU()] { gpu->ApplyHeldWritesBeforeList(); });
++                    }
+                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
+@@ -133,6 +137,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+             }
+             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                 Profile::Scope scope{Profile::Zone::Push};
++                system.GPU().ApplyHeldWritesBeforeList();
+                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+                 Profile::Scope scope{Profile::Zone::Tick};

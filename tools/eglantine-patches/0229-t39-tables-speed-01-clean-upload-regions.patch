@@ -1,0 +1,112 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0429-tables-speed-01-clean-upload-regions.patch
+
+Source: 0429-tables-speed-01-clean-upload-regions.patch
+Moved by hand: the ForEachUploadRange hunk placed by hand; the word manager hunks applied
+
+Opt in with EDEN_NX2_TABLES_SPEED=1 (only that exact value).
+Keep the 128 MiB descriptors and all dirty-page uploads. Remember that a
+whole WordManager region was scanned clean; CPU writes, cached CPU writes
+and cached-write flushes invalidate its generation. Partial scans never
+establish a clean region. Capture the generation before callbacks.
+
+This is an offline candidate, not a measured PS5 fps recovery. The isolated
+128 MiB scan benchmark improves; buffer memory pressure is unchanged.
+
+Assisted-by: OpenAI Codex (analysis, patch draft and isolated validation)
+
+diff --git a/src/video_core/buffer_cache/memory_tracker_base.h b/src/video_core/buffer_cache/memory_tracker_base.h
+index 89155ad954..20707d2014 100644
+--- a/src/video_core/buffer_cache/memory_tracker_base.h
++++ b/src/video_core/buffer_cache/memory_tracker_base.h
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <bit>
+ #include <deque>
++#include <cstdlib>
+ #include <limits>
+ #include <type_traits>
+ #include "common/container/unordered_set.h"
+@@ -161,9 +162,20 @@ public:
+     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
+     template <typename Func>
+     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+-            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
+-        });
++        static const bool cache_clean = [] {
++            const char* const value = std::getenv("EDEN_NX2_TABLES_SPEED");
++            return value != nullptr && value[0] == '1' && value[1] == '\0';
++        }();
++        if (cache_clean) {
++            IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
++                manager->template ForEachModifiedRange<true>(Type::CPU, true,
++                                                            manager->cpu_addr + offset, size, func);
++            });
++        } else {
++            IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
++                manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
++            });
++        }
+     }
+ 
+     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
+diff --git a/src/video_core/buffer_cache/word_manager.h b/src/video_core/buffer_cache/word_manager.h
+index f3a08ae993..8fafa28f89 100644
+--- a/src/video_core/buffer_cache/word_manager.h
++++ b/src/video_core/buffer_cache/word_manager.h
+@@ -54,6 +54,11 @@ struct WordManager {
+     /// Grows whenever pages here become CPU modified (MemoryTrackerBase::CpuWriteEpoch).
+     u64 cpu_epoch{1};
+ 
++    // A full upload scan leaves both CPU and untracked bits clear. Writes, including cached
++    // writes before they are flushed, invalidate that fact independently for each 4 MiB region.
++    u64 upload_epoch{};
++    u64 clean_upload_epoch{~u64{0}};
++
+     static u64 ExtractBits(u64 word, size_t page_start, size_t page_end) {
+         constexpr size_t number_bits = sizeof(u64) * 8;
+         const size_t limit_page_end = number_bits - (std::min)(page_end, number_bits);
+@@ -119,6 +124,9 @@ struct WordManager {
+     /// @param dirty_addr    Base address to mark or unmark as modified
+     /// @param size          Size in bytes to mark or unmark as modified
+     void ChangeRegionState(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
++        if (enable && (type == Type::CPU || type == Type::CachedCPU)) {
++            ++upload_epoch;
++        }
+         std::span<u64> state_words = Span(type);
+         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
+         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
+@@ -155,8 +163,13 @@ struct WordManager {
+     /// @param query_cpu_range Base CPU address to loop over
+     /// @param size            Size in bytes of the CPU range to loop over
+     /// @param func            Function to call for each turned off region
+-    template <typename Func>
++    template <bool cache_upload = false, typename Func>
+     void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
++        const bool cache_clean = cache_upload && type == Type::CPU && clear;
++        const u64 epoch = upload_epoch;
++        if (cache_clean && clean_upload_epoch == epoch) {
++            return;
++        }
+         //static_assert(type != Type::Untracked);
+         std::span<u64> state_words = Span(type);
+         std::span<u64> untracked_words = Span(Type::Untracked);
+@@ -210,6 +223,9 @@ struct WordManager {
+         if (!ranges.empty()) {
+             ApplyCollectedRanges(ranges, 1);
+         }
++        if (cache_clean && offset == 0 && size >= static_cast<s64>(size_bytes)) {
++            clean_upload_epoch = epoch;
++        }
+     }
+ 
+     /// @brief Returns true when a region has been modified
+@@ -254,6 +270,7 @@ struct WordManager {
+     }
+ 
+     void FlushCachedWrites() noexcept {
++        ++upload_epoch;
+         auto const cached_words = Span(Type::CachedCPU);
+         auto const untracked_words = Span(Type::Untracked);
+         auto const cpu_words = Span(Type::CPU);

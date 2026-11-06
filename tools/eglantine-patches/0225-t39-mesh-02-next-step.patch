@@ -1,0 +1,60 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0416-mesh-02-next-step.patch
+
+Source: 0416-mesh-02-next-step.patch
+Apply to the core after the frontend's 0001-0410 series. Generated with
+OpenAI Codex; local draft, no human sign-off or upstream submission.
+
+EDEN_NX2_MESH_AS_COMPUTE=1 is the only enable switch; it remains off by
+default. No new environment setting, allocation, or GPU wait is added.
+
+ConfigureImpl reads the graphics pipeline handle, then ConfigureDraw calls
+RecordMeshComputePasses, which reads mesh_pipeline and task_pipeline before
+the scheduler's existing build wait. The builder may still be writing those
+non-atomic handles. Making mesh_pipeline last in 0302 does not publish them
+across threads. An unfinished build can also make the first draw disappear.
+
+Wait under the existing build mutex at the start of ConfigureImpl for this
+path only. Both success and the handled Vulkan failure signal is_built under
+that mutex. Unlocking after the wait publishes all handles before the first
+CPU read; the existing null checks still reject a failed build. Ordinary
+graphics pipelines keep their current asynchronous path. A driver compiler
+that never returns can still block this CPU wait.
+
+Checked in a private copy: core16 plus 0182-0410 applies; clang++ -std=c++20
+-fsyntax-only on the full changed translation unit passes using local Vulkan,
+Boost, Sirit and VMA headers (one existing nodiscard warning in macro.h).
+A host test of the extracted wait block passes delayed success, delayed
+failure, already-finished and disabled cases. git apply --check passes.
+No PS5 build or GPU draw was tested. This does not fix the separate rescaling
+push-block failure, output omissions or capped task work documented in
+mesh-real-plan.md.
+ src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 5e4d6e71f2..ce94bcbf71 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -407,6 +407,11 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
+ 
+ template <typename Spec>
+ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
++    if (RunsMeshAsCompute()) {
++        // The compute path reads pipeline handles on this thread, before scheduler.Record.
++        std::unique_lock lock{build_mutex};
++        build_condvar.wait(lock, [this] { return is_built.load(std::memory_order_relaxed); });
++    }
+     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
+     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
+     views.reserve(num_image_elements);
+@@ -1310,8 +1315,7 @@ void GraphicsPipeline::MakeMeshComputePipelines() {
+         };
+         return device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+     };
+-    // The mesh pipeline last: this runs on a worker, RecordMeshComputePasses does not wait for it,
+-    // and it takes a set mesh_pipeline to mean the draw's other pipelines are there too.
++    // The mesh pipeline last: a failed task or scan build leaves it empty.
+     if (mesh_compute->task) {
+         task_pipeline = make(mesh_compute->task, true);
+         scan_pipeline = make(mesh_compute->scan, false);

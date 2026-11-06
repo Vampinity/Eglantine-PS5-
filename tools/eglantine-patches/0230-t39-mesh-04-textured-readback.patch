@@ -1,0 +1,508 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0434-mesh-04-textured-readback.patch
+
+Source: 0434-mesh-04-textured-readback.patch
+Local experimental draft against fully patched core-t33 (T35 includes
+0425 mesh-03 and 0426). Generated with OpenAI Codex; no human sign-off.
+
+Preserve ordinary UV interpolation, flatten per-primitive inputs on both
+sides of the generated vertex/fragment interface, and carry programmed
+PrimitiveId through a collision-free private uint varying. Export mesh
+clip distances rather than dropping them. Refuse an exhausted varying
+map or unsupported clip-distance count at pipeline compilation.
+
+Only the existing EDEN_NX2_MESH_AS_COMPUTE=1 enables this path; default
+off. No additional switch, scratch allocation or native mesh requirement.
+Native fragment inputs keep BuiltIn PrimitiveId and PerPrimitiveEXT.
+
+The emitter harness checks textured inputs, interpolation, scratch-loaded
+PrimitiveId, clip limits and varying exhaustion. Five modules validate
+for Vulkan 1.3. Host pipeline syntax and T22 preparation were checked;
+no full console build, guest shader replay or GPU rendering was tested.
+Task batching, instances, indirect guest draws and cull outputs remain.
+
+Assisted-by: OpenAI Codex (implementation, review and local checks)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_mesh_readback.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_mesh_readback.cpp
+index 2d2219306e..81fa8e268b 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_mesh_readback.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_mesh_readback.cpp
+@@ -44,7 +44,8 @@ private:
+     const MeshInfo& mesh;
+ 
+     Id void_type{}, bool_type{}, uint_type{}, sint_type{}, ulong_type{}, float_type{}, vec4_type{};
+-    Id push{}, vertex_index{}, position{}, layer{}, viewport{};
++    Id push{}, vertex_index{}, position{}, layer{}, viewport{}, primitive_id{}, clip_distances{};
++    u32 num_clip_distances{};
+     std::array<Id, NUM_GENERICS> vertex_generics{}, primitive_generics{};
+     std::vector<Id> interfaces;
+     bool uses_layer{}, uses_viewport{};
+@@ -101,6 +102,10 @@ private:
+ 
+         for (const u32 line : mesh.vertex_lines) {
+             const auto attribute{static_cast<IR::Attribute>(line)};
++            if (attribute >= IR::Attribute::ClipDistance0 && attribute <= IR::Attribute::ClipDistance7) {
++                num_clip_distances = std::max(num_clip_distances,
++                    line - static_cast<u32>(IR::Attribute::ClipDistance0) + 1);
++            }
+             if (!IR::IsGeneric(attribute)) {
+                 continue;
+             }
+@@ -110,6 +115,21 @@ private:
+                 Decorate(variable, spv::Decoration::Location, IR::GenericAttributeIndex(attribute));
+             }
+         }
++        if (num_clip_distances != 0) {
++            if (num_clip_distances > profile.max_user_clip_distances) {
++                throw NotImplementedException("Mesh readback clip distances exceed device limit");
++            }
++            AddCapability(spv::Capability::ClipDistance);
++            clip_distances = Global(spv::StorageClass::Output,
++                                    TypeArray(float_type, Const(num_clip_distances)));
++            Decorate(clip_distances, spv::Decoration::BuiltIn, spv::BuiltIn::ClipDistance);
++        }
++        if (runtime_info.mesh_compute_primitive_id_location) {
++            primitive_id = Global(spv::StorageClass::Output, uint_type);
++            Decorate(primitive_id, spv::Decoration::Location,
++                     *runtime_info.mesh_compute_primitive_id_location);
++            Decorate(primitive_id, spv::Decoration::Flat);
++        }
+         for (const u32 line : mesh.primitive_lines) {
+             const auto attribute{static_cast<IR::Attribute>(line)};
+             if (IR::IsGeneric(attribute)) {
+@@ -133,8 +153,7 @@ private:
+                 uses_viewport = true;
+                 break;
+             case IR::Attribute::PrimitiveId:
+-                // The fragment program reads the rasterizer's primitive id: the triangle's index
+-                // in the draw, not what the mesh program wrote.
++                // Carried through the private flat varying when the fragment program reads it.
+                 break;
+             default:
+                 break;
+@@ -199,6 +218,13 @@ private:
+         const Id record{OpIAdd(uint_type, vertices, OpIMul(uint_type, index, Const(vertex_words)))};
+         const Id primitive_record{OpIAdd(uint_type, primitives, OpIMul(uint_type, triangle, Const(primitive_words)))};
+ 
++        if (Sirit::ValidId(primitive_id)) {
++            OpStore(primitive_id, triangle); // default when the mesh output map omits PrimitiveId
++        }
++        for (u32 index_ = 0; index_ < num_clip_distances; ++index_) {
++            OpStore(OpAccessChain(TypePointer(spv::StorageClass::Output, float_type),
++                                  clip_distances, Const(index_)), Constant(float_type, 0.0f));
++        }
+         std::array<Id, 4> position_values{Constant(float_type, 0.0f), Constant(float_type, 0.0f),
+                                           Constant(float_type, 0.0f), Constant(float_type, 1.0f)};
+         std::array<std::array<Id, 4>, NUM_GENERICS> generic_values{};
+@@ -210,6 +236,13 @@ private:
+                               [IR::GenericAttributeElement(attribute)] = OpBitcast(float_type, word());
+                 continue;
+             }
++            if (attribute >= IR::Attribute::ClipDistance0 && attribute <= IR::Attribute::ClipDistance7) {
++                const u32 index_ = static_cast<u32>(attribute) -
++                                   static_cast<u32>(IR::Attribute::ClipDistance0);
++                OpStore(OpAccessChain(TypePointer(spv::StorageClass::Output, float_type),
++                                      clip_distances, Const(index_)), OpBitcast(float_type, word()));
++                continue;
++            }
+             switch (attribute) {
+             case IR::Attribute::PositionX:
+             case IR::Attribute::PositionY:
+@@ -251,7 +284,9 @@ private:
+                 }
+                 continue;
+             }
+-            if (attribute == IR::Attribute::Layer && Sirit::ValidId(layer)) {
++            if (attribute == IR::Attribute::PrimitiveId && Sirit::ValidId(primitive_id)) {
++                OpStore(primitive_id, word());
++            } else if (attribute == IR::Attribute::Layer && Sirit::ValidId(layer)) {
+                 OpStore(layer, OpBitcast(sint_type, word()));
+             } else if (attribute == IR::Attribute::ViewportIndex && Sirit::ValidId(viewport)) {
+                 OpStore(viewport, OpBitcast(sint_type, word()));
+diff --git a/src/shader_recompiler/backend/spirv/mesh_compute_interface.h b/src/shader_recompiler/backend/spirv/mesh_compute_interface.h
+new file mode 100644
+index 0000000000..b08165c1b8
+--- /dev/null
++++ b/src/shader_recompiler/backend/spirv/mesh_compute_interface.h
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include "shader_recompiler/exception.h"
++#include "shader_recompiler/runtime_info.h"
++#include "shader_recompiler/shader_info.h"
++
++namespace Shader::Backend::SPIRV {
++
++// Use the same interface for readback and fragment compilation, including disk-cache replay.
++inline void ConfigureMeshComputeInterface(RuntimeInfo& runtime, const MeshInfo& mesh,
++                                          const Info& fragment) {
++    std::bitset<32> occupied;
++    std::bitset<32> vertex;
++    for (u32 index = 0; index < 32; ++index) {
++        occupied[index] = fragment.loads.Generic(index);
++    }
++    for (const u32 line : mesh.vertex_lines) {
++        const auto attribute = static_cast<IR::Attribute>(line);
++        if (IR::IsGeneric(attribute)) {
++            vertex.set(IR::GenericAttributeIndex(attribute));
++        }
++    }
++    occupied |= vertex;
++    runtime.per_primitive_generics.reset();
++    runtime.mesh_compute_primitive_id_location.reset();
++    for (const u32 line : mesh.primitive_lines) {
++        const auto attribute = static_cast<IR::Attribute>(line);
++        if (IR::IsGeneric(attribute)) {
++            const u32 index = IR::GenericAttributeIndex(attribute);
++            occupied.set(index);
++            if (!vertex[index]) {
++                runtime.per_primitive_generics.set(index);
++            }
++        }
++    }
++    if (!fragment.loads[IR::Attribute::PrimitiveId]) {
++        return;
++    }
++    // A vertex shader cannot export BuiltIn PrimitiveId. Reserve a whole unused location;
++    // never alias guest texture coordinates or a fragment input absent from the output map.
++    for (u32 index = 0; index < 32; ++index) {
++        if (!occupied[index]) {
++            runtime.mesh_compute_primitive_id_location = index;
++            return;
++        }
++    }
++    throw NotImplementedException("Mesh compute PrimitiveId needs a free varying location");
++}
++
++} // namespace Shader::Backend::SPIRV
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 1af2cdee3d..7b984343d6 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1831,7 +1831,13 @@ void EmitContext::DefineInputs(const IR::Program& program) {
+             ConstantComposite(F32[4], f32_minus_one, f32_minus_one, f32_one, f32_minus_one);
+     }
+     if (loads[IR::Attribute::PrimitiveId]) {
+-        primitive_id = DefineInput(*this, U32[1], false, spv::BuiltIn::PrimitiveId);
++        if (stage == Stage::Fragment && runtime_info.mesh_compute_primitive_id_location) {
++            primitive_id = DefineInput(*this, U32[1], false);
++            Decorate(primitive_id, spv::Decoration::Location,
++                     *runtime_info.mesh_compute_primitive_id_location);
++        } else {
++            primitive_id = DefineInput(*this, U32[1], false, spv::BuiltIn::PrimitiveId);
++        }
+         if (stage == Stage::Fragment) {
+             Decorate(primitive_id, spv::Decoration::Flat);
+         }
+@@ -1929,7 +1935,11 @@ void EmitContext::DefineInputs(const IR::Program& program) {
+         const bool is_integer = input_type == AttributeType::SignedInt ||
+                                 input_type == AttributeType::UnsignedInt;
+         if (runtime_info.per_primitive_generics.test(index)) {
+-            // Written per primitive by a mesh program: constant over the primitive.
++            // Readback supplies ordinary flat varyings; native mesh uses PerPrimitiveEXT.
++            if (runtime_info.mesh_as_compute) {
++                Decorate(id, spv::Decoration::Flat);
++                continue;
++            }
+             AddExtension("SPV_EXT_mesh_shader");
+             AddCapability(spv::Capability::MeshShadingEXT);
+             Decorate(id, spv::Decoration::PerPrimitiveEXT);
+diff --git a/src/shader_recompiler/runtime_info.h b/src/shader_recompiler/runtime_info.h
+index 43ee23b64c..538cee7333 100644
+--- a/src/shader_recompiler/runtime_info.h
++++ b/src/shader_recompiler/runtime_info.h
+@@ -91,8 +91,10 @@ struct RuntimeInfo {
+     /// Task and mesh programs run as compute (EDEN_NX2_MESH_AS_COMPUTE): the mesh program writes
+     /// its vertices and primitives to the draw's scratch buffer, which a generated vertex shader
+     /// reads back (backend/spirv/mesh_compute_layout.h). The fragment program after such a mesh
+-    /// program gets no per-primitive inputs: the readback shader gives them flat.
++    /// program receives per-primitive values as ordinary flat varyings.
+     bool mesh_as_compute{};
++    /// Private flat varying used to carry a mesh-written PrimitiveId through vertex readback.
++    std::optional<u32> mesh_compute_primitive_id_location;
+     std::map<IR::Attribute, IR::Attribute> previous_stage_legacy_stores_mapping;
+ 
+     bool convert_depth_mode{};
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 0aac823e4a..4a1d1bd5e6 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -82,3 +82,16 @@ if (SPIRV_VAL_EXECUTABLE)
+         set_tests_properties(mesh_compute_push_${module} PROPERTIES DEPENDS mesh_compute_push)
+     endforeach()
+ endif()
++
++add_executable(mesh_compute_interface_test video_core/mesh_compute_interface.cpp)
++target_link_libraries(mesh_compute_interface_test PRIVATE shader_recompiler)
++add_test(NAME mesh_compute_interface COMMAND mesh_compute_interface_test)
++if (SPIRV_VAL_EXECUTABLE)
++    foreach(module mesh_interface_readback mesh_interface_fragment mesh_interface_linear
++                   mesh_interface_flat mesh_interface_native)
++        add_test(NAME ${module}
++            COMMAND "${SPIRV_VAL_EXECUTABLE}" --target-env vulkan1.3
++                    "${CMAKE_CURRENT_BINARY_DIR}/${module}.spv")
++        set_tests_properties(${module} PROPERTIES DEPENDS mesh_compute_interface)
++    endforeach()
++endif()
+diff --git a/src/tests/video_core/mesh_compute_interface.cpp b/src/tests/video_core/mesh_compute_interface.cpp
+new file mode 100644
+index 0000000000..aacff779ef
+--- /dev/null
++++ b/src/tests/video_core/mesh_compute_interface.cpp
+@@ -0,0 +1,216 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include <cstdio>
++#include <fstream>
++#include <map>
++#include <set>
++#include <stdexcept>
++
++#include <spirv/unified1/spirv.hpp>
++#include "shader_recompiler/backend/spirv/emit_spirv.h"
++#include "shader_recompiler/backend/spirv/emit_spirv_mesh_readback.h"
++#include "shader_recompiler/backend/spirv/mesh_compute_interface.h"
++#include "shader_recompiler/frontend/ir/basic_block.h"
++#include "shader_recompiler/frontend/ir/ir_emitter.h"
++
++using namespace Shader;
++using namespace Shader::Backend::SPIRV;
++
++void Require(bool condition) {
++    if (!condition) {
++        throw std::runtime_error("mesh compute interface regression");
++    }
++}
++
++struct Module {
++    std::map<std::pair<u32, u32>, u32> decorations;
++    std::set<u32> flat;
++    std::set<u32> capabilities;
++    std::map<u32, u32> storage;
++    std::map<u32, u32> stores;
++    std::set<u32> loads;
++    bool sample{};
++    explicit Module(const std::vector<u32>& code, bool compute = true) {
++        for (size_t pos = 5; pos < code.size();) {
++            const u32 size = code[pos] >> 16;
++            Require(size != 0 && pos + size <= code.size());
++            const auto op = static_cast<spv::Op>(code[pos] & 0xffff);
++            if (op == spv::OpDecorate) {
++                if (size == 4)
++                    decorations[{code[pos + 1], code[pos + 2]}] = code[pos + 3];
++                if (code[pos + 2] == spv::DecorationFlat)
++                    flat.insert(code[pos + 1]);
++                if (compute)
++                    Require(code[pos + 2] != spv::DecorationPerPrimitiveEXT);
++            }
++            if (op == spv::OpCapability)
++                capabilities.insert(code[pos + 1]);
++            if (op == spv::OpVariable)
++                storage[code[pos + 2]] = code[pos + 3];
++            if (op == spv::OpStore)
++                stores[code[pos + 1]] = code[pos + 2];
++            if (op == spv::OpLoad)
++                loads.insert(code[pos + 2]);
++            if (op == spv::OpImageSampleImplicitLod)
++                sample = true;
++            pos += size;
++        }
++        if (compute)
++            Require(!capabilities.contains(spv::CapabilityMeshShadingEXT));
++    }
++    u32 Location(u32 location, spv::StorageClass sc) const {
++        for (const auto& [key, value] : decorations) {
++            if (key.second == spv::DecorationLocation && value == location &&
++                storage.at(key.first) == sc)
++                return key.first;
++        }
++        throw std::runtime_error("missing varying");
++    }
++};
++
++void Save(const char* name, const std::vector<u32>& code) {
++    std::ofstream out{name, std::ios::binary};
++    out.write(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
++    Require(static_cast<bool>(out));
++}
++
++int main() {
++    MeshInfo mesh;
++    mesh.max_vertices = 3;
++    mesh.max_primitives = 1;
++    mesh.topology = 4;
++    mesh.vertex_lines = {u32(IR::Attribute::PositionX),     u32(IR::Attribute::PositionY),
++                         u32(IR::Attribute::PositionZ),     u32(IR::Attribute::PositionW),
++                         u32(IR::Attribute::Generic0X),     u32(IR::Attribute::Generic0Y),
++                         u32(IR::Attribute::ClipDistance0), u32(IR::Attribute::ClipDistance7)};
++    mesh.primitive_lines = {u32(IR::Attribute::PrimitiveId), u32(IR::Attribute::Generic1X),
++                            u32(IR::Attribute::Generic0X)};
++    Info fragment;
++    fragment.loads.Set(IR::Attribute::PrimitiveId, true);
++    fragment.loads.Set(IR::Attribute::Generic0X, true);
++    fragment.loads.Set(IR::Attribute::Generic0Y, true);
++    fragment.loads.Set(IR::Attribute::Generic1X, true);
++    fragment.loads.Set(IR::Attribute::Generic2X, true); // reserve even without a mesh output
++    RuntimeInfo runtime;
++    runtime.mesh_as_compute = true;
++    ConfigureMeshComputeInterface(runtime, mesh, fragment);
++    Require(runtime.mesh_compute_primitive_id_location == 3);
++    Require(runtime.per_primitive_generics[1] && !runtime.per_primitive_generics[0]);
++    Profile profile{};
++    profile.supported_spirv = 0x00010600;
++    profile.support_int64 = true;
++    profile.max_user_clip_distances = 8;
++    profile.unified_descriptor_binding = true;
++    const auto readback = EmitMeshReadbackVertex(profile, runtime, mesh);
++    Module vertex{readback};
++    Require(!vertex.flat.contains(vertex.Location(0, spv::StorageClassOutput)));
++    Require(vertex.flat.contains(vertex.Location(1, spv::StorageClassOutput)));
++    Require(vertex.flat.contains(vertex.Location(3, spv::StorageClassOutput)));
++    Require(vertex.capabilities.contains(spv::CapabilityClipDistance));
++    // The final PrimitiveId store must come from scratch, replacing the triangle fallback.
++    Require(vertex.loads.contains(vertex.stores.at(vertex.Location(3, spv::StorageClassOutput))));
++    bool clips{};
++    for (const auto& [key, value] : vertex.decorations) {
++        if (key.second == spv::DecorationBuiltIn && value == spv::BuiltInClipDistance)
++            clips = true;
++        Require(key.second != spv::DecorationBuiltIn || value != spv::BuiltInPrimitiveId);
++    }
++    Require(clips);
++    Save("mesh_interface_readback.spv", readback);
++
++    ObjectPool<IR::Inst> pool;
++    IR::Block block{pool};
++    IR::IREmitter ir{block};
++    ir.Prologue();
++    const auto uv = ir.CompositeConstruct(ir.GetAttribute(IR::Attribute::Generic0X),
++                                          ir.GetAttribute(IR::Attribute::Generic0Y));
++    IR::TextureInstInfo texture{};
++    texture.type.Assign(TextureType::Color2D);
++    const auto sampled = ir.ImageSampleImplicitLod(ir.Imm32(0), uv, {}, {}, {}, texture);
++    // The emitter consumes indexed texture IR, after the guest descriptor lowering pass.
++    sampled.Inst()->ReplaceOpcode(IR::Opcode::ImageSampleImplicitLod);
++    ir.SetFragColor(0, 0, IR::F32{ir.CompositeExtract(sampled, 0)});
++    ir.SetFragColor(0, 1, ir.GetAttribute(IR::Attribute::Generic1X));
++    ir.SetFragColor(0, 2, ir.BitCast<IR::F32>(ir.GetAttributeU32(IR::Attribute::PrimitiveId)));
++    ir.SetFragColor(0, 3, IR::F32{ir.CompositeExtract(sampled, 3)});
++    ir.Epilogue();
++    IR::Program program;
++    program.stage = Stage::Fragment;
++    program.blocks = {&block};
++    program.post_order_blocks = {&block};
++    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
++                           {{}, IR::AbstractSyntaxNode::Type::Return}};
++    program.info = fragment;
++    program.info.stores_frag_color[0] = true;
++    program.info.texture_descriptors.push_back({.type = TextureType::Color2D, .count = 1});
++    runtime.previous_stage_stores.mask.set();
++    runtime.generic_input_types.fill(AttributeType::Float);
++    runtime.color_output_types.fill(AttributeType::Float);
++    Backend::Bindings bindings{};
++    const auto frag = EmitSPIRV(profile, runtime, program, bindings);
++    Module input{frag};
++    Require(input.sample);
++    Require(!input.flat.contains(input.Location(0, spv::StorageClassInput)));
++    Require(input.flat.contains(input.Location(1, spv::StorageClassInput)));
++    Require(input.flat.contains(input.Location(3, spv::StorageClassInput)));
++    Save("mesh_interface_fragment.spv", frag);
++    program.info.interpolation[0] = Interpolation::NoPerspective;
++    bindings = {};
++    const auto no_perspective = EmitSPIRV(profile, runtime, program, bindings);
++    Module linear{no_perspective};
++    // NoPerspective is an operand-free decoration, like Flat.
++    bool has_no_perspective{};
++    const u32 uv_input = linear.Location(0, spv::StorageClassInput);
++    for (size_t pos = 5; pos < no_perspective.size(); pos += no_perspective[pos] >> 16) {
++        if ((no_perspective[pos] & 0xffff) == spv::OpDecorate &&
++            no_perspective[pos + 1] == uv_input &&
++            no_perspective[pos + 2] == spv::DecorationNoPerspective)
++            has_no_perspective = true;
++    }
++    Require(has_no_perspective);
++    Save("mesh_interface_linear.spv", no_perspective);
++    program.info.interpolation[0] = Interpolation::Flat;
++    bindings = {};
++    const auto flat = EmitSPIRV(profile, runtime, program, bindings);
++    Module flat_input{flat};
++    Require(flat_input.flat.contains(flat_input.Location(0, spv::StorageClassInput)));
++    Save("mesh_interface_flat.spv", flat);
++
++    RuntimeInfo native = runtime;
++    native.mesh_as_compute = false;
++    native.mesh_compute_primitive_id_location.reset();
++    bindings = {};
++    const auto native_code = EmitSPIRV(profile, native, program, bindings);
++    Module native_input{native_code, false};
++    Require(native_input.capabilities.contains(spv::CapabilityMeshShadingEXT));
++    bool builtin_id{};
++    for (const auto& [key, value] : native_input.decorations) {
++        if (key.second == spv::DecorationBuiltIn && value == spv::BuiltInPrimitiveId)
++            builtin_id = true;
++    }
++    Require(builtin_id);
++    Save("mesh_interface_native.spv", native_code);
++
++    profile.max_user_clip_distances = 4;
++    bool rejected{};
++    try {
++        EmitMeshReadbackVertex(profile, runtime, mesh);
++    } catch (const NotImplementedException&) {
++        rejected = true;
++    }
++    Require(rejected);
++    std::puts("textured fragment/readback interface and clip limit checked");
++    Info full = fragment;
++    for (u32 index = 0; index < 32; ++index)
++        full.loads.Set(IR::Attribute::Generic0X + index * 4, true);
++    rejected = false;
++    try {
++        ConfigureMeshComputeInterface(runtime, mesh, full);
++    } catch (const NotImplementedException&) {
++        rejected = true;
++    }
++    Require(rejected);
++    full.loads.Set(IR::Attribute::PrimitiveId, false);
++    ConfigureMeshComputeInterface(runtime, mesh, full);
++    Require(!runtime.mesh_compute_primitive_id_location);
++    std::puts("varying exhaustion and unused PrimitiveId checked");
++}
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index dbc83b66bb..5b855670c4 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -29,6 +29,7 @@
+ #include "common/thread_worker.h"
+ #include "core/core.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
++#include "shader_recompiler/backend/spirv/mesh_compute_interface.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv_mesh_readback.h"
+ #include "shader_recompiler/environment.h"
+@@ -193,6 +194,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+             }
+         }
+     }
++    if (mesh_as_compute && program.stage == Shader::Stage::Mesh) {
++        Shader::Backend::SPIRV::ConfigureMeshComputeInterface(info, program.mesh, programs[5].info);
++    } else if (mesh_as_compute && program.stage == Shader::Stage::Fragment && previous_program &&
++               previous_program->stage == Shader::Stage::Mesh) {
++        info.mesh_as_compute = true;
++        Shader::Backend::SPIRV::ConfigureMeshComputeInterface(info, previous_program->mesh,
++                                                             program.info);
++    }
+     const Shader::Stage stage{program.stage};
+     const bool has_geometry{key.unique_hashes[4] != 0 && !programs[4].is_geometry_passthrough};
+     const bool gl_ndc{key.state.ndc_minus_one_to_one != 0};
+@@ -1681,6 +1690,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         Shader::IR::Program& mesh_program{programs[mesh_index]};
+         const auto mesh_runtime{MakeRuntimeInfo(programs, key, mesh_program,
+                                                 has_task ? &programs[1] : nullptr, device, true)};
++        LOG_INFO(Render_Vulkan,
++                 "Mesh readback v4 {:016x}: flat_generics={:08x} primitive_id_location={} "
++                 "(32 means unused)",
++                 hash, mesh_runtime.per_primitive_generics.to_ullong(),
++                 mesh_runtime.mesh_compute_primitive_id_location.value_or(32));
+         mesh_compute = std::make_unique<MeshComputeShaders>();
+         mesh_compute->mesh_info = mesh_program.mesh;
+         mesh_compute->readback = BuildShader(

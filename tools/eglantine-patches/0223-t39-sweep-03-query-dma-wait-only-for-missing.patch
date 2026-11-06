@@ -1,0 +1,247 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0399-sweep-03-query-dma-wait-only-for-missing.patch
+
+Source: 0399-sweep-03-query-dma-wait-only-for-missing.patch
+Moved by hand: without its FrontDmaReadFast hunk: that fast path belongs to the left-out 0353 (EDEN_NX2_DMA_WAIT_WRITERS)
+
+query: EDEN_NX2_QUERY_DMA_SYNC=2 writes landed reports at once and waits only for missing ones
+
+Port of what 0317 (lichii-shaders-0203) lacks from zortos293/Lichii PR 215 (WeslieDE, 9ab3d845b8, on
+vouion's #204, 0bdc4ad004, open). GPL-3.0-or-later, as the core.
+
+The source: Ocarina's leaves and terrain flashed overexposed whenever the camera moved. 976 macro DMA
+reads of pending reports in about 2.5 minutes, all macro 0xe2c method 0x158, each read a value other
+than the one that landed. With the PR the flashes are gone. Author test only: NVIDIA, Linux, Low.
+
+Same in 0317: EDEN_NX2_QUERY_DMA_TRACE, and a wait that really waits below High accuracy.
+SignalAndWait does what the PR's FlushQueryResults does (operation behind the reports, fence, deferred
+work submitted, wait), so it is reused. SkipEmptyFence cannot drop that fence: it sees the operation.
+
+Missing from 0317, added here:
+- SemiFlushRegion: reports with a final value go to guest memory at once, with no wait.
+- The wait only when a report has no host result yet. 0317 waits on anything still registered, and
+  nothing sets IsGuestSynced, so it also waits on reports that have landed.
+- The hook in macro.cpp, for macros run where the caches are owned. Trace and sync work there now
+  too. It only matters with EDEN_NX2_SPLIT below 2, or before the front takes the macros.
+
+Changed from the source: behind the switch, as =2, so =1 stays 0317 and the two can be compared. The
+reports go after the buffer cache flush at both sites; the PR does that in FrontDmaRead only, and
+goes first in macro.cpp. =2 also turns FrontDmaReadFast off, which would skip the hook under
+EDEN_NX2_DMA_WAIT_WRITERS, a path the PR's base does not have.
+
+The wait has no time limit, as in the PR and 0317: if the GPU hangs, the back waits with it. It runs
+on the split's back inside a drain, like 0317's. Unset, nothing changes but one comparison per DMA
+read. Memory: none. Not run. Syntax checked for the PS5 target only.
+
+Co-authored-by: WeslieDE <7493154+WeslieDE@users.noreply.github.com>
+Co-authored-by: Gavin Schiller <283578663+vouion@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index b0b666fbb7..016a380fb5 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1224,6 +1224,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+         if (memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+         }
++        VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+     });
+     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+     for (u32 i = 0; i < words; ++i) {
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index a01a757e86..1db63df342 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -44,6 +44,7 @@
+ #include "common/logging.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/query_dma.h"
+ 
+ namespace Tegra {
+ 
+@@ -1537,6 +1538,14 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+                         const char* const flush = std::getenv("EDEN_NX2_MACRO_QUERY_FLUSH");
+                         return flush != nullptr && flush[0] != '0';
+                     }();
++                    // EDEN_NX2_QUERY_DMA_TRACE / EDEN_NX2_QUERY_DMA_SYNC, here for macros run where
++                    // the rasterizer's caches are owned (EDEN_NX2_SPLIT below 2, or no split yet).
++                    const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
++                                             VideoCommon::GpuSplit::OnBackThread();
++                    if (owns_caches) {
++                        VideoCommon::QueryDma::BeforeRead(memory, maxwell3d.Rasterizer(), method,
++                                                          address, source, read_bytes);
++                    }
+                     if (flush_queries && !VideoCommon::GpuSplit::Get().Active()) {
+                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+                     }
+@@ -1547,6 +1556,10 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+                             LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
+                         }
+                     }
++                    if (owns_caches) {
++                        VideoCommon::QueryDma::AfterBufferFlush(memory, maxwell3d.Rasterizer(),
++                                                                source, read_bytes);
++                    }
+                     static u32 dma_logs{};
+                     if (dma_logs < 400) {
+                         ++dma_logs;
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+index e344ccd8e9..0ec1105422 100644
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -67,14 +67,19 @@ public:
+     }
+ 
+     void FlushRegion(VAddr addr, std::size_t size) {
++        if (SemiFlushRegion(addr, size)) {
++            RequestGuestHostSync();
++        }
++    }
++
++    /// Writes out the finalized reports in the region. True when some still wait for host results.
++    bool SemiFlushRegion(VAddr addr, std::size_t size) {
+         bool result = false;
+         IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
+             result |= SemiFlushQueryDirty(location);
+             return result;
+         });
+-        if (result) {
+-            RequestGuestHostSync();
+-        }
++        return result;
+     }
+ 
+     static u64 BuildMask(std::span<const QueryType> types) {
+diff --git a/src/video_core/query_dma.h b/src/video_core/query_dma.h
+index 849a3c9050..f6a97eed7d 100644
+--- a/src/video_core/query_dma.h
++++ b/src/video_core/query_dma.h
+@@ -30,12 +30,17 @@ inline bool TraceEnabled() {
+ 
+ /// EDEN_NX2_QUERY_DMA_SYNC=1 (Lichii's experiment, branch test/all-in-one-flash): before such a
+ /// read, wait for the host GPU and the fence that writes the results, as High accuracy does.
+-inline bool SyncEnabled() {
+-    static const bool enabled = [] {
++/// EDEN_NX2_QUERY_DMA_SYNC=2 (Lichii PR 215): write out reports with a final value at once, and
++/// wait only when one still has no host result. Reports already landed cost no wait.
++inline int SyncMode() {
++    static const int mode = [] {
+         const char* value = std::getenv("EDEN_NX2_QUERY_DMA_SYNC");
+-        return value != nullptr && value[0] != '0';
++        if (value == nullptr || value[0] == '0') {
++            return 0;
++        }
++        return value[0] == '2' ? 2 : 1;
+     }();
+-    return enabled;
++    return mode;
+ }
+ 
+ /// Whether [source, source + size) holds reports still waiting for host query results. Runs
+@@ -57,6 +62,21 @@ inline bool HasPendingQueries(const Tegra::MemoryManager& memory,
+     return false;
+ }
+ 
++/// Writes the reports in [source, source + size) to guest memory, waiting for pending host
++/// results. Runs where the rasterizer's caches are owned.
++inline void FlushPending(const Tegra::MemoryManager& memory,
++                         VideoCore::RasterizerInterface& rasterizer, GPUVAddr source, size_t size) {
++    constexpr GPUVAddr page_size = 0x1000;
++    const GPUVAddr end = source + size;
++    for (GPUVAddr begin = source; begin < end;) {
++        const GPUVAddr page_end = (std::min)((begin & ~(page_size - 1)) + page_size, end);
++        if (const auto device = memory.GpuToCpuAddress(begin)) {
++            rasterizer.FlushQueryResults(*device, page_end - begin);
++        }
++        begin = page_end;
++    }
++}
++
+ /// Logs a read of pending reports with the words it reads, and the same words once the next
+ /// fence has popped and the results have landed.
+ inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
+@@ -84,11 +104,11 @@ inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInter
+     });
+ }
+ 
+-/// Traces and, with EDEN_NX2_QUERY_DMA_SYNC, waits for the pending reports a read covers.
++/// Traces and, with EDEN_NX2_QUERY_DMA_SYNC=1, waits for the pending reports a read covers.
+ inline void BeforeRead(const Tegra::MemoryManager& memory,
+                        VideoCore::RasterizerInterface& rasterizer, u32 macro, u32 method,
+                        GPUVAddr source, size_t size) {
+-    if (!TraceEnabled() && !SyncEnabled()) {
++    if (!TraceEnabled() && SyncMode() != 1) {
+         return;
+     }
+     if (!HasPendingQueries(memory, rasterizer, source, size)) {
+@@ -97,9 +117,19 @@ inline void BeforeRead(const Tegra::MemoryManager& memory,
+     if (TraceEnabled()) {
+         Trace(memory, rasterizer, macro, method, source, size);
+     }
+-    if (SyncEnabled()) {
++    if (SyncMode() == 1) {
+         rasterizer.WaitForQueries();
+     }
+ }
+ 
++/// EDEN_NX2_QUERY_DMA_SYNC=2: the last step before a read, after the buffer cache flush, so that
++/// the flush cannot put older words over the reports.
++inline void AfterBufferFlush(const Tegra::MemoryManager& memory,
++                             VideoCore::RasterizerInterface& rasterizer, GPUVAddr source,
++                             size_t size) {
++    if (SyncMode() == 2) {
++        FlushPending(memory, rasterizer, source, size);
++    }
++}
++
+ } // namespace VideoCommon::QueryDma
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 2392af362a..bb45c5f8e8 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -127,6 +127,11 @@ public:
+     /// Flushes commands and blocks until a new fence has popped, which writes pending reports.
+     virtual void WaitForQueries() {}
+ 
++    /// Writes the region's query reports to guest memory, waiting for pending host results.
++    virtual void FlushQueryResults(DAddr addr, u64 size) {
++        FlushRegion(addr, size, VideoCommon::CacheType::QueryCache);
++    }
++
+     /// Notify rasterizer that any caches of the specified region should be invalidated
+     virtual void InvalidateRegion(DAddr addr, u64 size,
+                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 461e1c54c2..2dd060e555 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1619,6 +1619,15 @@ void RasterizerVulkan::WaitForQueries() {
+     fence_manager.SignalAndWait();
+ }
+ 
++void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
++    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
++        return;
++    }
++    // Below High GPU accuracy a fence runs its own callback at once, so ReleaseFences would return
++    // before the report writes ran. SignalAndWait waits for an operation queued behind them.
++    fence_manager.SignalAndWait();
++}
++
+ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+     {
+         std::scoped_lock lock{texture_cache.mutex};
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 5eea4396a3..d165b26cfe 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -106,6 +106,7 @@ public:
+     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+     bool HasPendingQueries(DAddr addr, u64 size) override;
+     void WaitForQueries() override;
++    void FlushQueryResults(DAddr addr, u64 size) override;
+     void InvalidateRegion(DAddr addr, u64 size,
+                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;

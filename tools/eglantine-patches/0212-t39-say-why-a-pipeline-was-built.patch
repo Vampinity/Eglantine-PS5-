@@ -1,0 +1,102 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0183-say-why-a-pipeline-was-built.patch
+
+Source: 0183-say-why-a-pipeline-was-built.patch
+Moved by hand: the mesh reason is set where upstream's mesh cache file (0071) now decides is_mesh
+
+Core patch, for tools/eglantine-patches after 0182. Ours, no source to credit.
+
+next17 has no pipeline-keep-02, so the mesh reason is set in the IsMeshPipeline branch as it stands
+without that patch. The text of the report is the same.
+
+Each logged build now gives its reason and key hash, and the 10 s line counts the reasons:
+new, on disk but not built at boot, evicted, or mesh and not in the disk cache. Comparing two runs'
+hashes then shows which pipelines really come back every run. Run 62 has about 100 builds that are
+not task/mesh; the log does not say what they are.
+
+No switch: log text only, nothing else changes. The old start of both lines is kept, so
+run-report.py still counts them. Not run on a console. Syntax checked with clang (stubs for the
+SDK).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 8ecab2903a..e47a7e357d 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1625,8 +1625,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+ namespace {
+ // Pipelines built on the GPU thread at run time (shader translation; the driver compile is on
+ // workers): every one over 2 ms is logged, and the total every 10 s, to tell how much of the
+-// stutter on new content is translation.
+-void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin) {
++// stutter on new content is translation. The reason and the key hash tell two runs' lists apart:
++// a pipeline with one hash in every run, not "new", is one the disk cache does not keep.
++enum class RuntimeBuild : size_t { New, OnDisk, Evicted, Mesh, Count };
++
++void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
++                           RuntimeBuild reason, u64 hash) {
++    static constexpr std::array<const char*, static_cast<size_t>(RuntimeBuild::Count)> names{
++        "new", "on disk, not built at boot", "evicted", "mesh, not in the disk cache"};
++    static std::array<u32, static_cast<size_t>(RuntimeBuild::Count)> reasons{};
+     static std::chrono::steady_clock::duration total{};
+     static u32 count{}, logged{};
+     static auto window = std::chrono::steady_clock::now();
+@@ -1634,16 +1641,21 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
+     const auto elapsed = now - begin;
+     total += elapsed;
+     ++count;
++    ++reasons[static_cast<size_t>(reason)];
+     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+     if (elapsed > std::chrono::milliseconds{2} && logged < 400) {
+         ++logged;
+-        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms", kind, ms(elapsed));
++        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {} {:016x}", kind,
++                 ms(elapsed), names[static_cast<size_t>(reason)], hash);
+     }
+     if (now - window > std::chrono::seconds{10}) {
+-        LOG_INFO(Render_Vulkan, "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread",
+-                 count, ms(total));
++        LOG_INFO(Render_Vulkan,
++                 "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
++                 "(new {}, on disk {}, evicted {}, mesh {})",
++                 count, ms(total), reasons[0], reasons[1], reasons[2], reasons[3]);
+         total = {};
+         count = 0;
++        reasons = {};
+         window = now;
+     }
+ }
+@@ -1651,8 +1663,12 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
+ 
+ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     const auto begin = std::chrono::steady_clock::now();
++    const u64 key_hash = graphics_key.Hash();
++    RuntimeBuild reason = used_and_evicted.contains(key_hash)  ? RuntimeBuild::Evicted
++                          : disk_pipelines.contains(key_hash) ? RuntimeBuild::OnDisk
++                                                              : RuntimeBuild::New;
+     SCOPE_EXIT {
+-        ReportRuntimePipeline("Graphics", begin);
++        ReportRuntimePipeline("Graphics", begin, reason, key_hash);
+     };
+     GraphicsEnvironments environments;
+     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+@@ -1666,6 +1682,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     // Task and mesh programs are translated with the mesh registers, which vulkan.bin doesn't
+     // carry: they go to their own file (builds without it never read those records).
+     const bool is_mesh = pipeline->IsMeshPipeline();
++    if (is_mesh) {
++        reason = RuntimeBuild::Mesh;
++    }
+     if (disk_pipelines.contains(graphics_key.Hash())) {
+         // In the disk cache already, only not built at boot.
+         QueueVulkanPipelineCacheFlush();
+@@ -1697,7 +1716,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+     const auto begin = std::chrono::steady_clock::now();
+     SCOPE_EXIT {
+-        ReportRuntimePipeline("Compute", begin);
++        ReportRuntimePipeline("Compute", begin, RuntimeBuild::New, key.Hash());
+     };
+     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
+     const auto& qmd{kepler_compute->launch_description};

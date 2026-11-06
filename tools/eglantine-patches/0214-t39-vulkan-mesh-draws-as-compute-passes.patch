@@ -1,0 +1,1057 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0301-vulkan-mesh-draws-as-compute-passes.patch
+
+Source: 0301-vulkan-mesh-draws-as-compute-passes.patch
+Moved by hand: the mesh-draw guard now also carries upstream's Mario Kart World no_mesh_title
+
+EDEN_NX2_MESH_AS_COMPUTE=1 (off by default; mesh draws stay skipped as before):
+a task/mesh pipeline's programs are compiled as compute (patch 0300) and drawn
+with the generated readback vertex shader. Before the draw's render pass,
+GraphicsPipeline records on the one queue: a barrier against the previous mesh
+draw's reads of the scratch region, a clear of its header, the task pass, the
+scan and the mesh pass (vkCmdDispatchIndirect from the scan's words), or the mesh
+pass alone, then a barrier to the vertex shader and the indirect read; the
+rasterizer then issues vkCmdDrawIndirect from the region's header instead of
+vkCmdDrawMeshTasksEXT. The pipeline layout gains the compute stage and the
+MeshComputeLayout push constants, the descriptors are pushed at both bind points
+(a second update template), and the fragment program after the mesh program gets
+flat inputs instead of per-primitive ones.
+
+Memory: one scratch region for every such draw, EDEN_NX2_MESH_COMPUTE_MIB (default
+32), made once; a draw that needs more is skipped and logged (32 draws), as is one
+with more than 65535 task or mesh workgroups; after a task pass the scan caps the
+mesh groups at what the region holds. The device must give buffer device
+addresses, else the switch logs and stays off. Indirect task/mesh draws are still
+skipped; instance counts above one run once. Without VK_EXT_mesh_shader the compute
+variant is used too.
+
+Not built for or run on the console; the three changed files pass a syntax check
+against the Vulkan headers on the Mac. The RADV mesh hang this works around is
+avoided only in that no mesh or task stage reaches the driver; the compute passes
+themselves are ordinary compute.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/CMakeLists.txt                      |   2 +
+ src/video_core/renderer_vulkan/pipeline_helper.h   |  33 ++-
+ .../renderer_vulkan/vk_graphics_pipeline.cpp       | 300 +++++++++++++++++++--
+ .../renderer_vulkan/vk_graphics_pipeline.h         |  49 +++-
+ src/video_core/renderer_vulkan/vk_mesh_compute.cpp |  71 +++++
+ src/video_core/renderer_vulkan/vk_mesh_compute.h   |  50 ++++
+ .../renderer_vulkan/vk_pipeline_cache.cpp          |  62 ++++-
+ src/video_core/renderer_vulkan/vk_pipeline_cache.h |   9 +-
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp   |  33 ++-
+ src/video_core/renderer_vulkan/vk_rasterizer.h     |   2 +
+ 10 files changed, 571 insertions(+), 40 deletions(-)
+
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 58eecc1baa..a8ab730b32 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -188,6 +188,8 @@ add_library(video_core STATIC
+     renderer_vulkan/vk_fence_manager.h
+     renderer_vulkan/vk_graphics_pipeline.cpp
+     renderer_vulkan/vk_graphics_pipeline.h
++    renderer_vulkan/vk_mesh_compute.cpp
++    renderer_vulkan/vk_mesh_compute.h
+     renderer_vulkan/vk_multi_range_buffer.cpp
+     renderer_vulkan/vk_multi_range_buffer.h
+     renderer_vulkan/vk_master_semaphore.cpp
+diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
+index 40b01f253d..a2a4a6e824 100644
+--- a/src/video_core/renderer_vulkan/pipeline_helper.h
++++ b/src/video_core/renderer_vulkan/pipeline_helper.h
+@@ -232,6 +232,17 @@ public:
+     vk::DescriptorUpdateTemplate CreateTemplate(VkDescriptorSetLayout descriptor_set_layout,
+                                                 VkPipelineLayout pipeline_layout,
+                                                 bool use_push_descriptor) const {
++        return CreateTemplate(descriptor_set_layout, pipeline_layout, use_push_descriptor,
++                              is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE
++                                         : VK_PIPELINE_BIND_POINT_GRAPHICS);
++    }
++
++    // A graphics pipeline whose task and mesh programs run as compute pushes the same descriptors
++    // at both bind points (vk_graphics_pipeline.cpp), with a template for each.
++    vk::DescriptorUpdateTemplate CreateTemplate(VkDescriptorSetLayout descriptor_set_layout,
++                                                VkPipelineLayout pipeline_layout,
++                                                bool use_push_descriptor,
++                                                VkPipelineBindPoint bind_point) const {
+         if (entries.empty()) {
+             return nullptr;
+         }
+@@ -246,8 +257,7 @@ public:
+             .pDescriptorUpdateEntries = entries.data(),
+             .templateType = type,
+             .descriptorSetLayout = descriptor_set_layout,
+-            .pipelineBindPoint =
+-                is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
++            .pipelineBindPoint = bind_point,
+             .pipelineLayout = pipeline_layout,
+             .set = 0,
+         });
+@@ -257,12 +267,23 @@ public:
+         using Shader::Backend::SPIRV::RenderAreaLayout;
+         using Shader::Backend::SPIRV::RescalingLayout;
+         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
++        return CreatePipelineLayout(
++            descriptor_set_layout,
++            static_cast<VkShaderStageFlags>(is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
++                                                       : GraphicsPushConstantStages(*device)),
++            static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
++                static_cast<u32>(sizeof(RenderAreaLayout)));
++    }
++
++    // One push constant range of `size` bytes for `stages`: a graphics pipeline with task and mesh
++    // programs run as compute adds the compute and vertex stages and the MeshComputeLayout bytes
++    // (shader_recompiler/backend/spirv/mesh_compute_layout.h).
++    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout,
++                                            VkShaderStageFlags stages, u32 size) const {
+         const VkPushConstantRange range{
+-            .stageFlags = static_cast<VkShaderStageFlags>(
+-                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : GraphicsPushConstantStages(*device)),
++            .stageFlags = stages,
+             .offset = 0,
+-            .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
+-                    static_cast<u32>(sizeof(RenderAreaLayout)),
++            .size = size,
+         };
+         return device->GetLogical().CreatePipelineLayout({
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 4243bec5d0..3c029a2280 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -20,6 +20,8 @@
+ #include "video_core/renderer_vulkan/pipeline_statistics.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
++#include "video_core/renderer_vulkan/vk_mesh_compute.h"
++#include "shader_recompiler/backend/spirv/mesh_compute_layout.h"
+ #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+@@ -55,18 +57,21 @@ using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
+ 
+ constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
+ 
+-// The stage of a program: task and mesh programs sit in the vertex and tessellation slots.
+-VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits slot_stage) {
++// The stage of a program: task and mesh programs sit in the vertex and tessellation slots. Run as
++// compute (mesh_as_compute) their descriptors are read by compute pipelines.
++VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits slot_stage,
++                                bool mesh_as_compute) {
+     if (info.is_task) {
+-        return VK_SHADER_STAGE_TASK_BIT_EXT;
++        return mesh_as_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_TASK_BIT_EXT;
+     }
+     if (info.is_mesh) {
+-        return VK_SHADER_STAGE_MESH_BIT_EXT;
++        return mesh_as_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_MESH_BIT_EXT;
+     }
+     return slot_stage;
+ }
+ 
+-DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
++DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
++                                    bool mesh_as_compute) {
+     DescriptorLayoutBuilder builder{device};
+     for (size_t index = 0; index < infos.size(); ++index) {
+         static constexpr std::array stages{
+@@ -76,7 +81,7 @@ DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader
+             VK_SHADER_STAGE_GEOMETRY_BIT,
+             VK_SHADER_STAGE_FRAGMENT_BIT,
+         };
+-        builder.Add(infos[index], StageFlag(infos[index], stages.at(index)));
++        builder.Add(infos[index], StageFlag(infos[index], stages.at(index), mesh_as_compute));
+     }
+     return builder;
+ }
+@@ -270,11 +275,13 @@ GraphicsPipeline::GraphicsPipeline(
+     Common::ThreadWorker* worker_thread,
+     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
+-    const std::array<const Shader::Info*, NUM_STAGES>& infos)
++    const std::array<const Shader::Info*, NUM_STAGES>& infos, MeshComputeScratch* mesh_scratch_,
++    std::unique_ptr<MeshComputeShaders> mesh_compute_)
+     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
+       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
+       guest_descriptor_queue{guest_descriptor_queue_},
+-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
++      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
++      mesh_scratch{mesh_scratch_}, mesh_compute{std::move(mesh_compute_)} {
+     if (shader_notify) {
+         shader_notify->MarkShaderBuilding();
+     }
+@@ -295,7 +302,13 @@ GraphicsPipeline::GraphicsPipeline(
+     }
+     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+ 
+-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
++    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, RunsMeshAsCompute())};
++    // Task and mesh programs run as compute read the rescaling words and the MeshComputeLayout
++    // after them, the readback vertex shader the layout: one push constant range for every stage.
++    push_constant_stages = GraphicsPushConstantStages(device);
++    if (RunsMeshAsCompute()) {
++        push_constant_stages |= VK_SHADER_STAGE_COMPUTE_BIT;
++    }
+     uses_push_descriptor = builder.CanUsePushDescriptor();
+     uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+     descriptor_set_layout =
+@@ -314,10 +327,18 @@ GraphicsPipeline::GraphicsPipeline(
+     }
+ 
+     const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
+-    pipeline_layout = builder.CreatePipelineLayout(set_layout);
++    pipeline_layout =
++        RunsMeshAsCompute()
++            ? builder.CreatePipelineLayout(set_layout, push_constant_stages,
++                                           Shader::Backend::SPIRV::MESH_COMPUTE_PUSH_END)
++            : builder.CreatePipelineLayout(set_layout);
+     if (!uses_descriptor_buffer) {
+-        descriptor_update_template =
+-            builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
++        descriptor_update_template = builder.CreateTemplate(
++            set_layout, *pipeline_layout, uses_push_descriptor, VK_PIPELINE_BIND_POINT_GRAPHICS);
++        if (RunsMeshAsCompute()) {
++            compute_update_template = builder.CreateTemplate(
++                set_layout, *pipeline_layout, uses_push_descriptor, VK_PIPELINE_BIND_POINT_COMPUTE);
++        }
+         if (!uses_push_descriptor) {
+             descriptor_allocator =
+                 descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+@@ -329,6 +350,9 @@ GraphicsPipeline::GraphicsPipeline(
+         Validate();
+         try {
+             MakePipeline(render_pass);
++            if (RunsMeshAsCompute()) {
++                MakeMeshComputePipelines();
++            }
+         } catch (const vk::Exception& exception) {
+             LOG_CRITICAL(Render_Vulkan,
+                          "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
+@@ -352,6 +376,12 @@ GraphicsPipeline::GraphicsPipeline(
+         for (vk::ShaderModule& module : spv_modules) {
+             module.reset();
+         }
++        if (mesh_compute) {
++            mesh_compute->task.reset();
++            mesh_compute->mesh.reset();
++            mesh_compute->scan.reset();
++            mesh_compute->readback.reset();
++        }
+ 
+         std::scoped_lock lock{build_mutex};
+         is_built = true;
+@@ -361,7 +391,8 @@ GraphicsPipeline::GraphicsPipeline(
+         }
+     }};
+     // Before the build: it frees the modules this looks at.
+-    configure_func = ConfigureFunc(spv_modules, stage_infos);
++    configure_func = RunsMeshAsCompute() ? MakeConfigureSpecFunc<DefaultSpec>()
++                                         : ConfigureFunc(spv_modules, stage_infos);
+     if (worker_thread) {
+         worker_thread->QueueWork(std::move(func));
+     } else {
+@@ -689,6 +720,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+         }
+     }
+ 
++    if (RunsMeshAsCompute() &&
++        !RecordMeshComputePasses(descriptor_data, descriptor_buffer_offset, descriptor_buffer_chunk,
++                                 rescaling)) {
++        return false;
++    }
+     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+@@ -739,18 +775,18 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             }
+             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+         }
+-        cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
++        cmdbuf.PushConstants(*pipeline_layout, push_constant_stages,
+                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
+                              rescaling_data.data());
+         if (update_rescaling) {
+             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
+             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
+-            cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
++            cmdbuf.PushConstants(*pipeline_layout, push_constant_stages,
+                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
+                                  &scale_down_factor);
+         }
+         if (uses_render_area) {
+-            cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
++            cmdbuf.PushConstants(*pipeline_layout, push_constant_stages,
+                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
+                                  &render_area_data);
+         }
+@@ -819,6 +855,12 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     }
+     ASSERT(vertex_attributes.size() <= device.GetMaxVertexInputAttributes());
+ 
++    if (RunsMeshAsCompute()) {
++        // The readback vertex shader reads the mesh pass's records: no vertex input.
++        vertex_bindings.clear();
++        vertex_binding_divisors.clear();
++        vertex_attributes.clear();
++    }
+     VkPipelineVertexInputStateCreateInfo vertex_input_ci{
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+         .pNext = nullptr,
+@@ -841,6 +883,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     // has no tessellation and no input assembly (pInputAssemblyState is null for it below).
+     const bool has_tess_stages = !IsMeshPipeline() && (spv_modules[1] || spv_modules[2]);
+     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
++    if (RunsMeshAsCompute()) {
++        input_assembly_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // the readback draw
++    }
+     if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+         if (!has_tess_stages) {
+             LOG_WARNING(Render_Vulkan, "Patch topology used without tessellation, using points");
+@@ -1135,9 +1180,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         }
+     }
+ 
+-    const bool is_mesh{IsMeshPipeline()};
+-    if (is_mesh) {
+-        // Mesh pipelines have no vertex input or input assembly.
++    const bool is_mesh{IsMeshPipeline() && !RunsMeshAsCompute()};
++    if (is_mesh || RunsMeshAsCompute()) {
++        // Mesh pipelines have no vertex input or input assembly; the readback draw has a fixed one.
+         dynamic_states.erase(std::remove_if(dynamic_states.begin(), dynamic_states.end(),
+                                             [](VkDynamicState state) {
+                                                 return state == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT ||
+@@ -1162,7 +1207,10 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     };
+     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+     for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+-        if (!spv_modules[stage]) {
++        // Run as compute, the task and mesh modules are compute pipelines (MakeMeshComputePipelines)
++        // and the vertex slot holds the readback shader.
++        const bool readback_vertex{RunsMeshAsCompute() && stage == 0};
++        if (!spv_modules[stage] && !readback_vertex) {
+             continue;
+         }
+         [[maybe_unused]] auto& stage_ci =
+@@ -1170,9 +1218,12 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                 .pNext = nullptr,
+                 .flags = 0,
+-                .stage = StageFlag(stage_infos[stage],
+-                                   MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
+-                .module = *spv_modules[stage],
++                .stage = readback_vertex
++                             ? VK_SHADER_STAGE_VERTEX_BIT
++                             : StageFlag(stage_infos[stage],
++                                         MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)),
++                                         false),
++                .module = readback_vertex ? *mesh_compute->readback : *spv_modules[stage],
+                 .pName = "main",
+                 .pSpecializationInfo = nullptr,
+             });
+@@ -1218,6 +1269,209 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     }
+ }
+ 
++// Task and mesh programs run as compute: their pipelines, over the graphics pipeline's layout
++// (the same descriptors and push constants, with the compute stage in every range).
++void GraphicsPipeline::MakeMeshComputePipelines() {
++    // NVN task and mesh programs are written for 32-lane warps, as the compute programs are
++    // (vk_compute_pipeline.cpp): the subgroup size is pinned where the device allows it.
++    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
++        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
++        .pNext = nullptr,
++        .requiredSubgroupSize = GuestWarpSize,
++    };
++    const bool pin_subgroup{device.IsExtSubgroupSizeControlSupported() &&
++                            device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)};
++    VkPipelineCreateFlags flags{};
++    if (uses_descriptor_buffer) {
++        flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
++    }
++    const auto make = [&](const vk::ShaderModule& module, bool guest_program) {
++        const VkComputePipelineCreateInfo compute_ci{
++            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = flags,
++            .stage{
++                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++                .pNext = guest_program && pin_subgroup ? &subgroup_size_ci : nullptr,
++                .flags = 0,
++                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++                .module = *module,
++                .pName = "main",
++                .pSpecializationInfo = nullptr,
++            },
++            .layout = *pipeline_layout,
++            .basePipelineHandle = 0,
++            .basePipelineIndex = 0,
++        };
++        return device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
++    };
++    mesh_pipeline = make(mesh_compute->mesh, true);
++    if (mesh_compute->task) {
++        task_pipeline = make(mesh_compute->task, true);
++        scan_pipeline = make(mesh_compute->scan, false);
++    }
++}
++
++// Records the draw's compute passes (mesh_compute_layout.h) before its render pass: the scratch
++// region is reused draw after draw behind a barrier, its header cleared, then the task pass, the
++// scan and the mesh pass (or the mesh pass alone) write it for the readback draw. False when the
++// draw does not fit the region or the pipelines are not there: the draw is skipped.
++bool GraphicsPipeline::RecordMeshComputePasses(const void* descriptor_data,
++                                               VkDeviceSize descriptor_buffer_offset,
++                                               u32 descriptor_buffer_chunk,
++                                               const RescalingPushConstant& rescaling) {
++    using namespace Shader::Backend::SPIRV;
++    mesh_compute_draw = {};
++    if (!mesh_scratch || !mesh_scratch->IsValid() || !mesh_pipeline) {
++        return false;
++    }
++    static std::atomic<u32> refusals{};
++    const auto refuse = [&](const char* why, u64 a, u64 b) {
++        if (refusals.fetch_add(1, std::memory_order_relaxed) < 32) {
++            LOG_WARNING(Render_Vulkan, "Mesh draw as compute skipped: {} ({}, {})", why, a, b);
++        }
++        return false;
++    };
++    const Shader::MeshInfo& mesh{mesh_compute->mesh_info};
++    const bool has_task{static_cast<bool>(task_pipeline)};
++    const u32 groups{mesh_draw_groups};
++    if (groups == 0) {
++        return true; // nothing to draw (mesh_compute_draw.recorded stays false)
++    }
++    // Vulkan guarantees 65535 workgroups per dispatch dimension (RADV allows no more).
++    static constexpr u32 MaxDispatch = 65535;
++    const u64 budget_words{mesh_scratch->SizeBytes() / sizeof(u32)};
++    u32 tasks{};
++    u32 mesh_groups{};
++    if (has_task) {
++        tasks = groups;
++        if (tasks > MaxDispatch) {
++            return refuse("too many task workgroups", tasks, MaxDispatch);
++        }
++        // The region holds as many mesh groups as fit after the header, prefix sums and payloads:
++        // the scan caps the task pass's count there.
++        const u64 per_group{2 + 3ull * mesh.max_primitives +
++                            u64{mesh.max_vertices} * mesh.vertex_lines.size() +
++                            u64{mesh.max_primitives} * mesh.primitive_lines.size()};
++        const u64 fixed{PlanMeshScratch(tasks, 0, mesh).total};
++        if (fixed >= budget_words || per_group == 0) {
++            return refuse("the task payloads alone fill the scratch region", fixed * 4,
++                          mesh_scratch->SizeBytes());
++        }
++        mesh_groups = static_cast<u32>(std::min<u64>(
++            {(budget_words - fixed) / per_group, u64{tasks} * MESH_MAX_GROUPS_PER_TASK, MaxDispatch}));
++        if (mesh_groups == 0) {
++            return refuse("no room for a mesh group", per_group * 4, mesh_scratch->SizeBytes());
++        }
++    } else {
++        mesh_groups = groups;
++        if (mesh_groups > MaxDispatch) {
++            return refuse("too many mesh workgroups", mesh_groups, MaxDispatch);
++        }
++    }
++    const MeshScratchPlan plan{PlanMeshScratch(tasks, mesh_groups, mesh)};
++    if (plan.total * sizeof(u32) > mesh_scratch->SizeBytes()) {
++        return refuse("the draw does not fit the scratch region", plan.total * 4,
++                      mesh_scratch->SizeBytes());
++    }
++    const VkDeviceAddress address{mesh_scratch->Address()};
++    const MeshComputeLayout push{
++        .scratch_low = static_cast<u32>(address),
++        .scratch_high = static_cast<u32>(address >> 32),
++        .tasks = tasks,
++        .groups = mesh_groups,
++        .group_corners = 3 * mesh.max_primitives,
++        .padding = {},
++    };
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([this, descriptor_data, descriptor_buffer_offset, descriptor_buffer_chunk, push,
++                      has_task, rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
++        const VkBuffer scratch{mesh_scratch->Handle()};
++        // The last draw's reads of the region come before this draw's writes; the header is cleared.
++        static constexpr VkMemoryBarrier reuse_barrier{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                             VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
++            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
++                             VK_ACCESS_SHADER_WRITE_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
++                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               0, reuse_barrier);
++        cmdbuf.FillBuffer(scratch, 0, MESH_SCRATCH_HEADER_WORDS * sizeof(u32), 0);
++        static constexpr VkMemoryBarrier filled_barrier{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               0, filled_barrier);
++        // The draw's descriptors, at the compute bind point.
++        if (descriptor_set_layout) {
++            if (uses_descriptor_buffer) {
++                cmdbuf.BindDescriptorBuffersEXT(descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk));
++                const u32 buffer_index{};
++                cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                                     *pipeline_layout, 0, buffer_index,
++                                                     descriptor_buffer_offset);
++            } else if (uses_push_descriptor) {
++                cmdbuf.PushDescriptorSetWithTemplateKHR(*compute_update_template, *pipeline_layout,
++                                                        0, descriptor_data);
++            } else {
++                const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
++                device.GetLogical().UpdateDescriptorSet(descriptor_set, *compute_update_template,
++                                                        descriptor_data);
++                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
++                                          descriptor_set, nullptr);
++            }
++        }
++        cmdbuf.PushConstants(*pipeline_layout, push_constant_stages, RESCALING_LAYOUT_WORDS_OFFSET,
++                             sizeof(rescaling_data), rescaling_data.data());
++        cmdbuf.PushConstants(*pipeline_layout, push_constant_stages, MESH_COMPUTE_PUSH_OFFSET,
++                             sizeof(push), &push);
++        static constexpr VkMemoryBarrier pass_barrier{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                             VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
++        };
++        if (has_task) {
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *task_pipeline);
++            cmdbuf.Dispatch(push.tasks, 1, 1);
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, pass_barrier);
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *scan_pipeline);
++            cmdbuf.Dispatch(1, 1, 1);
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
++                                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
++                                   0, pass_barrier);
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_pipeline);
++            cmdbuf.DispatchIndirect(scratch, 4 * sizeof(u32)); // the scan's dispatch words
++        } else {
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_pipeline);
++            cmdbuf.Dispatch(push.groups, 1, 1);
++        }
++        static constexpr VkMemoryBarrier read_barrier{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
++                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
++                               0, read_barrier);
++    });
++    mesh_compute_draw = {.recorded = true, .buffer = mesh_scratch->Handle(), .offset = 0};
++    return true;
++}
++
+ void GraphicsPipeline::Validate() {
+     size_t num_images{};
+     for (const auto& info : stage_infos) {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 33b81f797d..d4431a0f7b 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -10,6 +10,7 @@
+ #include <array>
+ #include <atomic>
+ #include <condition_variable>
++#include <memory>
+ #include <mutex>
+ #include <type_traits>
+ #include <vector>
+@@ -72,6 +73,18 @@ class RescalingPushConstant;
+ class RenderAreaPushConstant;
+ class Scheduler;
+ 
++class MeshComputeScratch;
++
++/// Task and mesh programs run as compute (EDEN_NX2_MESH_AS_COMPUTE=1, vk_mesh_compute.h): the
++/// pipeline's compute passes and the vertex shader that reads their records back.
++struct MeshComputeShaders {
++    vk::ShaderModule task;     ///< the task program as compute; null without one
++    vk::ShaderModule mesh;     ///< the mesh program as compute
++    vk::ShaderModule scan;     ///< the scan between them (mesh_compute_scan.comp); null without a task
++    vk::ShaderModule readback; ///< the vertex shader of the graphics pipeline
++    Shader::MeshInfo mesh_info;
++};
++
+ class GraphicsPipeline {
+     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+ 
+@@ -84,7 +97,9 @@ public:
+         DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
+         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
+-        const std::array<const Shader::Info*, NUM_STAGES>& infos);
++        const std::array<const Shader::Info*, NUM_STAGES>& infos,
++        MeshComputeScratch* mesh_scratch = nullptr,
++        std::unique_ptr<MeshComputeShaders> mesh_compute = nullptr);
+ 
+     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+     bool SupportsAlphaToCoverage() const noexcept {
+@@ -108,6 +123,24 @@ public:
+     [[nodiscard]] bool IsMeshPipeline() const noexcept {
+         return stage_infos[0].is_task || stage_infos[0].is_mesh;
+     }
++    /// A task/mesh pipeline whose programs run as compute passes before an ordinary draw.
++    [[nodiscard]] bool RunsMeshAsCompute() const noexcept {
++        return mesh_compute != nullptr;
++    }
++    /// The task or mesh workgroups of the draw being configured (the draw's vertex count).
++    void SetMeshDrawGroups(u32 groups) noexcept {
++        mesh_draw_groups = groups;
++    }
++    /// After Configure: where the readback draw's VkDrawIndirectCommand is, when the compute passes
++    /// were recorded (vkCmdDrawIndirect instead of vkCmdDrawMeshTasksEXT).
++    struct MeshComputeDraw {
++        bool recorded{};
++        VkBuffer buffer{};
++        VkDeviceSize offset{};
++    };
++    [[nodiscard]] const MeshComputeDraw& LastMeshComputeDraw() const noexcept {
++        return mesh_compute_draw;
++    }
+     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
+     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
+ 
+@@ -166,6 +199,9 @@ private:
+                        const RenderAreaPushConstant& render_are);
+ 
+     void MakePipeline(VkRenderPass render_pass);
++    void MakeMeshComputePipelines();
++    bool RecordMeshComputePasses(const void* descriptor_data, VkDeviceSize descriptor_buffer_offset,
++                                 u32 descriptor_buffer_chunk, const RescalingPushConstant& rescaling);
+ 
+     void Validate();
+ 
+@@ -202,6 +238,17 @@ private:
+     vk::DescriptorUpdateTemplate descriptor_update_template;
+     vk::Pipeline pipeline;
+ 
++    // Task and mesh programs run as compute (RunsMeshAsCompute).
++    MeshComputeScratch* mesh_scratch{};
++    std::unique_ptr<MeshComputeShaders> mesh_compute;
++    vk::DescriptorUpdateTemplate compute_update_template; ///< the same descriptors, compute bind point
++    vk::Pipeline task_pipeline;
++    vk::Pipeline scan_pipeline;
++    vk::Pipeline mesh_pipeline;
++    VkShaderStageFlags push_constant_stages{};
++    u32 mesh_draw_groups{};
++    MeshComputeDraw mesh_compute_draw{};
++
+     DescriptorBufferLayout descriptor_buffer_layout;
+     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+     VkDeviceSize last_descriptor_buffer_offset{};
+diff --git a/src/video_core/renderer_vulkan/vk_mesh_compute.cpp b/src/video_core/renderer_vulkan/vk_mesh_compute.cpp
+new file mode 100644
+index 0000000000..0825a6e96e
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_mesh_compute.cpp
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <algorithm>
++#include <cstdlib>
++
++#include "common/logging.h"
++#include "video_core/renderer_vulkan/vk_mesh_compute.h"
++#include "video_core/vulkan_common/vulkan_device.h"
++#include "video_core/vulkan_common/vulkan_memory_allocator.h"
++
++namespace Vulkan {
++
++bool MeshComputeScratch::Requested() noexcept {
++    static const bool requested = [] {
++        const char* value = std::getenv("EDEN_NX2_MESH_AS_COMPUTE");
++        return value != nullptr && value[0] == '1';
++    }();
++    return requested;
++}
++
++MeshComputeScratch::MeshComputeScratch(const Device& device, MemoryAllocator& memory_allocator) {
++    if (!device.IsBufferDeviceAddressSupported()) {
++        refusal = "the device has no buffer device addresses";
++        LOG_WARNING(Render_Vulkan, "Mesh draws as compute: off, {}", refusal);
++        return;
++    }
++    u64 mib = 32;
++    if (const char* value = std::getenv("EDEN_NX2_MESH_COMPUTE_MIB")) {
++        mib = std::clamp<u64>(std::strtoull(value, nullptr, 10), 4, 1024);
++    }
++    size = mib << 20;
++    const VkBufferCreateInfo buffer_ci{
++        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++        .pNext = nullptr,
++        .flags = 0,
++        .size = size,
++        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
++                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++        .queueFamilyIndexCount = 0,
++        .pQueueFamilyIndices = nullptr,
++    };
++    try {
++        buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
++    } catch (const vk::Exception& exception) {
++        refusal = "the scratch region could not be made";
++        LOG_WARNING(Render_Vulkan, "Mesh draws as compute: off, {} ({} MiB: {})", refusal, mib,
++                    exception.what());
++        size = 0;
++        return;
++    }
++    if (!buffer) {
++        refusal = "the scratch region could not be made";
++        LOG_WARNING(Render_Vulkan, "Mesh draws as compute: off, {} ({} MiB)", refusal, mib);
++        size = 0;
++        return;
++    }
++    address = device.GetLogical().GetBufferDeviceAddress(*buffer);
++    if (address == 0) {
++        refusal = "the scratch region has no device address";
++        LOG_WARNING(Render_Vulkan, "Mesh draws as compute: off, {}", refusal);
++        buffer.reset();
++        size = 0;
++        return;
++    }
++    LOG_INFO(Render_Vulkan, "Mesh draws as compute: on, scratch region of {} MiB", mib);
++}
++
++MeshComputeScratch::~MeshComputeScratch() = default;
++
++} // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_mesh_compute.h b/src/video_core/renderer_vulkan/vk_mesh_compute.h
+new file mode 100644
+index 0000000000..4ebdf1ac95
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_mesh_compute.h
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include "common/common_types.h"
++#include "video_core/vulkan_common/vulkan_wrapper.h"
++
++namespace Vulkan {
++
++class Device;
++class MemoryAllocator;
++
++// Task and mesh programs run as compute (EDEN_NX2_MESH_AS_COMPUTE=1): the one scratch region every
++// such draw uses in turn (shader_recompiler/backend/spirv/mesh_compute_layout.h). A draw's compute
++// passes write it and its readback draw reads it; a barrier between one draw's reads and the next
++// draw's writes serialises them on the one queue, so no draw needs a region of its own.
++// EDEN_NX2_MESH_COMPUTE_MIB sets its size (default 32); a draw that needs more is skipped and logged.
++// The device must give buffer device addresses: the shaders reach the region through them.
++class MeshComputeScratch {
++public:
++    /// The switch, read once.
++    [[nodiscard]] static bool Requested() noexcept;
++
++    explicit MeshComputeScratch(const Device& device, MemoryAllocator& memory_allocator);
++    ~MeshComputeScratch();
++
++    [[nodiscard]] bool IsValid() const noexcept {
++        return address != 0;
++    }
++    [[nodiscard]] VkBuffer Handle() const noexcept {
++        return *buffer;
++    }
++    [[nodiscard]] VkDeviceAddress Address() const noexcept {
++        return address;
++    }
++    [[nodiscard]] u64 SizeBytes() const noexcept {
++        return size;
++    }
++    /// Why the region could not be made (for the log), "" when it was.
++    [[nodiscard]] const char* Refusal() const noexcept {
++        return refusal;
++    }
++
++private:
++    vk::Buffer buffer;
++    VkDeviceAddress address{};
++    u64 size{};
++    const char* refusal{""};
++};
++
++} // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index e47a7e357d..31eec6261e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -24,6 +24,7 @@
+ #include "common/thread_worker.h"
+ #include "core/core.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
++#include "shader_recompiler/backend/spirv/emit_spirv_mesh_readback.h"
+ #include "shader_recompiler/environment.h"
+ #include "shader_recompiler/frontend/maxwell/control_flow.h"
+ #include "shader_recompiler/frontend/maxwell/translate_program.h"
+@@ -40,6 +41,7 @@
+ #include "video_core/renderer_vulkan/vertex_repack.h"
+ #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
++#include "video_core/renderer_vulkan/vk_mesh_compute.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+@@ -164,7 +166,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+                                     const GraphicsPipelineCacheKey& key,
+                                     const Shader::IR::Program& program,
+                                     const Shader::IR::Program* previous_program,
+-                                    const Vulkan::Device& device) {
++                                    const Vulkan::Device& device, bool mesh_as_compute = false) {
+     Shader::RuntimeInfo info;
+     if (previous_program) {
+         info.previous_stage_stores = previous_program->info.stores;
+@@ -175,7 +177,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+     } else {
+         info.previous_stage_stores.mask.set();
+     }
+-    if (previous_program && previous_program->stage == Shader::Stage::Mesh) {
++    // Run as compute (mesh_as_compute), the readback vertex shader gives the fragment program the
++    // per-primitive values as flat inputs instead.
++    if (previous_program && previous_program->stage == Shader::Stage::Mesh && !mesh_as_compute) {
+         for (const u32 line : previous_program->mesh.primitive_lines) {
+             const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+             if (Shader::IR::IsGeneric(attribute)) {
+@@ -243,8 +247,12 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+             return Shader::TessSpacing::Equal;
+         }();
+         break;
++    case Shader::Stage::Task:
++        info.mesh_as_compute = mesh_as_compute;
++        break;
+     case Shader::Stage::Mesh:
+         info.convert_depth_mode = gl_ndc;
++        info.mesh_as_compute = mesh_as_compute;
+         break;
+     case Shader::Stage::Geometry:
+         if (program.output_topology == Shader::OutputTopology::PointList) {
+@@ -410,12 +418,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                              GuestDescriptorQueue& guest_descriptor_queue_,
+                              DescriptorBufferRing& descriptor_buffer_ring_,
+                              RenderPassCache& render_pass_cache_, BufferCache& buffer_cache_,
+-                             TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_)
++                             TextureCache& texture_cache_, VideoCore::ShaderNotify& shader_notify_,
++                             MemoryAllocator& memory_allocator)
+     : VideoCommon::ShaderCache{device_memory_}, device{device_}, scheduler{scheduler_},
+       descriptor_pool{descriptor_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
+       descriptor_buffer_ring{descriptor_buffer_ring_},
+       render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
+       texture_cache{texture_cache_}, shader_notify{shader_notify_},
++      mesh_scratch{MeshComputeScratch::Requested()
++                       ? std::make_unique<MeshComputeScratch>(device_, memory_allocator)
++                       : nullptr},
+       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+                                 !DriverCachesPipelines(device_)},
+@@ -1425,6 +1437,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
+     size_t env_index{0};
+     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
++    // Task and mesh programs run as compute (EDEN_NX2_MESH_AS_COMPUTE=1, vk_mesh_compute.h).
++    const bool mesh_as_compute{mesh_scratch != nullptr && mesh_scratch->IsValid()};
+     const bool uses_vertex_a{key.unique_hashes[0] != 0};
+     const bool uses_vertex_b{key.unique_hashes[1] != 0};
+ 
+@@ -1458,10 +1472,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         ++env_index;
+ 
+         // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
+-        // skipped (see the pipeline check in the rasterizer).
++        // skipped (see the pipeline check in the rasterizer), unless the programs run as compute.
+         if ((env.ShaderStage() == Shader::Stage::Task ||
+              env.ShaderStage() == Shader::Stage::Mesh) &&
+-            !device.IsExtMeshShaderSupported()) {
++            !device.IsExtMeshShaderSupported() && !mesh_as_compute) {
+             return nullptr;
+         }
+ 
+@@ -1551,7 +1565,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         const size_t stage_index{index - 1};
+         infos[stage_index] = &program.info;
+ 
+-        const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
++        const auto runtime_info{
++            MakeRuntimeInfo(programs, key, program, previous_stage, device, mesh_as_compute)};
+         ConvertLegacyToGeneric(program, runtime_info);
+         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+         device.SaveShader(code);
+@@ -1590,11 +1605,44 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         }
+         previous_stage = &program;
+     }
++    // Run as compute: the task and mesh modules leave the graphics stages for compute pipelines,
++    // the vertex slot gets the readback shader, and a task pipeline gets the scan between them.
++    std::unique_ptr<MeshComputeShaders> mesh_compute;
++    if (mesh_as_compute && key.unique_hashes[1] != 0 &&
++        (programs[1].stage == Shader::Stage::Task || programs[1].stage == Shader::Stage::Mesh)) {
++        const bool has_task{programs[1].stage == Shader::Stage::Task};
++        const size_t mesh_index{has_task ? 3U : 1U};
++        if (key.unique_hashes[mesh_index] == 0 || programs[mesh_index].stage != Shader::Stage::Mesh) {
++            LOG_WARNING(Render_Vulkan, "Mesh pipeline {:016x} has no mesh program to run as compute",
++                        hash);
++            return nullptr;
++        }
++        Shader::IR::Program& mesh_program{programs[mesh_index]};
++        const auto mesh_runtime{MakeRuntimeInfo(programs, key, mesh_program,
++                                                has_task ? &programs[1] : nullptr, device, true)};
++        mesh_compute = std::make_unique<MeshComputeShaders>();
++        mesh_compute->mesh_info = mesh_program.mesh;
++        mesh_compute->readback = BuildShader(
++            device, Shader::Backend::SPIRV::EmitMeshReadbackVertex(profile, mesh_runtime,
++                                                                   mesh_program.mesh));
++        mesh_compute->mesh = std::move(modules[mesh_index - 1]);
++        if (has_task) {
++            mesh_compute->task = std::move(modules[0]);
++            mesh_compute->scan = BuildShader(device, Shader::Backend::SPIRV::MeshComputeScanSpirv());
++        }
++        LOG_INFO(Render_Vulkan,
++                 "Mesh pipeline {:016x} runs as compute: task={} max_vertices={} max_primitives={} "
++                 "vertex_lines={} primitive_lines={} payload_words={}",
++                 hash, has_task, mesh_program.mesh.max_vertices, mesh_program.mesh.max_primitives,
++                 mesh_program.mesh.vertex_lines.size(), mesh_program.mesh.primitive_lines.size(),
++                 mesh_program.mesh.payload_words);
++    }
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+     return std::make_unique<GraphicsPipeline>(
+         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
+         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+-        render_pass_cache, key, std::move(modules), infos);
++        render_pass_cache, key, std::move(modules), infos, mesh_scratch.get(),
++        std::move(mesh_compute));
+ 
+ } catch (const Shader::Exception& exception) {
+     auto hash = key.Hash();
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 44f0436ace..8cfa854a7c 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -109,6 +109,9 @@ struct ShaderPools {
+     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
+ };
+ 
++class MemoryAllocator;
++class MeshComputeScratch;
++
+ class PipelineCache : public VideoCommon::ShaderCache {
+ public:
+     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
+@@ -116,7 +119,8 @@ public:
+                            GuestDescriptorQueue& guest_descriptor_queue,
+                            DescriptorBufferRing& descriptor_buffer_ring,
+                            RenderPassCache& render_pass_cache, BufferCache& buffer_cache,
+-                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
++                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_,
++                           MemoryAllocator& memory_allocator);
+     ~PipelineCache();
+ 
+     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+@@ -201,6 +205,9 @@ private:
+     BufferCache& buffer_cache;
+     TextureCache& texture_cache;
+     VideoCore::ShaderNotify& shader_notify;
++    /// Task and mesh programs run as compute (EDEN_NX2_MESH_AS_COMPUTE=1): their scratch region,
++    /// null while the switch is off (vk_mesh_compute.h).
++    std::unique_ptr<MeshComputeScratch> mesh_scratch;
+     bool use_asynchronous_shaders{};
+     bool use_vulkan_pipeline_cache{};
+     bool oot_visual_workaround{};
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index cfa24a1cf5..511926b2d2 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -235,7 +235,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+       query_cache(gpu, *this, device_memory, query_cache_runtime),
+       pipeline_cache(device_memory, device, scheduler, descriptor_pool, guest_descriptor_queue,
+                      descriptor_buffer_ring, render_pass_cache, buffer_cache, texture_cache,
+-                     gpu.ShaderNotify()),
++                     gpu.ShaderNotify(), memory_allocator),
+       accelerate_dma(buffer_cache, texture_cache, scheduler),
+       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
+       wfi_event(device.GetLogical().CreateEvent()) {
+@@ -627,7 +627,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         return value != nullptr && value[0] != '0';
+     }();
+     const bool no_mesh_title{!mkw_mesh && Settings::GetCurrentProgramID() == 0x0400C3F00006E000ULL};
+-    if (mesh_draw && (no_mesh || no_mesh_title || !device.IsExtMeshShaderSupported())) {
++    // EDEN_NX2_MESH_AS_COMPUTE=1: the task and mesh programs ran as compute passes in Configure, and
++    // the draw reads their records (GraphicsPipeline::RunsMeshAsCompute).
++    if (mesh_draw && (no_mesh || no_mesh_title ||
++                      (!device.IsExtMeshShaderSupported() && !pipeline->RunsMeshAsCompute()))) {
+         report_failure(no_mesh         ? "EDEN_NX2_NO_MESH"
+                        : no_mesh_title ? "off for Mario Kart World"
+                                        : "no VK_EXT_mesh_shader");
+@@ -644,6 +647,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
++    mesh_runs_as_compute = mesh_draw && pipeline->RunsMeshAsCompute();
++    if (mesh_runs_as_compute) {
++        // The draw's vertex count is its task (or mesh) workgroup count.
++        pipeline->SetMeshDrawGroups(maxwell3d->draw_manager.draw_state.vertex_buffer.count);
++    }
+     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+         maxwell3d->regs, pipeline->HasDynamicVertexInput());
+     if (repack_dirty) {
+@@ -660,6 +668,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         report_failure("configure failed");
+         return;
+     }
++    mesh_compute_draw = mesh_runs_as_compute ? pipeline->LastMeshComputeDraw()
++                                             : GraphicsPipeline::MeshComputeDraw{};
+ 
+     {
+         Profile::Scope scope{Profile::Zone::DynamicState};
+@@ -959,6 +969,25 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+         const u32 num_instances{instance_count};
+         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+ 
++        if (mesh_draw && mesh_runs_as_compute) {
++            // The compute passes were recorded by Configure: the draw reads their
++            // VkDrawIndirectCommand (mesh_compute_layout.h). Nothing when the draw did not fit.
++            // Instances are not run: the programs take their index from WorkgroupId.x alone.
++            if (!mesh_compute_draw.recorded) {
++                return;
++            }
++            if (num_instances > 1) {
++                static bool logged{};
++                if (!std::exchange(logged, true)) {
++                    LOG_WARNING(Render_Vulkan, "Task/mesh draw as compute with {} instances: one run",
++                                num_instances);
++                }
++            }
++            scheduler.Record([draw = mesh_compute_draw](vk::CommandBuffer cmdbuf) {
++                cmdbuf.DrawIndirect(draw.buffer, draw.offset, 1, sizeof(VkDrawIndirectCommand));
++            });
++            return;
++        }
+         if (mesh_draw) {
+             // The programs read the task index from WorkgroupId.x only, and Vulkan guarantees
+             // 65535 workgroups per dimension (RADV allows no more): a larger count is invalid and
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 8903922681..5eea4396a3 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -260,6 +260,8 @@ private:
+ 
+     u32 draw_counter = 0;
+     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
++    bool mesh_runs_as_compute{}; ///< ... whose programs run as compute passes (vk_mesh_compute.h)
++    GraphicsPipeline::MeshComputeDraw mesh_compute_draw{}; ///< the readback draw they left
+ };
+ 
+ } // namespace Vulkan

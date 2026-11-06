@@ -1,0 +1,125 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0338-nemyu-01-written-native-bindings-keep-stated-size.patch
+
+Source: 0338-nemyu-01-written-native-bindings-keep-stated-size.patch
+Moved by hand: the cut sits inside upstream's binding cache lambda (0066); a native pointer's size word is read there, the cache key does not carry it
+
+buffer_cache: EDEN_NX2_SSBO_WRITES_SIZED=1 keeps a written native binding at its stated size
+
+Rule from notquiteog/Elysium 1656cee4d8 (branch main, merge of zortos293/Lichii bisect/oot-6):
+native reads use the mapping, native writes keep descriptor sizing, "so both the grass fix and
+the MKW pacing fix hold". The fault it answers: Nemyu 6605d298 (Uesleizito Zin, gitlab.com/
+nemyu-emulator/nemyu, branch nemyu, tag nemyu-v0.1.4) and upstream PR 609 (Mcm190). GPL-3.0-or-later,
+as the core.
+
+Upstream #535 (2e12e0def5) sizes every native compute storage buffer from its mapping, up to 8 MiB.
+A written binding is marked GPU-written whole. Our pin e736dfde9e has that: it sits after the revert
+4bc1ede493 of #561 and before #571 put #561 back. 0082 already stops the worst of it. Nemyu's own
+table, RTX 3050 laptop, so only the order carries over:
+
+  mapped                       57-73 ms a race frame
+  mapped + exact preflush      29.5, 30.8 ms    <- our tree (0082)
+  descriptor sizing            22.4, 22.5 ms
+  descriptor + exact preflush  21.5, 21.1 ms    <- with rebase-03
+
+rebase-03 (EDEN_NX2_SSBO_DLSS_ONLY=1) also cuts read bindings. This one cuts only written ones:
+reads keep the mapping, tables and DLSS passes are untouched. Nothing here makes a binding larger.
+Its worst case, if the word after the pointer is not a size: a written binding ends early, so writes
+past that point are dropped and reads through the same binding past it return 0. The table above
+sizes every binding, reads too; nothing has measured this written-only rule.
+
+=1 cuts. =2 changes nothing and only logs what =1 would cut, so a normal run can count it. Unset
+is the old behaviour. With rebase-03 at =1 this has little left to do; the two stack. InDlssEvaluation
+is rebase-03's IsDlssDispatch under its own name so that each patch stands alone.
+
+Core patch. Nothing here has run on a console.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 1e28e49712..74d02bd325 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -871,6 +871,23 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+ 
+     const auto& cbufs = launch_desc.const_buffer_config;
+     GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
++    // EDEN_NX2_SSBO_WRITES_SIZED=1: a written binding of a direct native pointer keeps the size in
++    // the word after the pointer; read bindings, tables and DLSS passes keep their mappings. A
++    // written binding is marked GPU-written whole, so one of up to 8 MiB marks data the program
++    // never touched: Mario Kart World read back gigabytes a second (upstream #609). Nemyu's races
++    // ran 30 ms a frame, 21 with every binding sized, reads too. =2 only logs what =1 would cut.
++    static const u8 writes_sized = [] {
++        const char* const value = std::getenv("EDEN_NX2_SSBO_WRITES_SIZED");
++        return static_cast<u8>(value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0);
++    }();
++    native_written_binding_mode =
++        is_written && indirect_offset == ~0U && kepler_compute->IsNativeMode() &&
++                !kepler_compute->InDlssEvaluation()
++            ? writes_sized
++            : u8{0};
++    SCOPE_EXIT {
++        native_written_binding_mode = 0;
++    };
+     if (indirect_offset != ~0U) {
+         // The pointer is an entry of a table the constant buffer points to.
+         const GPUVAddr holder = gpu_memory->Read<u64>(ssbo_addr);
+@@ -3289,6 +3306,30 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+             }
+             return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+         }();
++        if (native_written_binding_mode != 0) {
++            // A native pointer's size word is read here only (the binding cache above keys native
++            // answers without it, so a stated size that changes under the same page table is seen
++            // at the next page table change).
++            const u64 stated_qword = reads_size_word ? next_qword : gpu_memory->Read<u64>(ssbo_addr + 8);
++            const u32 stated_size = static_cast<u32>(stated_qword);
++            if (static_cast<u32>(stated_qword >> 32) == 0 && stated_size != 0 && stated_size < size) {
++                // Runs on one thread; the log thins out as the count doubles.
++                static u64 cut_bindings{};
++                static u64 cut_bytes{};
++                ++cut_bindings;
++                cut_bytes += size - stated_size;
++                if ((cut_bindings & (cut_bindings - 1)) == 0) {
++                    LOG_INFO(HW_GPU,
++                             "Native written bindings cut to their stated size: {} so far, {} MiB "
++                             "fewer bytes marked; last {} to {} bytes (mode {})",
++                             cut_bindings, cut_bytes >> 20, size, stated_size,
++                             native_written_binding_mode);
++                }
++                if (native_written_binding_mode == 1) {
++                    size = stated_size;
++                }
++            }
++        }
+         if (native_pointer && size != 0) {
+             // Stop where the mapping or its device range does: the binding is one device range, and
+             // a written one isn't split into separate ranges without sparse sources.
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 966d7a5833..87969143db 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -453,6 +453,9 @@ public:
+         u64 size{};
+         u64 removals{~u64{0}};
+     };
++    /// EDEN_NX2_SSBO_WRITES_SIZED: the compute binding being made is written through a direct
++    /// native pointer. 1 keeps the size the word after the pointer states, 2 only counts it.
++    u8 native_written_binding_mode{};
+     std::array<Nx2RecentRange, 8> nx2_recent_gpu_ranges{};
+     std::array<Nx2RecentRange, 8> nx2_recent_uncommitted_ranges{};
+     size_t nx2_recent_gpu_next{};
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+index eca391240f..19cdf5c082 100644
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -259,6 +259,11 @@ public:
+     /// are emulated: in a game DLSS evaluation when the game's own network may draw, and always
+     /// for Donkey Kong Bananza.
+     [[nodiscard]] bool EmulatesNativeTensorPrograms() const;
++    /// Whether the dispatch being run belongs to a game DLSS evaluation, whose storage pointers
++    /// are followed by parameters, not sizes.
++    [[nodiscard]] bool InDlssEvaluation() const {
++        return native_mode && dlss_chain.active;
++    }
+ 
+     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
+     /// the front instead of CallMethod for native compute engines: runs their macros and macro

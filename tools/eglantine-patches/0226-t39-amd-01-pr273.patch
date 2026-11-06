@@ -1,0 +1,183 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0420-amd-01-pr273.patch
+
+Source: 0420-amd-01-pr273.patch
+tree lacked
+
+zortos293/Lichii PR 273 (68caa6c75e, zortos293, 6 Nov, "fix AMD shader typing, atomic retries and
+compiler stalls") has four parts. Against this tree (local/T30, core 0001-0418 with white-03):
+
+1. Compare-exchange loops retry with the word the exchange returned. CasLoop and the write-storage
+   bitfield loop already do, under EDEN_NX2_CAS_RETURNED=1 (0397, sweep-01, from Lichii PR 206).
+   The 8/16-bit shared store loop in DefineSharedMemory was the one loop left as it was; it now
+   takes the same form under this switch. On AMD a plain reload can keep returning a stale copy,
+   and the invocations that lost never match again: a hang or a lost device inside a compute
+   program that packs bytes into shared memory, or wrong packed values.
+2. Depth-compare samples keep a float image when the descriptor reads as an integer format:
+   already in this tree (texture_pass.cpp, the sampled descriptor site), nothing to port.
+3. Fragment shaders take the subgroup shuffle fallback (broadcast per lane) where the driver's
+   fragment-stage shuffles are wrong. The PR sets it for AMD's Windows driver; the switch sets it
+   on RADV too, as a test: fragment shaders run wave64 there, and a shuffle that crosses a guest
+   warp's half would mix lanes of two pixels' quads (the fallback masks to the guest lane).
+4. VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION for two Ocarina compute shaders on AMD's Windows driver
+   (6 and 18 minute compiles): driver-specific, not taken.
+
+EDEN_NX2_AMD_PR273=1 turns on 1 and 3; unset, nothing changes (the AMD-Windows condition of 3
+stays as upstream has it). Shaders are translated at every boot, so env.txt is enough. Clang
+syntax check clean on emit_spirv_warp.cpp, spirv_emit_context.cpp and vk_pipeline_cache.cpp. Not
+built, not run.
+ .../backend/spirv/emit_spirv_warp.cpp         | 11 +++++--
+ .../backend/spirv/spirv_emit_context.cpp      | 33 ++++++++++++++++---
+ .../backend/spirv/spirv_emit_context.h        |  6 ++++
+ src/shader_recompiler/profile.h               |  3 ++
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  7 ++++
+ 5 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+index 8d83509961..85d3e328eb 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+@@ -90,8 +90,15 @@ Id GuestLane(EmitContext& ctx, Id index) {
+     return ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.Const(31U));
+ }
+ 
++// Lichii PR 273 (68caa6c75e): fragment shaders take the broadcast fallback where the driver's
++// fragment-stage shuffles are wrong (AMD's Windows driver there; EDEN_NX2_AMD_PR273=1 on RADV).
++bool UseShuffleFallback(EmitContext& ctx) {
++    return ctx.profile.has_broken_spirv_subgroup_shuffle ||
++           (ctx.profile.has_broken_spirv_fragment_shuffle && ctx.stage == Stage::Fragment);
++}
++
+ Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
+-    if (!ctx.profile.has_broken_spirv_subgroup_shuffle) {
++    if (!UseShuffleFallback(ctx)) {
+         return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id);
+     }
+     Id result{ctx.u32_zero_value};
+@@ -105,7 +112,7 @@ Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
+ }
+ 
+ Id ShuffleRelative(EmitContext& ctx, Id value, Id delta, Id src_thread_id, spv::Op op) {
+-    if (!ctx.profile.support_shuffle_relative) {
++    if (!ctx.profile.support_shuffle_relative || UseShuffleFallback(ctx)) {
+         return ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id));
+     }
+     const Id result{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, delta)};
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index e2af16e85b..4bd5c38930 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -27,6 +27,14 @@
+ 
+ namespace Shader::Backend::SPIRV {
+ 
++bool AmdPr273Fixes() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_AMD_PR273");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
+ bool AmdShaderFixes() {
+     static const bool enabled = [] {
+         const char* const value = std::getenv("EDEN_NX2_AMD_SHADER_FIXES");
+@@ -756,22 +764,37 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
+         const Id offset{OpFunctionParameter(U32[1])};
+         const Id insert_value{OpFunctionParameter(U32[1])};
+         AddLabel();
+-        OpBranch(loop_header);
+-
+-        AddLabel(loop_header);
++        // EDEN_NX2_AMD_PR273=1 (Lichii PR 273, 68caa6c75e): each attempt expects the word the
++        // previous compare-exchange returned, as CasLoopReturnedWord does for the other loops
++        // under EDEN_NX2_CAS_RETURNED; a plain reload can keep returning a stale copy on AMD and
++        // the invocations that lost never match again. This 8/16-bit shared store loop was the
++        // one loop sweep-01 left as it was.
++        const bool returned_word{AmdPr273Fixes()};
+         const Id word_offset{OpShiftRightArithmetic(U32[1], offset, Const(2U))};
+         const Id shift_offset{OpShiftLeftLogical(U32[1], offset, Const(3U))};
+         const Id bit_offset{OpBitwiseAnd(U32[1], shift_offset, Const(mask))};
+         const Id count{Const(size)};
++        const Id word_pointer{OpAccessChain(shared_u32, shared_memory_u32, word_offset)};
++        Id expected_var{};
++        if (returned_word) {
++            expected_var = AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
++                                            spv::StorageClass::Function);
++            OpStore(expected_var, OpLoad(U32[1], word_pointer));
++        }
++        OpBranch(loop_header);
++
++        AddLabel(loop_header);
+         OpLoopMerge(merge_block, continue_block, spv::LoopControlMask::MaskNone);
+         OpBranch(continue_block);
+ 
+         AddLabel(continue_block);
+-        const Id word_pointer{OpAccessChain(shared_u32, shared_memory_u32, word_offset)};
+-        const Id old_value{OpLoad(U32[1], word_pointer)};
++        const Id old_value{OpLoad(U32[1], returned_word ? expected_var : word_pointer)};
+         const Id new_value{OpBitFieldInsert(U32[1], old_value, insert_value, bit_offset, count)};
+         const Id atomic_res{OpAtomicCompareExchange(U32[1], word_pointer, Const(1U), u32_zero_value,
+                                                     u32_zero_value, new_value, old_value)};
++        if (returned_word) {
++            OpStore(expected_var, atomic_res);
++        }
+         const Id success{OpIEqual(U1, atomic_res, old_value)};
+         OpBranchConditional(success, merge_block, loop_header);
+ 
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index a22dbc35ab..5c4595ceab 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -25,6 +25,12 @@ namespace Shader::Backend::SPIRV {
+ /// once; shaders are translated at every boot, so env.txt is enough.
+ [[nodiscard]] bool AmdShaderFixes();
+ 
++/// EDEN_NX2_AMD_PR273=1: the parts of zortos293/Lichii PR 273 (68caa6c75e, "fix AMD depth
++/// sampling, atomic retries and compiler stalls") this tree lacked: the 8/16-bit shared store
++/// loop retries with the returned word, and fragment shaders take the shuffle fallback. The
++/// depth-compare typing was already here; the AMD-Windows compiler stall list is not for RADV.
++[[nodiscard]] bool AmdPr273Fixes();
++
+ static std::bitset<8> clip_distance_written;
+ 
+ using Sirit::Id;
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index 8e9c83f888..c3e95daf5a 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -104,6 +104,9 @@ struct Profile {
+     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs
+     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
+     bool has_broken_spirv_subgroup_shuffle{};
++    /// Subgroup shuffles in fragment shaders go through the broadcast fallback (Lichii PR 273:
++    /// AMD's Windows driver; EDEN_NX2_AMD_PR273=1 tries it on RADV).
++    bool has_broken_spirv_fragment_shuffle{};
+     u32 max_subgroup_size{};
+ 
+     u32 gl_max_compute_smem_size{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 8d3d44ebc7..dbc83b66bb 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -29,6 +29,7 @@
+ #include "common/thread_worker.h"
+ #include "core/core.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
++#include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv_mesh_readback.h"
+ #include "shader_recompiler/environment.h"
+ #include "shader_recompiler/frontend/maxwell/control_flow.h"
+@@ -552,6 +553,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
+             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
+         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
++        // Lichii PR 273 sets this for AMD's Windows driver; EDEN_NX2_AMD_PR273=1 tries the same
++        // fallback on RADV (the console), where fragment shaders run wave64.
++        .has_broken_spirv_fragment_shuffle =
++            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
++            (Shader::Backend::SPIRV::AmdPr273Fixes() &&
++             (driver_id == VK_DRIVER_ID_MESA_RADV || driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE)),
+         .max_subgroup_size = device.GetMaxSubgroupSize(),
+         .has_broken_robust =
+             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,

@@ -1,0 +1,476 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0210-split-wait-report.patch
+
+Source: 0210-split-wait-report.patch
+Moved by hand: the map drain site is set at upstream's EDEN_NX2_MAP_ON_BACK form of the run command; the profile switch re-read is upstream's 0053 already, those hunks dropped
+
+gpu_split: report where the front waits for the back (EDEN_NX2_SPLIT_WAITS=1)
+
+Core patch. Paths are the submodule's. Numbered after 0181; 0210 to 0216 go in order.
+
+Source: zortos293/Lichii, GPL-3.0-or-later. DrainSite and the shared wait come from nx2 at
+27226d2568 (src/video_core/gpu_split.cpp, nx2_profile.h), carried in PR 161 (999sian, 64bb6fe0d7)
+and PR 179 (tibzejoker, head 3ce0ab7106). The report line is ours: the core's own zones cost ~25% of
+the GPU thread on the console (docs/MKW-TITLE-FPS.md), so it reads clocks only around waits.
+
+Why: run61 cannot say which waits cost time. Its only split log fires after 5 s, and it never fired.
+
+EDEN_NX2_SPLIT_WAITS=1 logs every 10 s from the front:
+  GPU split per second: back idle N ms, N ring words, front waited N ms, acquire N ms (N/s, longest
+  N ms), list writers ..., macro dma read ...
+Back idle near 0 means the back is the limit. Back idle high with little front wait means it is not:
+the guest or the front's own parsing is, and this line cannot tell which. Idle time includes the idle
+hook's submits.
+
+Also here:
+- WaitForSpace and WaitForWriters now share one wait. WaitForWriters had no re-wake and no report;
+  it now has both, as Drain has. Drain() itself is untouched (rebase-02 changes it); the new
+  Drain(site) wraps it.
+- EDEN_NX2_GPU_PROFILE was a global initialised from getenv, which runs before main reads env.txt,
+  so by reading the code it could never be turned on from env.txt. It is read on the GPU thread now.
+  Not proven: docs/MKW-TITLE-FPS.md gives a cost measured on the console, and no log here shows it.
+
+Runs on the PS5: yes. Run61 logs the split and macros on the first thread.
+Behaviour with the switch off: same waits and order. A full ring waits as it did: 4096 spins and no
+wait_target. With the switch on it spins longer and sets wait_target, so the back hands space back
+sooner. WaitForWriters' re-wake and 5 s warning are always there, and act only in a wait that is stuck.
+Hang: cannot add one. No new wait; one more place re-wakes a parked back.
+Pool memory: under 1 KiB.
+Checked: gpu_split.cpp built on the Mac with stubs and run under ThreadSanitizer, 2 sessions, front
+and back; PS5-target syntax compile. Not run on the console.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index dc410984be..fcdd939643 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -781,7 +781,7 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+     };
+     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+         split.Defer(flush);
+-        split.Drain();
++        split.Drain(VideoCommon::DrainSite::ListFlush);
+     } else {
+         flush();
+     }
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 7be36b0b10..9017f9ebfd 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -1646,7 +1646,7 @@ bool ComputeFrontVerify() {
+ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
+     if (!front) [[unlikely]] {
+         // Copy the back's state and take the macros over while it is idle.
+-        split.Drain();
++        split.Drain(VideoCommon::DrainSite::FrontStart);
+         front = std::make_unique<FrontState>();
+         front->registers = native_registers;
+         front->executing_macro = native_executing_macro;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 8125859f54..b0b666fbb7 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -956,7 +956,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
+     if (!front) [[unlikely]] {
+         // Copy the back's state and take the macros over while it is idle (state writes it
+         // still holds in its method sink first).
+-        split.Drain();
++        split.Drain(VideoCommon::DrainSite::FrontStart);
+         ConsumeSink(system);
+         front = std::make_unique<FrontState>();
+         std::memcpy(front->regs.data(), regs.reg_array.data(), sizeof(front->regs));
+@@ -1225,7 +1225,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+         }
+     });
+-    split.Drain();
++    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+         if (method == 0x158) {
+@@ -1237,7 +1237,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+ }
+ 
+ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+-    split.Drain();
++    split.Drain(VideoCommon::DrainSite::FrontVerify);
+     static u64 checks{};
+     static u64 differences{};
+     ++checks;
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 6e4e9717d4..d6c3347016 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -44,8 +44,8 @@ void OnBack(const Func& func) {
+     }
+ }
+ 
+-void DrainBack() {
+-    VideoCommon::GpuSplit::Get().Drain();
++void DrainBack(VideoCommon::DrainSite site = VideoCommon::DrainSite::Acquire) {
++    VideoCommon::GpuSplit::Get().Drain(site);
+ }
+ 
+ // The pending fences reach the query cache and the scheduler, which belong to the back thread even
+@@ -54,7 +54,7 @@ void DrainBack() {
+ // sees what they released.
+ void ReleaseFencesOnBack(VideoCore::RasterizerInterface* rasterizer) {
+     OnBack([rasterizer] { rasterizer->ReleaseFences(); });
+-    DrainBack();
++    DrainBack(VideoCommon::DrainSite::FenceRelease);
+ }
+ 
+ // Reads a semaphore word, flushing a GPU-written copy out of the buffer cache first. The flush
+@@ -370,7 +370,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+         return;
+     }
+     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+-    DrainBack();
++    DrainBack(VideoCommon::DrainSite::SemExecute);
+     ReleaseFencesOnBack(dma_pusher.rasterizer);
+     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+     const bool ready = operation == 0   ? word == payload
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 8bd6761fb4..7b87cca61c 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -4,6 +4,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
++#include <string>
+ #include <thread>
+ 
+ #ifdef _MSC_VER
+@@ -17,6 +18,7 @@
+ #endif
+ #include <cstdio>
+ 
++#include "common/cpu_features.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+@@ -46,6 +48,34 @@ void Pause() {
+ [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
+ std::atomic<bool> g_back_busy{};
+ 
++// EDEN_NX2_SPLIT_WAITS=1: every 10 s the front logs where it waited for the back and how long the
++// back had nothing to do. Clocks are read only around waits and sleeps, so unlike
++// EDEN_NX2_GPU_PROFILE (a clock pair per method, ~25% of the GPU thread on the console) it barely
++// moves what it measures. A function-local static: env.txt is read in main, after the globals.
++bool SplitWaitsEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_SPLIT_WAITS");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++u64 WaitClockNs() {
++    return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++}
++
++struct BackIdleClock {
++    explicit BackIdleClock(std::atomic<u64>& total_)
++        : total{total_}, start{SplitWaitsEnabled() ? WaitClockNs() : 0} {}
++    ~BackIdleClock() {
++        if (start != 0) {
++            total.fetch_add(WaitClockNs() - start, std::memory_order_relaxed);
++        }
++    }
++    std::atomic<u64>& total;
++    u64 start;
++};
++
+ } // Anonymous namespace
+ 
+ void GpuSplit::CheckOwner(const char* where) {
+@@ -87,6 +117,7 @@ void GpuSplit::CheckOwner(const char* where) {
+ GpuSplit GpuSplit::instance;
+ 
+ void GpuSplit::MaybeStart(Core::System& system_) {
++    Nx2Profile::ReadSwitch();
+     static const char mode = [] {
+         const char* value = std::getenv("EDEN_NX2_SPLIT");
+         return value != nullptr ? value[0] : '2';
+@@ -102,6 +133,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
+                                                           : Settings::IsDMALevelSafe();
+     const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
+                          Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
++    if (active && SplitWaitsEnabled()) [[unlikely]] {
++        ReportWaits();
++    }
+     if (active && !allowed) {
+         Drain();
+         Stop();
+@@ -150,6 +184,12 @@ void GpuSplit::Stop() {
+     published.store(0, std::memory_order_relaxed);
+     consumed.store(0, std::memory_order_relaxed);
+     back_waiting.store(false, std::memory_order_relaxed);
++    wait_ns.fill(0);
++    wait_count.fill(0);
++    wait_max_ns.fill(0);
++    waits_window_start = 0;
++    waits_window_words = 0;
++    back_idle_ns.store(0, std::memory_order_relaxed);
+ }
+ 
+ u64* GpuSplit::ReserveSlow(size_t words) {
+@@ -170,24 +210,7 @@ void GpuSplit::WaitForSpace(size_t words) {
+     if (write_position + words - consumed_cache <= RingWords) {
+         return;
+     }
+-    Publish();
+-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+-    for (u32 spins = 0;; ++spins) {
+-        consumed_cache = consumed.load(std::memory_order_acquire);
+-        if (write_position + words - consumed_cache <= RingWords) {
+-            return;
+-        }
+-        if (spins < 4096) {
+-            Pause();
+-        } else {
+-            std::this_thread::yield();
+-            // As in Drain: re-wake a back thread whose wake-up was lost.
+-            if ((spins & 1023) == 0 && back_waiting.load(std::memory_order_seq_cst)) {
+-                wake.fetch_add(1, std::memory_order_seq_cst);
+-                wake.notify_all();
+-            }
+-        }
+-    }
++    WaitFor(write_position + words - RingWords, DrainSite::RingFull);
+ }
+ 
+ void GpuSplit::Publish() {
+@@ -251,26 +274,120 @@ void GpuSplit::Drain() {
+     }
+ }
+ 
++void GpuSplit::Drain(DrainSite site) {
++    if (!SplitWaitsEnabled()) {
++        Drain();
++        return;
++    }
++    const bool behind = consumed.load(std::memory_order_acquire) != write_position;
++    const u64 start = WaitClockNs();
++    Drain();
++    if (behind) {
++        NoteWait(site, start);
++    }
++}
++
+ bool GpuSplit::WaitForWriters() {
+-    const u64 target = std::min(last_writer_position, write_position);
++    return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
++}
++
++// From Lichii (zortos293/Lichii, nx2 at 27226d2568): one wait with a site for the report. It waits
++// as WaitForWriters and WaitForSpace did, and now both wake a parked back and report as Drain does.
++bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+     consumed_cache = consumed.load(std::memory_order_acquire);
+     if (consumed_cache >= target) {
+         return false;
+     }
+-    wait_target.store(target, std::memory_order_seq_cst);
++    // Without EDEN_NX2_SPLIT_WAITS a full ring waits as WaitForSpace did: no early hand-back.
++    const bool plain_ring_wait = site == DrainSite::RingFull && !SplitWaitsEnabled();
++    if (!plain_ring_wait) {
++        wait_target.store(target, std::memory_order_seq_cst);
++    }
+     Publish();
++    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
++    const u64 start = SplitWaitsEnabled() ? WaitClockNs() : 0;
++    std::chrono::steady_clock::time_point next_report{};
+     for (u32 spins = 0;; ++spins) {
+         consumed_cache = consumed.load(std::memory_order_acquire);
+         if (consumed_cache >= target) {
+-            wait_target.store(~u64{0}, std::memory_order_relaxed);
+-            return true;
++            break;
+         }
+-        if (spins < 16384) {
++        if (spins < (plain_ring_wait ? 4096u : 16384u)) {
+             Pause();
+-        } else {
+-            std::this_thread::yield();
++            continue;
++        }
++        std::this_thread::yield();
++        if ((spins & 1023) != 0) {
++            continue;
++        }
++        // As in Drain: re-wake a back thread whose wake-up was lost, and say so if it never ends.
++        if (back_waiting.load(std::memory_order_seq_cst)) {
++            wake.fetch_add(1, std::memory_order_seq_cst);
++            wake.notify_all();
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (next_report == std::chrono::steady_clock::time_point{}) {
++            next_report = now + std::chrono::seconds{5};
++        } else if (now >= next_report) {
++            next_report += std::chrono::seconds{5};
++            LOG_WARNING(HW_GPU,
++                        "GPU split wait on the back thread: {} of {} words consumed, waiting for "
++                        "{} at {}, back {} ({})",
++                        consumed_cache, write_position, target,
++                        drain_site_names[static_cast<size_t>(site)],
++                        back_waiting.load() ? "parked" : "running",
++                        g_back_busy.load() ? "inside a command" : "between batches");
++        }
++    }
++    wait_target.store(~u64{0}, std::memory_order_relaxed);
++    if (start != 0) {
++        NoteWait(site, start);
++    }
++    return true;
++}
++
++void GpuSplit::NoteWait(DrainSite site, u64 start) {
++    const auto index = static_cast<size_t>(site);
++    const u64 elapsed = WaitClockNs() - start;
++    wait_ns[index] += elapsed;
++    ++wait_count[index];
++    wait_max_ns[index] = std::max(wait_max_ns[index], elapsed);
++}
++
++void GpuSplit::ReportWaits() {
++    const u64 now = WaitClockNs();
++    if (waits_window_start == 0) {
++        waits_window_start = now;
++        waits_window_words = write_position;
++        return;
++    }
++    const u64 window = now - waits_window_start;
++    if (window < 10'000'000'000ULL) {
++        return;
++    }
++    const auto per_second = [window](u64 amount) {
++        return static_cast<double>(amount) * 1e9 / static_cast<double>(window);
++    };
++    u64 total_ns = 0;
++    std::string sites;
++    for (size_t i = 0; i < wait_count.size(); ++i) {
++        if (wait_count[i] == 0) {
++            continue;
+         }
++        total_ns += wait_ns[i];
++        sites += fmt::format(", {} {:.1f} ms ({:.0f}/s, longest {:.1f} ms)", drain_site_names[i],
++                             per_second(wait_ns[i]) / 1e6, per_second(wait_count[i]),
++                             static_cast<double>(wait_max_ns[i]) / 1e6);
+     }
++    LOG_INFO(HW_GPU, "GPU split per second: back idle {:.1f} ms, {:.0f} ring words, front waited "
++                     "{:.1f} ms{}",
++             per_second(back_idle_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
++             per_second(write_position - waits_window_words), per_second(total_ns) / 1e6, sites);
++    wait_ns.fill(0);
++    wait_count.fill(0);
++    wait_max_ns.fill(0);
++    waits_window_start = now;
++    waits_window_words = write_position;
+ }
+ 
+ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
+@@ -411,6 +528,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         u64 available = published.load(std::memory_order_acquire);
+         if (available == read_position) {
+             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
++            const BackIdleClock idle_clock{back_idle_ns};
+             // The front usually sends more within microseconds: spin briefly before sleeping.
+             for (u32 spins = 0; spins < 8192 && available == read_position &&
+                                 !hook_requested.load(std::memory_order_relaxed);
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 4de1a05232..63cecd8778 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <atomic>
+ #include <cstring>
+ #include <functional>
+@@ -22,6 +23,27 @@ class EngineInterface;
+ 
+ namespace VideoCommon {
+ 
++/// Why the front waits for the back (EDEN_NX2_SPLIT_WAITS=1 logs the time spent per site).
++enum class DrainSite : u32 {
++    Other,
++    RingFull,      ///< The ring is full: over 8 MiB of work is queued
++    Acquire,       ///< A semaphore acquire reads a word the back may release or hold
++    FenceRelease,  ///< The puller's acquires release the pending fences
++    SemExecute,    ///< A SEM_EXECUTE acquire
++    ListWriters,   ///< GPU-written command lists: the dispatches and copies sent before them
++    ListFlush,     ///< Command lists on GPU-written pages: drain and flush the pages
++    MacroDmaRead,  ///< The front's macros read memory (MME DMA)
++    Map,           ///< GPU memory maps before later command reads
++    FrontStart,    ///< The front takes an engine's macros over
++    FrontVerify,   ///< EDEN_NX2_SPLIT_VERIFY
++    Count,
++};
++
++inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
++    "other",        "ring full",  "acquire",        "fence release", "sem execute", "list writers",
++    "list flush",   "macro dma read", "map",        "front start",   "front verify",
++};
++
+ // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
+ // CPU's commands, parses command lists and runs the puller; engine method calls and everything
+ // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a
+@@ -142,6 +164,8 @@ public:
+     void Publish();
+     /// Waits until the back executed everything sent so far.
+     void Drain();
++    /// As Drain, counting the wait under `site` (EDEN_NX2_SPLIT_WAITS).
++    void Drain(DrainSite site);
+ 
+     /// Compute or copy work was just sent: what can write GPU-written command lists.
+     void NoteWriter() {
+@@ -190,6 +214,12 @@ private:
+         }
+     }
+     void WaitForSpace(size_t words);
++    /// Waits until the back consumed `target`; returns whether it had to wait.
++    bool WaitFor(u64 target, DrainSite site);
++    /// Front thread, EDEN_NX2_SPLIT_WAITS=1: adds a wait that began at `start`.
++    void NoteWait(DrainSite site, u64 start);
++    /// Front thread, EDEN_NX2_SPLIT_WAITS=1: logs the totals every 10 s.
++    void ReportWaits();
+     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+         if (engine != front_engine) [[unlikely]] {
+             SwitchEngine(engine);
+@@ -214,6 +244,12 @@ private:
+     /// Words between publishes: small right after a drain, while the back has nothing to do.
+     size_t publish_every{PublishEvery};
+     Tegra::Engines::EngineInterface* front_engine{};
++    /// EDEN_NX2_SPLIT_WAITS=1: nanoseconds, waits and longest wait per site since the last report.
++    std::array<u64, static_cast<size_t>(DrainSite::Count)> wait_ns{};
++    std::array<u64, static_cast<size_t>(DrainSite::Count)> wait_count{};
++    std::array<u64, static_cast<size_t>(DrainSite::Count)> wait_max_ns{};
++    u64 waits_window_start{};
++    u64 waits_window_words{};
+ 
+     // Back side.
+     Tegra::Engines::EngineInterface* back_engine{};
+@@ -243,6 +279,8 @@ private:
+     alignas(128) std::atomic<bool> back_waiting{};
+     std::atomic<u32> wake{};
+     std::jthread back_thread;
++    /// EDEN_NX2_SPLIT_WAITS=1: time the back spun or slept for work or ran its idle hook.
++    alignas(128) std::atomic<u64> back_idle_ns{};
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 40be436f07..238a5c0215 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -110,7 +110,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                     if (run->before_later_reads) {
+                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
+                         split.DeferFunction(std::move(run->func));
+-                        split.Drain();
++                        split.Drain(VideoCommon::DrainSite::Map);
+                     } else {
+                         split.DeferFunction(std::move(run->func));
+                     }

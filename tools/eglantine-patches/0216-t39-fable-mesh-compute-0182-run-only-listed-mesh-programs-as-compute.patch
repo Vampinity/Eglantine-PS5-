@@ -1,0 +1,120 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0303-fable-mesh-compute-0182-run-only-listed-mesh-programs-as-compute.patch
+
+Source: 0303-fable-mesh-compute-0182-run-only-listed-mesh-programs-as-compute.patch
+(EDEN_NX2_MESH_COMPUTE_ONLY)
+
+With EDEN_NX2_MESH_AS_COMPUTE=1 every task/mesh pipeline ran as compute at once. A GPU hang
+needs someone at the console, so the first runs should try one draw family at a time.
+
+EDEN_NX2_MESH_COMPUTE_ONLY=<hash>[,<hash>...] (hex shader hashes: the task-or-lone-mesh
+program, unique_hashes[1], or the mesh program, unique_hashes[3], as the "Mesh pipeline ...
+runs as compute" and "first draw" lines and the EDEN_NX2_MESH_SPIRV_DUMP file names give
+them) lets only pipelines with one of these programs run as compute. The others are not
+built and their draws stay skipped, as without the compute switch; each is logged once:
+"Mesh pipeline not in EDEN_NX2_MESH_COMPUTE_ONLY, draws skipped: task/mesh <h1>, mesh <h3>".
+
+So EDEN_NX2_MESH_COMPUTE_ONLY=none (no hash parses) is a census run: as safe as today, no
+mesh pipeline built, and the log lists every task/mesh pipeline the scene uses by its two
+hashes. Pick one and list it in the next run.
+
+Unset: no filter, as before. Without EDEN_NX2_MESH_AS_COMPUTE=1 the switch does nothing.
+The check runs where the pipeline cache already refuses task/mesh pipelines on a device
+without VK_EXT_mesh_shader, before any translation. Syntax-checked with clang against the
+Vulkan headers; not built or run.
+
+Moved for next18, code unchanged: the new function stands before PreloadAllPipelines, since
+the end of that namespace is where 0330 adds MeshDiskCache.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 58 ++++++++++++++++++-
+ 1 file changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 31eec6261e..5aa28194f8 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -7,9 +7,14 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstddef>
++#include <cstdlib>
+ #include <fstream>
+ #include <iostream>
+ #include <memory>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <utility>
+ #include <span>
+ #include <string_view>
+ #include <thread>
+@@ -691,6 +696,53 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
+ // boot that ran out of memory never saved one and the next boot did the same.
+ constexpr size_t MaxPipelinesWithoutUsedList = 3000;
+ 
++// EDEN_NX2_MESH_COMPUTE_ONLY=<hash>[,<hash>...]: with EDEN_NX2_MESH_AS_COMPUTE=1, only task/mesh
++// pipelines whose task (or lone mesh) program or mesh program has one of these shader hashes (hex,
++// the hashes of the "Mesh pipeline ... runs as compute"/"first draw" lines and of the
++// EDEN_NX2_MESH_SPIRV_DUMP files) run as compute. The others are not built and their draws stay
++// skipped, as without the switch, and each is logged once with its two hashes, so a value that
++// names no hash (EDEN_NX2_MESH_COMPUTE_ONLY=none) lists every task/mesh pipeline a scene uses while
++// running none: the first run on a console, before a hang needs someone at it.
++bool MeshComputeAllowed(const GraphicsPipelineCacheKey& key) {
++    static const std::optional<std::vector<u64>> only = [] {
++        const char* text = std::getenv("EDEN_NX2_MESH_COMPUTE_ONLY");
++        if (text == nullptr) {
++            return std::optional<std::vector<u64>>{};
++        }
++        std::vector<u64> hashes;
++        for (const char* cursor = text; *cursor != '\0';) {
++            char* end = nullptr;
++            const u64 hash = std::strtoull(cursor, &end, 16);
++            if (end == cursor) {
++                break;
++            }
++            hashes.push_back(hash);
++            cursor = *end == ',' ? end + 1 : end;
++        }
++        LOG_INFO(Render_Vulkan, "Mesh draws as compute: only {} listed program(s) run", hashes.size());
++        return std::optional{std::move(hashes)};
++    }();
++    if (!only) {
++        return true;
++    }
++    const u64 first = key.unique_hashes[1];
++    const u64 mesh = key.unique_hashes[3];
++    if (std::ranges::find(*only, first) != only->end() ||
++        (mesh != 0 && std::ranges::find(*only, mesh) != only->end())) {
++        return true;
++    }
++    static std::mutex seen_mutex;
++    static std::set<std::pair<u64, u64>> seen;
++    std::scoped_lock lock{seen_mutex};
++    if (seen.size() < 256 && seen.emplace(first, mesh).second) {
++        LOG_INFO(Render_Vulkan,
++                 "Mesh pipeline not in EDEN_NX2_MESH_COMPUTE_ONLY, draws skipped: task/mesh {:016x}, "
++                 "mesh {:016x}",
++                 first, mesh);
++    }
++    return false;
++}
++
+ // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
+ bool PreloadAllPipelines() {
+     static const bool all = [] {
+@@ -1472,10 +1524,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         ++env_index;
+ 
+         // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
+-        // skipped (see the pipeline check in the rasterizer), unless the programs run as compute.
++        // skipped (see the pipeline check in the rasterizer), unless the programs run as compute
++        // and EDEN_NX2_MESH_COMPUTE_ONLY, if set, lists one of them.
+         if ((env.ShaderStage() == Shader::Stage::Task ||
+              env.ShaderStage() == Shader::Stage::Mesh) &&
+-            !device.IsExtMeshShaderSupported() && !mesh_as_compute) {
++            !device.IsExtMeshShaderSupported() &&
++            (!mesh_as_compute || !MeshComputeAllowed(key))) {
+             return nullptr;
+         }
+ 

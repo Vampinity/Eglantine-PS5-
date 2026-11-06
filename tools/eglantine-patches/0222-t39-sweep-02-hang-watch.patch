@@ -1,0 +1,322 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0398-sweep-02-hang-watch.patch
+
+Source: 0398-sweep-02-hang-watch.patch
+Moved by hand: the pipeline note moved after upstream's new bind_pipeline line; scheduler includes merged
+
+vulkan: EDEN_NX2_HANG_WATCH=1 names the unfinished submissions of a stalled GPU wait
+
+Port of the HANG_WATCH part of pavelgajdo/Lichii-Android 492774519b (pavelgajdo, 2026-11-05).
+GPL-3.0-or-later, as the core. Its EDEN_NX2_SPIRV_DUMP part is not ported.
+
+A wait for a GPU tick that lasts 3 s logs the waited tick, the tick the GPU reached, the last one
+submitted and the pipelines of every unfinished submission. Submitted and never finished is a
+GPU-side hang; never submitted is an emulator deadlock. Stages print as in the source, s0 to s5 by
+unique_hashes index and s6 for compute, so logs compare with the Android ones.
+
+Changed from the source:
+- One 3 s timed wait, then the plain wait, not 3 s waits in a loop. On the PS5 each timed wait
+  restarts RADV's 10 s no-progress check (radv_ps5_queue_wait_seq, mihawk-99/PS5_Mesa f5610fe), so
+  the source's loop would turn a hung GPU from device lost into a wait with no end. With the switch
+  on device lost comes after about 13 s instead of 10 s. One report per wait, not one per 3 s.
+- This core has no TraceGraphicsPipeline or TraceComputePipeline. The notes sit in ConfigureDraw,
+  when bind_pipeline is set, and in ComputePipeline::Configure. A mesh draw run as compute passes
+  goes through ConfigureDraw too, so its hashes are in the same submission.
+- Hashes are kept raw and formatted only in a report, not one string per bind. 256 pipelines per
+  submission, not 64, with the number not kept in the report.
+- ReportStall takes its lock with try_to_lock, copies and logs without it. Full lists for the first
+  4 reports, nothing after 64.
+- The switch is read once in the Scheduler constructor. EDEN_NX2_HANG_WATCH=0 is off.
+- The members sit before worker_thread, which uses them until it stops.
+- The SubmitExecution hook sits after on_submit: prepare-vulkan-port.py anchors on cmdbuf.End()
+  directly followed by on_submit, and a missed anchor is only skipped, which would lose GpuTimeEnd.
+
+Off: nothing recorded, no lock, no allocation, on_stall empty. The cost is a test of a bool per
+pipeline bind, dispatch and submission. MasterSemaphore::Wait tests on_stall only after its fast
+checks, where it is about to block anyway.
+
+It adds no wait: the timed wait replaces the start of the plain one. Not run; timed waits on the PS5
+read in radv_ps5_sync.c only. Memory with the switch on: at most about 1 MB. Off: under 200 bytes
+in Scheduler.
+
+Co-authored-by: pavelgajdo <234912265+pavelgajdo@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index fa14282585..a0d2be0dca 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -315,6 +315,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+         uses_descriptor_buffer && scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
+ 
+     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
++    if (scheduler.HangWatching()) [[unlikely]] {
++        scheduler.NoteHangPipeline({0, 0, 0, 0, 0, 0, shader_hash});
++    }
+     scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
+                       descriptor_buffer_chunk, bind_descriptor_buffer,
+                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 6463a36100..5e4d6e71f2 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -736,6 +736,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+     const bool is_rescaling{texture_cache.IsRescaling()};
+     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
+     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
++    if (bind_pipeline && scheduler.HangWatching()) [[unlikely]] {
++        Scheduler::HangPipeline hashes{};
++        std::ranges::copy(key.unique_hashes, hashes.begin());
++        scheduler.NoteHangPipeline(hashes);
++    }
+     const bool bind_descriptor_buffer{
+         descriptor_set_layout && uses_descriptor_buffer &&
+         scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+index ba364d99a0..4e368d8927 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -105,6 +105,13 @@ void MasterSemaphore::Wait(u64 tick) {
+ 
+     // If none of the above is hit, fallback to a regular wait
+     try {
++        // EDEN_NX2_HANG_WATCH: only the first 3 s of this wait, not a loop of them. Each timed wait
++        // restarts RADV's 10 s no-progress check on the PS5 (radv_ps5_queue_wait_seq), so a loop
++        // would stop a hung GPU from ever ending in device lost.
++        if (on_stall && !semaphore.Wait(tick, 3'000'000'000ULL)) {
++            Refresh();
++            on_stall(tick, KnownGpuTick(), CurrentTick());
++        }
+         while (!semaphore.Wait(tick)) {
+         }
+     } catch (const vk::Exception& exception) {
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.h b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+index f580c25d35..bbba59fd2e 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.h
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <condition_variable>
+ #include <deque>
++#include <functional>
+ #include <mutex>
+ #include <thread>
+ #include <queue>
+@@ -54,6 +55,10 @@ public:
+     /// Waits for a tick to be hit on the GPU
+     void Wait(u64 tick);
+ 
++    /// EDEN_NX2_HANG_WATCH=1: a wait for a GPU tick that lasts 3 s calls this once (waited tick,
++    /// tick the GPU reached, next tick to be submitted). Empty when the switch is off.
++    std::function<void(u64, u64, u64)> on_stall;
++
+     /// Submits the device graphics queue, updating the tick as necessary
+     VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+                          VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 736edc64e5..6dff4d9ca5 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -4,10 +4,13 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cstdlib>
+ #include <memory>
+ #include <mutex>
++#include <string>
+ #include <thread>
+ #include <utility>
+ 
+@@ -49,6 +52,14 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
+     : device{device_}, state_tracker{state_tracker_},
+       master_semaphore{std::make_unique<MasterSemaphore>(device)},
+       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
++    if (const char* const value = std::getenv("EDEN_NX2_HANG_WATCH");
++        value != nullptr && value[0] != '0') {
++        hang_watching = true;
++        master_semaphore->on_stall = [this](u64 tick, u64 gpu_tick, u64 next_tick) {
++            ReportStall(tick, gpu_tick, next_tick);
++        };
++        LOG_INFO(Render_Vulkan, "Hang watch on");
++    }
+ 
+     AcquireNewChunk();
+     AllocateWorkerCommandBuffer();
+@@ -57,6 +68,87 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
+ 
+ Scheduler::~Scheduler() = default;
+ 
++void Scheduler::NoteHangPipeline(const HangPipeline& pipeline) {
++    Record([this, pipeline](vk::CommandBuffer) {
++        static constexpr size_t max_pipelines = 256;
++        auto& pipelines = hang_work.pipelines;
++        if (std::ranges::find(pipelines, pipeline) != pipelines.end()) {
++            return;
++        }
++        if (pipelines.size() < max_pipelines) {
++            pipelines.push_back(pipeline);
++        } else {
++            ++hang_work.not_kept;
++        }
++    });
++}
++
++void Scheduler::HangSubmit(u64 tick, bool waits_on_semaphore) {
++    static constexpr size_t max_submissions = 64;
++    hang_work.tick = tick;
++    hang_work.waits_on_semaphore = waits_on_semaphore;
++    std::scoped_lock lock{hang_mutex};
++    hang_submissions.push_back(std::move(hang_work));
++    hang_work = {};
++    if (hang_submissions.size() > max_submissions) {
++        hang_submissions.pop_front();
++    }
++}
++
++// Never blocks: it copies what it can get and logs without the lock. Pipelines for the first few
++// reports, and silence after 64, so that a GPU that stays slow cannot flood the log.
++void Scheduler::ReportStall(u64 tick, u64 gpu_tick, u64 next_tick) {
++    static std::atomic<u32> reports{};
++    const u32 report = reports.fetch_add(1, std::memory_order_relaxed);
++    if (report >= 64) {
++        return;
++    }
++    std::vector<HangSubmission> unfinished;
++    u64 last_submitted{};
++    if (std::unique_lock lock{hang_mutex, std::try_to_lock}; lock.owns_lock()) {
++        if (!hang_submissions.empty()) {
++            last_submitted = hang_submissions.back().tick;
++        }
++        for (const HangSubmission& submission : hang_submissions) {
++            if (submission.tick > gpu_tick) {
++                unfinished.push_back(submission);
++            }
++        }
++    }
++    LOG_WARNING(Render_Vulkan,
++                "Hang watch: waited 3 s for GPU tick {}; the GPU is at tick {}, the last "
++                "submitted tick is {}, the next to record is {}",
++                tick, gpu_tick, last_submitted, next_tick);
++    if (report >= 4) {
++        return;
++    }
++    for (const HangSubmission& submission : unfinished) {
++        LOG_WARNING(Render_Vulkan, "Hang watch: unfinished tick {} ({} pipelines, {} not kept{})",
++                    submission.tick, submission.pipelines.size(), submission.not_kept,
++                    submission.waits_on_semaphore ? ", waits on a semaphore" : "");
++        // Stages as in the source commit: s0 to s5 by unique_hashes index, s6 for compute.
++        std::string line;
++        u32 on_line{};
++        for (const HangPipeline& pipeline : submission.pipelines) {
++            bool first{true};
++            for (size_t stage = 0; stage < pipeline.size(); ++stage) {
++                if (pipeline[stage] != 0) {
++                    line += fmt::format("{}s{}:{:016x}", first ? " " : "+", stage, pipeline[stage]);
++                    first = false;
++                }
++            }
++            if (++on_line == 8) {
++                LOG_WARNING(Render_Vulkan, "Hang watch: tick {}:{}", submission.tick, line);
++                line.clear();
++                on_line = 0;
++            }
++        }
++        if (on_line != 0) {
++            LOG_WARNING(Render_Vulkan, "Hang watch: tick {}:{}", submission.tick, line);
++        }
++    }
++}
++
+ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
+@@ -440,6 +532,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+             on_submit();
+         }
+ 
++        if (hang_watching) [[unlikely]] {
++            HangSubmit(signal_value, wait_semaphore != VK_NULL_HANDLE);
++        }
++
+         std::scoped_lock lock{submit_mutex};
+         switch (const VkResult result = master_semaphore->SubmitQueue(
+                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 566ebb68ec..4ebcd6953f 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -6,14 +6,19 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
++#include <cstdlib>
++#include <deque>
+ #include <functional>
+ #include <memory>
++#include <mutex>
+ #include <thread>
+ #include <utility>
+ #include <queue>
++#include <vector>
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
+@@ -149,6 +154,20 @@ public:
+             });
+     }
+ 
++    /// EDEN_NX2_HANG_WATCH=1: a wait for a GPU tick that lasts 3 s logs the waited tick, the tick
++    /// the GPU reached, the last one submitted and the pipelines of every unfinished submission.
++    /// Tells a GPU-side hang (submitted, never finished) from an emulator deadlock (never
++    /// submitted). Off, callers test this and nothing else runs.
++    [[nodiscard]] bool HangWatching() const noexcept {
++        return hang_watching;
++    }
++
++    /// Per-stage shader hashes of a bound pipeline; index 6 is a compute program.
++    using HangPipeline = std::array<u64, 7>;
++
++    /// With HangWatching(), notes a pipeline for the submission being recorded.
++    void NoteHangPipeline(const HangPipeline& pipeline);
++
+     /// Whether the recording thread submitted `tick` within 20 ms.
+     [[nodiscard]] bool WaitForSubmission(u64 tick) const {
+         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
+@@ -351,6 +370,9 @@ private:
+ 
+     void AcquireNewChunk();
+ 
++    void HangSubmit(u64 tick, bool waits_on_semaphore);
++    void ReportStall(u64 tick, u64 gpu_tick, u64 next_tick);
++
+     const Device& device;
+     StateTracker& state_tracker;
+ 
+@@ -369,6 +391,19 @@ private:
+     std::unique_ptr<CommandChunk> chunk;
+     std::function<void()> on_submit;
+ 
++    /// EDEN_NX2_HANG_WATCH: the pipelines of the last submissions, for a wait that stalls. Declared
++    /// before worker_thread, which uses them until it stops.
++    struct HangSubmission {
++        u64 tick{};
++        bool waits_on_semaphore{};
++        u32 not_kept{}; ///< Pipelines past the limit of one submission
++        std::vector<HangPipeline> pipelines;
++    };
++    bool hang_watching{};
++    HangSubmission hang_work; ///< Worker thread: the submission being recorded
++    std::mutex hang_mutex;    ///< Held only to move or copy lists, never across a log or a wait
++    std::deque<HangSubmission> hang_submissions;
++
+     State state;
+ 
+     u32 num_renderpass_images = 0;

@@ -1,0 +1,214 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0316-discord-fog-01-sun-share-of-the-fog.patch
+
+Source: 0316-discord-fog-01-sun-share-of-the-fog.patch
+Moved by hand: without its docs/OOT_VISUAL_WORKAROUND.md hunk, as 0315
+
+Core patch, for tools/eglantine-patches as 0197. Ours, on top of 0100 and 0101, in the same
+place and style: 0100 is Orchid 3fcd393b7 by zortos293, also zortos293/Lichii 4aa1e429a4 on
+exp/oot-visual-workaround. The two program hashes come from Lichii issue 101: kadinho
+(6a6f4e8d501a39c7), RambonL and PaulCopet (75d4369f3b1f5868). In those PC frame dumps both read
+a D32 4096 sun map and a D16 1600 map. 6a6f4e8d501a39c7 writes the per-froxel values that
+780c0536b89fc89e, which 0100 edits, adds up. 75d4369f3b1f5868 wrote all-zero light volumes in
+both dumps that looked, indoors and in the Lost Woods, so it may add nothing.
+
+EDEN_NX2_OOT_FOG_SUN=<0 to 1> multiplies every depth compare result in those two programs
+by that value. Unset, or out of range, nothing changes. Nothing outside the two programs
+changes, so ground and characters keep their light. Unlike EDEN_NX2_OOT_FOG_SCALE (fog-06)
+it leaves the fog's thickness alone.
+
+Why, a guess: kadinho's dump reads as added light from 6a6f4e8d501a39c7, and Lichii's fixed
+builds went from "white and yellow haze" to grey fog. Run62's colour does not settle it: in wide
+shots linear red over blue falls from 2.05 to 1.00 as pixels whiten, close shots read 1.4 to 2.1,
+and the tone map squeezes colour near white, so sun and sky cannot be told apart. A workaround,
+not a fix.
+
+Each program logs "TEMPORARY OoT fog sun <value>: shader <hash>, <n> compares and <n> gather
+parts scaled, <n> plain reads and <n> sparse compares left". Nobody has seen these programs'
+code, so it can miss in four ways. No such line: the program has another hash here. The hash
+covers the lowered code, and no PS5 log has shown either one, though 780c0536b89fc89e matched.
+0 compares and 0 gather parts: the program reads its maps without a compare and the switch does
+nothing. A compare of 1 may not mean lit, then the fog gets brighter. Two maps multiplied apply
+the value twice, so 0.15 acts as 0.02. A value of 1 only counts. Shaders are translated at every
+boot, so a new value needs no fresh cache and no build. Memory: none.
+
+Not run on a console. The core's IR built on a Mac with the test file below and a small stand-in
+for Catch2, 7 cases pass; vk_pipeline_cache.cpp syntax checked with clang.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/shader_recompiler/ir_opt/oot_visual_workaround.h b/src/shader_recompiler/ir_opt/oot_visual_workaround.h
+index e57310b5b7..d8f354df4e 100644
+--- a/src/shader_recompiler/ir_opt/oot_visual_workaround.h
++++ b/src/shader_recompiler/ir_opt/oot_visual_workaround.h
+@@ -90,4 +90,71 @@ inline std::optional<size_t> ApplyOotVisualWorkaround(IR::Program& program, u64
+     return matches.size();
+ }
+ 
++/// What ApplyOotFogSun did to one program.
++struct OotFogSunEdits {
++    size_t compares = 0; ///< Depth compare samples scaled
++    size_t gathers = 0;  ///< Components of depth compare gathers scaled
++    size_t plain = 0;    ///< Texture reads without a compare, left alone
++    size_t sparse = 0;   ///< Compares with a residency result, left alone
++};
++
++// TEMPORARY visual workaround for Ocarina of Time, not an emulator fix. In PC frame dumps these two
++// compute programs read the sun's shadow map and write froxel volumes; their code is unread. The
++// guess: those reads come back lit, so too much sun goes into the fog. This multiplies each depth
++// compare result in these two programs by the factor, and nothing outside them: the ground keeps
++// its light. It assumes a compare of 1 means lit. No factor, nothing happens. A factor of 1 only
++// counts.
++inline std::optional<OotFogSunEdits> ApplyOotFogSun(IR::Program& program, u64 title_id,
++                                                    u64 shader_hash, std::optional<float> factor) {
++    if (!factor || title_id != 0x0400486024DEC000ULL || program.stage != Stage::Compute) {
++        return std::nullopt;
++    }
++    // The lowest bit is the native hash salt, as in ApplyOotVisualWorkaround.
++    const auto is_shader = [shader_hash](u64 hash) { return (shader_hash | 1) == (hash | 1); };
++    if (!is_shader(0x6a6f4e8d501a39c7ULL) && !is_shader(0x75d4369f3b1f5868ULL)) {
++        return std::nullopt;
++    }
++    OotFogSunEdits edits;
++    std::vector<std::pair<IR::Block*, IR::Inst*>> matches;
++    for (IR::Block* block : program.blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            switch (inst.GetOpcode()) {
++            case IR::Opcode::ImageSampleDrefImplicitLod:
++            case IR::Opcode::ImageSampleDrefExplicitLod:
++                if (inst.HasAssociatedPseudoOperation()) {
++                    ++edits.sparse;
++                    break;
++                }
++                matches.emplace_back(block, &inst);
++                ++edits.compares;
++                break;
++            case IR::Opcode::CompositeExtractF32x4: {
++                const IR::Inst* const source{inst.Arg(0).TryInstRecursive()};
++                if (source && source->GetOpcode() == IR::Opcode::ImageGatherDref) {
++                    matches.emplace_back(block, &inst);
++                    ++edits.gathers;
++                }
++                break;
++            }
++            case IR::Opcode::ImageSampleImplicitLod:
++            case IR::Opcode::ImageSampleExplicitLod:
++            case IR::Opcode::ImageGather:
++            case IR::Opcode::ImageFetch:
++                ++edits.plain;
++                break;
++            default:
++                break;
++            }
++        }
++    }
++    for (const auto& [block, inst] : matches) {
++        const auto insertion = block->Instructions().iterator_to(*inst);
++        const auto original = block->PrependNewInst(insertion, *inst);
++        IR::IREmitter ir{*block, insertion};
++        const auto scaled = ir.FPMul(IR::F32{IR::Value{&*original}}, ir.Imm32(*factor));
++        inst->ReplaceUsesWith(scaled);
++    }
++    return edits;
++}
++
+ } // namespace Shader::Optimization
+diff --git a/src/tests/video_core/oot_visual_workaround.cpp b/src/tests/video_core/oot_visual_workaround.cpp
+index f07906b509..43f9257823 100644
+--- a/src/tests/video_core/oot_visual_workaround.cpp
++++ b/src/tests/video_core/oot_visual_workaround.cpp
+@@ -41,6 +41,9 @@ float Evaluate(IR::Value value) {
+         return Evaluate(inst.Arg(0)) + Evaluate(inst.Arg(1));
+     case IR::Opcode::FPMul32:
+         return Evaluate(inst.Arg(0)) * Evaluate(inst.Arg(1));
++    case IR::Opcode::ImageSampleDrefExplicitLod:
++    case IR::Opcode::CompositeExtractF32x4:
++        return 1.0f;
+     default:
+         FAIL("Unexpected opcode in visual-workaround fixture");
+         return 0;
+@@ -115,3 +118,50 @@ TEST_CASE("OoT visual workaround fails closed when the matched scalar shape chan
+     CHECK(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Fog, true) == 0);
+     CHECK(f.block.size() == size);
+ }
++
++namespace {
++constexpr u64 FogLight = 0x6a6f4e8d501a39c7ULL;
++constexpr u64 FogVolumes = 0x75d4369f3b1f5868ULL;
++
++IR::F32 Compare(Fixture& f) {
++    const IR::Value zero{0U};
++    const auto it = f.block.PrependNewInst(f.block.end(), IR::Opcode::ImageSampleDrefExplicitLod,
++                                           {zero, zero, f.ir.Imm32(0.5f), zero, zero});
++    return IR::F32{IR::Value{&*it}};
++}
++
++IR::F32 GatherPart(Fixture& f) {
++    const IR::Value zero{0U};
++    const auto it = f.block.PrependNewInst(f.block.end(), IR::Opcode::ImageGatherDref,
++                                           {zero, zero, zero, zero, f.ir.Imm32(0.5f)});
++    return IR::F32{f.ir.CompositeExtract(IR::Value{&*it}, 2)};
++}
++} // namespace
++
++TEST_CASE("OoT fog sun scales depth compares in the two light programs",
++          "[video_core][oot_visual_workaround]") {
++    for (const u64 hash : {FogLight, FogLight ^ 1, FogVolumes, FogVolumes ^ 1}) {
++        Fixture f;
++        const auto compare = f.ir.FPAdd(Compare(f), f.ir.Imm32(0.0f));
++        const auto gather = f.ir.FPAdd(GatherPart(f), f.ir.Imm32(0.0f));
++        const auto edits = Shader::Optimization::ApplyOotFogSun(f.program, Title, hash, 0.25f);
++        REQUIRE(edits.has_value());
++        CHECK(edits->compares == 1);
++        CHECK(edits->gathers == 1);
++        CHECK(edits->plain == 0);
++        CHECK(Evaluate(compare) == 0.25f);
++        CHECK(Evaluate(gather) == 0.25f);
++    }
++}
++
++TEST_CASE("OoT fog sun needs its switch, its title, compute and its programs",
++          "[video_core][oot_visual_workaround]") {
++    Fixture f;
++    const auto compare = f.ir.FPAdd(Compare(f), f.ir.Imm32(0.0f));
++    CHECK_FALSE(Shader::Optimization::ApplyOotFogSun(f.program, Title, FogLight, std::nullopt));
++    CHECK_FALSE(Shader::Optimization::ApplyOotFogSun(f.program, Title + 1, FogLight, 0.25f));
++    CHECK_FALSE(Shader::Optimization::ApplyOotFogSun(f.program, Title, Fog, 0.25f));
++    f.program.stage = Shader::Stage::Fragment;
++    CHECK_FALSE(Shader::Optimization::ApplyOotFogSun(f.program, Title, FogLight, 0.25f));
++    CHECK(Evaluate(compare) == 1.0f);
++}
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 5aa28194f8..8d3d44ebc7 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1868,6 +1868,29 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+                     "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
+                     key.unique_hash, *edits);
+     }
++    // EDEN_NX2_OOT_FOG_SUN=<0 to 1>: scales the depth compares of two Ocarina froxel fog programs.
++    // Unset, or out of range, changes nothing. Shaders are translated at every boot: no new cache.
++    static const std::optional<float> oot_fog_sun = []() -> std::optional<float> {
++        const char* const text = std::getenv("EDEN_NX2_OOT_FOG_SUN");
++        if (text == nullptr) {
++            return std::nullopt;
++        }
++        char* end = nullptr;
++        const double value = std::strtod(text, &end);
++        // Written this way round so "nan" is out of range too.
++        if (end == text || !(value >= 0.0 && value <= 1.0)) {
++            return std::nullopt;
++        }
++        return static_cast<float>(value);
++    }();
++    if (const auto edits = Shader::Optimization::ApplyOotFogSun(
++            program, visual_workaround_title, key.unique_hash, oot_fog_sun)) {
++        LOG_WARNING(Render_Vulkan,
++                    "TEMPORARY OoT fog sun {}: shader {:016x}, {} compares and {} gather parts "
++                    "scaled, {} plain reads and {} sparse compares left",
++                    *oot_fog_sun, key.unique_hash, edits->compares, edits->gathers, edits->plain,
++                    edits->sparse);
++    }
+     const VkDriverIdKHR driver_id = device.GetDriverID();
+     const bool needs_shared_mem_clamp =
+         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||

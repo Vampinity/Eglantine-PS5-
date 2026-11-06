@@ -1150,5 +1150,248 @@
   "reason": "Moved by hand: the release hook is set beside upstream's new SetPendingCpuWrites in the rasterizer's constructor",
   "target": "0210-t39-a-refused-buffer-waits-once-and-collectors-help.patch",
   "commit": "ba1897ee91d5ea6b94db0ce54d97601e7f16c97b"
+ },
+ {
+  "source": "0141-submit-deferred-work-before-waiting-on-fences.patch",
+  "status": "dropped",
+  "reason": "Upstream 0059 (kraibse 1b594aa6b6) submits deferred work before waiting on a fence: SubmitDeferred() in SignalAndWait and WaitPendingFences."
+ },
+ {
+  "source": "0145-cache-max-continuous-range.patch",
+  "status": "dropped",
+  "reason": "Upstream 0062 (Duck912 292a68df46) keeps 4096 continuous-range answers per thread, the bigger form of this cache."
+ },
+ {
+  "source": "0146-skip-upload-of-a-render-target-a-clear-overwrites.patch",
+  "status": "dropped",
+  "reason": "Upstream 0078 (Kaj, Lichii #141) skips the upload of a new target a clear overwrites whole: clearing_render_targets and the JoinImages check are there."
+ },
+ {
+  "source": "0148-gpu-thread-wakes-for-submissions-during-semaphore-waits.patch",
+  "status": "dropped",
+  "reason": "Upstream 0041 (Orchid b15e4257b5): the GPU thread polls the queue every quarter millisecond while channels wait on semaphores; PopWaitFor is in its queue."
+ },
+ {
+  "source": "0183-say-why-a-pipeline-was-built.patch",
+  "status": "moved",
+  "reason": "Moved by hand: the mesh reason is set where upstream's mesh cache file (0071) now decides is_mesh",
+  "target": "0212-t39-say-why-a-pipeline-was-built.patch",
+  "commit": "b51b625107ce076cab57886df8eb46b546efd968"
+ },
+ {
+  "source": "0200-drop-draws-after-a-failed-pipeline.patch",
+  "status": "dropped",
+  "reason": "Upstream 0079 (Felipe Lima, Lichii #142): the scheduler's GraphicsPipelineMissing drops draws after a failed pipeline."
+ },
+ {
+  "source": "0210-split-wait-report.patch",
+  "status": "moved",
+  "reason": "Moved by hand: the map drain site is set at upstream's EDEN_NX2_MAP_ON_BACK form of the run command; the profile switch re-read is upstream's 0053 already, those hunks dropped",
+  "target": "0213-t39-split-wait-report.patch",
+  "commit": "1eef393e16b63017b3e71ec36ff642505539e036"
+ },
+ {
+  "source": "0211-mark-written-pages-by-word.patch",
+  "status": "dropped",
+  "reason": "Upstream 0068 (zortos293 abb9ae8426) marks GPU-written pages a bitmap word at a time, with a count of new pages on top."
+ },
+ {
+  "source": "0301-vulkan-mesh-draws-as-compute-passes.patch",
+  "status": "moved",
+  "reason": "Moved by hand: the mesh-draw guard now also carries upstream's Mario Kart World no_mesh_title",
+  "target": "0214-t39-vulkan-mesh-draws-as-compute-passes.patch",
+  "commit": "518e844c314cd1b12ef3282dbdc9eb74c4d9a8fc"
+ },
+ {
+  "source": "0302-mesh-guard.patch",
+  "status": "moved",
+  "reason": "Applied unchanged in source order.",
+  "target": "0215-t39-mesh-guard.patch",
+  "commit": "373d3880e782f78bc2d121128f7839c99fd3af87"
+ },
+ {
+  "source": "0303-fable-mesh-compute-0182-run-only-listed-mesh-programs-as-compute.patch",
+  "status": "moved",
+  "reason": "Applied unchanged in source order.",
+  "target": "0216-t39-fable-mesh-compute-0182-run-only-listed-mesh-programs-as-compute.patch",
+  "commit": "4176fe697e871be5ec3476cb185450f04b6baf7a"
+ },
+ {
+  "source": "0315-fog-06-oot-fog-exposure-scale.patch",
+  "status": "moved",
+  "reason": "Moved by hand: without its docs/OOT_VISUAL_WORKAROUND.md hunk: the moved 0121 did not carry that file",
+  "target": "0217-t39-fog-06-oot-fog-exposure-scale.patch",
+  "commit": "b48fab0159d4e64cfa1a29328cebe4748a160966"
+ },
+ {
+  "source": "0316-discord-fog-01-sun-share-of-the-fog.patch",
+  "status": "moved",
+  "reason": "Moved by hand: without its docs/OOT_VISUAL_WORKAROUND.md hunk, as 0315",
+  "target": "0218-t39-discord-fog-01-sun-share-of-the-fog.patch",
+  "commit": "10f57843f71b08da94cc449ea2b9a2346592fe8d"
+ },
+ {
+  "source": "0321-rebase-02-split-quiet.patch",
+  "status": "dropped",
+  "reason": "Upstream merged PR 639 (rdenno, df92fc6c95) into the core pin 0ca2032bff: the back's quiet flag and the drain that waits for the idle hook are in."
+ },
+ {
+  "source": "0322-rebase-03-native-ssbo-dlss-only.patch",
+  "status": "dropped",
+  "reason": "Upstream merged PR 571 into the core pin: native compute bindings are sized from the mapping only for DLSS (IsDlssDispatch), with no switch."
+ },
+ {
+  "source": "0330-pipeline-keep-02-mesh-pipelines-in-their-own-cache-file.patch",
+  "status": "dropped",
+  "reason": "Upstream 0071 (Duck912 bc121caf3e): task and mesh pipelines keep their own disk cache file with their mesh state."
+ },
+ {
+  "source": "0331-frizti-01-writer-mark-only-real-writers.patch",
+  "status": "dropped",
+  "reason": "Upstream 0067 (Frizti dc5938b8bb): only compute and DMA methods that write memory count as split writers (DmaPusher::WritesMemory), on by default; our EDEN_NX2_WRITER_CLASS switch was the same idea."
+ },
+ {
+  "source": "0338-nemyu-01-written-native-bindings-keep-stated-size.patch",
+  "status": "moved",
+  "reason": "Moved by hand: the cut sits inside upstream's binding cache lambda (0066); a native pointer's size word is read there, the cache key does not carry it",
+  "target": "0219-t39-nemyu-01-written-native-bindings-keep-stated-size.patch",
+  "commit": "fb111c35ea4e9c61c1d4fe7237c3f7ab5340c57c"
+ },
+ {
+  "source": "0339-nemyu-02-held-writes-before-each-list.patch",
+  "status": "moved",
+  "reason": "Moved by hand: the held writes go through upstream's batched OnCacheInvalidations; declarations placed beside upstream's ForEachPendingCpuWrite",
+  "target": "0220-t39-nemyu-02-held-writes-before-each-list.patch",
+  "commit": "1c941e8786238272359e0fd13469a71d91ca5149"
+ },
+ {
+  "source": "0342-heap-04-gmmu-entries-sparse.patch",
+  "status": "moved",
+  "reason": "Moved by hand: only its include hunk moved (the array include it expected came from the dropped 0145)",
+  "target": "0221-t39-heap-04-gmmu-entries-sparse.patch",
+  "commit": "4b8a2a73416a2ec59918cccb4f4a31b0408d106e"
+ },
+ {
+  "source": "0387-frizti-v2-03-alpha-ref-in-pipeline-key-steps.patch",
+  "status": "dropped",
+  "reason": "Upstream 0075 (zortos293, Eglantine PR 544) rounds the alpha test reference in the pipeline key."
+ },
+ {
+  "source": "0389-frizti-v2-05-one-gatherer-at-a-time.patch",
+  "status": "dropped",
+  "reason": "Upstream 0080 (Paulo Tumabing, Lichii #138) serializes the dirty memory gatherers."
+ },
+ {
+  "source": "0391-upstream-02-keep-cpu-writes-over-downloads.patch",
+  "status": "dropped",
+  "reason": "Upstream 0061 (Duck912 fe2cd8be2b): GPU data is not copied back over newer CPU writes."
+ },
+ {
+  "source": "0392-upstream-03-refence-while-acquire-waits.patch",
+  "status": "dropped",
+  "reason": "Upstream 0060 (kraibse 90ff431884): fences are released again while an acquire waits."
+ },
+ {
+  "source": "0350-lichii-gpu-0212-run-and-layout-caches.patch",
+  "status": "left_out",
+  "reason": "Left out: a speed experiment behind a switch no batch or env ever set, and upstream's 4096-entry range cache and split changes moved the ground under it. Rebase by hand when a test wants it."
+ },
+ {
+  "source": "0352-lichii-gpu-0214-skip-instance-loop-writes.patch",
+  "status": "left_out",
+  "reason": "Left out: a speed experiment behind a switch no batch or env ever set, and upstream's 4096-entry range cache and split changes moved the ground under it. Rebase by hand when a test wants it."
+ },
+ {
+  "source": "0353-lichii-gpu-0215-reads-without-a-full-drain.patch",
+  "status": "left_out",
+  "reason": "Left out: a speed experiment behind a switch no batch or env ever set, and upstream's 4096-entry range cache and split changes moved the ground under it. Rebase by hand when a test wants it."
+ },
+ {
+  "source": "0361-lichii-cpu-0231-defer-fragment-barriers.patch",
+  "status": "left_out",
+  "reason": "Left out: a speed experiment behind a switch no batch or env ever set, and upstream's 4096-entry range cache and split changes moved the ground under it. Rebase by hand when a test wants it."
+ },
+ {
+  "source": "0365-lichii-cpu-0235-usage-tracker-fills-around-full-run.patch",
+  "status": "left_out",
+  "reason": "Left out: a speed experiment behind a switch no batch or env ever set, and upstream's 4096-entry range cache and split changes moved the ground under it. Rebase by hand when a test wants it."
+ },
+ {
+  "source": "0386-frizti-v2-01-usage-tracker-exact-blocks.patch",
+  "status": "left_out",
+  "reason": "Left out: a speed experiment behind a switch no batch or env ever set, and upstream's 4096-entry range cache and split changes moved the ground under it. Rebase by hand when a test wants it."
+ },
+ {
+  "source": "0418-speed-10-split-publish-batch.patch",
+  "status": "left_out",
+  "reason": "Left out: a speed experiment behind a switch no batch or env ever set, and upstream's 4096-entry range cache and split changes moved the ground under it. Rebase by hand when a test wants it."
+ },
+ {
+  "source": "0426-fence-01-signal-after-work.patch",
+  "status": "left_out",
+  "reason": "Left out: a speed experiment behind a switch no batch or env ever set, and upstream's 4096-entry range cache and split changes moved the ground under it. Rebase by hand when a test wants it."
+ },
+ {
+  "source": "0398-sweep-02-hang-watch.patch",
+  "status": "moved",
+  "reason": "Moved by hand: the pipeline note moved after upstream's new bind_pipeline line; scheduler includes merged",
+  "target": "0222-t39-sweep-02-hang-watch.patch",
+  "commit": "9167c5b1412c7539a306dcc9f6890e08f8bfa130"
+ },
+ {
+  "source": "0399-sweep-03-query-dma-wait-only-for-missing.patch",
+  "status": "moved",
+  "reason": "Moved by hand: without its FrontDmaReadFast hunk: that fast path belongs to the left-out 0353 (EDEN_NX2_DMA_WAIT_WRITERS)",
+  "target": "0223-t39-sweep-03-query-dma-wait-only-for-missing.patch",
+  "commit": "d979cb719c8989e14fdb36add424b628b0829c2f"
+ },
+ {
+  "source": "0409-motion-01-occlusion-reads.patch",
+  "status": "moved",
+  "reason": "Moved by hand: without its FrontDmaReadFast hunk, as 0399: that fast path is the left-out 0353's",
+  "target": "0224-t39-motion-01-occlusion-reads.patch",
+  "commit": "a2d5640b82806b3f55fb585f1ca9ff13bc72dfd2"
+ },
+ {
+  "source": "0416-mesh-02-next-step.patch",
+  "status": "moved",
+  "reason": "Applied unchanged in source order.",
+  "target": "0225-t39-mesh-02-next-step.patch",
+  "commit": "bd18c80d158a121166f3c9bb7a41cd5ca8cfea86"
+ },
+ {
+  "source": "0420-amd-01-pr273.patch",
+  "status": "moved",
+  "reason": "Applied unchanged in source order.",
+  "target": "0226-t39-amd-01-pr273.patch",
+  "commit": "f72f56ada6740074425a14f346be289f92565ba1"
+ },
+ {
+  "source": "0423-t33-ocarina-amd-fixes.patch",
+  "status": "moved",
+  "reason": "Moved by hand: the fragment_writes_color member added beside fragment_has_color0_output (the writes_storage line it expected is not in this tree)",
+  "target": "0227-t39-t33-ocarina-amd-fixes.patch",
+  "commit": "3b260397afca69919f082258a95f7576a72cd035"
+ },
+ {
+  "source": "0425-mesh-03-first-draw.patch",
+  "status": "moved",
+  "reason": "Applied unchanged in source order.",
+  "target": "0228-t39-mesh-03-first-draw.patch",
+  "commit": "f3a7aea9cabc3e6ebbf10a907b9bca10d4ea4a15"
+ },
+ {
+  "source": "0429-tables-speed-01-clean-upload-regions.patch",
+  "status": "moved",
+  "reason": "Moved by hand: the ForEachUploadRange hunk placed by hand; the word manager hunks applied",
+  "target": "0229-t39-tables-speed-01-clean-upload-regions.patch",
+  "commit": "878f82abb8a1e1fecae1d779297a1e62a6ba4673"
+ },
+ {
+  "source": "0434-mesh-04-textured-readback.patch",
+  "status": "moved",
+  "reason": "Applied unchanged in source order.",
+  "target": "0230-t39-mesh-04-textured-readback.patch",
+  "commit": "93c48778744f1632607b8318a06050fa8bc95977"
  }
 ]

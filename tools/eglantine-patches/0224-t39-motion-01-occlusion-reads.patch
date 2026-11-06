@@ -1,0 +1,193 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0409-motion-01-occlusion-reads.patch
+
+Source: 0409-motion-01-occlusion-reads.patch
+Moved by hand: without its FrontDmaReadFast hunk, as 0399: that fast path is the left-out 0353's
+
+and gives up after 2 s
+
+Core patch, after 0406. Part port, part ours. Camera-move glitches: motion-glitches.md,
+track-motion-fix.md.
+
+Already in T26, untouched here (read in the source, names found in T26's eboot):
+EDEN_NX2_QUERY_DMA_TRACE and =1 (0317), =2, which is Lichii PR 215 (0399), EDEN_NX2_ZPASS_PAUSE, both
+halves of 5b89a3daf (0110). No saved PS5 run shows any of them in use.
+
+Missing, added here as =3:
+
+1. A limit on the wait. Port of A-Man-With-A-Plan-dev's 08b5ed82eb, his review on PR 215. Ours, like
+   the PR, has none, and keeps its wait state on the stack: a lost operation hangs the GPU thread for
+   good. SignalAndWaitFor waits in 5 ms slices, submits deferred work again, gives up after 2 s and
+   keeps the state on the heap. Changed from the source: it sits beside SignalAndWait in the fence
+   manager, and only =3 uses it.
+
+2. Ours, from reading only, never seen in a log. =2 can hand a macro a 0. SemiFlushQueryDirty writes
+   a final value before its operation adds the carried count (query_cache.h). A sync abandons the
+   running query (PresyncWrites), so a report with no draw after it has final value 0 plus that
+   count, and the early write sends the 0 with no wait. PR 215 has this path too. Pausing keeps
+   carried counts alive across submissions, so it matters more with the pause on. =1 has no early
+   write, but waits before the buffer cache flush, which can put older words back. =3 goes where =2
+   goes, after the flush, and waits first.
+
+Use it with EDEN_NX2_ZPASS_PAUSE=1. A wait submits what is queued (fence or FlushCommands, then
+SubmitExecution, EndPendingOperations), and without the pause each submission resets the counter,
+the bug of #121. PR 215's base always pauses.
+
+Cost: =3 waits on every report still registered, landed ones too, as =1 does. PR 215 counted 976
+such reads in 2.5 minutes on NVIDIA. The PS5's rate is unknown; the trace gives it.
+
+Evidence for the lead, reported, not ours: PR 215, flashes gone (author, NVIDIA, Linux, Low). ajcohn716
+on PR 215, RX 7800 XT, RADV: 71 stale of 157 sampled, 0 of 120 with it; white vegetation not confirmed
+fixed. Feralnet on PR 215 never saw the flashes without it, so that report proves no fix.
+
+Risk: the pause alone hung an RX 9070 XT with the split on, at the save select (#121). The 256-slot
+bound was meant to end that; no AMD retest with the split on is reported. If the wait gives up, the
+read sees older words, as it does today, and the log says "Query DMA wait gave up".
+
+Not ported: the log capy-ai asked for when the 256-slot bound fires (#121), upstream never added it.
+166c21d96c and PR 243 are speed only.
+
+Unset, 0, 1, 2: nothing changes. Memory: one small allocation per wait, at =3 only.
+Clang syntax check, PS5 target, no warnings: vk_rasterizer, vk_fence_manager, maxwell_3d, macro, on
+core16 plus 0182-0406. The saved header overlay was older than that tree, so vk_scheduler.h,
+buffer_cache.h and texture_cache.h came from the tree. A deliberate typo in the new function fails
+the check. The function's own text ran in a small harness under ThreadSanitizer and AddressSanitizer:
+on time, lost, and late after giving up. Not built, not run on a PS5.
+
+Co-authored-by: AManWithAPlan <amanwithaplan_dev@proton.me>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+ src/video_core/engines/maxwell_3d.cpp            |    4 +-
+ src/video_core/fence_manager.h                   |   36 ++++++++++++++++++++++
+ src/video_core/query_dma.h                       |   10 ++++--
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp |   15 +++++++++
+ 4 files changed, 59 insertions(+), 6 deletions(-)
+
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 5c72c5ad75..f9a9200c58 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -7,11 +7,13 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <condition_variable>
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <functional>
++#include <memory>
+ #include <mutex>
+ #include <thread>
+ #include <vector>
+@@ -159,6 +161,40 @@ public:
+         wait_cv.wait(lk, [&finished] { return finished; });
+     }
+ 
++    /// SignalAndWait with a time limit: false when it gave up. The wait state is on the heap, because
++    /// the operation can still run after that.
++    bool SignalAndWaitFor(std::chrono::milliseconds limit) {
++        struct WaitState {
++            std::mutex mutex;
++            std::condition_variable cv;
++            bool finished{};
++        };
++        const auto state = std::make_shared<WaitState>();
++        SyncOperation([state] {
++            std::scoped_lock lk(state->mutex);
++            state->finished = true;
++            state->cv.notify_all();
++        });
++        SignalFence([] {});
++        rasterizer.FlushCommands();
++        SubmitDeferred();
++        if constexpr (!can_async_check) {
++            TryReleasePendingFences<true>();
++        }
++        const auto deadline = std::chrono::steady_clock::now() + limit;
++        std::unique_lock lk(state->mutex);
++        while (!state->cv.wait_for(lk, std::chrono::milliseconds{5},
++                                   [&state] { return state->finished; })) {
++            if (std::chrono::steady_clock::now() >= deadline) {
++                return false;
++            }
++            lk.unlock();
++            SubmitDeferred();
++            lk.lock();
++        }
++        return true;
++    }
++
+     void WaitPendingFences([[maybe_unused]] bool force) {
+         if constexpr (!can_async_check) {
+             TryReleasePendingFences<true>();
+diff --git a/src/video_core/query_dma.h b/src/video_core/query_dma.h
+index f6a97eed7d..e64e5e1b46 100644
+--- a/src/video_core/query_dma.h
++++ b/src/video_core/query_dma.h
+@@ -32,13 +32,15 @@ inline bool TraceEnabled() {
+ /// read, wait for the host GPU and the fence that writes the results, as High accuracy does.
+ /// EDEN_NX2_QUERY_DMA_SYNC=2 (Lichii PR 215): write out reports with a final value at once, and
+ /// wait only when one still has no host result. Reports already landed cost no wait.
++/// EDEN_NX2_QUERY_DMA_SYNC=3: at the same place as 2, but wait first and write after, so that no
++/// report goes out before its operation added the carried count, and give up after 2 s.
+ inline int SyncMode() {
+     static const int mode = [] {
+         const char* value = std::getenv("EDEN_NX2_QUERY_DMA_SYNC");
+         if (value == nullptr || value[0] == '0') {
+             return 0;
+         }
+-        return value[0] == '2' ? 2 : 1;
++        return value[0] == '2' || value[0] == '3' ? value[0] - '0' : 1;
+     }();
+     return mode;
+ }
+@@ -122,12 +124,12 @@ inline void BeforeRead(const Tegra::MemoryManager& memory,
+     }
+ }
+ 
+-/// EDEN_NX2_QUERY_DMA_SYNC=2: the last step before a read, after the buffer cache flush, so that
+-/// the flush cannot put older words over the reports.
++/// EDEN_NX2_QUERY_DMA_SYNC=2 and 3: the last step before a read, after the buffer cache flush, so
++/// that the flush cannot put older words over the reports.
+ inline void AfterBufferFlush(const Tegra::MemoryManager& memory,
+                              VideoCore::RasterizerInterface& rasterizer, GPUVAddr source,
+                              size_t size) {
+-    if (SyncMode() == 2) {
++    if (SyncMode() >= 2) {
+         FlushPending(memory, rasterizer, source, size);
+     }
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 2dd060e555..25e624e02d 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -57,6 +57,7 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/query_dma.h"
+ 
+ namespace Vulkan {
+ 
+@@ -1620,6 +1621,20 @@ void RasterizerVulkan::WaitForQueries() {
+ }
+ 
+ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
++    if (addr != 0 && size != 0 && VideoCommon::QueryDma::SyncMode() == 3) {
++        // SemiFlushRegion alone writes a final value before its operation adds the carried count:
++        // a report with no draw after a sync would go out as 0. So wait for the operations first.
++        if (query_cache.IsRegionGpuModified(addr, size) &&
++            !fence_manager.SignalAndWaitFor(std::chrono::seconds{2})) {
++            static u32 gave_up{};
++            if (++gave_up <= 16 || gave_up % 1000 == 0) {
++                LOG_WARNING(Render_Vulkan, "Query DMA wait gave up after 2 s at {:#x} ({} so far)",
++                            addr, gave_up);
++            }
++        }
++        query_cache.SemiFlushRegion(addr, size);
++        return;
++    }
+     if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+         return;
+     }

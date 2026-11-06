@@ -1,0 +1,66 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0315-fog-06-oot-fog-exposure-scale.patch
+
+Source: 0315-fog-06-oot-fog-exposure-scale.patch
+Moved by hand: without its docs/OOT_VISUAL_WORKAROUND.md hunk: the moved 0121 did not carry that file
+
+Core patch, for tools/eglantine-patches as 0195. Ours, on top of 0100 and 0101.
+
+EDEN_NX2_OOT_FOG_SCALE (default 0.25) and EDEN_NX2_OOT_EXPOSURE_SCALE (default 0.65)
+replace the two fixed factors of the visual workaround, 0 to 4; a value out of range
+is ignored. Unset, nothing changes. Shaders are translated at every boot, so a new
+value in env.txt needs no fresh cache and no build. Still a workaround, not a fix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+  docs/OOT_VISUAL_WORKAROUND.md                  |  2 ++
+  .../ir_opt/oot_visual_workaround.h             | 18 +++++++++++++++++-
+  2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/shader_recompiler/ir_opt/oot_visual_workaround.h b/src/shader_recompiler/ir_opt/oot_visual_workaround.h
+index 1bce69f415..e57310b5b7 100644
+--- a/src/shader_recompiler/ir_opt/oot_visual_workaround.h
++++ b/src/shader_recompiler/ir_opt/oot_visual_workaround.h
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ 
++#include <cstdlib>
+ #include <optional>
+ #include <utility>
+ #include <vector>
+@@ -11,6 +12,17 @@
+ 
+ namespace Shader::Optimization {
+ 
++// A factor from the environment, 0 to 4, or the default.
++inline float OotVisualScale(const char* name, float fallback) {
++    const char* const text = std::getenv(name);
++    if (text == nullptr) {
++        return fallback;
++    }
++    char* end = nullptr;
++    const double value = std::strtod(text, &end);
++    return end != text && value >= 0.0 && value <= 4.0 ? static_cast<float>(value) : fallback;
++}
++
+ // TEMPORARY visual workaround for Ocarina of Time, not an emulator fix.
+ inline std::optional<size_t> ApplyOotVisualWorkaround(IR::Program& program, u64 title_id,
+                                                      u64 shader_hash, bool enabled) {
+@@ -63,12 +75,16 @@ inline std::optional<size_t> ApplyOotVisualWorkaround(IR::Program& program, u64
+     if ((fog && matches.size() != 1) || (exposure && (matches.empty() || matches.size() > 3))) {
+         return 0;
+     }
++    // EDEN_NX2_OOT_FOG_SCALE and EDEN_NX2_OOT_EXPOSURE_SCALE replace the two factors. The shaders
++    // are translated at every boot, so a new value needs no fresh cache.
++    const float scale = fog ? OotVisualScale("EDEN_NX2_OOT_FOG_SCALE", 0.25f)
++                            : OotVisualScale("EDEN_NX2_OOT_EXPOSURE_SCALE", 0.65f);
+     for (const auto& [block, inst] : matches) {
+         const auto insertion = block->Instructions().iterator_to(*inst);
+         const auto original = block->PrependNewInst(insertion, *inst);
+         IR::IREmitter ir{*block, insertion};
+         const auto scaled = ir.FPMul(IR::F32{IR::Value{&*original}},
+-                                     ir.Imm32(fog ? 0.25f : 0.65f));
++                                     ir.Imm32(scale));
+         inst->ReplaceUsesWith(scaled);
+     }
+     return matches.size();

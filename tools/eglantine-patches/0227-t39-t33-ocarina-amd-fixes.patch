@@ -1,0 +1,255 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0423-t33-ocarina-amd-fixes.patch
+
+Source: 0423-t33-ocarina-amd-fixes.patch
+Moved by hand: the fragment_writes_color member added beside fragment_has_color0_output (the writes_storage line it expected is not in this tree)
+
+each behind a switch
+
+All off by default. Each one is a port, kept as close to the source as the tree allows.
+
+EDEN_NX2_BLEND_ALWAYS=1, mja00/Lichii f00aa63884 (from sharkiix): blend state is rebuilt at every
+refresh. Native Switch 2 paths write blend registers without raising Dirty::Blending, which leaves
+a stale state on a device without dynamic blend. The PS5 logs dynamic state level 2, so it takes
+this path.
+
+EDEN_NX2_PLAIN_SAMPLER=1, mja00/Lichii 05a9fb2dca (from sharkiix): a plain sample through a
+compare-enabled sampler uses a variant without comparison.
+
+EDEN_NX2_MASK_UNWRITTEN=1, mja00/Lichii c52c24239f: colour targets the fragment shader never writes
+are masked.
+
+EDEN_NX2_QUERY_WAIT_ONCE=1, mja00/Lichii cbf4f704c8: one wait per occlusion query resolve. The
+source limits this to AMD's own drivers; here the switch decides, since RADV also waits per query.
+
+EDEN_NX2_WFI_BARRIER=1, Lichii 18cfe85563 (PR 295): wait for idle is a pipeline barrier. The event
+it used is never reset, so only the first wait of a session waited.
+
+Not run yet.
+ .../renderer_vulkan/fixed_pipeline_state.cpp  |  9 +++-
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  | 12 +++++
+ .../renderer_vulkan/vk_graphics_pipeline.h    |  1 +
+ .../renderer_vulkan/vk_query_cache.cpp        | 44 +++++++++++++++++--
+ .../renderer_vulkan/vk_rasterizer.cpp         | 28 ++++++++++--
+ .../renderer_vulkan/vk_texture_cache.cpp      | 11 +++++
+ .../renderer_vulkan/vk_texture_cache.h        |  1 +
+ 7 files changed, 97 insertions(+), 9 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index babea58b1a..bd978f370e 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -254,7 +254,14 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
+     }
+     if (!extended_dynamic_state_3_blend) {
+-        if (maxwell3d.dirty.flags[Dirty::Blending]) {
++        // EDEN_NX2_BLEND_ALWAYS=1 (mja00/Lichii f00aa63884, from sharkiix): native Switch 2 paths
++        // write blend registers without raising Dirty::Blending, which leaves a stale blend state
++        // in the key on a device without dynamic blend. The PS5 runs at dynamic state level 2.
++        static const bool blend_always = [] {
++            const char* const value = std::getenv("EDEN_NX2_BLEND_ALWAYS");
++            return value != nullptr && value[0] != '0';
++        }();
++        if (blend_always || maxwell3d.dirty.flags[Dirty::Blending]) {
+             maxwell3d.dirty.flags[Dirty::Blending] = false;
+             for (size_t index = 0; index < attachments.size(); ++index) {
+                 attachments[index].Refresh(regs, index);
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index ce94bcbf71..4cd6f8bf29 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <span>
+@@ -301,6 +302,7 @@ GraphicsPipeline::GraphicsPipeline(
+         num_descriptor_entries += NumDescriptorEntries(*info);
+     }
+     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
++    fragment_writes_color = stage_infos[NUM_STAGES - 1].stores_frag_color;
+ 
+     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, RunsMeshAsCompute())};
+     // Task and mesh programs run as compute read the rescaling words and the MeshComputeLayout
+@@ -1082,6 +1084,16 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         for (size_t i = 0; i < mask_table.size(); ++i) {
+             write_mask |= mask[i] ? mask_table[i] : 0;
+         }
++        // EDEN_NX2_MASK_UNWRITTEN=1 (mja00/Lichii c52c24239f): a target the fragment shader never
++        // writes gets undefined values in Vulkan, and AMD's drivers store garbage.
++        static const bool mask_unwritten = [] {
++            const char* const value = std::getenv("EDEN_NX2_MASK_UNWRITTEN");
++            return value != nullptr && value[0] != '0';
++        }();
++        if (mask_unwritten &&
++            (index >= fragment_writes_color.size() || !fragment_writes_color[index])) {
++            write_mask = 0;
++        }
+         cb_attachments.push_back({
+             .blendEnable = blend.enable != 0,
+             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index d4431a0f7b..9735e9f36d 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -231,6 +231,7 @@ private:
+     size_t num_image_elements{};
+     u32 num_textures{};
+     bool fragment_has_color0_output{};
++    std::array<bool, 8> fragment_writes_color{};
+ 
+     vk::DescriptorSetLayout descriptor_set_layout;
+     DescriptorAllocator descriptor_allocator;
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index b505d75bc5..7bd1a770e4 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <cstdlib>
+ #include <cstddef>
+ #include <limits>
+ #include <map>
+@@ -260,6 +261,14 @@ public:
+         size_t resolve_buffer_index = ObtainBuffer<true>(num_slots_used);
+         resolve_buffers.push_back(resolve_buffer_index);
+         size_t base_offset = 0;
++        // EDEN_NX2_QUERY_WAIT_ONCE=1 (mja00/Lichii cbf4f704c8): AMD's drivers wait on each query of
++        // a WAIT_BIT copy separately (3.8 us per query, ~5 ms a frame in Ocarina). Queries complete
++        // in order on the queue, so waiting for the newest one is enough before copying the range
++        // without the wait. RADV emits one wait per query and render backend.
++        static const bool wait_on_last = [] {
++            const char* const value = std::getenv("EDEN_NX2_QUERY_WAIT_ONCE");
++            return value != nullptr && value[0] != '0';
++        }();
+ 
+         ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
+                                                  size_t amount) {
+@@ -281,10 +290,37 @@ public:
+                     .size = amount * SamplesQueryBank::QUERY_SIZE,
+                 };
+ 
+-                cmdbuf.CopyQueryPoolResults(
+-                    query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
+-                    static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
+-                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
++                if (!wait_on_last || amount == 1) {
++                    cmdbuf.CopyQueryPoolResults(
++                        query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
++                        static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
++                        VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
++                } else {
++                    const size_t last = amount - 1;
++                    const VkDeviceSize last_offset =
++                        base_offset + last * SamplesQueryBank::QUERY_SIZE;
++                    cmdbuf.CopyQueryPoolResults(query_pool, static_cast<u32>(start + last), 1,
++                                                buffer, last_offset, SamplesQueryBank::QUERY_SIZE,
++                                                VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
++                    // Orders the unwaited copy after the waited one.
++                    const VkBufferMemoryBarrier waited_barrier{
++                        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++                        .pNext = nullptr,
++                        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                        .buffer = buffer,
++                        .offset = last_offset,
++                        .size = SamplesQueryBank::QUERY_SIZE,
++                    };
++                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, waited_barrier);
++                    cmdbuf.CopyQueryPoolResults(
++                        query_pool, static_cast<u32>(start), static_cast<u32>(last), buffer,
++                        static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
++                        VK_QUERY_RESULT_64_BIT);
++                }
+                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, copy_query_pool_barrier);
+             });
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 25e624e02d..eac1b6a365 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1858,10 +1858,30 @@ void RasterizerVulkan::WaitForIdle() {
+     query_cache.NotifyWFI();
+ 
+     scheduler.RequestOutsideRenderPassOperationContext();
+-    scheduler.Record([event = *wfi_event, flags](vk::CommandBuffer cmdbuf) {
+-        cmdbuf.SetEvent(event, flags);
+-        cmdbuf.WaitEvents(event, flags, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, {}, {}, {});
+-    });
++    // EDEN_NX2_WFI_BARRIER=1 (Lichii 18cfe85563, PR 295): the event below is never reset, and
++    // vkCmdSetEvent on a signalled event makes no dependency, so only the first wait for idle of
++    // a session waits; its TOP_OF_PIPE wait makes no write visible either. A pipeline barrier does
++    // both.
++    static const bool wfi_barrier = [] {
++        const char* const value = std::getenv("EDEN_NX2_WFI_BARRIER");
++        return value != nullptr && value[0] != '0';
++    }();
++    if (wfi_barrier) {
++        scheduler.Record([flags](vk::CommandBuffer cmdbuf) {
++            static constexpr VkMemoryBarrier WFI_BARRIER{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++            };
++            cmdbuf.PipelineBarrier(flags, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
++        });
++    } else {
++        scheduler.Record([event = *wfi_event, flags](vk::CommandBuffer cmdbuf) {
++            cmdbuf.SetEvent(event, flags);
++            cmdbuf.WaitEvents(event, flags, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, {}, {}, {});
++        });
++    }
+     fence_manager.SignalOrdering();
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 00ccabdcbe..55ec1a18b0 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -4566,6 +4566,14 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
+     key.drop_reduction = has_minmax_reduction && !image_view.SupportsMinmaxFilter();
+     key.drop_custom_border = has_custom_border_colors && image_view.RequiresBorderColorFormat();
+     key.srgb_border = has_srgb_border_color && IsPixelFormatSRGB(image_view.format);
++    // EDEN_NX2_PLAIN_SAMPLER=1 (mja00/Lichii 05a9fb2dca, from sharkiix): a compare-enabled TSC read
++    // by a plain sample. Maxwell ignores the comparison, Vulkan leaves it undefined and AMD returns
++    // the 0/1 compare result (Ocarina's forest fog composite read alpha 0).
++    static const bool plain_sampler = [] {
++        const char* const value = std::getenv("EDEN_NX2_PLAIN_SAMPLER");
++        return value != nullptr && value[0] != '0';
++    }();
++    key.drop_compare = plain_sampler && has_depth_comparison && !is_depth;
+     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {
+         const VkComponentMapping& mapping = image_view.Swizzle();
+         key.swizzle = {mapping.r, mapping.g, mapping.b, mapping.a};
+@@ -4629,6 +4637,9 @@ VkSampler Sampler::Emplace(VariantKey key) {
+     }
+ 
+     VkSamplerCreateInfo create_info = base_ci;
++    if (key.drop_compare) {
++        create_info.compareEnable = VK_FALSE;
++    }
+     create_info.pNext = chain;
+     if (key.force_nearest) {
+         create_info.magFilter = VK_FILTER_NEAREST;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index f73924c5e5..98a964dc3e 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -834,6 +834,7 @@ private:
+         bool drop_reduction;
+         bool drop_custom_border;
+         bool srgb_border;
++        bool drop_compare;
+         std::array<VkComponentSwizzle, 4> swizzle;
+ 
+         bool operator==(const VariantKey&) const noexcept = default;
