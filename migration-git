@@ -1,4 +1,0 @@
-#!/bin/sh
-root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cd "$root" || exit
-exec git --git-dir="$root/.migration-git" --work-tree="$root" "$@"
