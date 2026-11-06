@@ -1,0 +1,95 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0125-copy-ipc-buffers-while-guest-slots-can-be-unmapped.patch
+
+Source: 0125-copy-ipc-buffers-while-guest-slots-can-be-unmapped.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/core/hle/service/hle_ipc.cpp b/src/core/hle/service/hle_ipc.cpp
+index f64b28c8a39e56da8a9f8155f9e06c6820f4c659..7f365f88cd46470cb6339b7b80e5c07ce72ce254 100644
+--- a/src/core/hle/service/hle_ipc.cpp
++++ b/src/core/hle/service/hle_ipc.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstring>
+ #include <sstream>
+ 
+ #include <boost/range/algorithm_ext/erase.hpp>
+@@ -27,8 +28,26 @@
+ #include "core/hle/service/ipc_helpers.h"
+ #include "core/memory.h"
+ 
++// PS5 port: cold guest memory can have no mapping (src/guest_memory_service.inc). A processor's touch
++// of it faults and brings it back, but a system call given a pointer into it only fails with EFAULT,
++// and what the guest sends to a file or a socket reaches one from here as a span of its own memory.
++// While that can happen the span is copied, and the copy's touch is an ordinary fault.
++extern "C" bool eden_guest_swap_active(void) noexcept __attribute__((weak));
++
+ namespace Service {
+ 
++namespace {
++std::span<const u8> CopiedIfSwapping(std::span<const u8> span, Common::ScratchBuffer<u8>& backup) {
++    if (span.empty() || span.data() == backup.data() || !eden_guest_swap_active ||
++        !eden_guest_swap_active()) {
++        return span;
++    }
++    backup.resize_destructive(span.size());
++    std::memcpy(backup.data(), span.data(), span.size());
++    return std::span<const u8>(backup.data(), span.size());
++}
++} // namespace
++
+ SessionRequestHandler::SessionRequestHandler(Kernel::KernelCore& kernel_, const char* service_name_)
+     : kernel{kernel_} {}
+ 
+@@ -344,8 +363,10 @@ std::span<const u8> HLERequestContext::ReadBufferA(std::size_t buffer_index) con
+     ASSERT_OR_EXECUTE_MSG(
+         BufferDescriptorA().size() > buffer_index, { return {}; },
+         "BufferDescriptorA invalid buffer_index {}", buffer_index);
+-    return gm.Read(BufferDescriptorA()[buffer_index].Address(),
+-                   BufferDescriptorA()[buffer_index].Size(), &read_buffer_data_a[buffer_index]);
++    return CopiedIfSwapping(
++                gm.Read(BufferDescriptorA()[buffer_index].Address(),
++                        BufferDescriptorA()[buffer_index].Size(), &read_buffer_data_a[buffer_index]),
++                read_buffer_data_a[buffer_index]);
+ }
+ 
+ std::span<const u8> HLERequestContext::ReadBufferX(std::size_t buffer_index) const {
+@@ -354,8 +375,10 @@ std::span<const u8> HLERequestContext::ReadBufferX(std::size_t buffer_index) con
+     ASSERT_OR_EXECUTE_MSG(
+         BufferDescriptorX().size() > buffer_index, { return {}; },
+         "BufferDescriptorX invalid buffer_index {}", buffer_index);
+-    return gm.Read(BufferDescriptorX()[buffer_index].Address(),
+-                   BufferDescriptorX()[buffer_index].Size(), &read_buffer_data_x[buffer_index]);
++    return CopiedIfSwapping(
++                gm.Read(BufferDescriptorX()[buffer_index].Address(),
++                        BufferDescriptorX()[buffer_index].Size(), &read_buffer_data_x[buffer_index]),
++                read_buffer_data_x[buffer_index]);
+ }
+ 
+ std::span<const u8> HLERequestContext::ReadBuffer(std::size_t buffer_index) const {
+@@ -376,14 +399,18 @@ std::span<const u8> HLERequestContext::ReadBuffer(std::size_t buffer_index) cons
+         ASSERT_OR_EXECUTE_MSG(
+             BufferDescriptorA().size() > buffer_index, { return {}; },
+             "BufferDescriptorA invalid buffer_index {}", buffer_index);
+-        return gm.Read(BufferDescriptorA()[buffer_index].Address(),
+-                       BufferDescriptorA()[buffer_index].Size(), &read_buffer_data_a[buffer_index]);
++        return CopiedIfSwapping(
++                    gm.Read(BufferDescriptorA()[buffer_index].Address(),
++                            BufferDescriptorA()[buffer_index].Size(), &read_buffer_data_a[buffer_index]),
++                    read_buffer_data_a[buffer_index]);
+     } else {
+         ASSERT_OR_EXECUTE_MSG(
+             BufferDescriptorX().size() > buffer_index, { return {}; },
+             "BufferDescriptorX invalid buffer_index {}", buffer_index);
+-        return gm.Read(BufferDescriptorX()[buffer_index].Address(),
+-                       BufferDescriptorX()[buffer_index].Size(), &read_buffer_data_x[buffer_index]);
++        return CopiedIfSwapping(
++                    gm.Read(BufferDescriptorX()[buffer_index].Address(),
++                            BufferDescriptorX()[buffer_index].Size(), &read_buffer_data_x[buffer_index]),
++                    read_buffer_data_x[buffer_index]);
+     }
+ }
+ 

@@ -1,0 +1,56 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0088-stream-ring-wrap-and-sliced-zero-fill.patch
+
+Source: 0088-stream-ring-wrap-and-sliced-zero-fill.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index e8db3c1a601208f457a8aea338151695ef9a4fbe..7c86ae952b0690e8bd76e5d11b58e4e1f92e9737 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -151,19 +151,24 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
+               current_tick);
+     used_iterator = iterator;
+-    free_iterator = (std::max)(free_iterator, iterator + size);
+ 
+     if (iterator + size >= stream_buffer_size) {
++        // The start of the ring is looked at before going back to it. It used to be looked at
++        // after: with the start busy this request went to a staging buffer, the iterators stayed
++        // at the start, and the next request's check covered no region, so it got offset 0 while
++        // the GPU could still be reading there. Slices of large images wrap the ring far more
++        // often than uniforms did.
++        if (AreRegionsActive(0, Region(size) + 1)) {
++            // Avoid waiting for the previous usages to be free
++            return GetStagingBuffer(size, MemoryUsage::Upload);
++        }
+         std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
+                   current_tick);
+         used_iterator = 0;
+         iterator = 0;
+         free_iterator = size;
+-
+-        if (AreRegionsActive(0, Region(size) + 1)) {
+-            // Avoid waiting for the previous usages to be free
+-            return GetStagingBuffer(size, MemoryUsage::Upload);
+-        }
++    } else {
++        free_iterator = (std::max)(free_iterator, iterator + size);
+     }
+     const size_t offset = iterator;
+     iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 525d7735e3966fc9dbe89228e8b174f1bcd68b62..a6bb012f84f2da181b3f4c10eb2c338c58606bdb 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2478,6 +2478,9 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+                 zero_bytes = (std::max)(zero_bytes, copy.buffer_size /
+                                         static_cast<size_t>(copy.image_subresource.num_layers));
+             }
++            // UploadMemory marks the image initialized at its first call, and each call's barrier
++            // covers its slice: every later slice would claim GENERAL on layers still UNDEFINED.
++            runtime.TransitionImageLayout(image);
+             auto staging = runtime.UploadStagingBuffer(zero_bytes);
+             std::memset(staging.mapped_span.data(), 0, zero_bytes);
+             size_t next_copy = 0;

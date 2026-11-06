@@ -1,0 +1,169 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0060-caches-report-what-they-hold-when-memory-is-refused.patch
+
+Source: 0060-caches-report-what-they-hold-when-memory-is-refused.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index a9cb4f7f247f209420e371acc39c3b61d07a78c1..d7d3b74f3f44ba15adece36c72d41b86ff63693e 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <memory>
+ #include <numeric>
+ #include <stdexcept>
+@@ -100,6 +101,21 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
+     }
+ }
+ 
++template <class P>
++void BufferCache<P>::ReportMemory() {
++    size_t buffers{};
++    u64 total{}, largest{};
++    for (const auto [buffer_id, buffer] : slot_buffers) {
++        const u64 bytes = buffer->SizeBytes();
++        ++buffers;
++        total += bytes;
++        largest = (std::max)(largest, bytes);
++    }
++    std::fprintf(stderr, "EDEN_REFUSED_BUFFERS %zu buffers hold %llu MiB, the largest %llu MiB\n",
++                 buffers, static_cast<unsigned long long>(total >> 20),
++                 static_cast<unsigned long long>(largest >> 20));
++}
++
+ template <class P>
+ void BufferCache<P>::TickFrame() {
+     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 161fb4c3722b0551c7b1c14dc8af187697997066..b5e8f4501c528a837d4fc8b2c36e63a102b7a9ca 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -231,6 +231,10 @@ public:
+ 
+     void TickFrame();
+ 
++    /// Writes what the buffers hold to stderr, for an allocation that was refused. The caller
++    /// holds mutex.
++    void ReportMemory();
++
+     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
+                                std::span<const MultiRangeSegment> pool);
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index d747ad55f57336bb3fe51af963aa9689b65fcab8..d4b8547c1e04d920d991d754b35877c899100817 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -7,13 +7,16 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <array>
+ #include <numeric>
++#include <cstdio>
+ #include <cstdlib>
+ #include <limits>
+ #include <map>
+ #include <vector>
+ #include <optional>
+ #include <bit>
++#include <utility>
+ #include "common/container/unordered_map.h"
+ #include <boost/container/small_vector.hpp>
+ 
+@@ -25,6 +28,7 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/texture_cache/formatter.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/texture_cache/texture_cache_base.h"
+@@ -2336,6 +2340,68 @@ u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
+     return Common::AlignUp(tentative_size, 1024);
+ }
+ 
++template <class P>
++void TextureCache<P>::ReportMemory() {
++    // As the collector counts them: a scaled image holds its original too, an unbacked one only
++    // what is bound to it.
++    const auto held = [this](const Image& image) {
++        return ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
++    };
++    struct Entry {
++        u64 bytes;
++        const Image* image;
++    };
++    std::array<Entry, 10> largest{};
++    size_t images{}, unbacked{}, idle_images{};
++    u64 total{}, modified{}, idle{};
++    for (const auto [image_id, image] : slot_images) {
++        const u64 bytes = held(*image);
++        ++images;
++        total += bytes;
++        unbacked += True(image->flags & ImageFlagBits::Unbacked) ? 1 : 0;
++        modified += True(image->flags & ImageFlagBits::GpuModified) ? bytes : 0;
++        Entry entry{bytes, image};
++        for (Entry& place : largest) {
++            if (entry.bytes > place.bytes) {
++                std::swap(entry, place);
++            }
++        }
++    }
++    // What the collector could take at its most aggressive (ticks_to_destroy in its hardest mode).
++    constexpr u64 IdleFrames = 10;
++    if (frame_tick > IdleFrames) {
++        lru_cache.ForEachItemBelow(frame_tick - IdleFrames, [&](ImageId image_id) {
++            ++idle_images;
++            idle += held(slot_images[image_id]);
++        });
++    }
++    std::fprintf(stderr,
++                 "EDEN_REFUSED_IMAGES %zu images hold %llu MiB, %zu of them with nothing bound; "
++                 "%llu MiB written by the GPU; %zu images, %llu MiB, unused for %llu frames; the "
++                 "collector counts %llu MiB against its marks of %llu and %llu MiB\n",
++                 images, static_cast<unsigned long long>(total >> 20), unbacked,
++                 static_cast<unsigned long long>(modified >> 20), idle_images,
++                 static_cast<unsigned long long>(idle >> 20),
++                 static_cast<unsigned long long>(IdleFrames),
++                 static_cast<unsigned long long>(total_used_memory >> 20),
++                 static_cast<unsigned long long>(expected_memory >> 20),
++                 static_cast<unsigned long long>(critical_memory >> 20));
++    for (const Entry& entry : largest) {
++        if (entry.image == nullptr) {
++            break;
++        }
++        const Image& image = *entry.image;
++        std::fprintf(stderr,
++                     "EDEN_REFUSED_IMAGE %.1f MiB %s %ux%ux%u, %d layers, %d levels, flags 0x%x, "
++                     "at 0x%llx\n",
++                     static_cast<double>(entry.bytes) / static_cast<double>(1ULL << 20),
++                     fmt::format("{}", image.info.format).c_str(), image.info.size.width,
++                     image.info.size.height, image.info.size.depth, image.info.resources.layers,
++                     image.info.resources.levels, static_cast<u32>(image.flags),
++                     static_cast<unsigned long long>(image.gpu_addr));
++    }
++}
++
+ template <class P>
+ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index ec981f3a6549ba1d616216765384d178472f20b6..e2b69aeb7c7776db92e08efbbeb69ba08e5da2c0 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -226,6 +226,10 @@ public:
+     /// Notify the cache that a new frame has been queued
+     void TickFrame();
+ 
++    /// Writes what the images hold to stderr, for an allocation that was refused. The caller holds
++    /// mutex, and the slots are only read: this can run from inside an image being constructed.
++    void ReportMemory();
++
+     /// Return a constant reference to the given image view id
+     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
+ 

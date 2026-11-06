@@ -1,0 +1,24 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0024-vdec-frames-without-decoder.patch
+
+Source: 0024-vdec-frames-without-decoder.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index fa49b3b3e307ea75f5066504461c5a300d2bb999..fa7e44b8da69be7c17c3caa7a8cbbe457c970a06 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -2854,6 +2854,12 @@ private:
+                 const u64 pts = picture.pts;
+                 m_decoded.push_back({std::move(picture), pts, false});
+             }
++            // No decoder for this codec (a build without AV1): still give each input a frame,
++            // without a picture, so the images handed out complete in step and the movie ends on
++            // time instead of the client waiting for frames that never come.
++            if (pictures.empty() && !input.end && decoder && !decoder->IsOpen()) {
++                m_decoded.push_back({std::nullopt, input.pts, false});
++            }
+             if (input.end) {
+                 // The client stops at the frame marked end of stream; give it one even when the
+                 // last input held no picture.

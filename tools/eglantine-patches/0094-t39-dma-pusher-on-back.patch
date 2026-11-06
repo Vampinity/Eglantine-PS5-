@@ -1,0 +1,85 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0046-dma-pusher-on-back.patch
+
+Source: 0046-dma-pusher-on-back.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 9cfc3b64122a6485e020c4f6ae501de1df9479ff..7dc780ae72dac20159815ff8967027ff693ba026 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -300,15 +300,22 @@ bool DmaPusher::Step() {
+     }
+ 
+     if (signal_sync) {
+-        // SignalFence invalidates the GPU caches, which can record copies into the scheduler: the
+-        // back's state, which a drained back still submits from in its idle hook.
+-        VideoCommon::GpuSplit::Get().RunOnBack([this] {
++        // The fence manager and the scheduler belong to the split's back, even once it has
++        // drained (its idle hook submits deferred work): signal the fence there, after the work
++        // sent so far. Published at once: the next Step waits for `synced`.
++        const auto signal = [this] {
+             rasterizer->SignalFence([this]() {
+                 std::scoped_lock lk(sync_mutex);
+                 synced = true;
+                 sync_cv.notify_all();
+             });
+-        });
++        };
++        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++            split.Defer(signal);
++            split.Publish();
++        } else {
++            signal();
++        }
+     }
+ 
+     return true;
+@@ -703,24 +710,31 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+     // The caches belong to the split's back: it first runs what the front queued (the dispatch
+     // that writes these words among it). The whole pages are flushed: their next lists read
+     // guest memory until GPU work writes them again.
+-    VideoCommon::GpuSplit::Get().Drain();
++    // The flush downloads through the scheduler, which the back owns even once it has drained:
++    // run it there and wait for it (the drain this needed anyway).
+     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
+     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
+-    if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
+-                                     VideoCommon::CacheType::BufferCache)) {
+-        VideoCommon::GpuSplit::Get().RunOnBack(
+-            [memory = &memory_manager, first_page, size = end_page - first_page] {
+-                memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
+-            });
+-    }
+-    if (rasterizer == nullptr) {
+-        return;
+-    }
+-    for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
+-        if (const auto device = memory_manager.GpuToCpuAddress(page);
+-            device && Tegra::Nx2IsCommandListPage(*device)) {
+-            rasterizer->NoteGpuWrittenCommandListSynced(*device);
++    const auto flush = [memory = &memory_manager, rasterizer_ = rasterizer, first_page, end_page] {
++        if (memory->IsMemoryDirty(first_page, end_page - first_page,
++                                  VideoCommon::CacheType::BufferCache)) {
++            memory->FlushRegion(first_page, end_page - first_page,
++                                VideoCommon::CacheType::BufferCache);
++        }
++        if (rasterizer_ == nullptr) {
++            return;
+         }
++        for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
++            if (const auto device = memory->GpuToCpuAddress(page);
++                device && Tegra::Nx2IsCommandListPage(*device)) {
++                rasterizer_->NoteGpuWrittenCommandListSynced(*device);
++            }
++        }
++    };
++    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++        split.Defer(flush);
++        split.Drain();
++    } else {
++        flush();
+     }
+ }
+ 

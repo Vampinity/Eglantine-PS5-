@@ -1,0 +1,143 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0112-native-gather-offsets-and-array-depth-samples.patch
+
+Source: 0112-native-gather-offsets-and-array-depth-samples.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 7a00cdca3189715d2d13272d89145adb8fc2d9fa..2c20cdd69f8f8b668dd248b1ce7edc6301d26f30 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -2375,23 +2375,6 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+             const bool depth_compare = insn.Bits(78, 1);
+             const u32 dimension = insn.Bits(61, 3), lod = insn.Bits(87, 3);
+             const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
+-            if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1) {
+-                if (!insn.Bits(60, 1) || insn.Bits(76, 2) || insn.Bits(81, 3) != 7 ||
+-                    insn.Bits(59, 1) || insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) != 2 ||
+-                    (source_a & 1) || (source_b & 1) || source_a >= 248 || source_b >= 248 || dest >= 248)
+-                    return fail(index, "native array depth comparison sample mode");
+-                if (!bind_texture_buffer(2)) return fail(index, "native texture descriptor buffer conflict");
+-                for (u32 i = 0; i < 3; ++i) {
+-                    const u32 source = i < 2 ? source_a + i : source_b;
+-                    emit(0x5c98000000000000ULL | predicate | (250 + i) |
+-                         (u64{15} << 39) | (u64{source} << 20));
+-                }
+-                emit(0xc000000000000000ULL | predicate | dest | (u64{250} << 8) |
+-                     (u64{source_b + 1} << 20) | (u64{3} << 28) | (u64{1} << 31) |
+-                     (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) |
+-                     (u64{1} << 50) | (u64{7} << 51));
+-                break;
+-            }
+             // General form: gather the native operand list (array index first, coordinates,
+             // then LOD/bias and the depth reference) into Maxwell TEX's coordinate and meta
+             // registers, sample into scratch and copy the packed components out. Native packs
+diff --git a/src/shader_recompiler/frontend/maxwell/translate/impl/texture_gather.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/texture_gather.cpp
+index 3263b3c7c9da60d1137d60230ed20d87f950c84f..7725f7798117c1ef929331312e6d65c52f78f250 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate/impl/texture_gather.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/texture_gather.cpp
+@@ -103,10 +103,19 @@ IR::Value MakeOffset(TranslatorVisitor& v, IR::Reg& reg, TextureType type) {
+     throw NotImplementedException("Invalid texture type {}", type);
+ }
+ 
++/**
++ * @brief Unpack per-pixel gather offsets from two consecutive registers.
++ *
++ * Native programs use signed 8-bit components; Maxwell programs use signed 6-bit components.
++ *
++ * @param v Translator that reads the registers and emits offset extraction operations.
++ * @param[in,out] reg First packed offset register; advanced by two registers.
++ * @return Two IR vectors, each containing four signed offset components.
++ */
+ std::pair<IR::Value, IR::Value> MakeOffsetPTP(TranslatorVisitor& v, IR::Reg& reg) {
+     const IR::U32 value1{v.X(reg++)};
+     const IR::U32 value2{v.X(reg++)};
+-    const IR::U32 bitsize{v.ir.Imm32(6)};
++    const IR::U32 bitsize{v.ir.Imm32(v.env.IsNativeProgram() ? 8 : 6)};
+     const auto make_vector{[&v, &bitsize](const IR::U32& value) {
+         return v.ir.CompositeConstruct(v.ir.BitFieldExtract(value, v.ir.Imm32(0), bitsize, true),
+                                        v.ir.BitFieldExtract(value, v.ir.Imm32(8), bitsize, true),
+diff --git a/src/tests/video_core/ampere_lowering.cpp b/src/tests/video_core/ampere_lowering.cpp
+index 21b9512d0bf05e848db9714c26a2c29af82754b2..bbde3f940e6a199dd0578ad96be7861f6add2658 100644
+--- a/src/tests/video_core/ampere_lowering.cpp
++++ b/src/tests/video_core/ampere_lowering.cpp
+@@ -373,4 +373,65 @@ TEST_CASE("Ampere Ocarina sign extends, uniform shifts and carries, LEA.HI and S
+     }};
+     CHECK_FALSE(LowerToMaxwell(straddle));
+ }
++
++TEST_CASE("Ampere half texture samples keep low and high channels in order",
++          "[video_core][ampere][welcome-tour]") {
++    for (const u32 mask : {3U, 7U, 15U}) {
++        Instruction sample{{0x01017b60, 0x33c04402, 0x049e8702, 0x101fc200}};
++        sample.words[2] = (sample.words[2] & ~0xfffU) | (mask << 8) |
++                          (mask == 3 ? 255U : 2U);
++        const std::array code{sample, EXIT};
++        const auto lowered = LowerToMaxwell(code);
++        REQUIRE(static_cast<bool>(lowered));
++        size_t packs{};
++        for (const u64 word : lowered.instructions) {
++            if ((word >> 48) != 0x5c18) continue;
++            ++packs;
++            REQUIRE(((word >> 8) & 0xff) == 247);
++            REQUIRE(((word >> 20) & 0xff) == 246);
++            REQUIRE(((word >> 39) & 0x1f) == 16);
++        }
++        REQUIRE(packs == (mask == 3 ? 1U : 2U));
++    }
++}
++
++TEST_CASE("Ampere array depth samples retain their own descriptor bank",
++          "[video_core][ampere][welcome-tour]") {
++    const std::array<Instruction, 3> code{{
++        {{0x01017b60, 0x33c04402, 0x049e8702, 0x101fc200}},
++        {{0x0a0d7b60, 0xb1012400, 0x041e41ff, 0x00114400}},
++        EXIT,
++    }};
++    const auto lowered = LowerToMaxwell(code);
++    REQUIRE(static_cast<bool>(lowered));
++    REQUIRE(lowered.required_texture_buffer == 15);
++    const u64 load = FindMaxwell(lowered, 0x4c98, 48);
++    REQUIRE(load != 0);
++    REQUIRE(((load >> 34) & 0x1f) == 4);
++    const u64 sample = FindMaxwell(lowered, 0xde, 56);
++    REQUIRE(sample != 0);
++    REQUIRE(((sample >> 20) & 0xff) == 246);
++    REQUIRE(((sample >> 28) & 7) == 3);
++    REQUIRE(((sample >> 50) & 1) == 1);
++}
++
++TEST_CASE("Ampere per-pixel gathers preserve both offset registers before aliased outputs",
++          "[video_core][ampere][welcome-tour]") {
++    const std::array<Instruction, 2> code{{
++        {{0x040a7b63, 0x33800408, 0x041e2f08, 0x100fc200}},
++        EXIT,
++    }};
++    const auto lowered = LowerToMaxwell(code);
++    REQUIRE(static_cast<bool>(lowered));
++    const u64 gather = FindMaxwell(lowered, 0xc8, 56);
++    REQUIRE(gather != 0);
++    REQUIRE((gather & 0xff) == 250);
++    REQUIRE(((gather >> 20) & 0xff) == 246);
++    REQUIRE(((gather >> 54) & 3) == 2);
++    const auto copy = 0x5c98000000000000ULL | (u64{7} << 16) | 247 |
++                      (u64{15} << 39) | (u64{9} << 20);
++    const auto copied_offsets = std::find(lowered.instructions.begin(), lowered.instructions.end(), copy);
++    const auto sample = std::find(lowered.instructions.begin(), lowered.instructions.end(), gather);
++    REQUIRE(copied_offsets < sample);
++}
+ } // namespace
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index 80a9c5c762e795db48836c2c80ad0118c7b98927..cc078e116bd10904435efc2d1e00f1f1f9a4d7fd 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -195,7 +195,7 @@ std::optional<u64> GenericEnvironment::Analyze() {
+     if (native_source_size) {
+         // Include the converted header and a version tag to isolate this experimental ABI.
+         return Common::CityHash64(reinterpret_cast<const char*>(code.data()),
+-                                  code.size() * sizeof(u64)) ^ 0x4f554e4345000002ULL;
++                                  code.size() * sizeof(u64)) ^ 0x4f554e4345000003ULL;
+     }
+     const std::optional<u64> size{TryFindSize()};
+     if (!size) {

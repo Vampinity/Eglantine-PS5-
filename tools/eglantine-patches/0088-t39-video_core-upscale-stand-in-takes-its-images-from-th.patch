@@ -1,0 +1,47 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0040-video_core-upscale-stand-in-takes-its-images-from-th.patch
+
+Source: 0040-video_core-upscale-stand-in-takes-its-images-from-th.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 2b362ac5df9f8c4178ae5718e69192fcd44660e7..a2bbff27bb0a6935ec648fd40eabcf8cc22957f9 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -12,6 +12,7 @@
+ #include <fstream>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include "common/assert.h"
+@@ -1011,8 +1012,16 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             }
+         }
+     }
+-    if (!input || !output)
++    const auto skip = [&](std::string_view reason) {
++        static std::unordered_set<GPUVAddr> reported;
++        if (reported.insert(regs.code_loc.Address()).second && reported.size() <= 64) {
++            LOG_INFO(HW_GPU, "Upscale fallback for program {:#x} skipped: {}", regs.code_loc.Address(),
++                     reason);
++        }
+         return false;
++    };
++    if (!input || !output)
++        return skip("no input/output image pair in the program's handles or cbuf0+0x80..0x11c");
+     using RTFormat = Tegra::RenderTargetFormat;
+     const auto blit_format = [](const Texture::TICEntry& tic) -> std::optional<RTFormat> {
+         switch (tic.format) {
+@@ -1030,7 +1039,8 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     // 32-bit placeholder surface and the texture cache samples it as E5B9G9R9.
+     const bool shared_exponent_input = input->format == Texture::TextureFormat::E5B9G9R9;
+     if ((!blit_format(*input) && !shared_exponent_input) || !blit_format(*output)) {
+-        return false;
++        return skip(fmt::format("formats {} -> {}", static_cast<u32>(input->format.Value()),
++                                static_cast<u32>(output->format.Value())));
+     }
+     const auto surface = [&](const Texture::TICEntry& tic) {
+         Fermi2D::Surface result{};

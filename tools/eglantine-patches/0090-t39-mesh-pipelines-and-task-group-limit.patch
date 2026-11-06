@@ -1,0 +1,67 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0042-mesh-pipelines-and-task-group-limit.patch
+
+Source: 0042-mesh-pipelines-and-task-group-limit.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 9989a38eee48302a3be188f9f5a2fa0570203139..527856ef59c02f028f91cb0151a94522dad7ce49 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -831,7 +831,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     if (!vertex_binding_divisors.empty()) {
+         vertex_input_ci.pNext = &input_divisor_ci;
+     }
+-    const bool has_tess_stages = spv_modules[1] || spv_modules[2];
++    // Task and mesh programs sit in the vertex and tessellation slots (StageFlag): a mesh pipeline
++    // has no tessellation and no input assembly (pInputAssemblyState is null for it below).
++    const bool has_tess_stages = !IsMeshPipeline() && (spv_modules[1] || spv_modules[2]);
+     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
+     if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+         if (!has_tess_stages) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index cb7606308a211b05d68fda4516bb936de2083a50..fba3994fff6afcbb1bd038aab68439de91f0bd56 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <memory>
+ #include <limits>
+@@ -692,7 +693,31 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+ 
+         if (mesh_draw) {
+-            scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
++            // The programs read the task index from WorkgroupId.x only, and Vulkan guarantees
++            // 65535 workgroups per dimension (RADV allows no more): a larger count is invalid and
++            // may hang the GPU. Such draws are skipped and logged. EDEN_NX2_MESH_GROUP_LIMIT=<n>
++            // sets the limit (0: none, as before).
++            static const u32 group_limit = [] {
++                const char* value = std::getenv("EDEN_NX2_MESH_GROUP_LIMIT");
++                return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10))
++                                        : 65535U;
++            }();
++            const u32 groups = draw_params.num_vertices;
++            if (group_limit != 0 && groups > group_limit) {
++                static std::atomic<u32> largest{};
++                static std::atomic<u32> reported{};
++                u32 seen = largest.load(std::memory_order_relaxed);
++                const bool new_max = groups > seen &&
++                                     largest.compare_exchange_strong(seen, groups,
++                                                                     std::memory_order_relaxed);
++                if (new_max || reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++                    LOG_WARNING(Render_Vulkan,
++                                "Task/mesh draw of {} workgroups skipped (limit {}, largest {})",
++                                groups, group_limit, largest.load(std::memory_order_relaxed));
++                }
++                return;
++            }
++            scheduler.Record([this, groups](vk::CommandBuffer cmdbuf) {
+                 if (scheduler.GraphicsPipelineMissing()) {
+                     return;
+                 }

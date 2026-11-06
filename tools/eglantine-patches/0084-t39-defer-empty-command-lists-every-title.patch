@@ -1,0 +1,30 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0026-defer-empty-command-lists-every-title.patch
+
+Source: 0026-defer-empty-command-lists-every-title.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp b/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+index 5dd830eb23bb4376f747658241cc6b4bfa250fd4..a3a6d2aa3ea4f0ffd961df24e30b31508d316dfc 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
++++ b/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+@@ -459,9 +459,16 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
+             entries.submitted_offsets.reserve(entries.command_lists.size());
+             // Donkey Kong Bananza submits startup lists before it writes them: a list that is all
+             // zeros now gets an out-of-range offset, which makes the DMA pusher read it from
+-            // memory when it parses it.
++            // memory when it parses it. Every Switch 2 title: an all-zero list runs nothing, so
++            // reading memory at parse time is never worse than the copy. EDEN_NX2_DEFER_EMPTY=0:
++            // Bananza only (as before), =2: no title.
++            static const char defer_empty_mode = [] {
++                const char* value = std::getenv("EDEN_NX2_DEFER_EMPTY");
++                return value != nullptr ? value[0] : '1';
++            }();
++            const bool bananza = system.GetApplicationProcessProgramID() == 0x040074a01bf12000ULL;
+             const bool defer_empty =
+-                system.GetApplicationProcessProgramID() == 0x040074a01bf12000ULL;
++                defer_empty_mode == '1' || (defer_empty_mode == '0' && bananza);
+             size_t offset = 0;
+             for (u32 i = 0; i < entries.command_lists.size(); ++i) {
+                 const auto& entry = entries.command_lists[i];

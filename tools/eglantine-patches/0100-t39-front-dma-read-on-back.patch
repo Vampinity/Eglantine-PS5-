@@ -1,0 +1,40 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0053-front-dma-read-on-back.patch
+
+Source: 0053-front-dma-read-on-back.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 7663ce384d3f583bb852700094ac62b1254e4515..1bb1e6853dc2ea1a961090475095f870f6225614 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1154,8 +1154,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                              u32 count) {
+     // The words may be written by methods still queued for the back (indirect draw arguments
+-    // from a culling dispatch), and the caches that may hold newer ones belong to it.
+-    split.Drain();
++    // from a culling dispatch), and the caches that may hold newer ones belong to it. The flush
++    // downloads through the scheduler, which the back owns even once it has drained (its idle
++    // hook submits deferred work): run it there, after those methods, and wait for it.
+     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
+     const u32 ram = fs.regs[0x156];
+     const u32 words = std::min<u32>(count, 0x1000);
+@@ -1163,11 +1164,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+     }
+-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+-        split.RunOnBack([memory = &memory_manager, source, read_bytes] {
++    split.Defer([memory = &memory_manager, source, read_bytes] {
++        if (memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+-        });
+-    }
++        }
++    });
++    split.Drain();
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+         if (method == 0x158) {

@@ -1,0 +1,130 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0050-mesh-pipeline-names-skips-and-spirv-dump.patch
+
+Source: 0050-mesh-pipeline-names-skips-and-spirv-dump.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 6d6e2ab12df6c6ec874fcb04538b466420d8d9fe..33b81f797d7fcae77914e64fa36e34d58c49b7a3 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -100,6 +100,11 @@ public:
+     }
+ 
+     /// Switch 2 task/mesh pipeline: drawn with vkCmdDrawMeshTasksEXT.
++    /// The cache key: unique_hashes[1] is the task program (or the mesh program without one),
++    /// unique_hashes[3] the mesh program, for task/mesh pipelines.
++    [[nodiscard]] const GraphicsPipelineCacheKey& Key() const noexcept {
++        return key;
++    }
+     [[nodiscard]] bool IsMeshPipeline() const noexcept {
+         return stage_infos[0].is_task || stage_infos[0].is_mesh;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 94a369102aa56d60b4445014c9b717c59e078a4b..b6da06580441078ce861a9f0b73ee8f2d0457f59 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1235,7 +1235,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
+         // is independent and gated only by gpu_log_shader_dumps.
+         const bool should_log = GPU::Logging::IsActive();
+-        const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
++        // EDEN_NX2_MESH_SPIRV_DUMP=1: also the task and mesh programs' SPIR-V, named by the hashes the
++        // rasterizer's "Mesh pipeline ... first draw" lines give, in the dump folder.
++        static const bool mesh_spirv_dump = [] {
++            const char* value = std::getenv("EDEN_NX2_MESH_SPIRV_DUMP");
++            return value != nullptr && value[0] == '1';
++        }();
++        const bool should_dump =
++            Settings::values.gpu_log_shader_dumps.GetValue() ||
++            (mesh_spirv_dump &&
++             (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh));
+         if (should_log || should_dump) {
+             static constexpr std::array stage_names{"vertex", "tess_control", "tess_eval", "geometry", "fragment"};
+             const std::string shader_name = fmt::format("shader_{:016x}_{}", key.unique_hashes[index], stage_names[stage_index]);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index fba3994fff6afcbb1bd038aab68439de91f0bd56..f2ed21f84a4d3bbc2dd5cb3389961f50560f9c56 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -331,6 +331,69 @@ bool RasterizerVulkan::TryNx2IndirectReset() {
+     return true;
+ }
+ 
++namespace {
++// A task/mesh pipeline's name across runs: its task (or lone mesh) program and its mesh program
++// (shader hashes of their code and the mesh registers, the names of their EDEN_NX2_MESH_SPIRV_DUMP
++// files). The first draw with each is logged with its workgroup count. To find a pipeline that
++// hangs the GPU, skip some and keep the rest:
++// - EDEN_NX2_MESH_SKIP=<id>[,<id>...]: these pipelines (hex, as logged);
++// - EDEN_NX2_MESH_SKIP_BITS=<n>:<v>: those whose id's low n bits are v (n = 1: half of them,
++//   v = 0 or 1; n = 2: a quarter; ...), without knowing the ids beforehand;
++// - EDEN_NX2_MESH_ONLY=<id>[,<id>...]: all but these.
++u64 MeshPipelineId(const GraphicsPipelineCacheKey& key) {
++    return (key.unique_hashes[1] * 0x9e3779b97f4a7c15ULL) ^ key.unique_hashes[3];
++}
++
++std::vector<u64> ParseMeshIds(const char* text) {
++    std::vector<u64> ids;
++    for (const char* cursor = text; cursor != nullptr && *cursor != '\0';) {
++        char* end = nullptr;
++        const u64 id = std::strtoull(cursor, &end, 16);
++        if (end == cursor) {
++            break;
++        }
++        ids.push_back(id);
++        cursor = *end == ',' ? end + 1 : end;
++    }
++    return ids;
++}
++
++bool MeshPipelineSkipped(const GraphicsPipeline& pipeline,
++                         const Tegra::Engines::Maxwell3D::DrawManager::State& draw_state) {
++    static const std::vector<u64> skip = ParseMeshIds(std::getenv("EDEN_NX2_MESH_SKIP"));
++    static const std::vector<u64> only = ParseMeshIds(std::getenv("EDEN_NX2_MESH_ONLY"));
++    static const std::pair<u32, u64> bits = [] {
++        const char* value = std::getenv("EDEN_NX2_MESH_SKIP_BITS");
++        if (value == nullptr) {
++            return std::pair<u32, u64>{0, 0};
++        }
++        char* end = nullptr;
++        const u32 count = static_cast<u32>(std::strtoul(value, &end, 10));
++        const u64 match = *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 0;
++        return std::pair<u32, u64>{(std::min)(count, 63U), match};
++    }();
++    const auto& key = pipeline.Key();
++    const u64 id = MeshPipelineId(key);
++    bool skipped = std::ranges::find(skip, id) != skip.end() ||
++                   (!only.empty() && std::ranges::find(only, id) == only.end());
++    if (bits.first != 0) {
++        const u64 mask = (u64{1} << bits.first) - 1;
++        skipped |= (id & mask) == (bits.second & mask);
++    }
++    static std::mutex seen_mutex;
++    static std::set<u64> seen;
++    std::scoped_lock lock{seen_mutex};
++    if (seen.size() < 512 && seen.insert(id).second) {
++        LOG_INFO(Render_Vulkan,
++                 "Mesh pipeline {:016x} first draw (#{}): task/mesh {:016x}, mesh {:016x}, {} "
++                 "workgroups{}",
++                 id, seen.size(), key.unique_hashes[1], key.unique_hashes[3],
++                 draw_state.vertex_buffer.count, skipped ? ", skipped" : "");
++    }
++    return skipped;
++}
++} // Anonymous namespace
++
+ template <typename Func>
+ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ 
+@@ -400,6 +463,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+                                        : "no VK_EXT_mesh_shader");
+         return;
+     }
++    if (mesh_draw && MeshPipelineSkipped(*pipeline, maxwell3d->draw_manager.draw_state)) {
++        report_failure("EDEN_NX2_MESH_SKIP");
++        return;
++    }
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);

@@ -1,0 +1,30 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0059-vk_rasterizer-alpha-to-coverage-per-pipeline.patch
+
+Source: 0059-vk_rasterizer-alpha-to-coverage-per-pipeline.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index f2ed21f84a4d3bbc2dd5cb3389961f50560f9c56..68ec465ff12cf97c151b5865d8344fb5d5e02d85 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2386,9 +2386,17 @@ void RasterizerVulkan::UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& r
+ }
+ 
+ void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
+-    if (!state_tracker.TouchAlphaToCoverageEnable()) {
++    // The enable also depends on the bound pipeline writing colour 0, which the register's dirty
++    // flag does not track: it is recorded again when the pipeline changes, so it never outlives
++    // the pipeline it was computed for. EDEN_NX2_A2C_REFRESH=1 records it on every draw
++    // (zortos293/Lichii fix/oot-fog 82b95a65d4).
++    static const bool refresh{std::getenv("EDEN_NX2_A2C_REFRESH") != nullptr};
++    static const GraphicsPipeline* recorded_pipeline{};
++    const bool dirty = state_tracker.TouchAlphaToCoverageEnable();
++    if (!dirty && !refresh && pipeline_cache.CurrentGraphicsPipeline() == recorded_pipeline) {
+         return;
+     }
++    recorded_pipeline = pipeline_cache.CurrentGraphicsPipeline();
+     if (!device.SupportsDynamicState3AlphaToCoverageEnable()) {
+         return;
+     }

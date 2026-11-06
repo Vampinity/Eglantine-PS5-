@@ -1,0 +1,38 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0048-upscale-frame-beside-program-handles.patch
+
+Source: 0048-upscale-frame-beside-program-handles.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 5f18091fdf73dc9149316dd52f69e2e5fa236107..3d02011a41a98166d950e98e27f214d4357eded2 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -990,6 +990,26 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             }
+             if (input) break;
+         }
++        // The last pass of a rejected network can read an image only the rejected passes fill
++        // (Ocarina of Time's title and movies): the frame is then another image of that size in
++        // cbuf0 that upscales to the same output, which is what the scan below used to find.
++        for (u32 slot = 0x80; input && slot < 0x120; slot += 4) {
++            const auto from = memory_manager.Read<u32>(cbuf_address + slot) != 0 ? image(slot)
++                                                                                    : std::nullopt;
++            if (!upscale_pair(from, output) || from->Address() == input->Address() ||
++                from->Width() != input->Width() || from->Height() != input->Height()) {
++                continue;
++            }
++            static std::unordered_set<GPUVAddr> reported;
++            if (reported.insert(regs.code_loc.Address()).second) {
++                LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: cbuf0+{:#x} {:#x} format {} replaces {:#x} format {}",
++                         regs.code_loc.Address(), slot, from->Address(),
++                         static_cast<u32>(from->format.Value()), input->Address(),
++                         static_cast<u32>(input->format.Value()));
++            }
++            input = from;
++            break;
++        }
+     }
+     // Donkey Kong Bananza's slots, after the program's own handles: other titles keep unrelated
+     // images there.

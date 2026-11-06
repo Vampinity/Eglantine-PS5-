@@ -1,0 +1,82 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0058-warn-dropped-global-atomics.patch
+
+Source: 0058-warn-dropped-global-atomics.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 2b8f2aaf83d70673810e87d450b274bb54787fe6..196f21d1aae201be9a4adf06d83e48e68647a40e 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <bit>
+ #include <climits>
+ #include <optional>
+@@ -16,6 +17,7 @@
+ 
+ #include "common/common_types.h"
+ #include "common/div_ceil.h"
++#include "common/logging.h"
+ #include "shader_recompiler/backend/nvn_storage_descriptor.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+@@ -1000,12 +1002,16 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+                 access(index, bases[index],
+                        OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
+             }
+-            return;
++            return num_buffers;
+         }
++        // The candidate buffers the address is tested against: with none, every access falls
++        // through to the caller's default (a load reads zero, a write or atomic is dropped).
++        size_t candidates = 0;
+         for (size_t index = 0; index < num_buffers; ++index) {
+             if (!UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
+                 continue;
+             }
++            ++candidates;
+             const auto& ssbo{info.storage_buffers_descriptors[index]};
+             const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
+             const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
+@@ -1017,6 +1023,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+                                        OpULessThan(U1, addr, ssbo_end))};
+             access(index, ssbo_addr, cond);
+         }
++        return candidates;
+     }};
+     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+         const Id function_type{TypeFunction(type, U64)};
+@@ -1095,7 +1102,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+                                     TypeFunction(type, U64, type))};
+         const Id addr{OpFunctionParameter(U64)};
+         const Id value{OpFunctionParameter(type)};
+-        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
++        const size_t candidates = define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                     [&](Id pointer, Id ssbo, Id word) {
+                         const auto atomic = [&](Id (Sirit::Module::*op)(Id, Id, Id, Id, Id)) {
+                             return (this->*op)(U32[1], pointer, scope, zero, value);
+@@ -1122,6 +1129,19 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+                         case Count: break;
+                         }
+                     });
++        if (candidates == 0) {
++            // No storage buffer to route this atomic to: the program's every such atomic does
++            // nothing and returns zero (histograms, counters and exposure sums stay empty).
++            // Counted: the first 16 and then every power of two.
++            static std::atomic<u32> dropped{};
++            const u32 count = ++dropped;
++            if (count <= 16 || std::has_single_bit(count)) {
++                LOG_WARNING(Shader_SPIRV,
++                            "Global atomic {} has no candidate storage buffer ({} tracked): it is "
++                            "dropped and returns zero ({} such atomic functions so far)",
++                            static_cast<u32>(kind), info.storage_buffers_descriptors.size(), count);
++            }
++        }
+         OpReturnValue(ConstantNull(type));
+         OpFunctionEnd();
+         global_atomic_funcs[index] = func_id;

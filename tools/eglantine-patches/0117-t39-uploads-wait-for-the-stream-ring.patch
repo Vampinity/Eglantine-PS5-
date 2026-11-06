@@ -1,0 +1,220 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0095-uploads-wait-for-the-stream-ring.patch
+
+Source: 0095-uploads-wait-for-the-stream-ring.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 2a5cda9525ebb34fcf61438f9d07578b18014497..ec528572a935d0dbdbfa193fa0ecfb42b17c4901 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -275,6 +275,12 @@ public:
+ 
+     void BindHostGeometryBuffers(bool is_indexed);
+ 
++    /// The same, for a command buffer that ended after they were bound: nothing is left to upload,
++    /// and what the first call recorded went with the old command buffer.
++    void RebindHostGeometryBuffers(bool is_indexed) {
++        BindHostGeometryBuffers(is_indexed);
++    }
++
+     void BindHostStageBuffers(size_t stage);
+ 
+     void BindHostComputeBuffers();
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index d4b1785d3d206cb03af9afcabd7e41cdfed57047..812041f2d1605650c7a90f6d03d94ccd46cc4640 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -580,6 +580,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+         scheduler.RequestOutsideRenderPassOperationContext();
+     }
+ 
++    u64 geometry_tick = scheduler.CurrentTick();
+     {
+         Profile::Scope scope{Profile::Zone::UpdateBuffers};
+         buffer_cache.UpdateGraphicsBuffers(is_indexed);
+@@ -643,6 +644,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     if (IsBuilt() && !pipeline) {
+         return false;
+     }
++    // An upload that waited for the GPU may have ended the command buffer, and the index and
++    // vertex buffers bound above went with it. Descriptors are written after this.
++    while (scheduler.CurrentTick() != geometry_tick) {
++        geometry_tick = scheduler.CurrentTick();
++        buffer_cache.RebindHostGeometryBuffers(is_indexed);
++    }
+     Profile::Scope scope{Profile::Zone::ConfigureDraw};
+     return ConfigureDraw(rescaling, render_area);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 1654cfabbb81ad110ca0034d4e76adc18b6bcd11..80a941377c3bee0a2d9a85f1ea73cdb60fca1dd6 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -15,6 +15,7 @@
+ #include "common/bit_util.h"
+ #include "common/common_types.h"
+ #include "common/literals.h"
++#include "common/logging.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+@@ -120,7 +121,7 @@ StagingBufferPool::~StagingBufferPool() = default;
+ 
+ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
+-        return GetStreamBuffer(size);
++        return GetStreamBuffer(size, true);
+     }
+     return GetStagingBuffer(size, usage, deferred);
+ }
+@@ -133,7 +134,9 @@ std::optional<StagingBufferRef> StagingBufferPool::TryRequest(size_t size, Memor
+     const auto now = std::chrono::steady_clock::now();
+     no_new_buffers = now < refused_until;
+     try {
+-        const StagingBufferRef ref = Request(size, usage, deferred);
++        const StagingBufferRef ref = !deferred && usage == MemoryUsage::Upload && size <= region_size
++                                         ? GetStreamBuffer(size, false)
++                                         : GetStagingBuffer(size, usage, deferred);
+         no_new_buffers = false;
+         return ref;
+     } catch (const vk::Exception& refused) {
+@@ -180,27 +183,26 @@ void StagingBufferPool::TickFrame() {
+     ReleaseCache(MemoryUsage::Download);
+ }
+ 
+-StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
++StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size, bool may_wait) {
++    // The start of the ring is looked at before going back to it. It used to be looked at after:
++    // with the start busy this request went to a staging buffer, the iterators stayed at the start,
++    // and the next request's check covered no region, so it got offset 0 while the GPU could still
++    // be reading there. Slices of large images wrap the ring far more often than uniforms did.
++    // Nothing below is touched when the ring is busy: what has been handed out since the last
++    // stamp gets the tick of the request that goes through, after any wait.
++    const bool wraps = iterator + size >= stream_buffer_size;
+     if (AreRegionsActive(Region(free_iterator) + 1,
+-                         (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
++                         (std::min)(Region(iterator + size) + 1, NUM_SYNCS)) ||
++        (wraps && AreRegionsActive(0, Region(size) + 1))) {
+         // Avoid waiting for the previous usages to be free
+-        return GetStagingBuffer(size, MemoryUsage::Upload);
++        return may_wait ? WaitForStream(size) : GetStagingBuffer(size, MemoryUsage::Upload);
+     }
+     const u64 current_tick = scheduler.CurrentTick();
+     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
+               current_tick);
+     used_iterator = iterator;
+ 
+-    if (iterator + size >= stream_buffer_size) {
+-        // The start of the ring is looked at before going back to it. It used to be looked at
+-        // after: with the start busy this request went to a staging buffer, the iterators stayed
+-        // at the start, and the next request's check covered no region, so it got offset 0 while
+-        // the GPU could still be reading there. Slices of large images wrap the ring far more
+-        // often than uniforms did.
+-        if (AreRegionsActive(0, Region(size) + 1)) {
+-            // Avoid waiting for the previous usages to be free
+-            return GetStagingBuffer(size, MemoryUsage::Upload);
+-        }
++    if (wraps) {
+         std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
+                   current_tick);
+         used_iterator = 0;
+@@ -222,6 +224,55 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+     };
+ }
+ 
++StagingBufferRef StagingBufferPool::WaitForStream(size_t size) {
++    if (const std::optional<StagingBufferRef> ref = TryRequest(size, MemoryUsage::Upload)) {
++        return *ref;
++    }
++    // The pool has nothing and the regions this request needs are with the GPU. Their memory has
++    // been there since the start, so waiting for them is an answer that needs none. An older tick
++    // costs only the wait; a tick still being recorded is submitted first, which ends the command
++    // buffer in the middle of a draw's setup (GraphicsPipeline::ConfigureImpl binds again).
++    const size_t region_begin = Region(free_iterator) + 1;
++    const size_t region_end = (std::min)(Region(iterator + size) + 1, NUM_SYNCS);
++    const size_t start_end = iterator + size >= stream_buffer_size ? Region(size) + 1 : 0;
++    const auto needed = [=](size_t region) {
++        return region < start_end || (region >= region_begin && region < region_end);
++    };
++    u64 tick = 0;
++    for (size_t region = 0; region < NUM_SYNCS; ++region) {
++        if (needed(region)) {
++            tick = (std::max)(tick, sync_ticks[region]);
++        }
++    }
++    static u64 times = 0;
++    if (++times; (times & (times - 1)) == 0) { // the 1st, 2nd, 4th, 8th ... time
++        LOG_WARNING(Render_Vulkan, "No staging buffer for an upload of {} bytes, {} times so far: "
++                                   "waited for the GPU and took the stream ring",
++                    size, times);
++    }
++    const u64 old_tick = scheduler.CurrentTick();
++    scheduler.Wait(tick);
++    if (const u64 new_tick = scheduler.CurrentTick(); new_tick != old_tick) {
++        // The draw being set up is now recorded in the new tick, and it reads what it got in the
++        // old one: its uniforms, in the ring or in a kept buffer. Those stay busy for one tick more.
++        // Copies already recorded in the old tick look busy a little longer, which does no harm.
++        // The regions this request needs keep their stamp, they are what was waited for.
++        for (size_t region = 0; region < NUM_SYNCS; ++region) {
++            if (sync_ticks[region] == old_tick && !needed(region)) {
++                sync_ticks[region] = new_tick;
++            }
++        }
++        for (StagingBuffers& level : upload_cache) {
++            for (StagingBuffer& entry : level.entries) {
++                if (entry.tick == old_tick) {
++                    entry.tick = new_tick;
++                }
++            }
++        }
++    }
++    return GetStreamBuffer(size, false);
++}
++
+ bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
+     const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+     return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index cea3ecde8a61abdcecce8a0241b71d789a6ce52c..011a06f7ab3ae4c29c38fd54c67decdbd0e16df3 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -39,9 +39,13 @@ public:
+                                Scheduler& scheduler);
+     ~StagingBufferPool();
+ 
++    /// An upload of at most UploadSliceBytes() is never refused: with no memory for a staging
++    /// buffer it waits for the GPU and takes the stream ring. A draw's setup may see the command
++    /// buffer end here.
+     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+     /// As Request, with nothing instead of the exception when memory is refused. For a moment
+-    /// after a refusal it hands out only what exists: a stream region or a kept buffer.
++    /// after a refusal it hands out only what exists: a stream region or a kept buffer. It never
++    /// waits for the GPU.
+     std::optional<StagingBufferRef> TryRequest(size_t size, MemoryUsage usage,
+                                                bool deferred = false);
+     /// A small download buffer made at the start and kept, for when no other can be had. One user
+@@ -50,6 +54,11 @@ public:
+     /// completed: the GPU is done with it (its fence passed), so it can be handed out right away.
+     void FreeDeferred(StagingBufferRef& ref, bool completed = false);
+ 
++    /// The most a Request can always give: one region of the stream ring.
++    [[nodiscard]] size_t UploadSliceBytes() const noexcept {
++        return static_cast<size_t>(region_size);
++    }
++
+     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
+         return *stream_buffer;
+     }
+@@ -94,7 +103,10 @@ private:
+     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
+     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
+ 
+-    StagingBufferRef GetStreamBuffer(size_t size);
++    StagingBufferRef GetStreamBuffer(size_t size, bool may_wait);
++
++    /// The ring is busy. A staging buffer if the pool has one, else the ring once the GPU is done.
++    StagingBufferRef WaitForStream(size_t size);
+ 
+     bool AreRegionsActive(size_t region_begin, size_t region_end) const;
+ 

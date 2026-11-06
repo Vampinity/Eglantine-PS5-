@@ -1,0 +1,780 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0131-a-refused-buffer-no-longer-ends-the-session.patch
+
+Source: 0131-a-refused-buffer-no-longer-ends-the-session.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 7cbef4142607bd6fc6ce5d47dfa4389471a8ed34..cefd86d8036dcc37fff8bbb56ecea22ab80b9f88 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -227,8 +227,9 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
+         if (inline_writes && IsRegionRegistered(device_addr, size)) {
+             tmp_buffer.resize_destructive(size);
+             device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
+-            InlineMemoryImplementation(device_addr, size, tmp_buffer);
+-            return;
++            if (InlineMemoryImplementation(device_addr, size, tmp_buffer)) {
++                return;
++            }
+         }
+         DownloadMemory(page_begin, page_end - page_begin);
+     }
+@@ -253,7 +254,9 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+     tmp_buffer.resize_destructive(size);
+     device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
+ 
+-    InlineMemoryImplementation(device_addr, size, tmp_buffer);
++    if (!InlineMemoryImplementation(device_addr, size, tmp_buffer)) {
++        memory_tracker.MarkRegionAsCpuModified(device_addr, size);
++    }
+ }
+ 
+ template <class P>
+@@ -346,6 +349,14 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+         buffer_a = FindBuffer(*cpu_src_address, static_cast<u32>(amount), false);
+         buffer_b = FindBuffer(*cpu_dest_address, static_cast<u32>(amount), false);
+     } while (channel_state->has_deleted_buffers);
++    if (buffer_cut) [[unlikely]] {
++        // Refused: the copy goes through guest memory (MaxwellDMA's software path).
++        buffer_cut = false;
++        if (!slot_buffers[buffer_a].IsInBounds(*cpu_src_address, amount) ||
++            !slot_buffers[buffer_b].IsInBounds(*cpu_dest_address, amount)) {
++            return false;
++        }
++    }
+     auto& src_buffer = slot_buffers[buffer_a];
+     auto& dest_buffer = slot_buffers[buffer_b];
+     SynchronizeBuffer(src_buffer, *cpu_src_address, static_cast<u32>(amount));
+@@ -410,6 +421,12 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
+ 
+     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
+     Buffer& dest_buffer = slot_buffers[buffer];
++    if (buffer_cut) [[unlikely]] {
++        buffer_cut = false;
++        if (!dest_buffer.IsInBounds(*cpu_dst_address, size)) {
++            return false;
++        }
++    }
+     const u32 offset = dest_buffer.Offset(*cpu_dst_address);
+     runtime.ClearBuffer(dest_buffer, offset, size, value);
+     dest_buffer.MarkUsage(offset, size);
+@@ -432,6 +449,13 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
+     DAddr device_addr, u32 size, ObtainBufferSynchronize sync_info, ObtainBufferOperation post_op) {
+     const BufferId buffer_id = FindBuffer(device_addr, size, false);
+     Buffer& buffer = slot_buffers[buffer_id];
++    if (buffer_cut) [[unlikely]] {
++        // The caller sees the null buffer, SizeBytes() 0, and goes without.
++        buffer_cut = false;
++        if (!buffer.IsInBounds(device_addr, size)) {
++            return {&slot_buffers[NULL_BUFFER_ID], 0};
++        }
++    }
+ 
+     // synchronize op
+     switch (sync_info) {
+@@ -1042,7 +1066,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
+     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+     if (draw_state.inline_index_draw_indexes.empty()) {
+         SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+-    } else {
++    } else if (size != 0) {
+         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+             auto upload_staging = runtime.UploadStagingBuffer(size);
+             std::array<BufferCopy, 1> copies{{BufferCopy{.src_offset = upload_staging.offset, .dst_offset = 0, .size = size}}};
+@@ -1411,7 +1435,9 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
+         for (const VirtualSegment& segment : segments) {
+             const BufferId buffer_id =
+                 FindBuffer(segment.device_addr, segment.size, prefer_sparse);
+-            if (!buffer_id) {
++            if (!buffer_id || buffer_cut) {
++                // Refused: the binding goes on as the one range it is.
++                buffer_cut = false;
+                 pool.resize(first);
+                 return;
+             }
+@@ -1711,10 +1737,17 @@ void BufferCache<P>::UpdateIndexBuffer() {
+         if (inline_buffer_id == NULL_BUFFER_ID) [[unlikely]] {
+             inline_buffer_id = CreateBuffer(0, buffer_size, false);
+         }
+-        if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
++        if (inline_buffer_id != NULL_BUFFER_ID &&
++            slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
+             slot_buffers.erase(inline_buffer_id);
+             inline_buffer_id = CreateBuffer(0, buffer_size, false);
+         }
++        if (inline_buffer_id == NULL_BUFFER_ID) [[unlikely]] {
++            // Refused (the slot must not be erased: it is the null buffer's).
++            buffer_cut = false;
++            channel_state->index_buffer = NULL_BINDING;
++            return;
++        }
+         channel_state->index_buffer = Binding{
+             .device_addr = 0,
+             .size = inline_index_size,
+@@ -1736,8 +1769,9 @@ void BufferCache<P>::UpdateIndexBuffer() {
+     channel_state->index_buffer = Binding{
+         .device_addr = *device_addr,
+         .size = size,
+-        .buffer_id = FindBuffer(*device_addr, size, false),
++        .buffer_id = BufferId{},
+     };
++    FindBinding(channel_state->index_buffer, true);
+ }
+ 
+ template <class P>
+@@ -1785,12 +1819,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
+     if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr_end) || size >= 64_MiB) {
+         size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr_begin, size));
+     }
+-    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
+-    const Binding binding{
++    Binding binding{
+         .device_addr = *device_addr,
+         .size = size,
+-        .buffer_id = buffer_id,
++        .buffer_id = BufferId{},
+     };
++    FindBinding(binding);
+     channel_state->vertex_buffers[index] = binding;
+     UpdateVertexBufferSlot(index, binding);
+ }
+@@ -1806,8 +1840,9 @@ void BufferCache<P>::UpdateDrawIndirect() {
+         binding = Binding{
+             .device_addr = *device_addr,
+             .size = static_cast<u32>(size),
+-            .buffer_id = FindBuffer(*device_addr, static_cast<u32>(size), false),
++            .buffer_id = BufferId{},
+         };
++        FindBinding(binding, true);
+     };
+     if (current_draw_indirect->include_count) {
+         update(current_draw_indirect->count_start_address, sizeof(u32),
+@@ -1833,7 +1868,7 @@ void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
+             channel_state->dirty_uniform_buffers[stage] |= 1U << index;
+         }
+         // Resolve buffer
+-        binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
++        FindBinding(binding);
+     });
+ }
+ 
+@@ -1845,8 +1880,7 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
+     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+         // Resolve buffer
+         Binding& binding = channel_state->storage_buffers[stage][index];
+-        const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
+-        binding.buffer_id = buffer_id;
++        FindBinding(binding);
+         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+         ResolveMultiRangeStorage(binding, is_written, graphics_segments);
+     });
+@@ -1858,8 +1892,7 @@ void BufferCache<P>::UpdateTextureBuffers(size_t stage) {
+         return;
+     }
+     ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
+-        Binding& binding = channel_state->texture_buffers[stage][index];
+-        binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
++        FindBinding(channel_state->texture_buffers[stage][index]);
+     });
+ }
+ 
+@@ -1883,12 +1916,12 @@ void BufferCache<P>::UpdateTransformFeedbackBuffer(u32 index) {
+         channel_state->transform_feedback_buffers[index] = NULL_BINDING;
+         return;
+     }
+-    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
+     channel_state->transform_feedback_buffers[index] = Binding{
+         .device_addr = *device_addr,
+         .size = size,
+-        .buffer_id = buffer_id,
++        .buffer_id = BufferId{},
+     };
++    FindBinding(channel_state->transform_feedback_buffers[index]);
+ }
+ 
+ template <class P>
+@@ -1905,7 +1938,7 @@ void BufferCache<P>::UpdateComputeUniformBuffers() {
+                 binding.size = cbuf.size;
+             }
+         }
+-        binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
++        FindBinding(binding);
+     });
+ }
+ 
+@@ -1914,7 +1947,7 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
+     ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+         // Resolve buffer
+         Binding& binding = channel_state->compute_storage_buffers[index];
+-        binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
++        FindBinding(binding);
+         const bool is_written =
+             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
+         ResolveMultiRangeStorage(binding, is_written, compute_segments);
+@@ -1924,8 +1957,7 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
+ template <class P>
+ void BufferCache<P>::UpdateComputeTextureBuffers() {
+     ForEachEnabledBit(channel_state->enabled_compute_texture_buffers, [&](u32 index) {
+-        Binding& binding = channel_state->compute_texture_buffers[index];
+-        binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
++        FindBinding(channel_state->compute_texture_buffers[index]);
+     });
+ }
+ 
+@@ -2187,7 +2219,8 @@ void BufferCache<P>::SynchronizeBufferWrites(Buffer& buffer) {
+ 
+ template <class P>
+ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr device_addr,
+-                                                                       u32 wanted_size) {
++                                                                       u32 wanted_size,
++                                                                       bool stream_leap) {
+     static constexpr int STREAM_LEAP_THRESHOLD = 16;
+     boost::container::small_vector<BufferId, 16> overlap_ids;
+     DAddr begin = device_addr;
+@@ -2247,10 +2280,10 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
+             // When this memory region has been joined a bunch of times, we assume it's being used
+             // as a stream buffer. Increase the size to skip constantly recreating buffers.
+             has_stream_leap = true;
+-            if (expands_right) {
++            if (stream_leap && expands_right) {
+                 expand_begin(CACHING_PAGESIZE * 128);
+             }
+-            if (expands_left) {
++            if (stream_leap && expands_left) {
+                 expand_end(CACHING_PAGESIZE * 128);
+             }
+         }
+@@ -2296,10 +2329,41 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
+     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
+     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+     wanted_size = static_cast<u32>(device_addr_end - device_addr);
+-    const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
++    const BufferId new_buffer_id = JoinBuffer(device_addr, wanted_size, sparse_compatible, true);
++    if constexpr (requires { runtime.TryCreateBuffer(DAddr{}, u64{}, bool{}); }) {
++        if (!new_buffer_id) [[unlikely]] {
++            return CreateRefusedBuffer(device_addr, wanted_size, sparse_compatible);
++        }
++    }
++    return new_buffer_id;
++}
++
++template <class P>
++BufferId BufferCache<P>::JoinBuffer(DAddr device_addr, u32 wanted_size, bool sparse_compatible,
++                                    bool stream_leap) {
++    const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size, stream_leap);
+     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+-    const BufferId new_buffer_id =
+-        slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
++    BufferId new_buffer_id;
++    if constexpr (requires { runtime.TryCreateBuffer(DAddr{}, u64{}, bool{}); }) {
++        std::optional<Buffer> made;
++        if (size < buffer_refused_size ||
++            std::chrono::steady_clock::now() >= buffer_refused_until) {
++            made = runtime.TryCreateBuffer(overlap.begin, size, sparse_compatible);
++            if (!made) {
++                buffer_refused_size = size;
++            }
++        }
++        if (!made) [[unlikely]] {
++            // Nothing else has changed: the buffers stay as they are, and they stay findable.
++            for (const BufferId overlap_id : overlap.ids) {
++                slot_buffers[overlap_id].Unpick();
++            }
++            return BufferId{};
++        }
++        new_buffer_id = slot_buffers.insert(std::move(*made));
++    } else {
++        new_buffer_id = slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
++    }
+     auto& new_buffer = slot_buffers[new_buffer_id];
+     const size_t size_bytes = new_buffer.SizeBytes();
+     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
+@@ -2312,6 +2376,105 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
+     return new_buffer_id;
+ }
+ 
++template <class P>
++template <typename Unused>
++BufferId BufferCache<P>::CreateRefusedBuffer(DAddr device_addr, u32 wanted_size,
++                                             bool sparse_compatible) {
++    static const bool cut_buffers = [] {
++        const char* value = std::getenv("EDEN_NX2_BUFFER_CUT");
++        return value == nullptr || value[0] != '0';
++    }();
++    if (!cut_buffers) {
++        runtime.ThrowRefused();
++    }
++    const auto now = std::chrono::steady_clock::now();
++    const bool first = now >= buffer_refused_until;
++    if (first) {
++        buffer_refused_until = now + std::chrono::milliseconds(250);
++        buffer_hole_refused = ~u64{0};
++    }
++    // A leap adds 8 MiB for a buffer that keeps growing. With nothing to spare it can do without.
++    if (const BufferId id = JoinBuffer(device_addr, wanted_size, sparse_compatible, false)) {
++        buffer_refused_size = ~u64{0};
++        return id;
++    }
++    if (first) {
++        std::fprintf(stderr,
++                     "EDEN_BUFFER_REFUSED %llu bytes at %llx (%u bytes wanted): since the last time "
++                     "%llu buffers held only the start of a range and %llu ranges went without\n",
++                     static_cast<unsigned long long>(buffer_refused_size),
++                     static_cast<unsigned long long>(device_addr), wanted_size,
++                     static_cast<unsigned long long>(buffers_cut),
++                     static_cast<unsigned long long>(buffers_dropped));
++        buffers_cut = buffers_dropped = 0;
++    }
++    // No join can be had, but what the range starts with can. The caller sees to the rest. Not for
++    // the inline index buffer, at 0, or a source of a multi range binding.
++    buffer_cut = true;
++    if (device_addr == 0 || sparse_compatible) {
++        ++buffers_dropped;
++        return NULL_BUFFER_ID;
++    }
++    const u64 page = device_addr >> CACHING_PAGEBITS;
++    if (const BufferId held = page_table[page]) {
++        ++buffers_cut;
++        return held;
++    }
++    // Free pages from the start, up to the next buffer: as much of them as fits a hole. The largest
++    // hole was 6 MiB when 10 MiB was refused (Ocarina, 2026-11-05), with 200 MiB in holes.
++    const u64 page_end =
++        (std::min<u64>)(page + (wanted_size >> CACHING_PAGEBITS), page_table.size());
++    u64 pages = 1;
++    while (page + pages < page_end && !page_table[page + pages]) {
++        ++pages;
++    }
++    for (; pages != 0; pages /= 2) {
++        const u64 bytes = pages << CACHING_PAGEBITS;
++        if (bytes >= buffer_hole_refused) {
++            continue;
++        }
++        std::optional<Buffer> made = runtime.TryCreateBufferInHoles(device_addr, bytes);
++        if (!made) {
++            buffer_hole_refused = bytes;
++            continue;
++        }
++        const BufferId id = slot_buffers.insert(std::move(*made));
++        Buffer& buffer = slot_buffers[id];
++        runtime.ClearBuffer(buffer, 0, bytes, 0);
++        buffer.MarkUsage(0, bytes);
++        Register(id);
++        TouchBuffer(buffer, id);
++        ++buffers_cut;
++        return id;
++    }
++    ++buffers_dropped;
++    return NULL_BUFFER_ID;
++}
++
++template <class P>
++template <typename BindingType>
++void BufferCache<P>::FindBinding(BindingType& binding, bool whole) {
++    binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
++    if (!buffer_cut) [[likely]] {
++        return;
++    }
++    buffer_cut = false;
++    bindings_cut = true;
++    const Buffer& buffer = slot_buffers[binding.buffer_id];
++    if (buffer.IsInBounds(binding.device_addr, binding.size)) {
++        return;
++    }
++    if (!whole && buffer.IsInBounds(binding.device_addr, 1)) {
++        binding.size = static_cast<u32>(buffer.CpuAddr() + buffer.SizeBytes() - binding.device_addr);
++        return;
++    }
++    // As an address with nothing mapped: reads give zero, writes are dropped.
++    static_cast<Binding&>(binding) = NULL_BINDING;
++    if constexpr (std::is_same_v<BindingType, TextureBufferBinding>) {
++        binding.format = PixelFormat::Invalid;
++    }
++}
++
+ template <class P>
+ void BufferCache<P>::Register(BufferId buffer_id) {
+     ChangeRegister<true>(buffer_id);
+@@ -2561,13 +2724,11 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
+         return false;
+     }
+ 
+-    InlineMemoryImplementation(dest_address, copy_size, inlined_buffer);
+-
+-    return true;
++    return InlineMemoryImplementation(dest_address, copy_size, inlined_buffer);
+ }
+ 
+ template <class P>
+-void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
++bool BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
+                                                 std::span<const u8> inlined_buffer) {
+     ClearDownload(dest_address, copy_size);
+     gpu_modified_ranges.Subtract(dest_address, copy_size);
+@@ -2575,6 +2736,12 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
+ 
+     BufferId buffer_id = FindBuffer(dest_address, static_cast<u32>(copy_size), false);
+     auto& buffer = slot_buffers[buffer_id];
++    if (buffer_cut) [[unlikely]] {
++        buffer_cut = false;
++        if (!buffer.IsInBounds(dest_address, copy_size)) {
++            return false;
++        }
++    }
+     SynchronizeBuffer(buffer, dest_address, static_cast<u32>(copy_size));
+ 
+     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+@@ -2591,6 +2758,7 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
+     } else {
+         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
+     }
++    return true;
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index d0d59ee26f720101df0922702cace1ec699ad97d..a085ab2004229d0362bb94bb8a5236db6f29e468 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdlib>
+ #include <array>
+ #include <bit>
+@@ -560,10 +561,28 @@ private:
+ 
+     void SynchronizeBufferWrites(Buffer& buffer);
+ 
+-    [[nodiscard]] OverlapResult ResolveOverlaps(DAddr device_addr, u32 wanted_size);
++    [[nodiscard]] OverlapResult ResolveOverlaps(DAddr device_addr, u32 wanted_size,
++                                                bool stream_leap = true);
+ 
+     void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
+ 
++    /// Makes the buffer for an aligned range and what overlaps it. An empty id: memory refused it,
++    /// and nothing has changed.
++    [[nodiscard]] BufferId JoinBuffer(DAddr device_addr, u32 wanted_size, bool sparse_compatible,
++                                      bool stream_leap);
++
++    /// What is left when JoinBuffer is refused: see buffer_cut. A template so that only a runtime
++    /// that has TryCreateBuffer needs what this calls: `template class` makes all other members.
++    template <typename Unused = void>
++    [[nodiscard]] BufferId CreateRefusedBuffer(DAddr device_addr, u32 wanted_size,
++                                               bool sparse_compatible);
++
++    /// Sets the binding's buffer. When that buffer was cut (buffer_cut) the binding shrinks to what
++    /// the buffer holds, or to nothing. `whole`: for what the GPU reads without a limit, as the
++    /// command processor does: all of it or nothing.
++    template <typename BindingType>
++    void FindBinding(BindingType& binding, bool whole = false);
++
+     [[nodiscard]] BufferId CreateBuffer(DAddr device_addr, u32 wanted_size,
+                                         bool sparse_compatible);
+ 
+@@ -639,7 +658,7 @@ private:
+     void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
+                                const u8* data, u64 size);
+ 
+-    void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
++    bool InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
+                                     std::span<const u8> inlined_buffer);
+ 
+     Tegra::MaxwellDeviceMemoryManager& device_memory;
+@@ -795,6 +814,20 @@ private:
+     u64 frame_tick = 0;
+     u64 total_used_memory = 0;
+     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
++
++    /// FindBuffer gave what memory left, not a buffer in which the whole range fits: one that holds
++    /// the start of the range, or the null buffer. Whoever calls FindBuffer checks the range when
++    /// this is set, and clears it.
++    bool buffer_cut = false;
++    bool bindings_cut = false; ///< Vertex and index bindings may hold less than the guest set
++
++    /// After a refusal the allocator is not asked for this size or more until the time below: a
++    /// refusal walks the caches and writes to stderr, and the next draw is microseconds away.
++    u64 buffer_refused_size = ~u64{0};
++    u64 buffer_hole_refused = ~u64{0}; ///< The same for the holes, in the same pause
++    std::chrono::steady_clock::time_point buffer_refused_until{};
++    u64 buffers_cut = 0;     ///< Since the last report: buffers that held only the start
++    u64 buffers_dropped = 0; ///< Since the last report: ranges that got no buffer
+     u64 minimum_memory = 0;
+     u64 critical_memory = 0;
+     BufferId inline_buffer_id;
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index ff9331b8597309cdee049bd5d7321309a7c75c52..78a5653e65797c49592f432323c77c71fb2dface 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -8,7 +8,9 @@
+ #include <array>
+ #include <cstring>
+ #include <cstdlib>
++#include <new>
+ #include <span>
++#include <utility>
+ #include <vector>
+ 
+ #include "video_core/buffer_cache/buffer_cache_base.h"
+@@ -59,7 +61,7 @@ size_t BytesPerIndex(VkIndexType index_type) {
+ }
+ 
+ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator, u64 size,
+-                        VkDeviceSize sparse_alignment) {
++                        VkDeviceSize sparse_alignment, bool in_holes = false) {
+     VkBufferUsageFlags flags =
+         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+@@ -85,6 +87,9 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
+         .queueFamilyIndexCount = 0,
+         .pQueueFamilyIndices = nullptr,
+     };
++    if (in_holes) {
++        return memory_allocator.CreateBufferInHoles(buffer_ci, MemoryUsage::DeviceLocal);
++    }
+     if (sparse_alignment > 1) {
+         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
+     }
+@@ -121,6 +126,14 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
+     }
+ }
+ 
++Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_, vk::Buffer&& made)
++    : VideoCommon::BufferBase(cpu_addr_, size_bytes_), device{&runtime.device},
++      scheduler{&runtime.scheduler}, buffer{std::move(made)}, tracker{SizeBytes()} {
++    if (device->IsBufferDeviceAddressSupported()) {
++        device_address = device->GetLogical().GetBufferDeviceAddress(*buffer);
++    }
++}
++
+ void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
+     tracker.Track(offset, size);
+     last_usage_tick = scheduler->CurrentTick();
+@@ -454,6 +467,36 @@ u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
+     return static_cast<u32>(device.GetStorageBufferAlignment());
+ }
+ 
++std::optional<Buffer> BufferCacheRuntime::TryCreateBuffer(DAddr cpu_addr, u64 size,
++                                                          bool sparse_compatible) {
++    try {
++        return std::optional<Buffer>{std::in_place, *this, cpu_addr, size, sparse_compatible};
++    } catch (const vk::Exception& refused) {
++        if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++            throw;
++        }
++    } catch (const std::bad_alloc&) {
++        // The usage tracker of a large buffer: the same answer.
++    }
++    return std::nullopt;
++}
++
++std::optional<Buffer> BufferCacheRuntime::TryCreateBufferInHoles(DAddr cpu_addr, u64 size) {
++    vk::Buffer made = CreateBuffer(device, memory_allocator, size, 0, true);
++    if (!made) {
++        return std::nullopt;
++    }
++    try {
++        return std::optional<Buffer>{std::in_place, *this, cpu_addr, size, std::move(made)};
++    } catch (const std::bad_alloc&) {
++        return std::nullopt;
++    }
++}
++
++void BufferCacheRuntime::ThrowRefused() const {
++    throw vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
++}
++
+ void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept {
+     for (auto it = slot_buffers.begin(); it != slot_buffers.end(); it++) {
+         if (scheduler.IsFree(it->LastUsageTick())) {
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+index 0e1b86f6e77e11dbf7a4ceb3b7bba7c6eae67c16..cc26eda963d84ff968e0f01e7f65bd1e9621b043 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -37,6 +37,8 @@ public:
+     explicit Buffer(BufferCacheRuntime&, VideoCommon::NullBufferParams null_params);
+     explicit Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_,
+                     bool sparse_compatible_);
++    explicit Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_,
++                    vk::Buffer&& made);
+ 
+     [[nodiscard]] VkBufferView View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format);
+ 
+@@ -111,6 +113,17 @@ public:
+ 
+     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
+ 
++    /// A buffer for the cache, or nothing when memory refuses it. Made here, not in the slot:
++    /// nothing of the cache has changed when this comes back empty.
++    [[nodiscard]] std::optional<Buffer> TryCreateBuffer(DAddr cpu_addr, u64 size,
++                                                        bool sparse_compatible);
++
++    /// The same in the holes of the allocator's blocks only (CreateBufferInHoles).
++    [[nodiscard]] std::optional<Buffer> TryCreateBufferInHoles(DAddr cpu_addr, u64 size);
++
++    /// What MemoryAllocator::CreateBuffer throws, for a refusal that is to end the session.
++    [[noreturn]] void ThrowRefused() const;
++
+     /// Returns the mask of bindings whose repacked state changed.
+     u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index 78723592ead7c799c919e518058a899bb35f240f..d60866fafc7c3748562da5e997d4d6a22df9a81c 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -1421,6 +1421,11 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
+         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
+         const auto [buffer, offset] =
+             impl->buffer_cache.ObtainCPUBuffer(object.address, 8, sync_info, post_op);
++        if (buffer->SizeBytes() == 0) {
++            // Refused: the draws go unconditionally, as they do on the drivers without this.
++            EndHostConditionalRendering();
++            return;
++        }
+         impl->hcr_buffer = buffer->Handle();
+         impl->hcr_offset = offset;
+     }
+@@ -1455,6 +1460,10 @@ void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, boo
+         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
+         const auto [buffer, offset] =
+             impl->buffer_cache.ObtainCPUBuffer(address, resolve_size, sync_info, post_op);
++        if (buffer->SizeBytes() == 0) {
++            EndHostConditionalRendering();
++            return;
++        }
+         to_resolve = buffer->Handle();
+         to_resolve_offset = static_cast<u32>(offset);
+     }
+@@ -1662,7 +1671,9 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
+             const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
+             const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
+                 pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+-            impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
++            // Refused: no copy for this range. The final values still reach the guest from the CPU.
++            impl->buffers_to_upload_to.emplace_back(
++                buffer->SizeBytes() != 0 ? buffer->Handle() : VkBuffer{}, offset);
+         }
+     });
+ 
+@@ -1704,7 +1715,9 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
+     impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
+         size_t size = dst_buffers.size();
+         for (size_t i = 0; i < size; i++) {
+-            cmdbuf.CopyBuffer(src_buffer, dst_buffers[i].first, vk_copies[i]);
++            if (dst_buffers[i].first != VkBuffer{}) {
++                cmdbuf.CopyBuffer(src_buffer, dst_buffers[i].first, vk_copies[i]);
++            }
+         }
+     });
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index b11217648849aec03169328b519ae63d54041bac..06c8bfde4e252b04dd013d83ea041b88fa109640 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -838,6 +838,10 @@ void RasterizerVulkan::DrawIndirect() {
+         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
+         const auto& buffer = indirect_buffer.first;
+         const auto& offset = indirect_buffer.second;
++        if (buffer->SizeBytes() == 0) {
++            // Memory refused the arguments' buffer: with no arguments there is no draw.
++            return;
++        }
+         if (params.is_byte_count) {
+             scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
+                               stride = params.stride](vk::CommandBuffer cmdbuf) {
+@@ -853,6 +857,9 @@ void RasterizerVulkan::DrawIndirect() {
+             const auto count = buffer_cache.GetDrawIndirectCount();
+             const auto& draw_buffer = count.first;
+             const auto& offset_base = count.second;
++            if (draw_buffer->SizeBytes() == 0) {
++                return;
++            }
+             scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
+                               buffer_obj = buffer->Handle(), offset_base, offset,
+                               params](vk::CommandBuffer cmdbuf) {
+@@ -1169,6 +1176,11 @@ void RasterizerVulkan::DispatchCompute() {
+         const auto post_op = VideoCommon::ObtainBufferOperation::DiscardWrite;
+         const auto [buffer, offset] =
+             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
++        if (buffer->SizeBytes() == 0) {
++            // Memory refused the arguments' buffer: with no arguments there is no dispatch.
++            SubmitNx2ListCopies();
++            return;
++        }
+         scheduler.RequestOutsideRenderPassOperationContext();
+         scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
+                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+@@ -1757,6 +1769,9 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
+                                          : VideoCommon::ObtainBufferOperation::MarkAsWritten;
+     const auto [buffer, offset] =
+         buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
++    if (buffer->SizeBytes() == 0) {
++        return false; // Refused: the copy goes through guest memory.
++    }
+ 
+     const auto [image, copy] = texture_cache.DmaBufferImageCopy(
+         copy_info, buffer_operand, image_operand, image_id, IS_IMAGE_UPLOAD);
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index a0a39abe392878492f00f4bc9edc88465908afc5..fbd62085026a33174c957bcb2625827dce63b5cf 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -501,6 +501,40 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
+                       location, device.GetDispatchLoader());
+ }
+ 
++vk::Buffer MemoryAllocator::CreateBufferInHoles(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
++    const VmaAllocationCreateInfo alloc_ci = {
++        .flags = VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT | MemoryUsageVmaFlags(usage),
++        .usage = MemoryUsageVma(usage),
++        .requiredFlags = 0,
++        .preferredFlags = MemoryUsagePreferredVmaFlags(usage),
++        .memoryTypeBits = valid_memory_types,
++        .pool = VK_NULL_HANDLE,
++        .pUserData = nullptr,
++        .priority = 0.f,
++    };
++
++    VkBuffer handle{};
++    VmaAllocationInfo alloc_info{};
++    VmaAllocation allocation{};
++    if (vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info) != VK_SUCCESS) {
++        return vk::Buffer{};
++    }
++    VkMemoryPropertyFlags property_flags{};
++    vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
++
++    u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
++    const std::span<u8> mapped_data = data ? std::span<u8>{data, ci.size} : std::span<u8>{};
++    const bool is_coherent = (property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
++
++    const vk::MemoryLocation location{
++        .memory = alloc_info.deviceMemory,
++        .offset = alloc_info.offset,
++        .memory_type = alloc_info.memoryType,
++    };
++    return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
++                      location, device.GetDispatchLoader());
++}
++
+ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage)
+ {
+     const auto vma_usage = MemoryUsageVma(usage);
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.h b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+index 8b9e72b3e335397f5836a932c941d5dcdcf48bd7..d1df00864d882f327404b866324d87a964699798 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.h
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+@@ -135,6 +135,10 @@ namespace Vulkan {
+ 
+         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
+ 
++        /// A buffer in the space of the blocks held already: no new block, no budget, no report.
++        /// Empty when no hole fits it. For a caller with something to fall back on.
++        vk::Buffer CreateBufferInHoles(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
++
+         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                 VkDeviceSize min_alignment) const;
+ 

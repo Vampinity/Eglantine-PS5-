@@ -1,0 +1,143 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0083-upload-cpu-writes-onto-gpu-written-pages.patch
+
+Source: 0083-upload-cpu-writes-onto-gpu-written-pages.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index b5e8f4501c528a837d4fc8b2c36e63a102b7a9ca..592b91a559fb83b913423537e1b20f25ca6e2bf2 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -249,6 +249,8 @@ public:
+ 
+     void CachedWriteMemory(DAddr device_addr, u64 size);
+ 
++    void ClearDownload(DAddr base_addr, u64 size);
++
+     bool OnCPUWrite(DAddr device_addr, u64 size);
+ 
+     void DownloadMemory(DAddr device_addr, u64 size);
+@@ -613,7 +615,6 @@ private:
+     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
+     void RefreshRepackedVertexBuffers();
+ 
+-    void ClearDownload(DAddr base_addr, u64 size);
+ 
+     /// CPU writes collected but not yet applied (SetPendingCpuWrites).
+     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index fa8a7ab76eb1efc1dc9631b367105ab4486d8376..3e6378b44565a68a1523e7eb5e29d1938cf95d5b 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -490,17 +490,21 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
+     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
+         if (!unsafe) {
+-            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
++            rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
+         }
+         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
+             std::memcpy(physical, src_buffer, copy_amount);
+         }
++        // After the copy: the buffer cache may upload the written bytes from guest memory.
++        if (!unsafe) {
++            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
++        }
+         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
+     };
+     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+         if (!unsafe) {
+-            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
++            rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
+         }
+         u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
+                                                              : nullptr;
+@@ -509,6 +513,9 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
+         } else {
+             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
+         }
++        if (!unsafe) {
++            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
++        }
+         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
+     };
+     auto write_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 9f0a60feeb5d5c80da1a086c3d55746f31548418..fe57642e10886b86aeefd1f81d2cf3029ceca48c 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -122,6 +122,10 @@ public:
+     virtual void InvalidateRegion(DAddr addr, u64 size,
+                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+ 
++    /// Called before guest memory in the region is overwritten, ahead of InvalidateRegion
++    virtual void PrepareRegionWrite([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size,
++                                    [[maybe_unused]] VideoCommon::CacheType which) {}
++
+     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+         if (!Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+             for (const auto& [cpu_addr, size] : sequences) {
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+index 387e4500cb0c5e6ed21809e99b14ca128a21430a..7dd336c675af129e56a0c06a17e2a011b48be3c6 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
++++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+@@ -533,6 +533,14 @@ VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64
+     return new_area;
+ }
+ 
++void RasterizerOpenGL::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) {
++    if (addr == 0 || size == 0 || False(which & VideoCommon::CacheType::BufferCache)) {
++        return;
++    }
++    std::scoped_lock lock{buffer_cache.mutex};
++    buffer_cache.ClearDownload(addr, size);
++}
++
+ void RasterizerOpenGL::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+     if (addr == 0 || size == 0) {
+         return;
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.h b/src/video_core/renderer_opengl/gl_rasterizer.h
+index 6eae51ff7d5dfe3f8e7ecebf0a924d8d4160f70a..70b161f5586e17341c69e5167595f5661266e05a 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.h
++++ b/src/video_core/renderer_opengl/gl_rasterizer.h
+@@ -99,6 +99,7 @@ public:
+     VideoCore::RasterizerDownloadArea GetFlushArea(PAddr addr, u64 size) override;
+     void InvalidateRegion(DAddr addr, u64 size,
+                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
++    void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
+     void OnCacheInvalidation(PAddr addr, u64 size) override;
+     bool OnCPUWrite(PAddr addr, u64 size) override;
+     void InvalidateGPUCache() override;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 68ec465ff12cf97c151b5865d8344fb5d5e02d85..b11217648849aec03169328b519ae63d54041bac 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1322,6 +1322,14 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
+     return new_area;
+ }
+ 
++void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) {
++    if (addr == 0 || size == 0 || False(which & VideoCommon::CacheType::BufferCache)) {
++        return;
++    }
++    std::scoped_lock lock{buffer_cache.mutex};
++    buffer_cache.ClearDownload(addr, size);
++}
++
+ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+     if (addr == 0 || size == 0) {
+         return;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index bb3ad6796b43f02b334e090cf78b804494d3edb5..e252926be1632587c342e526a49d185cc1f448c6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -106,6 +106,7 @@ public:
+     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+     void InvalidateRegion(DAddr addr, u64 size,
+                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
++    void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
+     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+     void OnCacheInvalidation(DAddr addr, u64 size) override;
+     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;

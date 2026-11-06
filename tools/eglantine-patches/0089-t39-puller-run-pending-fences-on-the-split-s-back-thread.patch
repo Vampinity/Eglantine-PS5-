@@ -1,0 +1,27 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0041-puller-run-pending-fences-on-the-split-s-back-thread.patch
+
+Source: 0041-puller-run-pending-fences-on-the-split-s-back-thread.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 36f418c75056b4f527728d80f40eee0bbf2541cb..8266c6bf65a3be645b416d9f7257bc21157f5d0a 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -68,6 +68,15 @@ void DrainBack() {
+     VideoCommon::GpuSplit::Get().Drain();
+ }
+ 
++// The pending fences reach the query cache and the scheduler, which belong to the back thread even
++// when it has drained: it can still be submitting deferred work before it sleeps, and the
++// scheduler's chunk is empty for a moment then. Run them there and wait for them, so the caller
++// sees what they released.
++void ReleaseFencesOnBack(VideoCore::RasterizerInterface* rasterizer) {
++    OnBack([rasterizer] { rasterizer->ReleaseFences(); });
++    DrainBack();
++}
++
+ } // Anonymous namespace
+ 
+ bool Puller::PendingAcquire::Matches(u32 current) const {

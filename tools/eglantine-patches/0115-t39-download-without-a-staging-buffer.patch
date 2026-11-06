@@ -1,0 +1,360 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0089-download-without-a-staging-buffer.patch
+
+Source: 0089-download-without-a-staging-buffer.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index d7d3b74f3f44ba15adece36c72d41b86ff63693e..edb9aafbae1011e2b6d6bf10f883a258eda8cf98 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -818,7 +818,22 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+         runtime.FreeDeferredStagingBuffer(buffer);
+     }
+     async_buffers_death_ring.clear();
+-    auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
++    std::optional<Async_Buffer> staged;
++    if constexpr (requires { runtime.TryDownloadStagingBuffer(size_t{}, true); }) {
++        staged = runtime.TryDownloadStagingBuffer(total_size_bytes, true);
++        if (!staged) {
++            // The bytes reach guest memory now instead of when the fence pops; nothing is skipped.
++            for (const auto& [copy, buffer_id] : downloads) {
++                DownloadInPieces(slot_buffers[buffer_id], copy);
++            }
++            FinishDownloadPieces();
++            async_buffers.emplace_back(std::optional<Async_Buffer>{});
++            return;
++        }
++    } else {
++        staged = runtime.DownloadStagingBuffer(total_size_bytes, true);
++    }
++    Async_Buffer& download_staging = *staged;
+     boost::container::small_vector<BufferCopy, 4> normalized_copies;
+     Common::RangeSet<DAddr> download_ranges;
+     runtime.PreCopyBarrier();
+@@ -853,6 +868,56 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+     async_buffers.emplace_back(download_staging);
+ }
+ 
++template <class P>
++void BufferCache<P>::DownloadInPieces(Buffer& buffer, const BufferCopy& copy) {
++    if constexpr (requires { runtime.ReservedDownloadBuffer(); }) {
++        const auto piece = runtime.ReservedDownloadBuffer();
++        const u64 piece_size = piece.mapped_span.size();
++        for (u64 done = 0; done < copy.size;) {
++            if (download_pieces_bytes >= piece_size) {
++                FinishDownloadPieces();
++            }
++            const u64 size = (std::min)(copy.size - done, piece_size - download_pieces_bytes);
++            const BufferCopy part{
++                .src_offset = copy.src_offset + done,
++                .dst_offset = piece.offset + download_pieces_bytes,
++                .size = size,
++            };
++            buffer.MarkUsage(part.src_offset, size);
++            runtime.CopyBuffer(piece.buffer, buffer, std::span{&part, 1}, true);
++            download_pieces.push_back({buffer.CpuAddr() + part.src_offset, download_pieces_bytes,
++                                       size});
++            download_pieces_bytes += Common::AlignUp(size, 64);
++            done += size;
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::FinishDownloadPieces() {
++    if constexpr (requires { runtime.ReservedDownloadBuffer(); }) {
++        if (download_pieces.empty()) {
++            return;
++        }
++        static u64 times = 0;
++        if (++times; (times & (times - 1)) == 0) { // the 1st, 2nd, 4th, 8th ... time
++            LOG_WARNING(HW_GPU, "No staging buffer for a download, {} times so far: waited for the "
++                                "GPU and copied through the small buffer",
++                        times);
++        }
++        runtime.Finish();
++        const u8* const mapped = runtime.ReservedDownloadBuffer().mapped_span.data();
++        for (const DownloadPiece& piece : download_pieces) {
++            device_memory.WriteBlockUnsafe(piece.device_addr, mapped + piece.offset, piece.size);
++            // Older downloads of these bytes must not land over them when their fences pop.
++            ClearDownload(piece.device_addr, piece.size);
++            gpu_modified_ranges.Subtract(piece.device_addr, piece.size);
++        }
++        download_pieces.clear();
++        download_pieces_bytes = 0;
++    }
++}
++
+ template <class P>
+ void BufferCache<P>::CommitAsyncFlushes() {
+     CommitAsyncFlushesHigh();
+@@ -2516,7 +2581,20 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
+     if (total_size_bytes == 0) {
+         return;
+     }
+-    auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
++    std::optional<Async_Buffer> staged;
++    if constexpr (requires { runtime.TryDownloadStagingBuffer(size_t{}, false); }) {
++        staged = runtime.TryDownloadStagingBuffer(total_size_bytes, false);
++        if (!staged) {
++            for (const Download& download : downloads) {
++                DownloadInPieces(slot_buffers[download.buffer_id], download.copy);
++            }
++            FinishDownloadPieces();
++            return;
++        }
++    } else {
++        staged = runtime.DownloadStagingBuffer(total_size_bytes);
++    }
++    Async_Buffer& download_staging = *staged;
+     for (Download& download : downloads) {
+         download.copy.dst_offset += download_staging.offset;
+         Buffer& buffer = slot_buffers[download.buffer_id];
+@@ -2577,7 +2655,20 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+         }
+     }
+     if constexpr (USE_MEMORY_MAPS) {
+-        auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
++        std::optional<Async_Buffer> staged;
++        if constexpr (requires { runtime.TryDownloadStagingBuffer(size_t{}, false); }) {
++            staged = runtime.TryDownloadStagingBuffer(total_size_bytes, false);
++            if (!staged) {
++                for (const BufferCopy& copy : copies) {
++                    DownloadInPieces(buffer, copy);
++                }
++                FinishDownloadPieces();
++                return;
++            }
++        } else {
++            staged = runtime.DownloadStagingBuffer(total_size_bytes);
++        }
++        Async_Buffer& download_staging = *staged;
+         const u8* const mapped_memory = download_staging.mapped_span.data();
+         const std::span<BufferCopy> copies_span(copies.data(), copies.data() + copies.size());
+         for (BufferCopy& copy : copies) {
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 592b91a559fb83b913423537e1b20f25ca6e2bf2..2a5cda9525ebb34fcf61438f9d07578b18014497 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -588,6 +588,12 @@ private:
+     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
+     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
+ 
++    /// A copy of a download that found no staging buffer goes through the pool's small buffer of
++    /// its own. FinishDownloadPieces waits for the GPU once for all that buffer holds, then guest
++    /// memory has the bytes, as it does after a fence.
++    void DownloadInPieces(Buffer& buffer, const BufferCopy& copy);
++    void FinishDownloadPieces();
++
+     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
+ 
+     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+@@ -755,6 +761,14 @@ private:
+ 
+     std::deque<Async_Buffer> async_buffers_death_ring;
+ 
++    struct DownloadPiece {
++        DAddr device_addr;
++        u64 offset; ///< In the small buffer.
++        u64 size;
++    };
++    std::vector<DownloadPiece> download_pieces;
++    u64 download_pieces_bytes = 0;
++
+     size_t immediate_buffer_capacity = 0;
+     Common::ScratchBuffer<u8> immediate_buffer_alloc;
+     /// Guest memory large uploads came from since the last cold hint (device address, size).
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index 4963ae3764036b880077dde8584abcec1bc33e0f..08fbf7d356c129c7e851bdb9c70774f9a3f4e811 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -408,6 +408,15 @@ StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool def
+     return staging_pool.Request(size, MemoryUsage::Download, deferred);
+ }
+ 
++std::optional<StagingBufferRef> BufferCacheRuntime::TryDownloadStagingBuffer(size_t size,
++                                                                             bool deferred) {
++    return staging_pool.TryRequest(size, MemoryUsage::Download, deferred);
++}
++
++StagingBufferRef BufferCacheRuntime::ReservedDownloadBuffer() noexcept {
++    return staging_pool.ReservedDownload();
++}
++
+ VkFormat BufferCacheRuntime::TexelBufferFormat(VideoCore::Surface::PixelFormat format) const {
+     return MaxwellToVK::SurfaceFormat(device, FormatType::Buffer, false, format).format;
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+index 68a0c037f5c5db15e179ffe36140e78310a1d1af..6567a63d56e385d43ebaac0bc006dcecfe55d1ad 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <limits>
++#include <optional>
+ 
+ #include <boost/container/small_vector.hpp>
+ 
+@@ -142,6 +143,11 @@ public:
+ 
+     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
+ 
++    [[nodiscard]] std::optional<StagingBufferRef> TryDownloadStagingBuffer(size_t size,
++                                                                           bool deferred = false);
++
++    [[nodiscard]] StagingBufferRef ReservedDownloadBuffer() noexcept;
++
+     bool CanReorderUpload(const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies);
+ 
+     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 7c86ae952b0690e8bd76e5d11b58e4e1f92e9737..1654cfabbb81ad110ca0034d4e76adc18b6bcd11 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -110,6 +110,10 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
+     }
+     stream_pointer = stream_buffer.Mapped();
+     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
++    VkBufferCreateInfo reserved_ci = stream_ci;
++    reserved_ci.size = 4_MiB;
++    reserved_ci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++    reserved_download = memory_allocator.CreateBuffer(reserved_ci, MemoryUsage::Download);
+ }
+ 
+ StagingBufferPool::~StagingBufferPool() = default;
+@@ -121,6 +125,41 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
+     return GetStagingBuffer(size, usage, deferred);
+ }
+ 
++std::optional<StagingBufferRef> StagingBufferPool::TryRequest(size_t size, MemoryUsage usage,
++                                                              bool deferred) {
++    // A refusal walks the caches, trims the heap and writes to stderr, and the next fence comes
++    // within milliseconds: for 250 ms only what already exists is handed out.
++    constexpr auto RefusalPause = std::chrono::milliseconds(250);
++    const auto now = std::chrono::steady_clock::now();
++    no_new_buffers = now < refused_until;
++    try {
++        const StagingBufferRef ref = Request(size, usage, deferred);
++        no_new_buffers = false;
++        return ref;
++    } catch (const vk::Exception& refused) {
++        const bool paused = std::exchange(no_new_buffers, false);
++        if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++            throw;
++        }
++        if (!paused) {
++            refused_until = now + RefusalPause;
++        }
++        return std::nullopt;
++    }
++}
++
++StagingBufferRef StagingBufferPool::ReservedDownload() noexcept {
++    return StagingBufferRef{
++        .buffer = *reserved_download,
++        .device_address = {},
++        .offset = 0,
++        .mapped_span = reserved_download.Mapped(),
++        .usage = MemoryUsage::Download,
++        .log2_level = {},
++        .index = {},
++    };
++}
++
+ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref, bool completed) {
+     auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
+     const auto is_this_one = [&ref](const StagingBuffer& entry) {
+@@ -194,6 +233,9 @@ StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage us
+     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
+         return *ref;
+     }
++    if (no_new_buffers) {
++        throw vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
++    }
+     return CreateStagingBuffer(size, usage, deferred);
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 6bf8edbb2d27a7c16ada4afd4d643f8d66b91fec..cea3ecde8a61abdcecce8a0241b71d789a6ce52c 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -6,7 +6,9 @@
+ 
+ #pragma once
+ 
++#include <chrono>
+ #include <climits>
++#include <optional>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -38,6 +40,13 @@ public:
+     ~StagingBufferPool();
+ 
+     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
++    /// As Request, with nothing instead of the exception when memory is refused. For a moment
++    /// after a refusal it hands out only what exists: a stream region or a kept buffer.
++    std::optional<StagingBufferRef> TryRequest(size_t size, MemoryUsage usage,
++                                               bool deferred = false);
++    /// A small download buffer made at the start and kept, for when no other can be had. One user
++    /// at a time: the GPU thread, which waits for its copies before it uses the buffer again.
++    [[nodiscard]] StagingBufferRef ReservedDownload() noexcept;
+     /// completed: the GPU is done with it (its fence passed), so it can be handed out right away.
+     void FreeDeferred(StagingBufferRef& ref, bool completed = false);
+ 
+@@ -109,6 +118,7 @@ private:
+     MemoryAllocator& memory_allocator;
+     Scheduler& scheduler;
+ 
++    vk::Buffer reserved_download;
+     vk::Buffer stream_buffer;
+     VkDeviceAddress stream_buffer_address{};
+     std::span<u8> stream_pointer;
+@@ -124,6 +134,9 @@ private:
+     StagingBuffersCache upload_cache;
+     StagingBuffersCache download_cache;
+ 
++    bool no_new_buffers = false; ///< Set by TryRequest during the pause after a refusal.
++    std::chrono::steady_clock::time_point refused_until{};
++
+     size_t current_delete_level = 0;
+     u64 buffer_index = 0;
+     u64 unique_ids{};
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 0fbc6400c3c21be7436081f2c73fb5244ed0a2f9..9e86f6930d9b988d708b3ec56300dafe8f0904f3 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1281,6 +1281,15 @@ StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool de
+     return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
+ }
+ 
++std::optional<StagingBufferRef> TextureCacheRuntime::TryUploadStagingBuffer(size_t size) {
++    return staging_buffer_pool.TryRequest(size, MemoryUsage::Upload);
++}
++
++std::optional<StagingBufferRef> TextureCacheRuntime::TryDownloadStagingBuffer(size_t size,
++                                                                              bool deferred) {
++    return staging_buffer_pool.TryRequest(size, MemoryUsage::Download, deferred);
++}
++
+ void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
+     staging_buffer_pool.FreeDeferred(ref);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index df3d3d79eb01734038fc551d4cd536a7e7c0a7df..4382f34d77bc0f6898a2c541bb1724f3daa4de96 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -65,6 +65,10 @@ public:
+ 
+     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
+ 
++    std::optional<StagingBufferRef> TryUploadStagingBuffer(size_t size);
++
++    std::optional<StagingBufferRef> TryDownloadStagingBuffer(size_t size, bool deferred = false);
++
+     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
+ 
+     void TickFrame();

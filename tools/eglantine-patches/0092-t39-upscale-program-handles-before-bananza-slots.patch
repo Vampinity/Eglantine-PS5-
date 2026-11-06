@@ -1,0 +1,35 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0044-upscale-program-handles-before-bananza-slots.patch
+
+Source: 0044-upscale-program-handles-before-bananza-slots.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index a2bbff27bb0a6935ec648fd40eabcf8cc22957f9..5f18091fdf73dc9149316dd52f69e2e5fa236107 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -968,10 +968,6 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         output = image(0x348);
+         fortunes_weave = upscale_pair(input, output);
+     }
+-    if (!upscale_pair(input, output)) {
+-        input = image(0x60);
+-        output = image(0x70);
+-    }
+     if (!upscale_pair(input, output)) {
+         // The images the program itself uses: textures it reads and the surface it stores to
+         // through cbuf0 handles (Ocarina of Time's gameplay network reads +0xc0, writes +0xd0).
+@@ -995,6 +991,12 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             if (input) break;
+         }
+     }
++    // Donkey Kong Bananza's slots, after the program's own handles: other titles keep unrelated
++    // images there.
++    if (!upscale_pair(input, output, false)) {
++        input = image(0x60);
++        output = image(0x70);
++    }
+     if (!upscale_pair(input, output, false)) {
+         input.reset();
+         output.reset();

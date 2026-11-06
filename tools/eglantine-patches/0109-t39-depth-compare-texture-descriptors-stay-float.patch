@@ -1,0 +1,23 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0081-depth-compare-texture-descriptors-stay-float.patch
+
+Source: 0081-depth-compare-texture-descriptors-stay-float.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+index ec10da965ce78ca18a97618e42f3e5c38e3e56c1..5aaafb71e703f8feccd40ad01cfcdf7fa367a245 100644
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -1330,7 +1330,10 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
+                 });
+             } else {
+                 count = std::min(count, sampled_dynamic_cap);
+-                const bool is_integer{is_texture_pixel_format_integer(cbuf)};
++                // A depth-compare image is float in SPIR-V (OpImageSampleDref* returns a float
++                // and needs a float sampled type). An integer format bound to one is a stale or
++                // out-of-range TIC entry, and the integer type made RADV's spirv_to_nir fail.
++                const bool is_integer{!flags.is_depth && is_texture_pixel_format_integer(cbuf)};
+                 index = descriptors.Add(TextureDescriptor{
+                     .type = flags.type,
+                     .is_depth = flags.is_depth != 0,

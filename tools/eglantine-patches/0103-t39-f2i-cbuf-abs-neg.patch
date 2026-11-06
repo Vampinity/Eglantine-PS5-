@@ -1,0 +1,59 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0057-f2i-cbuf-abs-neg.patch
+
+Source: 0057-f2i-cbuf-abs-neg.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index a2f2f381795abaa731dcab03a563f48551cb9dca..d79873c9193f7f8267df5e208b81b3b35290ac59 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -1972,10 +1972,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                 return fail(index, "native float-to-integer conversion mode");
+             }
+             const bool is_signed = insn.Bits(72, 1);
+-            // U16 constant sources use the ordinary float absolute/negate bits.
+-            // Apply them before NaN handling, saturation and rounding.
+-            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, small && insn.Bits(62, 1),
+-                                                       small && insn.Bits(63, 1))
++            // Constant-buffer sources use the ordinary float absolute/negate bits (nvdisasm prints
++            // |c[..]| for bit 62 and -c[..] for bit 63 in every width, not only U16); apply them
++            // before NaN handling, saturation and rounding. Ported from zortos293/Lichii 1ad14bebb8.
++            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, insn.Bits(62, 1), insn.Bits(63, 1))
+                        : opcode == 0xd05 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
+             if (half) {
+                 extract_half({source, insn.Bits(60, 1) ? 3U : 2U, false, false}, 0, 252);
+diff --git a/src/tests/video_core/ampere_f2i.cpp b/src/tests/video_core/ampere_f2i.cpp
+index 0b7e26bb82a781dc4c5b784332809152479d8715..0e82fd4ed1b0e686f8227a3f71d6eced830d5130 100644
+--- a/src/tests/video_core/ampere_f2i.cpp
++++ b/src/tests/video_core/ampere_f2i.cpp
+@@ -58,3 +58,28 @@ TEST_CASE("Ampere F2I signed byte clamps after conversion", "[video_core][ampere
+     REQUIRE(((i2i >> 20) & 0xff) == 9);
+     REQUIRE(((i2i >> 50) & 1) == 1);
+ }
++
++TEST_CASE("Ampere F2I applies abs and neg to constant-buffer sources", "[video_core][ampere]") {
++    using Shader::Ampere::Instruction;
++    using Shader::Ampere::LowerToMaxwell;
++    // nvdisasm: bit 62 prints |c[..]| and bit 63 -c[..]; U16 and truncating 32-bit forms.
++    for (const u32 mode : {0x00212800U, 0x0021f100U}) {
++        for (const u32 modifiers : {0U, 1U, 2U, 3U}) {
++            const std::array<Instruction, 2> code{{
++                {{0x00157b05, 0x00400400 | (modifiers << 30), mode, 0x0001e400}},
++                {{0x0000794d, 0, 0x03800000, 0}},
++            }};
++            const auto lowered = LowerToMaxwell(code);
++            INFO(lowered.error);
++            REQUIRE(lowered);
++            const auto& out = lowered.instructions;
++            const auto has = [&](u64 instruction) {
++                return std::find(out.begin(), out.end(), instruction) != out.end();
++            };
++            CHECK(has(0x0400000000070000ULL | 252 | (252ULL << 8) | (0x7fffffffULL << 20)) ==
++                  ((modifiers & 1) != 0));
++            CHECK(has(0x0400000000070000ULL | 252 | (252ULL << 8) | (0x80000000ULL << 20) |
++                      (2ULL << 53)) == ((modifiers & 2) != 0));
++        }
++    }
++}

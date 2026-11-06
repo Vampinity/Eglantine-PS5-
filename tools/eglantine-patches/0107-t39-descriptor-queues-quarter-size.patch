@@ -1,0 +1,25 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0061-descriptor-queues-quarter-size.patch
+
+Source: 0061-descriptor-queues-quarter-size.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/renderer_vulkan/vk_update_descriptor.h b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+index 4d393376b45463ec40f6f78bc092482255e5bb20..1d929cef29111cec2cb09c64c4a4eed0de4e9e8c 100644
+--- a/src/video_core/renderer_vulkan/vk_update_descriptor.h
++++ b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+@@ -41,8 +41,11 @@ class UpdateDescriptorQueue final {
+     static constexpr size_t FRAMES_IN_FLIGHT = 8;
+ 
+ public:
+-    static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x80000;
+-    static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x20000;
++    // A quarter of upstream's sizes: at 24 bytes an entry and 8 frames they held 120 MiB of the
++    // PS5's shared 12 GiB (96 + 24 MiB), and a frame that needs more waits for the worker and
++    // starts its payload again (Acquire). Title 4 (Donkey Kong Bananza) draws ~4,400 times a frame.
++    static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x20000;
++    static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x8000;
+ 
+     explicit UpdateDescriptorQueue(const Device& device_, size_t frame_payload_size_,
+                                    bool supports_descriptor_buffer_ = false);

@@ -1,0 +1,32 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0130-query-sync-ranges-stay-inside-a-cache-page.patch
+
+Source: 0130-query-sync-ranges-stay-inside-a-cache-page.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index c2d9bc9d61267ebae3e0cae5c4e2d82e3ec2730b..78723592ead7c799c919e518058a899bb35f240f 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -1613,6 +1613,10 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
+     }
+     impl->redirect_cache.clear();
+     impl->little_cache.clear();
++    // Neighbouring pages are joined into one range only inside a 64 KiB page of the buffer cache: a
++    // range over two of them, one in a buffer and the other not, had the cache make a new buffer
++    // for all of that buffer. A range inside one is in a buffer already or needs 64 KiB.
++    static constexpr u32 JOIN_LIMIT_BITS = 16;
+     size_t total_size = 0;
+     for (auto& sync_val : values) {
+         total_size += sync_val.size;
+@@ -1629,6 +1633,9 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
+                 set_found();
+                 break;
+             }
++            if (loc.first >> JOIN_LIMIT_BITS != base >> JOIN_LIMIT_BITS) {
++                continue;
++            }
+             if (loc.first == base_end) {
+                 loc.first = base;
+                 set_found();

@@ -1,0 +1,57 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0047-av1-decoder-threads.patch
+
+Source: 0047-av1-decoder-threads.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
+index 1af8307adc7130eed9b18aa72eacbb6546d09bef..3ced29f18a8d0b2356e8b263a2dcbde124396d48 100644
+--- a/src/video_core/host1x/ffmpeg.cpp
++++ b/src/video_core/host1x/ffmpeg.cpp
+@@ -4,7 +4,10 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <string_view>
+ #include <vector>
+ 
+@@ -288,6 +291,34 @@ DecoderContext::DecoderContext(const Decoder& decoder) : m_decoder{decoder} {
+     m_codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+     m_codec_context->flags2 |= AV_CODEC_FLAG2_FAST;
+ #endif
++    // AV1 (libdav1d: Switch 2 movies, 1080p60). dav1d runs its own frame and tile threads.
++    // With thread_count 0 it counts the CPUs the calling thread may run on, which is one when
++    // that thread is pinned, so it decoded single-threaded. A fixed count avoids that.
++    // EDEN_NX2_AV1_THREADS=<1-16> sets the count (default 4). EDEN_NX2_AV1_FRAME_DELAY=<1-8>
++    // limits frame threading (1 = none, as with a single thread). The default (0) lets dav1d
++    // choose, which is 2 for 4 threads.
++    if (const AVCodec* codec = m_decoder.GetCodec(); codec != nullptr && codec->id == AV_CODEC_ID_AV1) {
++        static const int av1_threads = [] {
++            const char* value = std::getenv("EDEN_NX2_AV1_THREADS");
++            const int count = value != nullptr ? std::atoi(value) : 0;
++            return count > 0 ? (std::min)(count, 16) : 4;
++        }();
++        static const int av1_frame_delay = [] {
++            const char* value = std::getenv("EDEN_NX2_AV1_FRAME_DELAY");
++            const int delay = value != nullptr ? std::atoi(value) : 0;
++            return (std::clamp)(delay, 0, 8);
++        }();
++        m_codec_context->thread_count = av1_threads;
++        if (av1_frame_delay > 0 && m_codec_context->priv_data != nullptr) {
++            av_opt_set_int(m_codec_context->priv_data, "max_frame_delay", av1_frame_delay, 0);
++        }
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            LOG_INFO(HW_GPU, "AV1 decoder {}: {} threads, frame delay {}", codec->name, av1_threads,
++                     av1_frame_delay > 0 ? std::to_string(av1_frame_delay) : std::string{"auto"});
++        }
++    }
+ }
+ 
+ DecoderContext::~DecoderContext() {

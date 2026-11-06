@@ -1,0 +1,41 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0025-copy-command-lists-after-queued-gpu-maps.patch
+
+Source: 0025-copy-command-lists-after-queued-gpu-maps.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp b/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+index 433fff4151b93b507159a5f43da275e16f705144..5dd830eb23bb4376f747658241cc6b4bfa250fd4 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
++++ b/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp
+@@ -470,8 +470,15 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
+                 // copies it after the map instead.
+                 const u64 bytes = static_cast<u64>(entry.size) * sizeof(u32);
+                 if (system.GPU().IsMapPending(entry.addr, bytes)) {
+-                    entries.submitted_offsets.push_back(static_cast<u32>(offset));
++                    static std::atomic<u32> deferred_reported{0};
++                    if (deferred_reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++                        LOG_INFO(Service_NVDRV,
++                                 "Command list at {:#x} ({} words) lies on a GPU map still queued: "
++                                 "copied after the map",
++                                 static_cast<u64>(entry.addr), static_cast<u32>(entry.size));
++                    }
+                     entries.deferred_entries.push_back(i);
++                    entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                     offset += entry.size;
+                     continue;
+                 }
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index e7c91f58c11d8adeeefef0f620263f3475465721..c7bdfc9bb8294ec76dcd5d43afcd28d4c12c000e 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -604,7 +604,7 @@ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+         }
+         const CommandListHeader& entry = list.command_lists[i];
+         const u32 offset = list.submitted_offsets[i];
+-        if (offset + entry.size > list.submitted_words.size()) {
++        if (size_t{offset} + entry.size > list.submitted_words.size()) {
+             continue;
+         }
+         memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,

@@ -1,0 +1,40 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0029-full-list-drain-switch.patch
+
+Source: 0029-full-list-drain-switch.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index c7bdfc9bb8294ec76dcd5d43afcd28d4c12c000e..9cfc3b64122a6485e020c4f6ae501de1df9479ff 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -89,6 +89,18 @@ void DmaPusher::DispatchCalls() {
+     system.GPU().OnCommandListEnd();
+ }
+ 
++// EDEN_NX2_LIST_DRAIN_FULL=1 (A/B): a command list on pages the GPU wrote waits for everything
++// queued for the split's back and is flushed and read from guest memory (FlushGpuWrittenCommands),
++// as the Zortos-based Mario Kart World builds did by default, instead of reading the buffer cache's
++// copy after waiting only for compute and copy work (ReadGpuWrittenCommands).
++static bool ListDrainFull() {
++    static const bool full = [] {
++        const char* value = std::getenv("EDEN_NX2_LIST_DRAIN_FULL");
++        return value != nullptr && value[0] == '1';
++    }();
++    return full;
++}
++
+ bool DmaPusher::Step() {
+     if (!ib_enable || dma_pushbuffer.empty()) {
+         return false;
+@@ -244,7 +256,8 @@ bool DmaPusher::Step() {
+             RecordParsedEntry(header, commands);
+             command_resume_offset +=
+                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+-        } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
++        } else if (!ListDrainFull() &&
++                   ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
+             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+             RecordParsedEntry(header, commands);
+             command_resume_offset +=

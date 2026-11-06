@@ -1,0 +1,316 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0100-oot-fog-exposure-workaround.patch
+
+Source: 0100-oot-fog-exposure-workaround.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/CMakeLists.txt b/src/shader_recompiler/CMakeLists.txt
+index f88571b6481da337a11cb6e725fde247321c2b23..e7cd4894159ce449b6108dc78f24f47b78994644 100644
+--- a/src/shader_recompiler/CMakeLists.txt
++++ b/src/shader_recompiler/CMakeLists.txt
+@@ -185,6 +185,7 @@ add_library(shader_recompiler STATIC
+     ir_opt/lower_fp16_to_fp32.cpp
+     ir_opt/lower_fp64_to_fp32.cpp
+     ir_opt/lower_int64_to_int32.cpp
++    ir_opt/oot_visual_workaround.h
+     ir_opt/passes.h
+     ir_opt/predicate_mask.h
+     ir_opt/position_pass.cpp
+diff --git a/src/shader_recompiler/ir_opt/oot_visual_workaround.h b/src/shader_recompiler/ir_opt/oot_visual_workaround.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cbcbab5aad32fe68a765c973747691e3320731e4
+--- /dev/null
++++ b/src/shader_recompiler/ir_opt/oot_visual_workaround.h
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <optional>
++#include <utility>
++#include <vector>
++
++#include "shader_recompiler/frontend/ir/ir_emitter.h"
++#include "shader_recompiler/frontend/ir/program.h"
++
++namespace Shader::Optimization {
++
++// TEMPORARY opt-in visual workaround for Ocarina of Time, not an emulator fix.
++inline std::optional<size_t> ApplyOotVisualWorkaround(IR::Program& program, u64 title_id,
++                                                     u64 shader_hash, bool enabled) {
++    if (!enabled || title_id != 0x0400486024DEC000ULL) {
++        return std::nullopt;
++    }
++    // A native program's hash ends in a version salt, and raising the salt from 2 to 3 flips the
++    // lowest bit of every hash: compare without it, or the edits would silently stop applying.
++    const auto is_shader = [shader_hash](u64 hash) { return (shader_hash | 1) == (hash | 1); };
++    const bool fog = is_shader(0x780c0536b89fc89eULL) && program.stage == Stage::Compute;
++    const bool exposure = is_shader(0xbded5ce917183214ULL) && program.stage == Stage::Fragment;
++    if (!fog && !exposure) {
++        return std::nullopt;
++    }
++    const auto has_opcode = [](const IR::Value& value, IR::Opcode opcode) {
++        return !value.IsImmediate() && value.InstRecursive()->GetOpcode() == opcode;
++    };
++    const auto negative_exp = [&](const IR::Value& value) {
++        if (has_opcode(value, IR::Opcode::FPNeg32)) {
++            return has_opcode(value.InstRecursive()->Arg(0), IR::Opcode::FPExp2);
++        }
++        if (!has_opcode(value, IR::Opcode::BitCastF32U32)) {
++            return false;
++        }
++        const auto bits = value.InstRecursive()->Arg(0);
++        if (!has_opcode(bits, IR::Opcode::BitwiseXor32)) {
++            return false;
++        }
++        const auto* flip = bits.InstRecursive();
++        const auto source = flip->Arg(0);
++        return flip->Arg(1).IsImmediate() && flip->Arg(1).U32() == 0x80000000U &&
++               has_opcode(source, IR::Opcode::BitCastU32F32) &&
++               has_opcode(source.InstRecursive()->Arg(0), IR::Opcode::FPExp2);
++    };
++    std::vector<std::pair<IR::Block*, IR::Inst*>> matches;
++    for (IR::Block* block : program.blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            if (fog && inst.GetOpcode() == IR::Opcode::FPAdd32 &&
++                ((negative_exp(inst.Arg(0)) && has_opcode(inst.Arg(1), IR::Opcode::FPExp2)) ||
++                 (negative_exp(inst.Arg(1)) && has_opcode(inst.Arg(0), IR::Opcode::FPExp2)))) {
++                matches.emplace_back(block, &inst);
++            }
++            if (exposure && inst.GetOpcode() == IR::Opcode::GetCbufF32 &&
++                inst.Arg(0).IsImmediate() && inst.Arg(0).U32() == 3 &&
++                inst.Arg(1).IsImmediate() && inst.Arg(1).U32() == 0x38) {
++                matches.emplace_back(block, &inst);
++            }
++        }
++    }
++    if ((fog && matches.size() != 1) || (exposure && (matches.empty() || matches.size() > 3))) {
++        return 0;
++    }
++    for (const auto& [block, inst] : matches) {
++        const auto insertion = block->Instructions().iterator_to(*inst);
++        const auto original = block->PrependNewInst(insertion, *inst);
++        IR::IREmitter ir{*block, insertion};
++        const auto scaled = ir.FPMul(IR::F32{IR::Value{&*original}},
++                                     ir.Imm32(fog ? 0.25f : 0.65f));
++        inst->ReplaceUsesWith(scaled);
++    }
++    return matches.size();
++}
++
++} // namespace Shader::Optimization
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 8e73d771083e01c9aa45adc5b86eaa0157ceaffa..141492ad448cdc9c8f0a4554e38a99da6c6052e4 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -26,6 +26,7 @@ add_executable(tests
+     core/nup_writer.cpp
+     core/priority_queue.cpp
+     core/internal_network/network.cpp
++    video_core/oot_visual_workaround.cpp
+     video_core/memory_tracker.cpp
+     video_core/h264_packet.cpp
+     video_core/vertex_repack.cpp
+diff --git a/src/tests/video_core/oot_visual_workaround.cpp b/src/tests/video_core/oot_visual_workaround.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f07906b5090ed8080c5b99468d5cdb03ccbd00c2
+--- /dev/null
++++ b/src/tests/video_core/oot_visual_workaround.cpp
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <cmath>
++
++#include <catch2/catch_approx.hpp>
++#include <catch2/catch_test_macros.hpp>
++
++#include "shader_recompiler/ir_opt/oot_visual_workaround.h"
++
++namespace {
++namespace IR = Shader::IR;
++constexpr u64 Title = 0x0400486024DEC000ULL;
++constexpr u64 Fog = 0x780c0536b89fc89eULL;
++constexpr u64 Final = 0xbded5ce917183214ULL;
++
++struct Fixture {
++    Shader::ObjectPool<IR::Inst> pool;
++    IR::Block block{pool};
++    IR::Program program;
++    IR::IREmitter ir{block};
++
++    Fixture() {
++        program.blocks.push_back(&block);
++        program.stage = Shader::Stage::Compute;
++    }
++};
++
++float Evaluate(IR::Value value) {
++    if (value.IsImmediate()) {
++        return value.F32();
++    }
++    const auto& inst = *value.InstRecursive();
++    switch (inst.GetOpcode()) {
++    case IR::Opcode::GetCbufF32:
++        return 2.0f;
++    case IR::Opcode::FPExp2:
++        return std::exp2(Evaluate(inst.Arg(0)));
++    case IR::Opcode::FPNeg32:
++        return -Evaluate(inst.Arg(0));
++    case IR::Opcode::FPAdd32:
++        return Evaluate(inst.Arg(0)) + Evaluate(inst.Arg(1));
++    case IR::Opcode::FPMul32:
++        return Evaluate(inst.Arg(0)) * Evaluate(inst.Arg(1));
++    default:
++        FAIL("Unexpected opcode in visual-workaround fixture");
++        return 0;
++    }
++}
++} // namespace
++
++TEST_CASE("OoT visual workaround scales slice distance before extinction and scattering",
++          "[video_core][oot_visual_workaround]") {
++    Fixture f;
++    const auto distance = f.ir.FPAdd(f.ir.FPNeg(f.ir.FPExp2(f.ir.Imm32(1.0f))),
++                                    f.ir.FPExp2(f.ir.Imm32(3.0f)));
++    const auto extinction = f.ir.FPAdd(f.ir.Imm32(1.0f), f.ir.FPMul(distance, f.ir.Imm32(2.0f)));
++    const auto scattering = f.ir.FPMul(distance, f.ir.Imm32(4.0f));
++    const auto transmittance = f.ir.FPExp2(IR::F32{f.ir.FPNeg(extinction)});
++    REQUIRE(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Fog, true) == 1);
++    CHECK(Evaluate(distance) == 1.5f);
++    CHECK(Evaluate(extinction) == 4.0f);
++    CHECK(Evaluate(scattering) == 6.0f);
++    CHECK(Evaluate(transmittance) == Catch::Approx(0.0625f));
++}
++
++TEST_CASE("OoT exposure workaround scales only the verified exposure load",
++          "[video_core][oot_visual_workaround]") {
++    Fixture f;
++    f.program.stage = Shader::Stage::Fragment;
++    const auto exposure = f.ir.GetFloatCbuf(f.ir.Imm32(3U), f.ir.Imm32(0x38U));
++    const auto other_bank = f.ir.GetFloatCbuf(f.ir.Imm32(4U), f.ir.Imm32(0x38U));
++    const auto other_offset = f.ir.GetFloatCbuf(f.ir.Imm32(3U), f.ir.Imm32(0x34U));
++    const auto color = f.ir.FPMul(f.ir.Imm32(10.0f), exposure);
++    const auto alpha = f.ir.Imm32(0.75f);
++    REQUIRE(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Final, true) == 1);
++    CHECK(Evaluate(color) == Catch::Approx(13.0f));
++    CHECK(Evaluate(other_bank) == 2.0f);
++    CHECK(Evaluate(other_offset) == 2.0f);
++    CHECK(Evaluate(alpha) == 0.75f);
++}
++
++TEST_CASE("OoT fog matches the native sign-bit negate without touching other bit operations",
++          "[video_core][oot_visual_workaround]") {
++    Fixture f;
++    const auto value = f.ir.FPExp2(f.ir.Imm32(1.0f));
++    const auto bits = f.ir.BitCast<IR::U32>(value);
++    const auto negated = f.ir.BitCast<IR::F32>(f.ir.BitwiseXor(bits, f.ir.Imm32(0x80000000U)));
++    static_cast<void>(f.ir.FPAdd(negated, f.ir.FPExp2(f.ir.Imm32(3.0f))));
++    REQUIRE(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Fog, true) == 1);
++}
++
++TEST_CASE("OoT visual workaround is opt-in and rejects unknown titles stages and programs",
++          "[video_core][oot_visual_workaround]") {
++    Fixture f;
++    f.program.stage = Shader::Stage::Fragment;
++    const auto exposure = f.ir.GetFloatCbuf(f.ir.Imm32(3U), f.ir.Imm32(0x38U));
++    CHECK_FALSE(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Final, false));
++    CHECK_FALSE(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title + 1, Final, true));
++    CHECK_FALSE(Shader::Optimization::ApplyOotVisualWorkaround(
++        f.program, Title, 0x6cb06edf14be1d79ULL, true));
++    f.program.stage = Shader::Stage::Compute;
++    CHECK_FALSE(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Final, true));
++    CHECK(Evaluate(exposure) == 2.0f);
++}
++
++TEST_CASE("OoT visual workaround fails closed when the matched scalar shape changes",
++          "[video_core][oot_visual_workaround]") {
++    Fixture f;
++    CHECK(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Fog, true) == 0);
++    for (int i = 0; i < 2; ++i) {
++        static_cast<void>(f.ir.FPAdd(f.ir.FPNeg(f.ir.FPExp2(f.ir.Imm32(1.0f))),
++                                    f.ir.FPExp2(f.ir.Imm32(3.0f))));
++    }
++    const auto size = f.block.size();
++    CHECK(Shader::Optimization::ApplyOotVisualWorkaround(f.program, Title, Fog, true) == 0);
++    CHECK(f.block.size() == size);
++}
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index b6da06580441078ce861a9f0b73ee8f2d0457f59..99bbb47f0df6ecbcca48a4f2d4b05c5d111110ca 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -11,6 +11,7 @@
+ #include <iostream>
+ #include <memory>
+ #include <span>
++#include <string_view>
+ #include <thread>
+ #include <vector>
+ #include <bit>
+@@ -26,6 +27,7 @@
+ #include "shader_recompiler/frontend/maxwell/control_flow.h"
+ #include "shader_recompiler/frontend/maxwell/translate_program.h"
+ #include "shader_recompiler/ir_opt/passes.h"
++#include "shader_recompiler/ir_opt/oot_visual_workaround.h"
+ #include "shader_recompiler/program_header.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/maxwell_3d.h"
+@@ -393,6 +395,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+                                 !DriverCachesPipelines(device_)},
++      oot_visual_workaround{[] {
++          const char* value = std::getenv("EDEN_NX2_OOT_VISUAL_WORKAROUND");
++          return value != nullptr && std::string_view{value} == "1";
++      }()},
+       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+       serialization_thread(1, "VkPipelineSerialization", {},
+@@ -750,6 +756,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
+ 
+ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                       const VideoCore::DiskResourceLoadCallback& callback) {
++    visual_workaround_title = title_id;
+     if (title_id == 0) {
+         return;
+     }
+@@ -1159,6 +1166,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+         }
+ 
++        if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
++                programs[index], visual_workaround_title, key.unique_hashes[index],
++                oot_visual_workaround)) {
++            LOG_WARNING(Render_Vulkan,
++                        "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
++                        key.unique_hashes[index], *edits);
++        }
+         if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
+             LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
+             return nullptr;
+@@ -1405,6 +1419,12 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     }
+ 
+     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
++    if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
++            program, visual_workaround_title, key.unique_hash, oot_visual_workaround)) {
++        LOG_WARNING(Render_Vulkan,
++                    "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
++                    key.unique_hash, *edits);
++    }
+     const VkDriverIdKHR driver_id = device.GetDriverID();
+     const bool needs_shared_mem_clamp =
+         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index c7e562163b7a640f419b53a3ed9ea920f198f0e7..32657561e2d2502d95922ffe6ab5715115b9f4c8 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -165,6 +165,8 @@ private:
+     VideoCore::ShaderNotify& shader_notify;
+     bool use_asynchronous_shaders{};
+     bool use_vulkan_pipeline_cache{};
++    bool oot_visual_workaround{};
++    u64 visual_workaround_title{};
+ 
+     GraphicsPipelineCacheKey graphics_key{};
+     GraphicsPipeline* current_pipeline{};

@@ -1,0 +1,575 @@
+[
+  {
+    "source": "0024-vdec-frames-without-decoder.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0082-t39-vdec-frames-without-decoder.patch",
+    "commit": "6f38c0b7aeb6b39bf43525822797e4e99dd4554d",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0025-copy-command-lists-after-queued-gpu-maps.patch",
+    "status": "moved",
+    "reason": "Upstream has queued-map tracking; retained our bounded diagnostic and size_t overflow guard after three-way merge.",
+    "target": "0083-t39-copy-command-lists-after-queued-gpu-maps.patch",
+    "commit": "c8ea1326f3fe134a73c7251f9268a65b35ef9844",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0026-defer-empty-command-lists-every-title.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0084-t39-defer-empty-command-lists-every-title.patch",
+    "commit": "7045087c77ca447ade3b351f805ca29b0f1bf008",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0027-unwritten-reads-switch.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0085-t39-unwritten-reads-switch.patch",
+    "commit": "d645ee7e7c968da62011eb2fd84cdcf832aa9812",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0028-unbounded-gpu-command-queue.patch",
+    "status": "moved",
+    "reason": "Rebased queue alias: preserve our unbounded HostCommandQueue instead of upstream larger bounded SPSC queue.",
+    "target": "0086-t39-unbounded-gpu-command-queue.patch",
+    "commit": "6f9000ed815c1200462d29cb3c47b2b4544ab63e",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0029-full-list-drain-switch.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0087-t39-full-list-drain-switch.patch",
+    "commit": "60f10809ded2b4da811211e4ce896187fda17fdc",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0030-shader-lower-Ocarina-ISETP.EX-accumulation-and-F32-g.patch",
+    "status": "dropped",
+    "reason": "Upstream already includes predicate accumulation, F32 RED and high-register shadows; retains additional opcodes and signed RED type. Three-way merge with broader upstream forms is empty."
+  },
+  {
+    "source": "0031-shader-lower-more-Ocarina-compute-and-high-register-.patch",
+    "status": "dropped",
+    "reason": "Upstream already lowers these Ocarina forms and includes later SHF clamp fix; keep broader uniform/opcode handling. Resolved merge is empty."
+  },
+  {
+    "source": "0032-shader-lower-Ocarina-CALL-helpers-64-bit-shifts-and-.patch",
+    "status": "dropped",
+    "reason": "CALL helpers, shifts, program capture and tests already upstream; keep additional upstream uniform forms and later tests. Resolved merge is empty."
+  },
+  {
+    "source": "0033-shader-lower-Ocarina-guarded-uniform-compares-and-un.patch",
+    "status": "dropped",
+    "reason": "Guarded uniform comparisons already upstream; retain later gather and sign/shift/carry tests. Resolved merge is empty."
+  },
+  {
+    "source": "0034-shader-lower-Ocarina-2D-array-per-pixel-offset-and-d.patch",
+    "status": "dropped",
+    "reason": "Array/per-pixel/depth gathers already upstream; retain additional upstream operand shadows and tests. Resolved merge is empty."
+  },
+  {
+    "source": "0035-shader-lower-the-rest-of-Ocarina-s-dumped-native-pro.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0036-shader-route-untracked-32-bit-global-atomics-to-thei.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0037-shader-drop-the-U64-clamp-from-lowered-SHF.R-funnel-.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0038-shader-pack-FP16-texture-results-with-c0-in-the-low-.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0039-buffer_cache-re-upload-a-native-program-s-64-KiB-uni.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0040-video_core-upscale-stand-in-takes-its-images-from-th.patch",
+    "status": "moved",
+    "reason": "Native-program image handles already upstream; retained our reasoned format skip diagnostic.",
+    "target": "0088-t39-video_core-upscale-stand-in-takes-its-images-from-th.patch",
+    "commit": "312a7f0b43c0ec52a7fc64766f01bdda77c99301",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0041-puller-run-pending-fences-on-the-split-s-back-thread.patch",
+    "status": "moved",
+    "reason": "Back-thread fence release already upstream with DmaPusher-aware helper; retained current helper arguments.",
+    "target": "0089-t39-puller-run-pending-fences-on-the-split-s-back-thread.patch",
+    "commit": "88524d168b103cb7af4b62fd06d4cdc46108eebf",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0042-mesh-pipelines-and-task-group-limit.patch",
+    "status": "moved",
+    "reason": "Rebased task-group limit while preserving upstream missing-pipeline guard inside deferred draw lambda.",
+    "target": "0090-t39-mesh-pipelines-and-task-group-limit.patch",
+    "commit": "2505ce7fd9f2124420def5c1b337d26a6d4ac42a",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0043-native-hmma.patch",
+    "status": "moved",
+    "reason": "Rebased native HMMA translator with our explicit rounding/no-flush and register validation; preserve upstream predicate guard and opcode spelling. Later compact-HMMA patch follows.",
+    "target": "0091-t39-native-hmma.patch",
+    "commit": "c15e27aabbec2f49bad978d0bf03397754d1e8b7",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0044-upscale-program-handles-before-bananza-slots.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0092-t39-upscale-program-handles-before-bananza-slots.patch",
+    "commit": "c7ad20b440e72c3c7b75e68351d53aeed4f831b1",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0045-puller-flush-on-back.patch",
+    "status": "moved",
+    "reason": "Rebased flush onto back thread; consolidate duplicate upstream/ours semaphore readers and use the matching rasterizer helper at every fence call.",
+    "target": "0093-t39-puller-flush-on-back.patch",
+    "commit": "8b16b9deb7815a56cbfe5bb5de2f8b4f0f63760f",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0046-dma-pusher-on-back.patch",
+    "status": "moved",
+    "reason": "Rebased fence signalling and command-page dirty checks onto split back thread; retained asynchronous publish path from our patch.",
+    "target": "0094-t39-dma-pusher-on-back.patch",
+    "commit": "86f9f1060038d72cd7a5061e3911e787efe276ce",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0047-av1-decoder-threads.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0095-t39-av1-decoder-threads.patch",
+    "commit": "fa43f09dce8e009afa88bb21dcdf0e75fd9bcda9",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0048-upscale-frame-beside-program-handles.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0096-t39-upscale-frame-beside-program-handles.patch",
+    "commit": "940d8a23e0b0602413e9926ccc8167b6da2f7c52",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0050-mesh-pipeline-names-skips-and-spirv-dump.patch",
+    "status": "moved",
+    "reason": "Rebased by three-way merge; no conflicting lines.",
+    "target": "0097-t39-mesh-pipeline-names-skips-and-spirv-dump.patch",
+    "commit": "98b03c11a991035deb9f34522b2d15df1dc2dbf5",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0051-task-mesh-push-constant-stages.patch",
+    "status": "moved",
+    "reason": "Use shared device-aware GraphicsPushConstantStages for all graphics push ranges and updates, preserving task/mesh stages when supported.",
+    "target": "0098-t39-task-mesh-push-constant-stages.patch",
+    "commit": "ba671b55ad538261bc2806152675e2643dccced3",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0052-bound-task-counts-and-mesh-indices.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0099-t39-bound-task-counts-and-mesh-indices.patch",
+    "commit": "26b944a0b7258b882a4f96d3f3b8dd8c21c38f2d",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0053-front-dma-read-on-back.patch",
+    "status": "moved",
+    "reason": "Move both dirty query and flush onto the split back thread before front DMA read.",
+    "target": "0100-t39-front-dma-read-on-back.patch",
+    "commit": "615eb6bbc06350ae1f4b7af12890ce8c77ce13da",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0054-cpu-decode-large-astc.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0101-t39-cpu-decode-large-astc.patch",
+    "commit": "5b4aebb86459c0f504815aa4ae4303a31582e719",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0055-log-task-mesh-limits.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0102-t39-log-task-mesh-limits.patch",
+    "commit": "5c45bf2d33741923e6037ca19d1927b31a9f7938",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0057-f2i-cbuf-abs-neg.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0103-t39-f2i-cbuf-abs-neg.patch",
+    "commit": "54f9a91cb6f988d6b2b01b75c4536677b9603329",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0058-warn-dropped-global-atomics.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0104-t39-warn-dropped-global-atomics.patch",
+    "commit": "94be8a4aeec70da1f2ead4933a2bb432e2d2b8e2",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0059-vk_rasterizer-alpha-to-coverage-per-pipeline.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0105-t39-vk_rasterizer-alpha-to-coverage-per-pipeline.patch",
+    "commit": "907199bf62ed27592ca268430ab2389e6413fcbf",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0060-caches-report-what-they-hold-when-memory-is-refused.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0106-t39-caches-report-what-they-hold-when-memory-is-refused.patch",
+    "commit": "ad613af885d150698aab72372d2cd04b6bd19f94",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0061-descriptor-queues-quarter-size.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0107-t39-descriptor-queues-quarter-size.patch",
+    "commit": "edcda8356e00f940fa32ab249ee617d6efa811de",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0062-kernel-reference-count-tables-per-region.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0069-upload-large-decoded-images-in-slices.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0108-t39-upload-large-decoded-images-in-slices.patch",
+    "commit": "4d6c2368288820200b489583464209dc556f149c",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0070-command-lists-keep-fewer-entries-in-place.patch",
+    "status": "dropped",
+    "reason": "Upstream already uses 32-entry inline vectors and iterator-copy constructor; only queue comment differs (our 0028 provides unbounded queue)."
+  },
+  {
+    "source": "0071-clamp-oversized-native-vertex-streams-instead-of.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0072-drop-syncpoint-increments-with-an-id-past-the-ta.patch",
+    "status": "dropped",
+    "reason": "Bounds check already upstream; preserve later self-cancel thread marker."
+  },
+  {
+    "source": "0073-answer-the-switch-2-scale-chat-and-camera-comman.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0074-find-module-names-of-switch-2-programs.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0075-split-scalar-guest-reads-and-writes-at-4-kib-dev.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0076-run-syncpoint-actions-outside-the-guard.patch",
+    "status": "dropped",
+    "reason": "Actions-outside-lock implementation already upstream; retain immediate-action handle-zero cancellation guard."
+  },
+  {
+    "source": "0077-skip-tessellation-pipelines-the-driver-would-ref.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0078-count-what-host-images-really-take.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0079-back-sparse-layered-images-whole-when-their-bloc.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0080-hand-released-images-back-as-end-of-stream-frame.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0081-depth-compare-texture-descriptors-stay-float.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0109-t39-depth-compare-texture-descriptors-stay-float.patch",
+    "commit": "0b89498228d74f7bbbcac279673db4cf7818f3b7",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0082-download-only-preflushable-pages-at-fences.patch",
+    "status": "dropped",
+    "reason": "Upstream QueueGpuWrite and ForEachPreflushableRange already implement exact preflush and gap trapping; duplicate helper removed before proceeding."
+  },
+  {
+    "source": "0083-upload-cpu-writes-onto-gpu-written-pages.patch",
+    "status": "moved",
+    "reason": "Inline page writes already upstream with scheduler-owner guard; rebase missing PrepareRegionWrite cancellation, post-copy invalidation and expose ClearDownload.",
+    "target": "0110-t39-upload-cpu-writes-onto-gpu-written-pages.patch",
+    "commit": "ead54af55d0cb3d975689bfad2a21db09d209ade",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0084-shadow-stg-and-isbewr-data-registers.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0111-t39-shadow-stg-and-isbewr-data-registers.patch",
+    "commit": "40b2820f37db01dd06419832020cf1ddddf6f676",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0085-gpu-time-div-switch.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0112-t39-gpu-time-div-switch.patch",
+    "commit": "68ef90c3d8da7c16edd9da43789f0073f021c135",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0086-astc-convert-one-layer-at-a-time.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0113-t39-astc-convert-one-layer-at-a-time.patch",
+    "commit": "f75d21286df00e538945afd2366d4cbe3b1a9dda",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0087-reinterpret-image-copies.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0088-stream-ring-wrap-and-sliced-zero-fill.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0114-t39-stream-ring-wrap-and-sliced-zero-fill.patch",
+    "commit": "c5206343a8d08f288a013e24116e109dc6439dc6",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0089-download-without-a-staging-buffer.patch",
+    "status": "moved",
+    "reason": "Rebased by three-way merge; no conflicting lines.",
+    "target": "0115-t39-download-without-a-staging-buffer.patch",
+    "commit": "371b743465d14a1f37db96dd6f06c703da4f5303",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0090-decoder-survives-a-refusal.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0116-t39-decoder-survives-a-refusal.patch",
+    "commit": "054d3e00e72f79f676fbe9b1f42f1976620ba247",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0095-uploads-wait-for-the-stream-ring.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0117-t39-uploads-wait-for-the-stream-ring.patch",
+    "commit": "82c3601453a8c33c563506da7e9f4deed7e8acd4",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0096-refused-uploads-go-in-pieces.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0118-t39-refused-uploads-go-in-pieces.patch",
+    "commit": "341cc00c3f7d4c4f5bbcf91dc2f0db7025552adf",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0097-the-other-downloads-go-without-staging.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0119-t39-the-other-downloads-go-without-staging.patch",
+    "commit": "060ec13b9c1168a2e563e2150e9b7f49b105acce",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0098-reject-native-programs-by-hash.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0120-t39-reject-native-programs-by-hash.patch",
+    "commit": "d4cfb0f377f5dd3388cc4c60cc610a0790336539",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0100-oot-fog-exposure-workaround.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0121-t39-oot-fog-exposure-workaround.patch",
+    "commit": "ca56c22bc748f307da372389f968067a54896886",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0101-oot-workaround-on-by-default.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0122-t39-oot-workaround-on-by-default.patch",
+    "commit": "aa7fd8f3afb21473e75c347a268946435b298e7f",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  },
+  {
+    "source": "0102-fold-multiplies-by-0-and-1.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0110-pause-occlusion-counter-at-submission.patch",
+    "status": "moved",
+    "reason": "Retain our off-by-default EDEN_NX2_ZPASS_PAUSE gate instead of upstream unconditional pause (known AMD split hang risk).",
+    "target": "0123-t39-pause-occlusion-counter-at-submission.patch",
+    "commit": "23fe4bd10884c9eafc8130b5e90ea52b0ef95ead",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0111-count-nested-returns-before-moving-demotes.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0112-native-gather-offsets-and-array-depth-samples.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0124-t39-native-gather-offsets-and-array-depth-samples.patch",
+    "commit": "4a0ebc10f07fe0055152bfbcdcf572fae784baa8",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0113-nx2-gsv-1121-raw-session.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0125-t39-nx2-gsv-1121-raw-session.patch",
+    "commit": "4877a50ad62bcfea3d4988002ecd52f6c7d952aa",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0120-register-npad-callbacks-after-its-externals.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0121-map-reused-smmu-ranges-again.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0122-syncpt-page-acks-values-read-after-the-armed-bits.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0124-syncpoint-actions-identified-by-id.patch",
+    "status": "dropped",
+    "reason": "Exact reverse application succeeds: change already in the upstream stack or preceding migrated patches."
+  },
+  {
+    "source": "0125-copy-ipc-buffers-while-guest-slots-can-be-unmapped.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0126-t39-copy-ipc-buffers-while-guest-slots-can-be-unmapped.patch",
+    "commit": "4103391887d5e438a98fa9828cc79f2319f30387",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0130-query-sync-ranges-stay-inside-a-cache-page.patch",
+    "status": "moved",
+    "reason": "Applied unchanged in source order.",
+    "target": "0127-t39-query-sync-ranges-stay-inside-a-cache-page.patch",
+    "commit": "ce1bbaeb275a93467d35b77d0c13cf9616fd2f36",
+    "core_t33_forward": false,
+    "core_t33_reverse": true
+  },
+  {
+    "source": "0131-a-refused-buffer-no-longer-ends-the-session.patch",
+    "status": "moved",
+    "reason": "Rebase allocation-refusal handling while keeping upstream pending CPU write declarations and missing-pipeline lambda capture.",
+    "target": "0128-t39-a-refused-buffer-no-longer-ends-the-session.patch",
+    "commit": "3a3ee2a90008dce1342f94be1bea890153329509",
+    "core_t33_forward": false,
+    "core_t33_reverse": false
+  }
+]

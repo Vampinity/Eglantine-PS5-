@@ -1,0 +1,50 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0110-pause-occlusion-counter-at-submission.patch
+
+Source: 0110-pause-occlusion-counter-at-submission.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index 13e90d43bd015fbb98512563bfaa51d6c6637afd..c2d9bc9d61267ebae3e0cae5c4e2d82e3ec2730b 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -209,8 +209,8 @@ public:
+         last_accumulation_checkpoint = (std::max)(last_accumulation_checkpoint, num_slots_used);
+     }
+ 
+-    // Called at each submission. The running query carries the count across it: a guest's
+-    // reset-to-report window can span one.
++    // Called at each submission with EDEN_NX2_ZPASS_PAUSE=1. The running query carries the count
++    // across it: a guest's reset-to-report window can span one.
+     void CloseCounter() override {
+         PauseCounter();
+         // A title that counts without resetting or reporting grows the query by a slot at every
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 73e3cbe1ce6ebc2c830e6634df60bc88bd6e57a2..d0f4bcbb4263d1819f9e56c8d2dcf5ebbb21c28d 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -476,9 +476,20 @@ void Scheduler::InvalidateState() {
+ }
+ 
+ void Scheduler::EndPendingOperations() {
+-    // Pause, don't reset: a submission can land between a guest's counter reset and its report,
+-    // and resetting here would drop the samples counted so far (the report then reads too low).
+-    query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
++    // EDEN_NX2_ZPASS_PAUSE=1: pause, don't reset. A submission can land between a guest's counter
++    // reset and its report, and resetting here drops the samples counted so far (the report then
++    // reads too low). Off by default: with the split on, pausing hung an AMD host at a game's save
++    // select (Lichii #121), and the bound in SamplesStreamer::CloseCounter meant to stop that has
++    // not been tried on AMD yet.
++    static const bool pause_zpass = [] {
++        const char* value = std::getenv("EDEN_NX2_ZPASS_PAUSE");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (pause_zpass) {
++        query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
++    } else {
++        query_cache->CounterReset(VideoCommon::QueryType::ZPassPixelCount64);
++    }
+     EndRenderPass();
+ }
+ 

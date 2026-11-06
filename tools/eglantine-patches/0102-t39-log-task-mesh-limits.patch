@@ -1,0 +1,43 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0055-log-task-mesh-limits.patch
+
+Source: 0055-log-task-mesh-limits.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index ed644ce33fcd7030360d3b5e3035f04e3ac9f646..e085eeed768c91f43fb7bc44f8f58190f686f69e 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -12,6 +12,7 @@
+ #include <vector>
+ #include <queue>
+ 
++#include <atomic>
+ #include <cstdlib>
+ #include "common/logging.h"
+ #include "common/settings.h"
+@@ -420,6 +421,23 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
+             AddMeshLines(env.SPH(), program.mesh.vertex_lines);
+             AddMeshLines(env.MeshPrimitiveHeader(), program.mesh.primitive_lines);
+         }
++        // The sizes the driver is given (Vulkan's mesh limits: 256 vertices, 256 primitives, 16 KiB
++        // of payload); "parts" is how many 256-vertex groups the PS5's RADV splits a mesh program
++        // with per-primitive outputs into (radv_ms_prim_parts, before and after its fix).
++        if (static std::atomic<u32> logged{}; logged.fetch_add(1, std::memory_order_relaxed) < 256) {
++            const u32 per_prim = program.stage == Stage::Mesh
++                                     ? static_cast<u32>(program.mesh.primitive_lines.size())
++                                     : 0U;
++            const u32 prims = program.mesh.max_primitives;
++            LOG_INFO(Shader,
++                     "{} program {:#x}: max_vertices={} max_primitives={} threads={} "
++                     "payload_words={} vertex_lines={} primitive_lines={} parts={} (was {})",
++                     program.stage == Stage::Task ? "Task" : "Mesh", env.StartAddress(),
++                     program.mesh.max_vertices, prims, program.workgroup_size[0],
++                     program.mesh.payload_words, program.mesh.vertex_lines.size(), per_prim,
++                     per_prim != 0 ? (std::max)((prims + 84) / 85, 1U) : 0U,
++                     per_prim != 0 ? (std::max)((prims * 3 + 255) / 256, 1U) : 0U);
++        }
+         break;
+     }
+     default:

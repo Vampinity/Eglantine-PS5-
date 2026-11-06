@@ -1,0 +1,250 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0043-native-hmma.patch
+
+Source: 0043-native-hmma.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/CMakeLists.txt b/src/shader_recompiler/CMakeLists.txt
+index 753c2bdc5d3c79debeabb6ba44ba1a275e973a41..f88571b6481da337a11cb6e725fde247321c2b23 100644
+--- a/src/shader_recompiler/CMakeLists.txt
++++ b/src/shader_recompiler/CMakeLists.txt
+@@ -113,6 +113,7 @@ add_library(shader_recompiler STATIC
+     frontend/maxwell/translate/impl/half_floating_point_multiply.cpp
+     frontend/maxwell/translate/impl/half_floating_point_set.cpp
+     frontend/maxwell/translate/impl/half_floating_point_set_predicate.cpp
++    frontend/maxwell/translate/impl/hmma_native.cpp
+     frontend/maxwell/translate/impl/impl.cpp
+     frontend/maxwell/translate/impl/impl.h
+     frontend/maxwell/translate/impl/integer_add.cpp
+diff --git a/src/shader_recompiler/frontend/maxwell/translate/impl/hmma_native.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/hmma_native.cpp
+index e9485e2725d5e25fdb075bd63a80c3ca258186b8..4b16734c571c233c1d42838a3cf20041eea19654 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate/impl/hmma_native.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/hmma_native.cpp
+@@ -2,87 +2,122 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include "common/bit_field.h"
++#include "common/common_types.h"
++#include "shader_recompiler/exception.h"
+ #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
+ 
+ namespace Shader::Maxwell {
+ 
+-// HMMA.16816.F16 / HMMA.1688.F16 lowered natively (frontend/ampere/lower_to_maxwell.h emits this
+-// pseudo-instruction): D(16x8) = A(16xK) * B(Kx8) + C with f16 fragments, K = 8 or 16, for GPUs
+-// without a cooperative-matrix path. Lane t = 4g + q holds rows g and g + 8, columns 2q and 2q + 1
+-// of C and D; its A registers hold row g/g+8, k = 2q..2q+1 (+8 for the second chunk); its B registers
+-// hold k = 2q..2q+1 (+8), column g.
++// HMMA.1688.F16 / HMMA.16816.F16, which frontend/ampere/lower_to_maxwell.h (case 0x23c) lowers to
++// this pseudo-instruction unless EDEN_NX2_HMMA_NATIVE=0: D(16x8) = A(16xK) * B(Kx8) + C, K = 8 or
++// 16, f16 fragments. Lane t (group g = t/4, i = t%4): A registers hold rows g / g+8 at k 2i..2i+1
++// (a0, a1) and, for K = 16, 8+2i.. (a2, a3); B registers hold k 2i.. (b0) / 8+2i.. (b1) of column
++// g; C and D hold rows g / g+8 at columns 2i, 2i+1.
+ //
+-// Lane t needs A[g][0..K) and A[g+8][0..K), held by lanes 4g..4g+3, and B[0..K)[2q], B[0..K)[2q+1],
+-// held by lanes 8q..8q+3 and 8q+4..8q+7: one shuffle per source register and lane, 32 for K = 16.
+-// The Maxwell instruction sequence it replaces shuffled the same values once per product (96).
+-// Products are accumulated in f32 and rounded to f16 after every 8 k, in the same order as before.
++// The IR is the one the lowering's Maxwell expansion of the same instruction translates to, built
++// here directly: the same lane shuffles (SHFL.IDX, clamp 31), half extractions (F2F.F32.F16),
++// fused multiply-adds (FFMA: round to nearest, no flush) in the same order, roundings to half after
++// every eight products (F2F.F16.F32) and the final join (ISCADD by 16). Products are summed in f32.
++// Only the Maxwell temporaries, the scratch registers and the borrowed register quartet are gone.
+ void TranslatorVisitor::HMMA_NATIVE(u64 insn) {
+     union {
+         u64 raw;
+-        BitField<0, 8, IR::Reg> dest_reg;
+-        BitField<8, 8, IR::Reg> a_reg;
+-        BitField<20, 8, IR::Reg> b_reg;
+-        BitField<39, 8, IR::Reg> c_reg;
++        BitField<0, 8, u64> dest;
++        BitField<8, 8, u64> a;
++        BitField<20, 8, u64> b;
++        BitField<39, 8, u64> c;
+         BitField<47, 1, u64> deep;
+     } const hmma{insn};
+ 
+-    const u32 a = static_cast<u32>(hmma.a_reg.Value());
+-    const u32 b = static_cast<u32>(hmma.b_reg.Value());
+-    const u32 c = static_cast<u32>(hmma.c_reg.Value());
+-    const u32 chunks = hmma.deep != 0 ? 2U : 1U;
++    const u32 dest = static_cast<u32>(hmma.dest.Value());
++    const u32 a = static_cast<u32>(hmma.a.Value());
++    const u32 b = static_cast<u32>(hmma.b.Value());
++    const u32 c = static_cast<u32>(hmma.c.Value());
++    const u32 depth = hmma.deep != 0 ? 16U : 8U;
++    const u32 a_count = depth / 4, b_count = depth / 8;
++    if ((dest & 1) || dest + 2 > 255 || (a & (a_count - 1)) || a + a_count > 255 ||
++        (b & (b_count - 1)) || b + b_count > 255 || (c != 255 && ((c & 1) || c + 2 > 255))) {
++        throw LogicError("Invalid HMMA_NATIVE registers {:#x}", insn);
++    }
++    const auto reg = [](u32 index) { return static_cast<IR::Reg>(index); };
+ 
+-    const IR::U32 lane{ir.LaneId()};
+-    const IR::U32 row_group{ir.BitwiseAnd(lane, ir.Imm32(0x1c))};
+-    const IR::U32 column_lanes{ir.ShiftLeftLogical(ir.BitwiseAnd(lane, ir.Imm32(3)), ir.Imm32(3))};
+-    const IR::U32 clamp{ir.Imm32(31)};
+-    const IR::U32 segment{ir.Imm32(0)};
+-    const auto unpack = [&](const IR::U32& packed, u32 half) {
+-        return IR::F32{ir.CompositeExtract(ir.UnpackHalf2x16(packed), half)};
++    // F2F.F32.F16 (the expansion's extract_half) and F2F.F16.F32 (its round_half), as
++    // floating_point_conversion_floating_point.cpp translates them: round to nearest, no flush;
++    // the half result is packed with a zero high half.
++    const IR::FpControl convert_control{
++        .no_contraction = false,
++        .rounding = IR::FpRounding::RN,
++        .fmz_mode = IR::FmzMode::None,
++    };
++    // FFMA with no modifiers, as floating_point_fused_multiply_add.cpp translates it.
++    const IR::FpControl fma_control{
++        .no_contraction = true,
++        .rounding = IR::FpRounding::RN,
++        .fmz_mode = IR::FmzMode::None,
+     };
+-    const auto round_half = [&](const IR::F32& value) {
+-        return IR::F32{ir.FPConvert(32, ir.FPConvert(16, value))};
++    const auto to_f32 = [&](const IR::Value& unpacked, u32 half) {
++        const IR::F16 value{ir.CompositeExtract(unpacked, half)};
++        return IR::F32{ir.FPConvert(32, value, convert_control)};
++    };
++    const auto to_half_bits = [&](const IR::F32& value) {
++        const IR::F16 rounded{ir.FPConvert(16, value, convert_control)};
++        const IR::F16 zero{ir.FPConvert(16, ir.Imm32(0.0f))};
++        return ir.PackFloat2x16(ir.CompositeConstruct(rounded, zero));
++    };
++    // SHFL.IDX with the immediate mask 0x1f: clamp 31, no segmentation.
++    const auto shuffle = [&](u32 source, const IR::U32& lane) {
++        return ir.ShuffleIndex(X(reg(source)), lane, ir.Imm32(31), ir.Imm32(0));
+     };
+ 
++    // acc[row][col]: D[g (+8)][2i (+1)], starting from C (RZ reads zero).
+     IR::F32 acc[2][2];
+     for (u32 row = 0; row < 2; ++row) {
++        const IR::Value unpacked{ir.UnpackFloat2x16(X(c == 255 ? IR::Reg::RZ : reg(c + row)))};
+         for (u32 col = 0; col < 2; ++col) {
+-            acc[row][col] = c == 255 ? ir.Imm32(0.0f) : unpack(X(IR::Reg{c + row}), col);
++            acc[row][col] = to_f32(unpacked, col);
+         }
+     }
+-    for (u32 chunk = 0; chunk < chunks; ++chunk) {
+-        const IR::U32 a_rows[2]{X(IR::Reg{a + chunk * 2}), X(IR::Reg{a + chunk * 2 + 1})};
+-        const IR::U32 b_column{X(IR::Reg{b + chunk})};
+-        for (u32 k = 0; k < 4; ++k) {
+-            const IR::U32 a_lane{ir.BitwiseOr(row_group, ir.Imm32(k))};
+-            IR::U32 a_values[2];
++    IR::U32 bits[2][2];
++    const IR::U32 lane{ir.LaneId()};
++    const IR::U32 row_lanes{ir.BitwiseAnd(lane, ir.Imm32(0x1c))};                         // 4g
++    const IR::U32 column_lanes{ir.ShiftLeftLogical(ir.BitwiseAnd(lane, ir.Imm32(3)), ir.Imm32(3))}; // 8i
++    for (u32 pair = 0; pair < depth / 2; ++pair) {
++        // k = 2 pair, 2 pair + 1: A rows from lane 4g + pair % 4, B columns 2i and 2i + 1 from
++        // lanes 8i + pair % 4 and 8i + 4 + pair % 4.
++        const u32 chunk = pair / 4, step = pair % 4;
++        const IR::U32 a_lane{ir.IAdd(row_lanes, ir.Imm32(step))};
++        const IR::U32 b_lane{ir.IAdd(column_lanes, ir.Imm32(step))};
++        const IR::Value a_rows[2]{
++            ir.UnpackFloat2x16(shuffle(a + chunk * 2, a_lane)),
++            ir.UnpackFloat2x16(shuffle(a + chunk * 2 + 1, a_lane)),
++        };
++        const IR::Value b_columns[2]{
++            ir.UnpackFloat2x16(shuffle(b + chunk, b_lane)),
++            ir.UnpackFloat2x16(shuffle(b + chunk, ir.IAdd(b_lane, ir.Imm32(4)))),
++        };
++        for (u32 half = 0; half < 2; ++half) {
++            const IR::F32 b_values[2]{to_f32(b_columns[0], half), to_f32(b_columns[1], half)};
+             for (u32 row = 0; row < 2; ++row) {
+-                a_values[row] = ir.ShuffleIndex(a_rows[row], a_lane, clamp, segment);
+-            }
+-            IR::U32 b_values[2];
+-            for (u32 col = 0; col < 2; ++col) {
+-                const IR::U32 b_lane{ir.IAdd(column_lanes, ir.Imm32(col * 4 + k))};
+-                b_values[col] = ir.ShuffleIndex(b_column, b_lane, clamp, segment);
++                const IR::F32 a_value{to_f32(a_rows[row], half)};
++                for (u32 col = 0; col < 2; ++col) {
++                    acc[row][col] = IR::F32{ir.FPFma(a_value, b_values[col], acc[row][col], fma_control)};
++                }
+             }
++        }
++        if (step == 3) {
+             for (u32 row = 0; row < 2; ++row) {
+-                for (u32 half = 0; half < 2; ++half) {
+-                    const IR::F32 a_value{unpack(a_values[row], half)};
+-                    for (u32 col = 0; col < 2; ++col) {
+-                        acc[row][col] =
+-                            IR::F32{ir.FPFma(a_value, unpack(b_values[col], half), acc[row][col])};
++                for (u32 col = 0; col < 2; ++col) {
++                    bits[row][col] = to_half_bits(acc[row][col]);
++                    if (pair + 1 < depth / 2) {
++                        acc[row][col] = to_f32(ir.UnpackFloat2x16(bits[row][col]), 0);
+                     }
+                 }
+             }
+         }
+-        for (u32 row = 0; row < 2; ++row) {
+-            for (u32 col = 0; col < 2; ++col) {
+-                acc[row][col] = round_half(acc[row][col]);
+-            }
+-        }
+     }
+-    const u32 dest = static_cast<u32>(hmma.dest_reg.Value());
++    // D = (column 2i+1 << 16) + column 2i, written after every source has been read.
+     for (u32 row = 0; row < 2; ++row) {
+-        X(IR::Reg{dest + row},
+-          ir.PackHalf2x16(ir.CompositeConstruct(acc[row][0], acc[row][1])));
++        X(reg(dest + row), ir.IAdd(ir.ShiftLeftLogical(bits[row][1], ir.Imm32(16)), bits[row][0]));
+     }
+ }
+ 
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index c8a9b3ec0db97e41ebbec421523341afeba5303f..ed644ce33fcd7030360d3b5e3035f04e3ac9f646 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -12,6 +12,8 @@
+ #include <vector>
+ #include <queue>
+ 
++#include <cstdlib>
++#include "common/logging.h"
+ #include "common/settings.h"
+ #include "shader_recompiler/exception.h"
+ #include "shader_recompiler/frontend/ir/basic_block.h"
+@@ -475,6 +477,38 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
+ 
+     CollectInterpolationInfo(env, program);
+     AddNVNStorageBuffers(program);
++    // EDEN_NX2_IR_STATS=1: the optimized IR's size, lane shuffles and f32 FMAs of programs with
++    // 16 or more shuffles (the Ampere matrix instructions' emulation), to compare their lowerings
++    // (EDEN_NX2_HMMA_NATIVE=0 against the default, with an empty shader cache each time).
++    if (static const bool ir_stats = [] {
++            const char* const value = std::getenv("EDEN_NX2_IR_STATS");
++            return value != nullptr && value[0] == '1';
++        }();
++        ir_stats) {
++        size_t insts = 0, shuffles = 0, fmas = 0;
++        for (IR::Block* const block : program.blocks) {
++            for (const IR::Inst& inst : block->Instructions()) {
++                ++insts;
++                switch (inst.GetOpcode()) {
++                case IR::Opcode::ShuffleIndex:
++                case IR::Opcode::ShuffleUp:
++                case IR::Opcode::ShuffleDown:
++                case IR::Opcode::ShuffleButterfly:
++                    ++shuffles;
++                    break;
++                case IR::Opcode::FPFma32:
++                    ++fmas;
++                    break;
++                default:
++                    break;
++                }
++            }
++        }
++        if (shuffles >= 16) {
++            LOG_WARNING(Shader, "NX2_IR_STATS stage={} start={:#x} insts={} shuffles={} fma32={}",
++                        static_cast<u32>(program.stage), env.StartAddress(), insts, shuffles, fmas);
++        }
++    }
+     return program;
+ }
+ 

@@ -1,0 +1,136 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0028-unbounded-gpu-command-queue.patch
+
+Source: 0028-unbounded-gpu-command-queue.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/common/host_command_queue.h b/src/common/host_command_queue.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..311666b4ff0bfce2223375453a087b0c86743853
+--- /dev/null
++++ b/src/common/host_command_queue.h
+@@ -0,0 +1,97 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eglantine Contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <deque>
++#include <mutex>
++#include <utility>
++
++#include "common/polyfill_thread.h"
++
++namespace Common {
++
++// The GPU thread's command queue, without a capacity. Publishing work must never wait for the
++// consumer to finish earlier work: nx2:gpu requests queue GPU maps and runs while they hold the
++// memory registry's and the region mutexes, which the GPU thread takes before a write into a
++// lazily backed region (Tegra::Nx2BackSparseWrite). With a bounded queue full, the service thread
++// waits for the GPU thread and the GPU thread for the service thread's locks.
++// Same calls as SPSCQueue (TryEmplace always succeeds).
++template <typename T>
++class HostCommandQueue {
++public:
++    template <typename... Args>
++    bool TryEmplace(Args&&... args) {
++        {
++            std::scoped_lock lock{mutex};
++            entries.emplace_back(std::forward<Args>(args)...);
++        }
++        available.notify_one();
++        return true;
++    }
++
++    template <typename... Args>
++    void EmplaceWait(Args&&... args) {
++        TryEmplace(std::forward<Args>(args)...);
++    }
++
++    bool TryPop(T& out) {
++        std::scoped_lock lock{mutex};
++        if (entries.empty()) {
++            return false;
++        }
++        out = std::move(entries.front());
++        entries.pop_front();
++        return true;
++    }
++
++    void PopWait(T& out) {
++        std::unique_lock lock{mutex};
++        available.wait(lock, [this] { return !entries.empty(); });
++        out = std::move(entries.front());
++        entries.pop_front();
++    }
++
++    void PopWait(T& out, std::stop_token stop) {
++        // The next command usually follows within microseconds: EDEN_PS5_GPU_SPIN_US=<n> polls
++        // for that long before sleeping (unset or 0: sleep at once).
++        if (const long long spin = SpinNanoseconds(); spin > 0) {
++            const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds{spin};
++            while (!stop.stop_requested()) {
++                if (TryPop(out)) {
++                    return;
++                }
++                if (std::chrono::steady_clock::now() >= deadline) {
++                    break;
++                }
++#if defined(__x86_64__) || defined(_M_X64)
++                __builtin_ia32_pause();
++#endif
++            }
++        }
++        std::unique_lock lock{mutex};
++        if (!available.wait(lock, stop, [this] { return !entries.empty(); })) {
++            return;
++        }
++        out = std::move(entries.front());
++        entries.pop_front();
++    }
++
++private:
++    static long long SpinNanoseconds() {
++        static const long long value = [] {
++            const char* text = std::getenv("EDEN_PS5_GPU_SPIN_US");
++            return text != nullptr ? std::strtoll(text, nullptr, 10) * 1000 : 0LL;
++        }();
++        return value;
++    }
++
++    std::mutex mutex;
++    std::condition_variable_any available;
++    std::deque<T> entries;
++};
++
++} // namespace Common
+diff --git a/src/video_core/gpu_thread.h b/src/video_core/gpu_thread.h
+index f8f4fea9fcac5f7de3533b9467029b4088688b1a..fcd80d2d445f6388f3754727bd91ce51a6cf38e8 100644
+--- a/src/video_core/gpu_thread.h
++++ b/src/video_core/gpu_thread.h
+@@ -15,6 +15,7 @@
+ #include <variant>
+ 
+ #include "common/bounded_threadsafe_queue.h"
++#include "common/host_command_queue.h"
+ #include "common/polyfill_thread.h"
+ #include "video_core/dma_pusher.h"
+ #include "video_core/framebuffer_config.h"
+@@ -102,10 +103,9 @@ struct CommandDataContainer {
+ 
+ /// Struct used to synchronize the GPU thread
+ struct SynchState final {
+-    // Room for a burst of sparse tile maps. Their callers hold the nx2:gpu locks while they push,
+-    // and the GPU thread takes those locks to back a sparse write: with the queue full, neither
+-    // moves (Mario Kart World froze on its first screen with 4096 entries).
+-    using CommandQueue = Common::SPSCQueue<CommandDataContainer, 0x10000>;
++    // Unbounded (common/host_command_queue.h): a full queue let nx2:gpu requests, which push GPU
++    // maps holding the locks a GPU-thread write into a lazily backed region takes, wait for ever.
++    using CommandQueue = Common::HostCommandQueue<CommandDataContainer>;
+     std::mutex write_lock;
+     CommandQueue queue;
+     u64 last_fence{};

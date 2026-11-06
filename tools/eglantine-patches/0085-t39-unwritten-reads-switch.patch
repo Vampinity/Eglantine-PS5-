@@ -1,0 +1,26 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0027-unwritten-reads-switch.patch
+
+Source: 0027-unwritten-reads-switch.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 7daa4c311a51a6b097886f81875dce76e6809fd5..929e9bb66e549ec9950004f091f9ce19911a54ce 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -863,7 +863,13 @@ struct Memory::Impl {
+         // Without a fastmem arena (the PS5) every guest read of a GPU-tracked page comes here, and
+         // each miss of the area cache is a round trip through the GPU thread. A Switch 2 title's
+         // page the buffer cache never saw the GPU write has nothing to flush: read it directly.
+-        const bool nx2_direct = Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
++        // EDEN_PS5_UNWRITTEN_READS=0 sends every miss through the GPU thread again (A/B).
++        static const bool unwritten_reads_direct = [] {
++            const char* value = std::getenv("EDEN_PS5_UNWRITTEN_READS");
++            return value == nullptr || value[0] != '0';
++        }();
++        const bool nx2_direct = unwritten_reads_direct &&
++                                Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                                 !current_page_table->fastmem_arena;
+         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+             const DAddr end_address = address + size;

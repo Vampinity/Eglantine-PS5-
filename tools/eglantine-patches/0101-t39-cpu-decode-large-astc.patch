@@ -1,0 +1,55 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0054-cpu-decode-large-astc.patch
+
+Source: 0054-cpu-decode-large-astc.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index ed5fa5af92d4d1721320e09d0b1a1dbec80cfa5d..0fbc6400c3c21be7436081f2c73fb5244ed0a2f9 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -311,11 +311,31 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+     return HugeAstcHostFormat(device, info);
+ }
+ 
++// Whether TranscodeAstcToBcn's RGBA8 decode image (every level and layer of `info`, four bytes a
++// texel) would exceed EDEN_NX2_GPU_TRANSCODE_MIB (default 128 MiB). Ocarina of Time's
++// 1365x1365x90 arrays needed 853 MiB decode images next to their 213 MiB BC3 images, and
++// 6144x6144 ones 201 MiB, which ran the PS5 out of memory. Those decode on the CPU instead
++// (asynchronously, to the same BC1/BC3), which needs no full-size scratch image.
++[[nodiscard]] bool TranscodeScratchTooLarge(const ImageInfo& info) {
++    static const u64 limit = [] {
++        const char* value = std::getenv("EDEN_NX2_GPU_TRANSCODE_MIB");
++        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 128;
++        return mib != 0 ? mib << 20 : ~u64{0};
++    }();
++    u64 bytes = 0;
++    for (s32 level = 0; level < info.resources.levels; ++level) {
++        bytes += u64{(std::max)(info.size.width >> level, 1U)} *
++                 (std::max)(info.size.height >> level, 1U) * 4;
++    }
++    return bytes * static_cast<u64>(info.resources.layers) > limit;
++}
++
+ // ASTC that the GPU decodes and re-compresses to BC1/BC3 itself (TranscodeAstcToBcn): no CPU
+ // decode, so streamed textures are ready the frame they are first used instead of seconds later.
+ [[nodiscard]] bool WillUseGpuBcnTranscode(const Device& device, const ImageInfo& info) {
+     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
+-        IsHugeAstcArray(device, info) || info.type != ImageType::e2D || info.size.depth != 1) {
++        IsHugeAstcArray(device, info) || info.type != ImageType::e2D || info.size.depth != 1 ||
++        TranscodeScratchTooLarge(info)) {
+         return false;
+     }
+     return Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu &&
+@@ -2724,6 +2744,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+             if (WillUseAcceleratedAstcDecode(runtime->device, info) ||
+                 WillUseGpuBcnTranscode(runtime->device, info)) {
+                 flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
++            } else if (Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed &&
++                       TranscodeScratchTooLarge(info)) {
++                // Too large for the GPU transcode's scratch image: decode on the CPU, off the GPU thread.
++                flags |= VideoCommon::ImageFlagBits::AsynchronousDecode;
+             }
+             break;
+         case Settings::AstcDecodeMode::CpuAsynchronous:

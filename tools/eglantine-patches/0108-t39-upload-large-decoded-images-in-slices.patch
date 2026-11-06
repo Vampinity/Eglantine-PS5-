@@ -1,0 +1,162 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0069-upload-large-decoded-images-in-slices.patch
+
+Source: 0069-upload-large-decoded-images-in-slices.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index d4b8547c1e04d920d991d754b35877c899100817..525d7735e3966fc9dbe89228e8b174f1bcd68b62 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2402,6 +2402,48 @@ void TextureCache<P>::ReportMemory() {
+     }
+ }
+ 
++// Large images upload in slices of whole layers. One staging buffer for a whole image asks for a
++// single free block of the next power of two: 256 MiB for a 226 MiB array of Ocarina of Time,
++// with 844 MiB free on the PS5 but 117 MiB the largest block, and the app stopped. A slice fits a
++// region of the stream buffer, so it usually allocates nothing at all.
++constexpr size_t UPLOAD_SLICE_BYTES = size_t{8} << 20;
++constexpr size_t UPLOAD_FRAME_BYTES = size_t{32} << 20;
++
++// The next slice of `copies`: whole layers, at most `limit` bytes but at least one layer. The
++// layers of a copy sit back to back in its buffer range (ConvertedLayout gives its size).
++template <typename Copies>
++[[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> NextUploadSlice(
++    const Copies& copies, size_t& next_copy, s32& next_layer, size_t limit) {
++    boost::container::small_vector<BufferImageCopy, 16> slice;
++    size_t bytes = 0;
++    while (next_copy < copies.size() && bytes < limit) {
++        const BufferImageCopy& copy = copies[next_copy];
++        const s32 layers = copy.image_subresource.num_layers;
++        const size_t layer_bytes = copy.buffer_size / static_cast<size_t>(layers);
++        const size_t left = static_cast<size_t>(layers - next_layer);
++        size_t take = layer_bytes != 0 ? (std::min)(left, (limit - bytes) / layer_bytes) : left;
++        if (take == 0) {
++            if (!slice.empty()) {
++                break;
++            }
++            take = 1;
++        }
++        BufferImageCopy part = copy;
++        part.buffer_offset += static_cast<size_t>(next_layer) * layer_bytes;
++        part.buffer_size = take * layer_bytes;
++        part.image_subresource.base_layer += next_layer;
++        part.image_subresource.num_layers = static_cast<s32>(take);
++        slice.push_back(part);
++        bytes += part.buffer_size;
++        next_layer += static_cast<s32>(take);
++        if (next_layer == layers) {
++            ++next_copy;
++            next_layer = 0;
++        }
++    }
++    return slice;
++}
++
+ template <class P>
+ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
+@@ -2425,9 +2467,29 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+         image.flags |= ImageFlagBits::ZeroFilled;
+         auto zero_copies = copies;
+         ConvertedLayout(image.info, zero_copies);
+-        auto staging = runtime.UploadStagingBuffer(out_size);
+-        std::memset(staging.mapped_span.data(), 0, out_size);
+-        image.UploadMemory(staging, zero_copies);
++        if (out_size <= UPLOAD_SLICE_BYTES) {
++            auto staging = runtime.UploadStagingBuffer(out_size);
++            std::memset(staging.mapped_span.data(), 0, out_size);
++            image.UploadMemory(staging, zero_copies);
++        } else {
++            // Every slice reads the same zeros: one buffer the size of the largest slice.
++            size_t zero_bytes = UPLOAD_SLICE_BYTES;
++            for (const BufferImageCopy& copy : zero_copies) {
++                zero_bytes = (std::max)(zero_bytes, copy.buffer_size /
++                                        static_cast<size_t>(copy.image_subresource.num_layers));
++            }
++            auto staging = runtime.UploadStagingBuffer(zero_bytes);
++            std::memset(staging.mapped_span.data(), 0, zero_bytes);
++            size_t next_copy = 0;
++            s32 next_layer = 0;
++            while (next_copy < zero_copies.size()) {
++                auto slice = NextUploadSlice(zero_copies, next_copy, next_layer, zero_bytes);
++                for (BufferImageCopy& part : slice) {
++                    part.buffer_offset = 0;
++                }
++                image.UploadMemory(staging, slice);
++            }
++        }
+         runtime.InsertUploadMemoryBarrier();
+     }
+ 
+@@ -2463,6 +2525,7 @@ void TextureCache<P>::QueueAsyncUnswizzle(Image& image, ImageId image_id) {
+ template <class P>
+ void TextureCache<P>::TickAsyncDecode() {
+     bool has_uploads{};
++    size_t upload_budget = UPLOAD_FRAME_BYTES;
+     auto i = async_decodes.begin();
+     while (i != async_decodes.end()) {
+         auto* async_decode = i->get();
+@@ -2486,12 +2549,42 @@ void TextureCache<P>::TickAsyncDecode() {
+             i = async_decodes.erase(i);
+             continue;
+         }
+-        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+-        std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
+-                    async_decode->decoded_data.size());
+-        image.UploadMemory(staging, async_decode->copies);
++        if (MapSizeBytes(image) > UPLOAD_SLICE_BYTES) {
++            if (async_decode->next_copy == 0 && async_decode->next_layer == 0) {
++                ConvertedLayout(image.info, async_decode->copies);
++            }
++            while (upload_budget > 0 && async_decode->next_copy < async_decode->copies.size()) {
++                auto slice = NextUploadSlice(async_decode->copies, async_decode->next_copy,
++                                             async_decode->next_layer, UPLOAD_SLICE_BYTES);
++                size_t bytes = 0;
++                for (const BufferImageCopy& part : slice) {
++                    bytes += part.buffer_size;
++                }
++                auto staging = runtime.UploadStagingBuffer(bytes);
++                size_t offset = 0;
++                for (BufferImageCopy& part : slice) {
++                    std::memcpy(staging.mapped_span.data() + offset,
++                                async_decode->decoded_data.data() + part.buffer_offset,
++                                part.buffer_size);
++                    part.buffer_offset = offset;
++                    offset += part.buffer_size;
++                }
++                image.UploadMemory(staging, slice);
++                has_uploads = true;
++                upload_budget -= (std::min)(upload_budget, bytes);
++            }
++            if (async_decode->next_copy < async_decode->copies.size()) {
++                ++i; // the rest next frame, with the image still marked as decoding
++                continue;
++            }
++        } else {
++            auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
++            std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
++                        async_decode->decoded_data.size());
++            image.UploadMemory(staging, async_decode->copies);
++            has_uploads = true;
++        }
+         image.flags &= ~ImageFlagBits::IsDecoding;
+-        has_uploads = true;
+         i = async_decodes.erase(i);
+     }
+     if (has_uploads) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index e2b69aeb7c7776db92e08efbbeb69ba08e5da2c0..50ec6a105b6d24cda5f38b1e19a676c570226607 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -77,6 +77,8 @@ struct AsyncDecodeContext {
+     std::mutex mutex;
+     std::atomic_bool complete;
+     bool cancelled{}; ///< The image was deleted meanwhile: drop the result (GPU thread only).
++    size_t next_copy{}; ///< A large image uploads over several frames: the next copy...
++    s32 next_layer{};   ///< ...and the next layer of it (GPU thread only).
+ };
+ 
+ using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;

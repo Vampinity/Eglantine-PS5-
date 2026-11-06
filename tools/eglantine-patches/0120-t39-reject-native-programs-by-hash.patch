@@ -1,0 +1,38 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0098-reject-native-programs-by-hash.patch
+
+Source: 0098-reject-native-programs-by-hash.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index 57d151af5834b3f17293d3fc29e2ee3ae81a5f55..80a9c5c762e795db48836c2c80ad0118c7b98927 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -575,6 +575,26 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
+     // unreachable data. Existing disk-cache serialization carries it with code.
+     lowered_code.push_back(0);
+     Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
++    // EDEN_NX2_REJECT_HASH=<hash>,...: like EDEN_NX2_REJECT, but by what stays the same between
++    // runs: the native program key (EDEN_NX2_SHADER_DUMP file names) or the hash of the lowered
++    // code, the one Lichii's frame dumps show. Lower case, no 0x. A program already in the disk
++    // cache doesn't pass through here.
++    if (static const std::string reject_hashes = [] {
++            const char* text = std::getenv("EDEN_NX2_REJECT_HASH");
++            return text ? "," + std::string{text} + "," : std::string{};
++        }();
++        !reject_hashes.empty()) {
++        const u64 lowered_hash =
++            Common::CityHash64(reinterpret_cast<const char*>(lowered_code.data()),
++                               lowered_code.size() * sizeof(u64)) ^
++            0x4f554e4345000002ULL;
++        for (const u64 hash : {Shader::Ampere::NativeProgramKey(native), lowered_hash}) {
++            if (reject_hashes.find(fmt::format(",{:016x},", hash)) != std::string::npos) {
++                throw Shader::RuntimeError("Native shader at {:#x} ({:016x}) rejected by EDEN_NX2_REJECT_HASH",
++                                           program_base, hash);
++            }
++        }
++    }
+     LOG_DEBUG(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
+               program_base, result->source_size, lowered.instructions.size());
+     return result;

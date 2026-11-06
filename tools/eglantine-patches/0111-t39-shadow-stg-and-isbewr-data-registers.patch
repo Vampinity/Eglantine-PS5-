@@ -1,0 +1,20 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0084-shadow-stg-and-isbewr-data-registers.patch
+
+Source: 0084-shadow-stg-and-isbewr-data-registers.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index d79873c9193f7f8267df5e208b81b3b35290ac59..7a00cdca3189715d2d13272d89145adb8fc2d9fa 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -266,7 +266,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+         bool requires_shadow = false;
+         for (u32 bit : {16U, 24U, 32U, 64U}) {
+             if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xf66 &&
+-                opcode != 0x988) continue;
++                opcode != 0x988 && opcode != 0x986 && opcode != 0x927) continue;
+             const u32 reg = insn.Bits(bit, 8);
+             if (reg >= shadow_boundary && reg < 255) requires_shadow = true;
+         }

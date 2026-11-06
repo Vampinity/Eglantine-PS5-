@@ -1,0 +1,75 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0052-bound-task-counts-and-mesh-indices.patch
+
+Source: 0052-bound-task-counts-and-mesh-indices.patch
+Build gate: EDEN_MIGRATE_020=1 (default off). Original runtime gates retained.
+Assisted-by: OpenAI Codex (offline migration).
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+index 6c599528cc3c001a058a7a4041b1f3c985b594d5..3dffe44fe5659f43c5402b91ad8cf284d5ef50f1 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+@@ -10,6 +10,7 @@
+ // epilogue (reached by every invocation, see structured_control_flow.cpp) hands them to Vulkan.
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <span>
+ 
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
+@@ -107,9 +108,26 @@ void ConvertDepth(EmitContext& ctx, Id vertex) {
+     ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.output_position, vertex, ctx.Const(2U)), z);
+ }
+ 
++// Vulkan bounds the mesh workgroups one task workgroup may launch: groupCountX up to
++// maxMeshWorkGroupCount[0], at least 65535 everywhere (RADV: exactly that). A larger or garbage
++// count is undefined behaviour; on the PS5's RADV, whose mesh dispatch is emulated, it can keep the
++// GPU busy past the winsys's 10 s limit (device lost). NVN programs launch a few hundred at most.
++// EDEN_NX2_MESH_BOUNDS=0 leaves the counts and indices as the program wrote them (A/B).
++constexpr u32 MaxMeshWorkgroupsPerTask = 65535;
++
++bool MeshBounds() {
++    static const bool bounds = [] {
++        const char* value = std::getenv("EDEN_NX2_MESH_BOUNDS");
++        return value == nullptr || value[0] != '0';
++    }();
++    return bounds;
++}
++
+ void TaskEpilogue(EmitContext& ctx) {
+     Barrier(ctx);
+-    const Id count{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(1U)))};
++    const Id written{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(1U)))};
++    const Id count{MeshBounds() ? ctx.OpUMin(ctx.U32[1], written, ctx.Const(MaxMeshWorkgroupsPerTask))
++                                : written};
+     const Id one{ctx.Const(1U)};
+     // Marker for OpEmitMeshTasksEXT count, 1, 1, payload (PatchMeshInstructions).
+     ctx.OpStore(count, one);
+@@ -156,7 +174,12 @@ void MeshEpilogue(EmitContext& ctx) {
+             std::array<Id, 3> indices;
+             for (u32 element = 0; element < 3; ++element) {
+                 const Id address{ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element))};
+-                indices[element] = ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address));
++                // Below the vertex count, as Vulkan requires: map bytes the program left unwritten
++                // hold whatever workgroup memory held.
++                const Id index{ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address))};
++                indices[element] = MeshBounds() && mesh.max_vertices != 0
++                                       ? Clamped(ctx, index, mesh.max_vertices)
++                                       : index;
+             }
+             const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, ctx.U32[3])};
+             ctx.OpStore(ctx.OpAccessChain(output_indices, ctx.mesh_primitive_indices, primitive),
+@@ -207,6 +230,13 @@ void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value) {
+ }
+ 
+ void EmitMeshPrologue(EmitContext& ctx) {
++    if (ctx.stage == Stage::Task && MeshBounds()) {
++        // The mesh workgroup count starts at zero: the payload is workgroup memory, undefined until
++        // written, and a program that launches no mesh workgroups on some path may not write it.
++        ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
++        Barrier(ctx);
++        return;
++    }
+     if (ctx.stage != Stage::Mesh) {
+         return;
+     }
