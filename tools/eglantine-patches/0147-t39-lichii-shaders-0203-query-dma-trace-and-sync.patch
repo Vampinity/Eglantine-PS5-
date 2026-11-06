@@ -125,7 +125,7 @@ index 068ecbfbfd..5c72c5ad75 100644
 +        SignalFence([] {});
 +        rasterizer.FlushCommands();
 +        // As in WaitPendingFences: the fencing thread needs what the split's back defers.
-+        SubmitDeferredWork();
++        SubmitDeferred();
 +        if constexpr (!can_async_check) {
 +            TryReleasePendingFences<true>();
 +        }
