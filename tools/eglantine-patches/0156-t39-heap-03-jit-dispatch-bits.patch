@@ -1,0 +1,105 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0341-heap-03-jit-dispatch-bits.patch
+
+Source: 0341-heap-03-jit-dispatch-bits.patch
+Core patch: tools/eglantine-patches, next free number after 0181 (0183 if in order).
+
+The largest place the heap sites name: "96 MiB in 6 blocks" is new Jit::Impl, 0x1004000 bytes in
+Dynarmic::A64::Jit::Jit, and all but 16 KiB of each is fast_dispatch_table: 1 << 20 entries of 16
+bytes for each guest core. It is a cache of block lookups for indirect branches: an entry is
+overwritten by the next location landing on it and a miss takes the ordinary lookup.
+
+EDEN_JIT_DISPATCH_BITS=<12-19> sets the entries (18: 4 MiB a core, 72 MiB saved; 16: 1 MiB a core,
+90 MiB saved). Unset or anything else: 20 bits, the same mask as before. The table is its own block
+now; generated code gets its address as before, so headless/dynarmic/shared-jit.cmake's anchors hold.
+
+Checked on this Mac: the frontend's pinned CMake edits run to their end on this tree, dynarmic
+builds for x86-64 from the derived sources with real Boost and Xbyak, and under Rosetta a guest loop
+of 6,000,000 BRs over 16,384 targets gives the same result at 11 (ignored), 12, 14, 16, 18, 20 and
+99 (ignored) bits on the shared-JIT path. Speed on the console is not known: a miss costs a lookup
+under the group lock, and a smaller table also stays in cache. Not compiled for the console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 2307226744..40610d7094 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -8,6 +8,9 @@
+ 
+ #include "dynarmic/backend/x64/a64_emit_x64.h"
+ 
++#include <algorithm>
++#include <cstdlib>
++
+ #include <fmt/format.h>
+ #include <fmt/ostream.h>
+ #include "common/assert.h"
+@@ -57,6 +60,21 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
+ 
+ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
+         : EmitX64(code), conf(conf), jit_interface{jit_interface} {
++    // EglantinePS5: the table only saves a lookup, an entry is overwritten by the next location
++    // that lands on it, and it never changes what runs. 16 MiB a core is 96 MiB of the heap on a
++    // console that ran out of memory (run 61); 18 bits make it 4 MiB a core, 16 bits 1 MiB.
++    unsigned bits = fast_dispatch_table_max_bits;
++    if (const char* const chosen = std::getenv("EDEN_JIT_DISPATCH_BITS")) {
++        const unsigned long asked = std::strtoul(chosen, nullptr, 10);
++        if (asked >= 12 && asked < bits) {
++            bits = unsigned(asked);
++        }
++    }
++    const size_t entries = size_t(1) << bits;
++    fast_dispatch_storage = std::make_unique<FastDispatchEntry[]>(entries);
++    fast_dispatch_table = std::span<FastDispatchEntry>{fast_dispatch_storage.get(), entries};
++    fast_dispatch_table_mask = u32((entries - 1) * sizeof(FastDispatchEntry));
++
+     GenMemory128Accessors();
+     GenFastmemFallbacks();
+     GenTerminalHandlers();
+@@ -181,7 +199,7 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
+ 
+ void A64EmitX64::ClearFastDispatchTable() {
+     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+-        fast_dispatch_table.fill({});
++        std::fill(fast_dispatch_table.begin(), fast_dispatch_table.end(), FastDispatchEntry{});
+     }
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index a9f2d9b650..d131e85f39 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -10,7 +10,9 @@
+ 
+ #include <array>
+ #include <map>
++#include <memory>
+ #include <optional>
++#include <span>
+ #include <tuple>
+ #include "common/container/unordered_map.h"
+ #include "common/container/unordered_set.h"
+@@ -60,8 +62,9 @@ public:
+         const void* code_ptr = nullptr;
+     };
+     static_assert(sizeof(FastDispatchEntry) == 0x10);
+-    static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
+-    static constexpr size_t fast_dispatch_table_size = 0x100000;
++    // EglantinePS5: 1 << 20 entries, 16 MiB for each of the six guest cores, unless
++    // EDEN_JIT_DISPATCH_BITS=<12-20> in the environment asks for fewer (see the constructor).
++    static constexpr unsigned fast_dispatch_table_max_bits = 20;
+ 
+     void ClearFastDispatchTable();
+     void GenMemory128Accessors();
+@@ -126,7 +129,9 @@ public:
+     const A64::UserConfig conf;
+     RegAlloc reg_alloc; //reusable reg alloc
+     BlockRangeInformation<u64> block_ranges;
+-    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
++    std::unique_ptr<FastDispatchEntry[]> fast_dispatch_storage;
++    std::span<FastDispatchEntry> fast_dispatch_table;
++    u32 fast_dispatch_table_mask = 0;
+     std::vector<FastmemPatchInfo> fastmem_patch_info;  // sorted by rip
+     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
+     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;

@@ -8,7 +8,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = (root / 'headless/main.cpp').read_text()
 start = source.index('        if (std::exchange(autoboot_pending, false)) {')
-end = source.index('#else\n        Eden::BootTrace::Line("opening the launcher");', start)
+end = source.index('        Eden::BootTrace::Line("launcher closed: ', start)
 branch = source[start:end]
 wait_start = source.index('#elif defined(EDEN_DEV_ROM_ID)\n                        // Library and forwarded launches')
 wait_start = source.index('\n', wait_start) + 1

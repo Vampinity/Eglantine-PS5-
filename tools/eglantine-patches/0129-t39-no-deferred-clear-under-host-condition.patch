@@ -1,0 +1,73 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0140-no-deferred-clear-under-host-condition.patch
+
+Source: 0140-no-deferred-clear-under-host-condition.patch
+vk_rasterizer: do not defer a clear made under a host condition
+
+Community patch 0098 (updates-2026-11-05/community), unchanged. The cause is from
+nxnative PR 1299, which names it as Ocarina's white 3D scene.
+
+A deferred clear becomes a render pass load op, and VK_EXT_conditional_rendering does
+not apply to load ops. With a host predicate execute_on stays true, so a clear the GPU
+should have skipped ran anyway. agl clears a depth target under a condition, copies the
+prepass depth into it, and clears it again under the same condition, which the console
+skips; run unconditionally, the main opaque pass's EQUAL test fails and the sky shows
+through. Under a host condition the clear now goes through ClearAttachments, which is
+predicated.
+
+EDEN_NX2_DEFER_CONDITIONAL_CLEARS=1 restores the old behaviour for A/B runs (read with
+getenv, so env.txt works in a release).
+
+Not known yet: how many of Ocarina's conditions take the host path here. hcr_mode is 1
+(exact) by default: a condition with queries still pending is evaluated on the CPU and
+leaves hcr_is_set false, and this patch changes nothing for those. Only the host path
+is affected.
+
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index d60866fafc..b505d75bc5 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -1382,6 +1382,10 @@ void QueryCacheRuntime::View3DRegs(Func&& func) {
+     }
+ }
+ 
++bool QueryCacheRuntime::IsHostConditionalRenderingSet() const {
++    return impl->hcr_is_set;
++}
++
+ void QueryCacheRuntime::EndHostConditionalRendering() {
+     PauseHostConditionalRendering();
+     impl->hcr_is_set = false;
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.h b/src/video_core/renderer_vulkan/vk_query_cache.h
+index bbb5234e11..824bf2fa95 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.h
++++ b/src/video_core/renderer_vulkan/vk_query_cache.h
+@@ -48,6 +48,9 @@ public:
+ 
+     void ResumeHostConditionalRendering();
+ 
++    /// Whether the GPU predicates what is recorded now (which a render pass load op escapes).
++    [[nodiscard]] bool IsHostConditionalRenderingSet() const;
++
+     bool HostConditionalRenderingCompareValue(VideoCommon::LookupData object_1, bool qc_dirty);
+ 
+     bool HostConditionalRenderingCompareValues(VideoCommon::LookupData object_1,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 06c8bfde4e..eee79b26f5 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1053,7 +1053,13 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+         clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
+         clear_rect.rect.extent.width >= render_area.width &&
+         clear_rect.rect.extent.height >= render_area.height;
+-    const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
++    // A deferred clear becomes a render pass load op, and conditional rendering does not apply to
++    // load ops: under a host condition it would always run. EDEN_NX2_DEFER_CONDITIONAL_CLEARS=1
++    // defers it all the same, as before.
++    static const bool defer_conditional = std::getenv("EDEN_NX2_DEFER_CONDITIONAL_CLEARS") != nullptr;
++    const bool can_defer_clear = ENABLE_DEFERRED_CLEAR &&
++                                 (defer_conditional || !query_cache_runtime.IsHostConditionalRenderingSet()) &&
++                                 (!regs.clear_control.use_scissor || clear_covers_render_area) &&
+                                  regs.clear_surface.layer == 0 &&
+                                  !scheduler.IsRenderPassActive() &&
+                                  (!use_color || color_full_channels) && ds_deferrable;

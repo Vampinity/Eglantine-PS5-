@@ -1,0 +1,59 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0384-mem-audit-02-scratch-keep-switch.patch
+
+Source: 0384-mem-audit-02-scratch-keep-switch.patch
+Core patch, on core16 (through 0181). Paths are the submodule's. Use with mem-audit-04.
+
+TickFrame keeps swizzle_data_buffer and unswizzle_data_buffer up to 64 MiB each between frames, so
+up to 128 MiB stays held. Run62's largest uploads reached 64 and 288 MiB, so that ceiling is in
+reach, but how much was really held is not logged. The swizzle one only grows when guest memory is
+not contiguous, the unswizzle one only for converted images.
+
+EDEN_TC_SCRATCH_KEEP_MIB=<0..64> in env.txt. Unset, or out of range, as before; try 8. At 8 at most
+16 MiB stays held: up to 112 MiB back.
+
+What it costs: a frame that needs more allocates it again, up to 2 x 64 MiB of churn a frame, and
+when the pool is empty that can be refused where a kept buffer would not have been. That is why
+this goes with mem-audit-04: without it a refused growth there ends the session.
+
+TickFrame holds texture_cache.mutex and the buffers are only used within one call, so freeing them
+more often adds no race.
+
+Syntax-compiled for the PS5 target with warnings on, TextureCache instantiated for Vulkan and
+OpenGL, through prepare-vulkan-port.py (same skipped anchors as before). Not built, not run on the
+console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 1aceca5eb0..28f56411f5 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -317,8 +317,26 @@ template <class P>
+ void TextureCache<P>::TickFrame() {
+     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
+     // rather than kept for the rest of the session.
++    // EDEN_TC_SCRATCH_KEEP_MIB=<0..64>: keep less of each between frames. A frame that needs more
++    // allocates it again, which is what the two buffers exist to avoid, and that can be refused
++    // when the pool is empty (the image then keeps what it shows). Unset, as before.
++    static const size_t scratch_keep = [] {
++        const char* const value = std::getenv("EDEN_TC_SCRATCH_KEEP_MIB");
++        if (value == nullptr) {
++            return LargeScratchCapacity;
++        }
++        char* end = nullptr;
++        const unsigned long long mib = std::strtoull(value, &end, 10);
++        if (end == value || mib > (LargeScratchCapacity >> 20)) {
++            LOG_WARNING(HW_GPU, "EDEN_TC_SCRATCH_KEEP_MIB={} is not 0 to {}: ignored", value,
++                        LargeScratchCapacity >> 20);
++            return LargeScratchCapacity;
++        }
++        LOG_INFO(HW_GPU, "Upload scratch buffers keep at most {} MiB each", mib);
++        return static_cast<size_t>(mib) << 20;
++    }();
+     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
+-        if (scratch->capacity() > LargeScratchCapacity) {
++        if (scratch->capacity() > scratch_keep) {
+             scratch->release();
+         }
+     }

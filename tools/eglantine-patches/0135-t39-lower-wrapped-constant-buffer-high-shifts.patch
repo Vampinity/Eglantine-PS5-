@@ -1,0 +1,39 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0154-lower-wrapped-constant-buffer-high-shifts.patch
+
+Source: 0154-lower-wrapped-constant-buffer-high-shifts.patch
+40), not Ocarina; ported because it was on the candidate list and is small.
+
+SHF.L.W.U32.HI Rd, RZ, c[bank][offset], Rc: the upper word of (Rc:0) <<
+(count & 31) is Rc << (count & 31). The form failed with "native register
+shift mode" before.
+
+Changed from the source: this core loads a constant-buffer shift count into
+R251 (load_shift), so the SHL.W takes R251 where the source reads the count
+operand directly; the bank and offset checks are shift_operand's.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/shader_recompiler/frontend/ampere/lower_to_maxwell.h | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index ab693c1d56..7d9abf6b03 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -1443,6 +1443,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                 right_shift_u64_low(static_cast<u32>(dest), low, high, shift);
+                 break;
+             }
++            // SHF.L.W.U32.HI Rd, RZ, c[bank][offset], Rc: the upper word of (Rc:0) << (count & 31)
++            // is Rc << (count & 31). The count is loaded into R251, as the forms below load it.
++            if (constant && !right && high_result && low == 255 && insn.Bits(73, 2) == 3 &&
++                insn.Bits(75, 1) && shift_operand &&
++                (insn.words[2] & ~0x000108ffU) == 0x00000600U && !(insn.words[3] & 0xc00001ffU)) {
++                load_shift();
++                emit(base(0x5c48000000000000ULL) | (u64{high} << 8) | (u64{shift} << 20) |
++                     (u64{1} << 39));
++                break;
++            }
+             // SHF.R.U32 of the low word with a zero high word: a plain logical right shift.
+             if (right && !high_result && high == 255 && insn.Bits(73, 2) == 3 && shift != ~0U &&
+                 shift_operand &&

@@ -5,6 +5,7 @@
 #include "display_refresh.h"
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 
 namespace Vulkan {
 vk::SurfaceKHR CreateSurface(const vk::Instance& instance,
@@ -64,6 +65,24 @@ vk::SurfaceKHR CreateSurface(const vk::Instance& instance,
             break;
         }
     }
+    // The first mode of a rate is 3840x2160, and the driver keeps five framebuffers of a mode's size
+    // for good: 160 MiB of the pool for a session that outputs 1080p, whose frame was then copied
+    // up to them. The mode of the session's own output size, where there is one: VideoOut scales a
+    // buffer of each size to fill the screen (PS5_Mesa wsi_common_videoout.c), and at 1080p the five
+    // take 50 MiB. EDEN_VULKAN_FULL_FRAMEBUFFERS=1 keeps 3840x2160.
+    const char* const full_size = std::getenv("EDEN_VULKAN_FULL_FRAMEBUFFERS");
+    if (!full_size || full_size[0] != '1') {
+        for (const auto& candidate : modes) {
+            if ((candidate.parameters.refreshRate >= 119000) == fast &&
+                static_cast<int>(candidate.parameters.visibleRegion.width) == Eden::Display::output_width.load() &&
+                static_cast<int>(candidate.parameters.visibleRegion.height) == Eden::Display::output_height.load()) {
+                mode = candidate;
+                break;
+            }
+        }
+    }
+    std::fprintf(stderr, "[EglantinePS5] Vulkan display: framebuffers of %ux%u\n",
+                 mode.parameters.visibleRegion.width, mode.parameters.visibleRegion.height);
     Eden::Display::output_millihertz.store(static_cast<int>(mode.parameters.refreshRate));
     if (mode.parameters.refreshRate >= 119000) Eden::Display::settle.store(true);
     std::fprintf(stderr, "[EglantinePS5] Vulkan display: %u modes, asked for %d Hz, using %.2f Hz\n", count,

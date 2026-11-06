@@ -1,0 +1,133 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0143-lower-the-remaining-ocarina-compute-forms.patch
+
+Source: 0143-lower-the-remaining-ocarina-compute-forms.patch
+shader: lower the remaining Ocarina compute forms
+
+
+- ULDC with an index register: U8 and U16, signed offsets and any immediate, since the
+  register can align it. Comes with Lichii's direct U8/U16 ULDC form, which ours did not
+  have either (Star Fox there); the direct form keeps its range and alignment checks.
+- ULEA: the carry out can be any UPn. Our UIADD3 already takes any UPn.
+- F2IP.U8.F32: a second byte source and the default rounding.
+- I2F.U8 from a uniform register: any byte selector.
+
+Left out: the P2R change. It teaches Lichii's write_count, which this tree has no copy
+of; our call link proof marks bits 16-23 of every prior instruction as written, so P2R
+already counts as one write. UIADD3's carry hunk is here already. The test files of the
+PR do not exist in this tree.
+
+Added here: F2IP's Ra (bit 24) in PrepareRegisterPressure, which was only reachable as
+RZ before. Lichii's table still lacks it, so a reserved Ra would read the mirror there.
+
+The PR marks two things as inferred, not checked on hardware: F2IP's byte order and
+rounding, and that an unaligned indexed ULDC reads the aligned word. Lichii also notes
+that without its vegetation commits these programs may never be reached. None of our
+saved run logs shows a rejection by these forms: Ocarina's rejected programs all stop
+at op 23c (matrix multiply) first, so they could still come after it.
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 9ab1693045..ab693c1d56 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -103,7 +103,8 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+         operand(24, input.Bits(72, 1) ? 2 : 1);
+         operand(32, input.Bits(73, 3) == 2 || input.Bits(73, 3) == 5 ? 2 : 1);
+         break;
+-    case 0x202: case 0x243: operand(16); operand(32); break;
++    case 0x202: operand(16); operand(32); break;
++    case 0x243: operand(16); operand(24); operand(32); break;
+     case 0x812: case 0x824: case 0x831: case 0x424: case 0x624:
+         operand(16); operand(24); operand(64); break;
+     case 0x230: case 0x231: case 0x211: case 0x212: case 0x224:
+@@ -1050,14 +1051,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                 emit(0x5c98000000000000ULL | predicate | target | (u64{source} << 20) | (u64{15} << 39));
+             break;
+         }
+-        case 0xab9: case 0xabb: { // ULDC U32/U64, direct or indexed.
++        case 0xab9: case 0xabb: { // ULDC, direct or indexed.
+             const u32 uniform_dest = insn.Bits(16, 8), index_reg = insn.Bits(24, 8);
+             const u32 width = insn.Bits(73, 3);
++            const bool subword_load = width == 0 || width == 2;
++            const u32 offset = insn.Bits(38, 16);
++            const u32 alignment = width == 0 ? 1U : width == 2 ? 2U : 4U;
+             const u32 target = uniform_register(uniform_dest);
+             const u32 index_target = opcode == 0xabb ? uniform_register(index_reg) : 255U;
+-            if (target == ~0U || target == 255 || (width != 4 && width != 5) ||
++            if (target == ~0U || target == 255 || (!subword_load && width != 4 && width != 5) ||
++                (opcode == 0xab9 && subword_load && offset >= 0x8000) ||
+                 (width == 5 && ((uniform_dest & 1) || uniform_register(uniform_dest + 1) != target + 1)) ||
+-                bank() >= 18 || insn.Bits(38, 16) % 4 || insn.Bits(62, 2) ||
++                // An index register can align the offset; the host reads the aligned word either way.
++                bank() >= 18 || (opcode == 0xab9 && offset % alignment) || insn.Bits(62, 2) ||
+                 (insn.words[2] & ~0xe00U) != (opcode == 0xab9 ? 0U : 0x08000000U) ||
+                 index_target == ~0U)
+                 return fail(index, "native uniform constant load mode");
+@@ -1065,7 +1071,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                 emit(0x4c98000000000000ULL | predicate | target | (u64{15} << 39) | cbuf());
+             } else {
+                 emit(0xef90000000000000ULL | predicate | target |
+-                     (u64{index_target} << 8) | (u64{insn.Bits(38, 16)} << 20) |
++                     (u64{index_target} << 8) | (u64{offset} << 20) |
+                      (u64{bank()} << 36) | (u64{width} << 48));
+             }
+             break;
+@@ -1946,10 +1952,37 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                  (u64{insn.Bits(32, 8)} << 20) | (u64{insn.Bits(78, 2)} << 39));
+             break;
+         }
+-        case 0x243: // F2IP.U8.F32 with RZ for the second source: one unsigned byte, as F2I.U8
+-            if (insn.Bits(24, 8) != 255 || (insn.words[1] & ~0xffU) ||
+-                insn.words[2] != 0x0000c4ffU)
++        case 0x243:
++            // F2IP.U8.F32 Rd, Ra, Rb, RZ: Rb's byte in bits 0-7 and Ra's in bits 8-15. The default
++            // rounding (bits 78-79 clear) packs unorm values already scaled by 255. With RZ for
++            // the second source and the truncating mode: one unsigned byte, as F2I.U8.
++            if ((insn.words[1] & ~0xffU) ||
++                (insn.words[2] != 0x0000c4ffU && insn.words[2] != 0x000004ffU))
+                 return fail(index, "native packed float-to-byte mode");
++            if (insn.Bits(24, 8) != 255 || insn.words[2] == 0x000004ffU) {
++                const auto to_byte = [&](u32 source, u32 target) {
++                    emit(0x5800000000000000ULL | predicate | target | (u64{source} << 8) |
++                         (u64{source} << 20) | (u64{7} << 39) | (u64{7} << 48));
++                    emit(0x5c40000000000000ULL | predicate | target | (u64{source} << 8) |
++                         (u64{target} << 20) | (u64{7} << 48));
++                    mov_imm(252, 0);
++                    emit(0x5c60000000000000ULL | predicate | target | (u64{target} << 8) |
++                         (u64{252} << 20) | (u64{15} << 39));
++                    mov_imm(252, 0x437f0000U);
++                    emit(0x5c60000000000000ULL | predicate | target | (u64{target} << 8) |
++                         (u64{252} << 20) | (u64{7} << 39));
++                    emit(0x5cb0000000000000ULL | predicate | target | (u64{2} << 8) | (u64{2} << 10) |
++                         (u64{target} << 20) | (u64{insn.Bits(78, 2)} << 39));
++                };
++                to_byte(insn.Bits(32, 8), 250);
++                if (insn.Bits(24, 8) == 255) {
++                    emit(base(0x5c98000000000000ULL) | (u64{15} << 39) | (u64{250} << 20));
++                    break;
++                }
++                to_byte(insn.Bits(24, 8), 251);
++                emit(base(0x5c18000000000000ULL) | (u64{251} << 8) | (u64{250} << 20) | (u64{8} << 39));
++                break;
++            }
+             insn.words[0] &= 0x00ffffffU;
+             insn.words[2] = 0x0021e000U;
+             opcode = 0x305;
+@@ -2795,7 +2828,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+             }
+             // I2F.{U,S}8 Rd, Rs.B0-B3: the byte selector (bits 60-61) as Maxwell's (41-42).
+             if ((insn.words[2] & ~0x400U) != (opcode == 0xd06 ? 0x08001000U : 0x1000U) ||
+-                (insn.words[1] & (opcode == 0xd06 ? 0xffffff00U : 0xcfffff00U)) || source == ~0U)
++                (insn.words[1] & 0xcfffff00U) || source == ~0U)
+                 return fail(index, "native byte-to-float conversion mode");
+             emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (is_signed << 13) | (u64{source} << 20) |
+                  (u64{insn.Bits(60, 2)} << 41));
+@@ -3091,7 +3124,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+             const u32 carry_out = insn.Bits(81, 3);
+             if (insn.Bits(72, 1) || insn.Bits(74, 1) || insn.Bits(80, 1) ||
+                 (carry_out != 7 && ((opcode != 0x811 && insn.Bits(63, 1)) ||
+-                                    (rewritten_uniform && (opcode != 0x211 || carry_out > 1)))) ||
++                                    (rewritten_uniform && opcode != 0x211))) ||
+                 (opcode == 0x211 && insn.Bits(62, 1)) || (opcode == 0xc11 && (insn.words[1] & ~0x8000003fU)))
+                 return fail(index, "native LEA carry/high mode");
+             // 0x211 bit 63 negates Rb (LEA Rd, Ra, -Rb, s), as Maxwell ISCADD's bit 48.

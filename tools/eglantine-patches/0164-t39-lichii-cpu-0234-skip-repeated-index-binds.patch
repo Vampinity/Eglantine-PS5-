@@ -1,0 +1,120 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0364-lichii-cpu-0234-skip-repeated-index-binds.patch
+
+Source: 0364-lichii-cpu-0234-skip-repeated-index-binds.patch
+Core patch. Paths are the submodule's. Applies on core16 alone or in the lichii-cpu order.
+
+Source: zortos293/Lichii PR 161, commit 5a0cdcbeef, and PR 184, commit 440f0c2ac4, GPL-3.0-or-later.
+PR 161 was still open on 6 Nov; PR 184 is merged.
+
+EDEN_NX2_INDEX_REBIND=0: BindIndexBuffer returns when buffer, offset and type match the last bind and
+the scheduler's recording epoch has not moved. The epoch moves at InvalidateState and at the end of
+a render pass. BindQuadIndexBuffer clears the memory of it. Unset, every draw binds as before.
+
+Small: one Record and one vkCmdBindIndexBuffer per skipped draw.
+
+Pool memory: none.
+
+Checked: PS5-target syntax compile of the derived vk_buffer_cache_cost.cpp and vulkan_scheduler.cpp,
+0 errors. Every other vkCmdBindIndexBuffer runs through BindQuadIndexBuffer. Not run.
+
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index 78a5653e65..ffc1b47445 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -705,12 +705,32 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
+         ReserveNullBuffer();
+         vk_buffer = *null_buffer;
+     }
++    // EDEN_NX2_INDEX_REBIND=0: the same index buffer is still bound in this command buffer, so
++    // skip the rebind. Lichii PR 161, commit 5a0cdcbeef.
++    static const bool skip_rebind = [] {
++        const char* value = std::getenv("EDEN_NX2_INDEX_REBIND");
++        return value != nullptr && value[0] == '0';
++    }();
++    if (skip_rebind) {
++        const u64 epoch = scheduler.RecordingEpoch();
++        if (bound_index_valid && vk_buffer == bound_index_buffer &&
++            vk_offset == bound_index_offset && vk_index_type == bound_index_type &&
++            epoch == bound_index_epoch) {
++            return;
++        }
++        bound_index_valid = true;
++        bound_index_buffer = vk_buffer;
++        bound_index_offset = vk_offset;
++        bound_index_type = vk_index_type;
++        bound_index_epoch = epoch;
++    }
+     scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
+         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
+     });
+ }
+ 
+ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count) {
++    bound_index_valid = false;
+     if (count == 0) {
+         ReserveNullBuffer();
+         scheduler.Record([this](vk::CommandBuffer cmdbuf) {
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+index cc26eda963..f457f53d7c 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -335,6 +335,13 @@ private:
+ 
+     bool limit_dynamic_storage_buffers = false;
+     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
++
++    /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
++    VkBuffer bound_index_buffer = VK_NULL_HANDLE;
++    VkDeviceSize bound_index_offset = 0;
++    VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
++    u64 bound_index_epoch = 0;
++    bool bound_index_valid = false;
+ };
+ 
+ struct BufferCacheParams {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index d0f4bcbb42..736edc64e5 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -469,6 +469,7 @@ void Scheduler::AllocateNewContext() {
+ }
+ 
+ void Scheduler::InvalidateState() {
++    ++recording_epoch;
+     state.graphics_pipeline = nullptr;
+     state.rescaling_defined = false;
+     state.descriptor_buffer_bound = false;
+@@ -508,6 +509,7 @@ void Scheduler::EndRenderPass()
+             GPU::Logging::GPULogger::GetInstance().LogRenderPassEnd();
+         }
+ 
++        ++recording_epoch;
+         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
+         query_cache->NotifySegment(false);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 06b6dbcca1..566ebb68ec 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -210,6 +210,12 @@ public:
+         }
+     }
+ 
++    /// Changes whenever recorded command buffer state may have been reset (InvalidateState, the
++    /// end of a render pass), so a binding recorded at the same epoch is still bound.
++    [[nodiscard]] u64 RecordingEpoch() const noexcept {
++        return recording_epoch;
++    }
++
+     /// Returns the master timeline semaphore.
+     [[nodiscard]] MasterSemaphore& GetMasterSemaphore() const noexcept {
+         return *master_semaphore;
+@@ -353,6 +359,7 @@ private:
+     std::unique_ptr<CommandPool> command_pool;
+ 
+     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
++    u64 recording_epoch = 0;
+ 
+     vk::CommandBuffer current_cmdbuf;
+     vk::CommandBuffer current_upload_cmdbuf;

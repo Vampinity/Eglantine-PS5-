@@ -1,0 +1,146 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0415-mem-02-lazy-present.patch
+
+Source: 0415-mem-02-lazy-present.patch
+Core patch: paths relative to core16, through 0181. Also compatible with the
+frontend patch list through 0410: none changes these two files.
+Off by default. Enable with EDEN_PS5_LAZY_PRESENT=1 in env.txt. Only the exact
+value 1 enables it; unset, 0, and other values keep eager allocation.
+
+Proven source ownership: Layer::ConfigureDraw selects the cached GPU image for
+accelerated display, but RefreshResources allocates a staging buffer and N raw
+images anyway. These are VMA application allocations outside the image and
+buffer caches reported by EDEN_REFUSED_IMAGES / EDEN_REFUSED_BUFFERS.
+
+Saving, conditional on accelerated presentation: N * stride * height * bpp
+staging bytes plus N raw-image allocations (including driver padding). At
+3840x2160 RGBA8, stride 3840 and N=3, that is 189.84 MiB before image padding.
+Run101 stderr.log:9745 has a 94 MiB host-visible allocation, consistent with
+that staging buffer, not proof of its identity. The 3840x2160 cached images are
+logged at :828-830. Neither the swapchain image count nor accelerated-hit rate
+is measured by those lines. Do not advertise 190 MiB as measured savings.
+
+Keep resource ticks even without raw storage: descriptors and AA still use
+per-image slots. Switching to CPU upload allocates full-size storage before
+use. Switching back waits every recorded tick before releasing it; queued
+upload lambdas capture this Layer. Size, stride and format changes also wait.
+Release image views before their images. No texture levels or pixels change.
+A stream of alternating CPU/GPU frames can cause waits and allocation churn.
+
+Validation: git apply --check against core16 passed. Changed routines passed
+Apple clang 21 -std=c++20 -Wall -Wextra -Werror -fsyntax-only with stub types;
+constexpr checks covered repeated GPU frames, CPU fallback, return to GPU,
+stride/size/format changes and tick waits. This is not a full-file/PS5 compile.
+No console or full PS5 build was run.
+This removes redundant backing, but does not establish a cure for exhaustion.
+
+Assisted-by: Codex (local audit and draft; not submitted upstream)
+
+diff --git a/src/video_core/renderer_vulkan/present/layer.cpp b/src/video_core/renderer_vulkan/present/layer.cpp
+index 5652090bd7..1469565ff9 100644
+--- a/src/video_core/renderer_vulkan/present/layer.cpp
++++ b/src/video_core/renderer_vulkan/present/layer.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++#include <cstring>
+ #include <variant>
+ #include "video_core/present.h"
+ #include "video_core/renderer_vulkan/present/anti_alias_pass.h"
+@@ -103,7 +105,14 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
+         (framebuffer.layer_stack_mask & Service::Nvnflinger::LayerStackBit(
+                                             Service::Nvnflinger::LayerStackId::Recording)) == 0;
+ 
+-    RefreshResources(device, framebuffer);
++    // The cached GPU image is already the source of accelerated presentation. Raw
++    // upload images and their staging buffer are needed only by the CPU fallback.
++    // Keep this opt-in until accelerated/fallback transitions have run on PS5.
++    static const bool lazy_raw = [] {
++        const char* value = std::getenv("EDEN_PS5_LAZY_PRESENT");
++        return value != nullptr && std::strcmp(value, "1") == 0;
++    }();
++    RefreshResources(device, framebuffer, !lazy_raw || !use_accelerated);
+     SetAntiAliasPass(device);
+ #ifdef HAS_RESHADE
+     SetPostProcessPass(device, is_applet);
+@@ -191,7 +200,6 @@ void Layer::CreateStagingBuffer(const Device& device, const Tegra::FramebufferCo
+ 
+ void Layer::CreateRawImages(const Device& device, const Tegra::FramebufferConfig& framebuffer) {
+     const auto format = GetFormat(framebuffer);
+-    resource_ticks.resize(image_count);
+     raw_images.resize(image_count);
+     raw_image_views.resize(image_count);
+ 
+@@ -202,20 +210,32 @@ void Layer::CreateRawImages(const Device& device, const Tegra::FramebufferConfig
+     }
+ }
+ 
+-void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer) {
+-    if (framebuffer.width == raw_width && framebuffer.height == raw_height &&
+-        framebuffer.pixel_format == pixel_format && !raw_images.empty()) {
++void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer,
++                             bool need_raw_images) {
++    const bool same_shape = framebuffer.width == raw_width && framebuffer.height == raw_height &&
++                            framebuffer.stride == raw_stride &&
++                            framebuffer.pixel_format == pixel_format;
++    if (same_shape && resource_ticks.size() == image_count &&
++        need_raw_images == !raw_images.empty()) {
+         return;
+     }
+ 
++    // Wait for every descriptor/AA user too, even when no raw image was made.
++    // A queued CPU upload captures this Layer, so it must finish before reset.
++    ReleaseRawImages();
++    resource_ticks.assign(image_count, 0);
+     raw_width = framebuffer.width;
+     raw_height = framebuffer.height;
++    raw_stride = framebuffer.stride;
+     pixel_format = framebuffer.pixel_format;
+-    anti_alias.emplace<std::monostate>();
+-
+-    ReleaseRawImages();
+-    CreateStagingBuffer(device, framebuffer);
+-    CreateRawImages(device, framebuffer);
++    if (!same_shape) {
++        anti_alias.emplace<std::monostate>();
++    }
++    if (need_raw_images) {
++        // Allocate before UpdateRawImage can run. Size and format are unchanged.
++        CreateStagingBuffer(device, framebuffer);
++        CreateRawImages(device, framebuffer);
++    }
+ }
+ 
+ void Layer::SetAntiAliasPass(const Device& device) {
+@@ -287,6 +307,7 @@ void Layer::ReleaseRawImages() {
+     for (const u64 tick : resource_ticks) {
+         scheduler.Wait(tick);
+     }
++    raw_image_views.clear();
+     raw_images.clear();
+     buffer.reset();
+ }
+diff --git a/src/video_core/renderer_vulkan/present/layer.h b/src/video_core/renderer_vulkan/present/layer.h
+index 88fa0d6f9c..e9b6ea0569 100644
+--- a/src/video_core/renderer_vulkan/present/layer.h
++++ b/src/video_core/renderer_vulkan/present/layer.h
+@@ -68,7 +68,8 @@ private:
+     void CreateStagingBuffer(const Device& device, const Tegra::FramebufferConfig& framebuffer);
+     void CreateRawImages(const Device& device, const Tegra::FramebufferConfig& framebuffer);
+ 
+-    void RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer);
++    void RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer,
++                          bool need_raw_images);
+     void SetAntiAliasPass(const Device& device);
+ #ifdef HAS_RESHADE
+     void SetPostProcessPass(const Device& device, bool is_applet);
+@@ -97,6 +98,7 @@ private:
+     std::vector<vk::ImageView> raw_image_views{};
+     u32 raw_width{};
+     u32 raw_height{};
++    u32 raw_stride{};
+     Service::android::PixelFormat pixel_format{};
+ 
+     Settings::AntiAliasing anti_alias_setting{};

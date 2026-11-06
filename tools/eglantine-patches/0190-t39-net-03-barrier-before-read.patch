@@ -1,0 +1,234 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0414-net-03-barrier-before-read.patch
+
+Source: 0414-net-03-barrier-before-read.patch
+shader: EDEN_NX2_NET_BARRIER, keep a warp's shared memory accesses in order
+
+Applies after 0413 of test/T28-upscaler-safe. Off unless EDEN_NX2_NET_BARRIER=1.
+
+A warp's shared memory accesses stay in order on the console, so native programs may store rows
+and read other lanes' rows back with no BAR between them. Ocarina of Time's upscaler does this
+after its last BAR (agl_ndsr_vr_light.pck, program at 0x1be00: BAR 0x4c70, nine STS 0x4c90 to
+0x4d20, LDS from 0x4d40). A host compiler may move those accesses past each other. On Metal it
+did: about 100 pixels a frame came out wrong, up to 1.07, in all three channels at fixed tile
+positions, and two identical dispatches differed.
+
+EDEN_NX2_NET_BARRIER=1: in a program with HMMA, the first shared load after a store and before
+the next BAR gets a subgroup memory barrier. A new IR op, SubgroupMemoryBarrier, because
+MEMBAR.CTA here means workgroup scope with uniform and image memory as well, which waits for
+more than this needs. SPIR-V: OpMemoryBarrier, Subgroup scope, AcquireRelease | WorkgroupMemory.
+The lowering marks it with bit 20 of a Maxwell MEMBAR, a field Maxwell does not use.
+
+Ocarina's upscaler gets two barriers, 24 bytes of SPIR-V. On Metal the race went from 1,228
+differing pixels over 12 runs to none in 24 runs on two frames, with no measurable cost (27.5 ms
+against 27.4 ms at 1080p).
+
+Off: the module is byte for byte the same as without this patch, for this program. Not run on
+the console or on RADV. The guest warp must sit inside one host subgroup; subgroup sizes 32 and
+64 both satisfy that.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/shader_recompiler/backend/glasm/emit_glasm_barriers.cpp b/src/shader_recompiler/backend/glasm/emit_glasm_barriers.cpp
+index c42fa6cd16..59e07e8d33 100644
+--- a/src/shader_recompiler/backend/glasm/emit_glasm_barriers.cpp
++++ b/src/shader_recompiler/backend/glasm/emit_glasm_barriers.cpp
+@@ -14,6 +14,10 @@ void EmitWorkgroupMemoryBarrier(EmitContext& ctx) {
+     ctx.Add("MEMBAR.CTA;");
+ }
+ 
++void EmitSubgroupMemoryBarrier(EmitContext& ctx) {
++    ctx.Add("MEMBAR.CTA;");
++}
++
+ void EmitDeviceMemoryBarrier(EmitContext& ctx) {
+     ctx.Add("MEMBAR;");
+ }
+diff --git a/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h b/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
+index 994d46f9e3..546b816793 100644
+--- a/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
++++ b/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
+@@ -31,6 +31,7 @@ void EmitJoin(EmitContext& ctx);
+ void EmitDemoteToHelperInvocation(EmitContext& ctx);
+ void EmitBarrier(EmitContext& ctx);
+ void EmitWorkgroupMemoryBarrier(EmitContext& ctx);
++void EmitSubgroupMemoryBarrier(EmitContext& ctx);
+ void EmitDeviceMemoryBarrier(EmitContext& ctx);
+ void EmitPrologue(EmitContext& ctx);
+ void EmitEpilogue(EmitContext& ctx);
+diff --git a/src/shader_recompiler/backend/glsl/emit_glsl_barriers.cpp b/src/shader_recompiler/backend/glsl/emit_glsl_barriers.cpp
+index 2cf6140456..3c388c898f 100644
+--- a/src/shader_recompiler/backend/glsl/emit_glsl_barriers.cpp
++++ b/src/shader_recompiler/backend/glsl/emit_glsl_barriers.cpp
+@@ -13,6 +13,10 @@ void EmitWorkgroupMemoryBarrier(EmitContext& ctx) {
+     ctx.Add("groupMemoryBarrier();");
+ }
+ 
++void EmitSubgroupMemoryBarrier(EmitContext& ctx) {
++    ctx.Add("memoryBarrierShared();");
++}
++
+ void EmitDeviceMemoryBarrier(EmitContext& ctx) {
+     ctx.Add("memoryBarrier();");
+ }
+diff --git a/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h b/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
+index 0df361b59b..85d4246168 100644
+--- a/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
++++ b/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
+@@ -33,6 +33,7 @@ void EmitJoin(EmitContext& ctx);
+ void EmitDemoteToHelperInvocation(EmitContext& ctx);
+ void EmitBarrier(EmitContext& ctx);
+ void EmitWorkgroupMemoryBarrier(EmitContext& ctx);
++void EmitSubgroupMemoryBarrier(EmitContext& ctx);
+ void EmitDeviceMemoryBarrier(EmitContext& ctx);
+ void EmitPrologue(EmitContext& ctx);
+ void EmitEpilogue(EmitContext& ctx);
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp
+index 0b9a3664ff..a61114a3fc 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp
+@@ -29,6 +29,15 @@ void EmitWorkgroupMemoryBarrier(EmitContext& ctx) {
+     MemoryBarrier(ctx, spv::Scope::Workgroup);
+ }
+ 
++// Keeps one subgroup's shared memory accesses in program order, nothing more: no other storage
++// class, and no wait for other subgroups.
++void EmitSubgroupMemoryBarrier(EmitContext& ctx) {
++    const auto semantics{spv::MemorySemanticsMask::AcquireRelease |
++                         spv::MemorySemanticsMask::WorkgroupMemory};
++    ctx.OpMemoryBarrier(ctx.Const(static_cast<u32>(spv::Scope::Subgroup)),
++                        ctx.Const(static_cast<u32>(semantics)));
++}
++
+ void EmitDeviceMemoryBarrier(EmitContext& ctx) {
+     MemoryBarrier(ctx, spv::Scope::Device);
+ }
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+index 37f8e05b07..2b03878d2c 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+@@ -34,6 +34,7 @@ void EmitJoin(EmitContext& ctx);
+ void EmitDemoteToHelperInvocation(EmitContext& ctx);
+ void EmitBarrier(EmitContext& ctx);
+ void EmitWorkgroupMemoryBarrier(EmitContext& ctx);
++void EmitSubgroupMemoryBarrier(EmitContext& ctx);
+ void EmitDeviceMemoryBarrier(EmitContext& ctx);
+ void EmitPrologue(EmitContext& ctx);
+ void EmitEpilogue(EmitContext& ctx);
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 7d9abf6b03..46e5a648f3 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -211,6 +211,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+     const bool uses_async_copy = std::any_of(code.begin(), code.end(), [](const auto& instruction) {
+         return instruction.Bits(0, 12) == 0xfae;
+     });
++    // EDEN_NX2_NET_BARRIER=1: a warp's shared memory accesses stay in order on the console, so
++    // Ocarina of Time's upscaler (agl_ndsr_vr_light, 0x4c70 on) stores rows and reads other lanes'
++    // rows back with no BAR between them. Other compilers may reorder those accesses: on Metal
++    // about 100 pixels a frame came out wrong. In programs with HMMA, the first shared read after
++    // a store and before the next BAR gets a subgroup memory barrier.
++    static const bool order_warp_shared = [] {
++        const char* const text = std::getenv("EDEN_NX2_NET_BARRIER");
++        return text && text[0] == '1';
++    }();
++    const bool keep_shared_order = order_warp_shared &&
++        std::any_of(code.begin(), code.end(), [](const auto& instruction) {
++            return instruction.Bits(0, 12) == 0x23c;
++        });
++    bool shared_store_pending = false;
+     for (const auto& instruction : code) {
+         const u32 op = instruction.Bits(0, 12);
+         uses_uniform_bank |= op == 0x4a4 || op == 0x2bf || op == 0x499;
+@@ -1514,6 +1528,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                 return fail(index, "native workgroup barrier mode");
+             emit(0xf0a8000000000000ULL | predicate | (u64{1} << 43) |
+                 (u64{1} << 44) | (u64{1} << 39) | (u64{7} << 39));
++            shared_store_pending = false;
+             break;
+         case 0x388: case 0x984: case 0x988: { // Shared memory load/store with scaled register offsets.
+             const u32 width = insn.Bits(73, 3), stride = insn.Bits(78, 2);
+@@ -1537,6 +1552,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                 address = 250;
+             }
+             const bool store = opcode != 0x984;
++            if (keep_shared_order) {
++                if (!store && shared_store_pending) {
++                    emit(0xef98000000000000ULL | predicate | (u64{1} << 20)); // subgroup MEMBAR
++                    shared_store_pending = false;
++                } else if (store) {
++                    shared_store_pending = true;
++                }
++            }
+             const u32 data = store ? insn.Bits(32, 8) : static_cast<u32>(dest);
+             emit((store ? 0xef58000000000000ULL : 0xef48000000000000ULL) |
+                 predicate | data | (u64{address} << 8) | (u64{insn.Bits(40, 24)} << 20) |
+diff --git a/src/shader_recompiler/frontend/ir/ir_emitter.cpp b/src/shader_recompiler/frontend/ir/ir_emitter.cpp
+index 2a20ac2646..ff421105af 100644
+--- a/src/shader_recompiler/frontend/ir/ir_emitter.cpp
++++ b/src/shader_recompiler/frontend/ir/ir_emitter.cpp
+@@ -103,6 +103,10 @@ void IREmitter::WorkgroupMemoryBarrier() {
+     Inst(Opcode::WorkgroupMemoryBarrier);
+ }
+ 
++void IREmitter::SubgroupMemoryBarrier() {
++    Inst(Opcode::SubgroupMemoryBarrier);
++}
++
+ void IREmitter::DeviceMemoryBarrier() {
+     Inst(Opcode::DeviceMemoryBarrier);
+ }
+diff --git a/src/shader_recompiler/frontend/ir/ir_emitter.h b/src/shader_recompiler/frontend/ir/ir_emitter.h
+index 672c5960e7..847cc67571 100644
+--- a/src/shader_recompiler/frontend/ir/ir_emitter.h
++++ b/src/shader_recompiler/frontend/ir/ir_emitter.h
+@@ -162,6 +162,7 @@ public:
+ 
+     void Barrier();
+     void WorkgroupMemoryBarrier();
++    void SubgroupMemoryBarrier();
+     void DeviceMemoryBarrier();
+ 
+     template <typename Dest, typename Source>
+diff --git a/src/shader_recompiler/frontend/ir/microinstruction.cpp b/src/shader_recompiler/frontend/ir/microinstruction.cpp
+index 0d10b28eb2..4dd1deb15d 100644
+--- a/src/shader_recompiler/frontend/ir/microinstruction.cpp
++++ b/src/shader_recompiler/frontend/ir/microinstruction.cpp
+@@ -77,6 +77,7 @@ bool Inst::MayHaveSideEffects() const noexcept {
+     case Opcode::DemoteToHelperInvocation:
+     case Opcode::Barrier:
+     case Opcode::WorkgroupMemoryBarrier:
++    case Opcode::SubgroupMemoryBarrier:
+     case Opcode::DeviceMemoryBarrier:
+     case Opcode::EmitVertex:
+     case Opcode::EndPrimitive:
+diff --git a/src/shader_recompiler/frontend/ir/opcodes.inc b/src/shader_recompiler/frontend/ir/opcodes.inc
+index 890db69209..980bf89f47 100644
+--- a/src/shader_recompiler/frontend/ir/opcodes.inc
++++ b/src/shader_recompiler/frontend/ir/opcodes.inc
+@@ -23,6 +23,7 @@ OPCODE(EndPrimitive,                                        Void,           U32,
+ // Barriers
+ OPCODE(Barrier,                                             Void,                                                                                           )
+ OPCODE(WorkgroupMemoryBarrier,                              Void,                                                                                           )
++OPCODE(SubgroupMemoryBarrier,                               Void,                                                                                           )
+ OPCODE(DeviceMemoryBarrier,                                 Void,                                                                                           )
+ 
+ // Context getters/setters
+diff --git a/src/shader_recompiler/frontend/maxwell/translate/impl/barrier_operations.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/barrier_operations.cpp
+index aa494e24cc..4f13852a58 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate/impl/barrier_operations.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/barrier_operations.cpp
+@@ -23,9 +23,12 @@ void TranslatorVisitor::MEMBAR(u64 inst) {
+     union {
+         u64 raw;
+         BitField<8, 2, LocalScope> scope;
++        BitField<20, 1, u64> subgroup; // set only by the Ampere lowering, not a Maxwell field
+     } const membar{inst};
+ 
+-    if (membar.scope == LocalScope::CTA) {
++    if (membar.subgroup != 0) {
++        ir.SubgroupMemoryBarrier();
++    } else if (membar.scope == LocalScope::CTA) {
+         ir.WorkgroupMemoryBarrier();
+     } else {
+         ir.DeviceMemoryBarrier();

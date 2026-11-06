@@ -1,0 +1,62 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0407-black-world-07-source-size-own-pair.patch
+
+Source: 0407-black-world-07-source-size-own-pair.patch
+network's own pair by itself
+
+T26's run87 and run90 set EDEN_NX2_UPSCALE_SOURCE_SIZE=960x540 without EDEN_NX2_UPSCALE_SAME_SIZE
+or _HANDLES_ONLY. The handle path accepts a same-size own pair only with own_same_size, which was
+same_size_ok || handles_only: r@0xc0 1920x1080 format 32 -> w@0xd0 1920x1080 format 33 was "no
+pair", own_pair_programs stayed empty, own_guard never held, and the Bananza slots and the cbuf0
+scan ran as in T23 ("source (cbuf0 scan): 480x270", then 128x72; black). The two checks after the
+handle path also passed same_size_ok, so even a formed same-size pair would have been scanned
+away under HANDLES_ONLY or SOURCE_SIZE alone.
+
+own_same_size is now same_size_ok || handles_only || small_source, defined after those switches,
+and the Bananza and scan checks use it. With SAME_SIZE set nothing changes; with none of the
+three switches nothing changes.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/kepler_compute.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 0e7f81e0a3..fefb9ac2d6 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -961,7 +961,6 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     // dispatch where such a program's own handles form no pair is skipped. Programs whose own
+     // pair upscales (the movies' last pass) keep the old path. Same-size own pairs are allowed.
+     static const bool handles_only = std::getenv("EDEN_NX2_UPSCALE_HANDLES_ONLY") != nullptr;
+-    const bool own_same_size = same_size_ok || handles_only;
+     static std::unordered_set<GPUVAddr> own_pair_programs; // 1:1 networks seen so far
+     // EDEN_NX2_UPSCALE_SOURCE_SIZE=<width>x<height>, or "half" (the output's size over 2): for a
+     // 1:1 network, the copy's source is an image of that size in the output's format, looked for
+@@ -983,6 +982,12 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     }();
+     const bool small_source = source_size.first != 0 && source_size.second != 0;
+     const bool no_scans = handles_only || small_source;
++    // Same-size own pairs are accepted with SAME_SIZE, HANDLES_ONLY or SOURCE_SIZE: the last two
++    // mean nothing without the own pair. T26's run87 and run90 had SOURCE_SIZE alone: the handle
++    // path refused r@0xc0 -> w@0xd0 as "no pair", no program was ever a 1:1 network, and the
++    // Bananza slots and the cbuf0 scan ran as before (480x270 and 128x72 sources, black). The two
++    // checks after the handle path use this too, so a same-size own pair is not scanned away.
++    const bool own_same_size = same_size_ok || no_scans;
+     // EDEN_NX2_UPSCALE_STEADY=1 (run75, Docked: that program's pair was found at 106 s and the
+     // world showed, then it was lost again while the program kept being dispatched; the log has no
+     // per-dispatch data): the program's own handle slots that last gave a pair are tried first on
+@@ -1232,12 +1237,12 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     }
+     // Donkey Kong Bananza's slots, after the program's own handles: other titles keep unrelated
+     // images there.
+-    if (!own_guard && !upscale_pair(input, output, false, same_size_ok)) {
++    if (!own_guard && !upscale_pair(input, output, false, own_same_size)) {
+         input = image(0x60);
+         output = image(0x70);
+         step = "Bananza slots";
+     }
+-    if (!own_guard && !upscale_pair(input, output, false, same_size_ok)) {
++    if (!own_guard && !upscale_pair(input, output, false, own_same_size)) {
+         input.reset();
+         output.reset();
+         step = "cbuf0 scan";

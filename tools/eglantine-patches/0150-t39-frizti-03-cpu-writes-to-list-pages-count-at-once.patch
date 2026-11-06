@@ -1,0 +1,93 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0333-frizti-03-cpu-writes-to-list-pages-count-at-once.patch
+
+Source: 0333-frizti-03-cpu-writes-to-list-pages-count-at-once.patch
+buffer_cache: a CPU write to a GPU-written list page counts at once (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone.
+
+Source: sylvieistaken/selevet-eglantine a3644b1b3e (Performance build 7), GPL-3.0-or-later. Not in
+Lichii or Frizti. Zortos's Selevet audit is older than that build.
+
+EDEN_NX2_LIST_CPU_SYNC=1. A CPU write to a page the GPU wrote is collected until the next fence. If
+the page holds command lists, the front meanwhile takes the host copy as current and runs its old
+lists, a whole earlier frame. Selevet reports old frames flashing between new ones in Ocarina, fixed
+by this, on one RTX 3050 machine. Now the write marks the copy stale at once. The list then goes the
+flush way, which first applies the collected writes, or the download would put the old lists back.
+
+Goes with nemyu-02 (EDEN_NX2_HELD_WRITES), it does not replace it: that one gets the bytes to the GPU
+before a list, this one stops the front reading an old copy of the list itself.
+
+Limit, as in the source: OnCPUWrite runs only when a core moves to another page, so only the first
+write of a run on a page counts at once. Nothing shows the console has these flashes at all.
+
+Changed from the source: off by default; there it is on, with =0 to leave it. The flush here is the
+one core16 has, without Selevet's page batch.
+
+Runs on the PS5: same core path. No log says how often the console's Ocarina reaches it.
+Hang: no new kind of wait. Such lists take the drain and flush core16 already has for a page's first
+list, possibly more often, so it can cost time. Running stale lists is the worse failure: stale draw
+arguments lost the device in Fast Fusion.
+Pool memory: none.
+Checked: PS5-target syntax compile, dma_pusher and the buffer cache. Not run.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9b21661658..7b54a2dfa6 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -266,6 +266,9 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
+         return false;
+     }
+     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
++        if (Tegra::Nx2ListCpuSync()) {
++            Nx2NoteListHostWrite(device_addr, size);
++        }
+         return true;
+     }
+     WriteMemory(device_addr, size);
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 7dc780ae72..9561d522d4 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -715,6 +715,9 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
+     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
+     const auto flush = [memory = &memory_manager, rasterizer_ = rasterizer, first_page, end_page] {
++        if (rasterizer_ != nullptr && Tegra::Nx2ListCpuSync()) {
++            rasterizer_->InvalidateGPUCache();
++        }
+         if (memory->IsMemoryDirty(first_page, end_page - first_page,
+                                   VideoCommon::CacheType::BufferCache)) {
+             memory->FlushRegion(first_page, end_page - first_page,
+diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
+index f0bddd3e68..42705ab708 100644
+--- a/src/video_core/nx2.h
++++ b/src/video_core/nx2.h
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <cstdlib>
+ #include <functional>
+ #include <map>
+ #include <mutex>
+@@ -66,6 +67,19 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
+     }
+ }
+ 
++// EDEN_NX2_LIST_CPU_SYNC=1: a CPU write to a command list page the GPU also wrote counts at once.
++// Otherwise it is collected until the next fence, and until then the split's front runs the host
++// copy of the page's old lists, a whole earlier frame. The flush of such a page applies the
++// collected writes first, or the download would put the old lists back over them.
++// From sylvieistaken/selevet-eglantine a3644b1b3e (Performance build 7). On by default there.
++[[nodiscard]] inline bool Nx2ListCpuSync() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_LIST_CPU_SYNC");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
+ [[nodiscard]] inline bool Nx2IsCommandListPage(u64 device_address) {
+     const u64 page = device_address >> Nx2WrittenPageBits;
+     if (page >= g_nx2_command_list_pages.size() * 64) {

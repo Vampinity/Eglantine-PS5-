@@ -20,6 +20,7 @@
 #include "pe/ui/launcher.hpp"
 #include "radio_input.h"
 #include "ps5_system_language.hpp"
+#include "test_harness.h"
 #ifdef EDEN_DEV_ROM_ID
 #include "crash_trigger.h"
 #include "development_input.h"
@@ -249,7 +250,8 @@ std::string RunApp(const std::string& launch_error, bool first_start, Eden::Mult
         pe::gfx::Viewport viewport = pe::gfx::fit_viewport(display.width(), display.height());
         auto previous = Clock::now();
         bool first_frame = true;
-        while (running && !launcher.done()) {
+        // test-quit (test_harness.h) closes the launcher as its own Quit does.
+        while (running && !launcher.done() && !Eden::TestHarness::QuitAsked()) {
             const auto frame_start = Clock::now();
             // Start-to-start frame time; a long frame does not make the animations jump.
             const float dt = first_frame ? 1.0f / 60.0f :
@@ -388,7 +390,7 @@ std::string RunApp(const std::string& launch_error, bool first_start, Eden::Mult
         }
 
         selected_game = launcher.selected_game();
-        if (!launcher.done()) selected_game.clear();
+        if (!launcher.done() || Eden::TestHarness::QuitAsked()) selected_game.clear();
         // Let the last sound end (the screen is already dark), then give everything back.
         for (int wait = 0; audio_ready && wait < 60 && mixer->active_voices() > 0; ++wait) sceKernelUsleep(10000);
         audio.stop();

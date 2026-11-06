@@ -1,0 +1,497 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0320-rebase-01-compact-hmma.patch
+
+Source: 0320-rebase-01-compact-hmma.patch
+Moved by hand: a comment hunk moved by upstream's movie note; code hunks unchanged
+
+shader: EDEN_NX2_TENSOR=compact runs HMMA through one shared software helper
+
+Port of Djihads80/Eglantine e88024e6b0 (Duck912, branch scratch/oot-shader-lab, 2026-11-05), which
+ports zortos293/Lichii #5 by Mattscreative in its form from 8cd5c6a44b. GPL-3.0-or-later, as the
+core. Credit lines of the source commit: Co-authored-by Mattscreative, Zortos.
+
+Why: the source commit says Ocarina of Time draws its final image through an 11-program network
+after the tonemap, and measured Kokiri Forest median luma ~0.29 with the stand-in against ~0.10 with
+the network, "flat and far too bright". run61 logs 11 "native matrix multiply" rejections: ten in one
+burst at 34 s (code at 0x216c8...), one at 90.9 s from another region (0x1148bd5300). Only the count
+matches; the source names no addresses, so these being its 11 programs is a guess.
+
+run60 is the one console measure (EDEN_NX2_TENSOR=1, HMMA_NATIVE, the same arithmetic as this form):
+- Its ten compute pipelines were translated by 34.9 s, then one frame took 15.66 s. That timer leaves
+  out the driver compile, which runs on workers, so the stall is likely the compile, not proven.
+- Frames came back at 17.2 fps (worst 61 ms) where run61 holds 60: about 40 ms a frame, one 5 s
+  sample. This form does the same products, so do not expect it to be cheaper on the GPU.
+- At the third heap report the heap held 2188 MiB against 1174 in run61, with 907 and 943 in use. Run
+  with EDEN_HEAP_KEEP_ARENAS=1, that extra GiB is not given back. Whether this form costs it too is
+  not known.
+- No frame after about 55 s, no crash report, and the log runs on to 146 s with most guest threads
+  unchanged. Cause unknown. It came after the pipelines were built, so compile cost does not explain it.
+
+RADV inlines every function (nir_inline_functions, radv_shader.c), so DontInline does not hold there:
+each HMMA gets its own copy of the helper's loop, 207 lines of SPIR-V. The gain over HMMA_NATIVE on
+the console is a rolled loop per site, not one helper per program. How much that cuts the compile is
+not known.
+
+HMMA now lowers to TENSOR_MUL_ADD, a Maxwell-encoded pseudo-instruction (bit 48 marks it, bit 49
+selects K = 8). The translator makes an IR TensorMulAdd; the SPIR-V backend defines one loop helper
+per K depth and program and calls it at each site: same lane mapping, f32 sums and half rounding
+after every eight products as the expansion, with subgroup shuffles. GLSL and GLASM don't have it.
+A guarded HMMA keeps HMMA_NATIVE.
+
+Changed from the source: no per-title default and no compact_tensor option. It runs only with
+EDEN_NX2_TENSOR=compact, set by hand; unset, nothing changes. No cache version bump, as in 0043: the
+lowered code is the pipeline key (Analyze hashes it). The source's check that compute shaders are
+made 32 threads wide is gone with its per-title gate: vk_compute_pipeline.cpp asks for 32 when a
+program uses warp operations, RADV offers that from GFX10, and the helper masks lane & ~31 anyway.
+spirv_software_matrix.cpp, the source's test, is left out.
+
+Checked off the console: spirv-val accepts the helper's SPIR-V for K = 8 and 16, made by this
+emit_spirv_tensor.cpp through a stand-in for sirit's calls, not real sirit. A C copy of round_half
+matches _Float16 on all 2^32 float patterns (NaNs skipped). Neither ran on a GPU.
+
+Core patch. Nothing here has run on a console.
+
+diff --git a/src/shader_recompiler/CMakeLists.txt b/src/shader_recompiler/CMakeLists.txt
+index c30779401e..13c0c06d8f 100644
+--- a/src/shader_recompiler/CMakeLists.txt
++++ b/src/shader_recompiler/CMakeLists.txt
+@@ -34,6 +34,7 @@ add_library(shader_recompiler STATIC
+     backend/spirv/emit_spirv_warp.cpp
+     backend/spirv/spirv_emit_context.cpp
+     backend/spirv/spirv_emit_context.h
++    backend/spirv/emit_spirv_tensor.cpp
+     environment.h
+     exception.h
+     frontend/ir/abstract_syntax_list.h
+@@ -162,6 +163,7 @@ add_library(shader_recompiler STATIC
+     frontend/maxwell/translate/impl/texture_gradient.cpp
+     frontend/maxwell/translate/impl/texture_load.cpp
+     frontend/maxwell/translate/impl/texture_load_swizzled.cpp
++    frontend/maxwell/translate/impl/tensor_mul_add.cpp
+     frontend/maxwell/translate/impl/texture_mipmap_level.cpp
+     frontend/maxwell/translate/impl/texture_query.cpp
+     frontend/maxwell/translate/impl/video_helper.cpp
+diff --git a/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h b/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
+index 546b816793..46e33ce6f5 100644
+--- a/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
++++ b/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
+@@ -63,6 +63,8 @@ void EmitIsbeRead(EmitContext& ctx);
+ void EmitIsbeWriteAttribute(EmitContext& ctx);
+ void EmitIsbeWriteMapU8(EmitContext& ctx);
+ void EmitIsbeWriteMapU32(EmitContext& ctx);
++void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a, const IR::Value& b,
++                      const IR::Value& c);
+ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, ScalarF32 value);
+ void EmitSetSampleMask(EmitContext& ctx, ScalarS32 value);
+ void EmitSetFragDepth(EmitContext& ctx, ScalarF32 value);
+diff --git a/src/shader_recompiler/backend/glasm/emit_glasm_not_implemented.cpp b/src/shader_recompiler/backend/glasm/emit_glasm_not_implemented.cpp
+index 41c829ca5d..09e0458616 100644
+--- a/src/shader_recompiler/backend/glasm/emit_glasm_not_implemented.cpp
++++ b/src/shader_recompiler/backend/glasm/emit_glasm_not_implemented.cpp
+@@ -113,4 +113,9 @@ void EmitIsbeWriteMapU32(EmitContext& ctx) {
+     NotImplemented();
+ }
+ 
++void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a, const IR::Value& b,
++                      const IR::Value& c) {
++    NotImplemented();
++}
++
+ } // namespace Shader::Backend::GLASM
+diff --git a/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h b/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
+index 85d4246168..28c5f518ca 100644
+--- a/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
++++ b/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
+@@ -77,6 +77,8 @@ void EmitIsbeRead(EmitContext& ctx);
+ void EmitIsbeWriteAttribute(EmitContext& ctx);
+ void EmitIsbeWriteMapU8(EmitContext& ctx);
+ void EmitIsbeWriteMapU32(EmitContext& ctx);
++void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a, const IR::Value& b,
++                      const IR::Value& c);
+ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, std::string_view value);
+ void EmitSetSampleMask(EmitContext& ctx, std::string_view value);
+ void EmitSetFragDepth(EmitContext& ctx, std::string_view value);
+diff --git a/src/shader_recompiler/backend/glsl/emit_glsl_not_implemented.cpp b/src/shader_recompiler/backend/glsl/emit_glsl_not_implemented.cpp
+index 18779e51b8..1e93fe6da7 100644
+--- a/src/shader_recompiler/backend/glsl/emit_glsl_not_implemented.cpp
++++ b/src/shader_recompiler/backend/glsl/emit_glsl_not_implemented.cpp
+@@ -113,4 +113,9 @@ void EmitIsbeWriteMapU32(EmitContext& ctx) {
+     NotImplemented();
+ }
+ 
++void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a, const IR::Value& b,
++                      const IR::Value& c) {
++    NotImplemented();
++}
++
+ } // namespace Shader::Backend::GLSL
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index 3757bfd951..8f3ecafb8d 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -657,6 +657,7 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
+ 
+ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
+     EmitContext ctx{profile, runtime_info, program, bindings};
++    DefineSoftwareMatrixFunctions(ctx, program);
+     const Id main{DefineMain(ctx, program)};
+     DefineEntryPoint(program, ctx, main);
+     if (profile.support_float_controls) {
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+index 2b03878d2c..7e9a078fac 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+@@ -15,6 +15,7 @@ enum class Attribute : u64;
+ enum class Patch : u64;
+ class Inst;
+ class Value;
++struct Program;
+ } // namespace Shader::IR
+ 
+ namespace Shader::Backend::SPIRV {
+@@ -66,6 +67,8 @@ Id EmitIsbeRead(EmitContext& ctx, Id address);
+ void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value);
+ void EmitIsbeWriteMapU8(EmitContext& ctx, Id address, Id value);
+ void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value);
++Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
++void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
+ void EmitMeshPrologue(EmitContext& ctx);
+ void EmitMeshEpilogue(EmitContext& ctx);
+ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value);
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
+new file mode 100644
+index 0000000000..16600e58b9
+--- /dev/null
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
+@@ -0,0 +1,160 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "common/common_types.h"
++#include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
++#include "shader_recompiler/backend/spirv/spirv_emit_context.h"
++#include "shader_recompiler/frontend/ir/program.h"
++
++namespace Shader::Backend::SPIRV {
++void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program) {
++    std::array<bool, 2> needed{};
++    for (const auto* block : program.blocks) {
++        for (const auto& inst : block->Instructions()) {
++            if (inst.GetOpcode() != IR::Opcode::TensorMulAdd || inst.Flags<u32>() == 0) {
++                continue;
++            }
++            const u32 depth = inst.Flags<u32>();
++            if (depth != 8 && depth != 16) {
++                throw LogicError("Invalid software HMMA depth");
++            }
++            needed[depth == 16] = true;
++        }
++    }
++    for (u32 variant = 0; variant < 2; ++variant) {
++        if (!needed[variant]) {
++            continue;
++        }
++        ctx.AddCapability(spv::Capability::GroupNonUniform);
++        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
++        if (!ctx.profile.SupportsSubgroupStage(program.stage) ||
++            ctx.profile.has_broken_spirv_subgroup_shuffle)
++            throw NotImplementedException("Software HMMA requires subgroup shuffle support");
++        const Id u32ty = ctx.U32[1], f32ty = ctx.F32[1];
++        const auto imm = [&](u32 v) { return ctx.Const(v); };
++        const auto add = [&](Id a, Id b) { return ctx.OpIAdd(u32ty, a, b); };
++        const auto and_ = [&](Id a, u32 b) { return ctx.OpBitwiseAnd(u32ty, a, imm(b)); };
++        const auto unpack = [&](Id v) { return ctx.OpUnpackHalf2x16(ctx.F32[2], v); };
++        const auto round_half = [&](Id value) {
++            // Do not express the intermediate rounding as unpack(pack(value)): drivers may
++            // eliminate that round trip. Round normal significands explicitly, ties to even;
++            // half subnormals lie on the exactly representable 2^-24 grid.
++            const Id bits = ctx.OpBitcast(u32ty, value);
++            const Id magnitude = and_(bits, 0x7fffffffU);
++            const Id tie = and_(ctx.OpShiftRightLogical(u32ty, magnitude, imm(13)), 1);
++            const Id rounded = and_(add(add(magnitude, imm(0xfff)), tie), ~0x1fffU);
++            const Id normal =
++                ctx.OpSelect(u32ty, ctx.OpUGreaterThanEqual(ctx.U1, rounded, imm(0x47800000)),
++                             imm(0x7f800000), rounded);
++            const Id scaled =
++                ctx.OpFMul(f32ty, ctx.OpBitcast(f32ty, magnitude), ctx.Const(16777216.0f));
++            const Id subnormal = ctx.OpBitcast(
++                u32ty, ctx.OpFMul(f32ty, ctx.OpRoundEven(f32ty, scaled), ctx.Const(0x1p-24f)));
++            const Id finite =
++                ctx.OpSelect(u32ty, ctx.OpUGreaterThanEqual(ctx.U1, magnitude, imm(0x38800000)),
++                             normal, subnormal);
++            const Id result =
++                ctx.OpSelect(u32ty, ctx.OpUGreaterThanEqual(ctx.U1, magnitude, imm(0x7f800000)),
++                             magnitude, finite);
++            return ctx.OpBitcast(f32ty, ctx.OpBitwiseOr(u32ty, result, and_(bits, 0x80000000)));
++        };
++        const Id type = ctx.TypeFunction(ctx.U32[2], ctx.U32[4], ctx.U32[2], ctx.U32[2]);
++        const Id fn = ctx.OpFunction(ctx.U32[2], spv::FunctionControlMask::DontInline, type);
++        ctx.software_matrix_functions[variant] = fn;
++        const Id matrix_a = ctx.OpFunctionParameter(ctx.U32[4]);
++        const Id matrix_b = ctx.OpFunctionParameter(ctx.U32[2]);
++        const Id matrix_c = ctx.OpFunctionParameter(ctx.U32[2]);
++        ctx.AddLabel();
++        const Id counter = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, u32ty),
++                                                spv::StorageClass::Function);
++        std::array<Id, 4> accumulators;
++        for (auto& acc : accumulators)
++            acc = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, f32ty),
++                                       spv::StorageClass::Function);
++        std::array<Id, 8> inputs;
++        for (u32 i = 0; i < 4; ++i)
++            inputs[i] = ctx.OpCompositeExtract(u32ty, matrix_a, i);
++        for (u32 i = 0; i < 2; ++i) {
++            inputs[4 + i] = ctx.OpCompositeExtract(u32ty, matrix_b, i);
++            inputs[6 + i] = ctx.OpCompositeExtract(u32ty, matrix_c, i);
++        }
++        for (u32 row = 0; row < 2; ++row) {
++            const Id c = unpack(inputs[6 + row]);
++            for (u32 col = 0; col < 2; ++col)
++                ctx.OpStore(accumulators[row * 2 + col], ctx.OpCompositeExtract(f32ty, c, col));
++        }
++        ctx.OpStore(counter, imm(0));
++        const Id lane = ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id);
++        const Id warp_base = and_(lane, ~31U);
++        const Id row_base = and_(lane, 28);
++        const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
++        const Id header = ctx.OpLabel(), body = ctx.OpLabel(), next = ctx.OpLabel(),
++                 end = ctx.OpLabel();
++        ctx.OpBranch(header);
++        ctx.AddLabel(header);
++        const Id pair = ctx.OpLoad(u32ty, counter);
++        const Id more = ctx.OpULessThan(ctx.U1, pair, imm(variant ? 8 : 4));
++        ctx.OpLoopMerge(end, next, spv::LoopControlMask::DontUnroll);
++        ctx.OpBranchConditional(more, body, end);
++        ctx.AddLabel(body);
++        const Id upper = ctx.OpUGreaterThanEqual(ctx.U1, pair, imm(4));
++        const Id component = and_(pair, 3);
++        const Id a_lane = add(warp_base, add(row_base, component));
++        const Id b_lane = add(warp_base, add(col_base, component));
++        const Id b = ctx.OpSelect(u32ty, upper, inputs[5], inputs[4]);
++        std::array<Id, 2> bs;
++        for (u32 col = 0; col < 2; ++col)
++            bs[col] =
++                unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), b, add(b_lane, imm(col * 4))));
++        const Id round_now = ctx.OpIEqual(ctx.U1, component, imm(3));
++        for (u32 row = 0; row < 2; ++row) {
++            const Id a = ctx.OpSelect(u32ty, upper, inputs[row + 2], inputs[row]);
++            const Id as = unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), a, a_lane));
++            for (u32 col = 0; col < 2; ++col) {
++                Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
++                for (u32 half = 0; half < 2; ++half) {
++                    value = ctx.OpFma(f32ty, ctx.OpCompositeExtract(f32ty, as, half),
++                                      ctx.OpCompositeExtract(f32ty, bs[col], half), value);
++                    ctx.Decorate(value, spv::Decoration::NoContraction);
++                }
++                ctx.OpStore(accumulators[row * 2 + col], value);
++            }
++        }
++        // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
++        // OpSelect evaluates both operands: keep the expensive half conversion in
++        // a branch so the other three pairs do no rounding work. The counter is
++        // identical in every participating lane and all shuffles precede this branch.
++        const Id round_block = ctx.OpLabel(), round_merge = ctx.OpLabel();
++        ctx.OpSelectionMerge(round_merge, spv::SelectionControlMask::DontFlatten);
++        ctx.OpBranchConditional(round_now, round_block, round_merge);
++        ctx.AddLabel(round_block);
++        for (const Id accumulator : accumulators) {
++            ctx.OpStore(accumulator, round_half(ctx.OpLoad(f32ty, accumulator)));
++        }
++        ctx.OpBranch(round_merge);
++        ctx.AddLabel(round_merge);
++        ctx.OpBranch(next);
++        ctx.AddLabel(next);
++        ctx.OpStore(counter, add(pair, imm(1)));
++        ctx.OpBranch(header);
++        ctx.AddLabel(end);
++        std::array<Id, 2> packed;
++        for (u32 row = 0; row < 2; ++row)
++            packed[row] = ctx.OpPackHalf2x16(
++                u32ty,
++                ctx.OpCompositeConstruct(ctx.F32[2], ctx.OpLoad(f32ty, accumulators[row * 2]),
++                                         ctx.OpLoad(f32ty, accumulators[row * 2 + 1])));
++        ctx.OpReturnValue(ctx.OpCompositeConstruct(ctx.U32[2], packed[0], packed[1]));
++        ctx.OpFunctionEnd();
++    }
++}
++
++Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
++    const u32 depth = inst->Flags<u32>();
++    if (depth != 8 && depth != 16) {
++        throw NotImplementedException("Unsupported matrix multiply depth");
++    }
++    return ctx.OpFunctionCall(ctx.U32[2], ctx.software_matrix_functions[depth == 16], a, b, c);
++}
++
++} // namespace Shader::Backend::SPIRV
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index d391ff5e86..a22dbc35ab 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -372,6 +372,7 @@ public:
+     Id sample_mask{};
+     Id frag_depth{};
+ 
++    std::array<Id, 2> software_matrix_functions{};
+     std::vector<Id> interfaces;
+     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
+ 
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 46e5a648f3..058a855da3 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -1601,7 +1601,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+             // minutes to compile, so it is only lowered when the caller asks (`tensor`: a game
+             // DLSS evaluation the game's own network may draw, or Donkey Kong Bananza's programs),
+             // or with EDEN_NX2_TENSOR set (the QMD still completes when rejected).
+-            // EDEN_NX2_TENSOR=stub keeps the rest of the program but makes every HMMA D = C.
++            // EDEN_NX2_TENSOR=stub keeps the rest of the program but makes every HMMA D = C, and
++            // EDEN_NX2_TENSOR=compact uses the compact form below (HMMA_NATIVE on the console, run60:
++            // one 15.7 s frame at Ocarina of Time's title, then 17 fps, then no more frames).
+             static const char* const forced_mode = std::getenv("EDEN_NX2_TENSOR");
+             // The Legend of Zelda: Ocarina of Time upscales its frame through such a network. With
+             // the plain upscale that replaces a rejected network, its movies stayed black on the
+@@ -1622,6 +1624,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                 dest + 2 > 246 || (a & (a_count - 1)) || a + a_count > 246 || (b & (b_count - 1)) ||
+                 b + b_count > 246 || (c != 255 && ((c & 1) || c + 2 > 246)))
+                 return fail(index, "native matrix multiply mode");
++            if (std::string_view{mode} == "compact" && native_predicate == 7) {
++                // TENSOR_MUL_ADD, not a Maxwell instruction: the SPIR-V backend calls one shared
++                // loop per program (same products, f32 sums and half rounding after every eight
++                // products as the expansion below). Bit 48 marks it, bit 49 selects K = 8. The
++                // helper shuffles across the warp, so a guarded HMMA keeps the expansion.
++                emit(0x5d30000000000000ULL | predicate | dest | (u64{a} << 8) | (u64{b} << 20) |
++                     (u64{c} << 39) | (u64{1} << 48) | (u64{depth == 8} << 49));
++                break;
++            }
+             if (std::string_view{mode} == "stub") {
+                 for (u32 row = 0; row < 2; ++row) {
+                     if (c == 255) mov_imm(static_cast<u32>(dest) + row, 0);
+diff --git a/src/shader_recompiler/frontend/ir/ir_emitter.cpp b/src/shader_recompiler/frontend/ir/ir_emitter.cpp
+index ff421105af..ba7c1d3cf7 100644
+--- a/src/shader_recompiler/frontend/ir/ir_emitter.cpp
++++ b/src/shader_recompiler/frontend/ir/ir_emitter.cpp
+@@ -575,6 +575,16 @@ F16F32F64 IREmitter::FPAdd(const F16F32F64& a, const F16F32F64& b, FpControl con
+     }
+ }
+ 
++Value IREmitter::TensorMulAdd(const Value& a, const Value& b, const Value& c, u32 depth) {
++    if (a.Type() != Type::U32x4 || b.Type() != Type::U32x2 || c.Type() != Type::U32x2 ||
++        (depth != 8 && depth != 16)) {
++        throw InvalidArgument("Invalid software matrix operands");
++    }
++    const Value result = Inst(Opcode::TensorMulAdd, a, b, c);
++    result.Inst()->SetFlags<u32>(depth);
++    return result;
++}
++
+ Value IREmitter::CompositeConstruct(const Value& e1, const Value& e2) {
+     if (e1.Type() != e2.Type()) {
+         throw InvalidArgument("Mismatching types {} and {}", e1.Type(), e2.Type());
+diff --git a/src/shader_recompiler/frontend/ir/ir_emitter.h b/src/shader_recompiler/frontend/ir/ir_emitter.h
+index 847cc67571..bee0884f06 100644
+--- a/src/shader_recompiler/frontend/ir/ir_emitter.h
++++ b/src/shader_recompiler/frontend/ir/ir_emitter.h
+@@ -150,6 +150,7 @@ public:
+     [[nodiscard]] U1 GetSparseFromOp(const Value& op);
+     [[nodiscard]] U1 GetInBoundsFromOp(const Value& op);
+ 
++    [[nodiscard]] Value TensorMulAdd(const Value& a, const Value& b, const Value& c, u32 depth);
+     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2);
+     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2, const Value& e3);
+     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2, const Value& e3,
+diff --git a/src/shader_recompiler/frontend/ir/opcodes.inc b/src/shader_recompiler/frontend/ir/opcodes.inc
+index 980bf89f47..ae037ff49e 100644
+--- a/src/shader_recompiler/frontend/ir/opcodes.inc
++++ b/src/shader_recompiler/frontend/ir/opcodes.inc
+@@ -575,6 +575,9 @@ OPCODE(ImageAtomicOr32,                                     U32,            Opaq
+ OPCODE(ImageAtomicXor32,                                    U32,            Opaque,            Opaque,            U32,                                      )
+ OPCODE(ImageAtomicExchange32,                               U32,            Opaque,            Opaque,            U32,                                      )
+ 
++// Software matrix collective (HMMA lowered for SPIR-V; flags = K depth).
++OPCODE(TensorMulAdd,                                        U32x2,          U32x4,          U32x2,          U32x2,                                          )
++
+ // Warp operations
+ OPCODE(LaneId,                                              U32,                                                                                            )
+ OPCODE(VoteAll,                                             U1,             U1,                                                                             )
+diff --git a/src/shader_recompiler/frontend/maxwell/maxwell.inc b/src/shader_recompiler/frontend/maxwell/maxwell.inc
+index 1e74e77e8d..ec8f3994d6 100644
+--- a/src/shader_recompiler/frontend/maxwell/maxwell.inc
++++ b/src/shader_recompiler/frontend/maxwell/maxwell.inc
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++INST(TENSOR_MUL_ADD, "TENSOR_MUL_ADD", "0101 1101 0011 0---")
+ INST(CCTLT,        "CCTLT",          "1110 1011 1111 0--0")
+ INST(AL2P,         "AL2P",           "1110 1111 1010 0---")
+ INST(ALD,          "ALD",            "1110 1111 1101 1---")
+diff --git a/src/shader_recompiler/frontend/maxwell/translate/impl/tensor_mul_add.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/tensor_mul_add.cpp
+new file mode 100644
+index 0000000000..4a93b0556d
+--- /dev/null
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/tensor_mul_add.cpp
+@@ -0,0 +1,47 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
++
++namespace Shader::Maxwell {
++
++// Not a Maxwell instruction: the Ampere lowering emits it for HMMA.1688/.16816.F16 when the
++// compact software form is asked for (bit 48). Bit 49 selects K = 8 instead of K = 16.
++void TranslatorVisitor::TENSOR_MUL_ADD(u64 insn) {
++    union {
++        u64 raw;
++        BitField<0, 8, IR::Reg> dest_reg;
++        BitField<8, 8, IR::Reg> matrix_a;
++        BitField<20, 8, IR::Reg> matrix_b;
++        BitField<39, 8, IR::Reg> matrix_c;
++        BitField<48, 1, u64> software;
++        BitField<49, 1, u64> short_depth;
++    } const tensor{insn};
++
++    if (tensor.software == 0) {
++        throw NotImplementedException("Unsupported matrix multiply encoding");
++    }
++    const IR::Reg ar{tensor.matrix_a};
++    const IR::Reg br{tensor.matrix_b};
++    const IR::Reg cr{tensor.matrix_c};
++    const IR::Reg dr{tensor.dest_reg};
++    const bool short_depth{tensor.short_depth != 0};
++    const bool has_c{cr != IR::Reg::RZ};
++
++    const IR::U32 a0{X(ar)};
++    const IR::U32 a1{X(ar + 1)};
++    const IR::U32 a2{short_depth ? ir.Imm32(0u) : X(ar + 2)};
++    const IR::U32 a3{short_depth ? ir.Imm32(0u) : X(ar + 3)};
++    const IR::U32 b0{X(br)};
++    const IR::U32 b1{short_depth ? ir.Imm32(0u) : X(br + 1)};
++    const IR::U32 c0{has_c ? X(cr) : ir.Imm32(0u)};
++    const IR::U32 c1{has_c ? X(cr + 1) : ir.Imm32(0u)};
++
++    const IR::Value result{ir.TensorMulAdd(ir.CompositeConstruct(a0, a1, a2, a3),
++                                           ir.CompositeConstruct(b0, b1),
++                                           ir.CompositeConstruct(c0, c1), short_depth ? 8U : 16U)};
++    X(dr, IR::U32{ir.CompositeExtract(result, 0)});
++    X(dr + 1, IR::U32{ir.CompositeExtract(result, 1)});
++}
++
++} // namespace Shader::Maxwell
+diff --git a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+index 6bf28fa380..85919bac42 100644
+--- a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
++++ b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+@@ -490,6 +490,11 @@ void VisitUsages(Info& info, IR::Inst& inst) {
+     case IR::Opcode::IsImageScaled:
+         info.uses_rescaling_uniform = true;
+         break;
++    case IR::Opcode::TensorMulAdd:
++        info.uses_subgroup_shuffles = true;
++        info.uses_fp32_denorms_preserve = true;
++        info.uses_subgroup_invocation_id = true;
++        break;
+     case IR::Opcode::LaneId:
+         info.uses_subgroup_invocation_id = true;
+         break;

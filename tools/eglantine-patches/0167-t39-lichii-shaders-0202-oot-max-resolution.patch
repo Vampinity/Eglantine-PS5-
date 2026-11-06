@@ -1,0 +1,161 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0372-lichii-shaders-0202-oot-max-resolution.patch
+
+Source: 0372-lichii-shaders-0202-oot-max-resolution.patch
+Core patch, for tools/eglantine-patches as 0202.
+
+Port of zortos293/Lichii PR 124 (99ac3d5955, Zortos): one instruction at main+0x805bd0 takes the
+game's own "dynamic resolution disabled" branch, keyed by title, module, build id and the original
+word. The build id is the one run 61 logs for main (E0F3CCFA...3348, display version 1.1.1). Only
+the build id, offset and two instruction words are in the source: no game data.
+
+Changed from the source: off unless asked; no Add-Ons entry (GetPatches, DisabledAddOns), the
+switch does that job; and the table also applies when there is no mods folder, the usual case
+on the console, where PatchNSO would return before reaching it.
+
+Switch: EDEN_NX2_OOT_MAX_RESOLUTION=1. Default off.
+
+Memory: costs pool memory. Lichii says docked 3D then renders at 2560x1440. Run 61's 3D targets are
+1920x1080, upscaled to 2560x1440 by the stand-in, so the console is not at the 854x480 floor Lichii
+starts from: our GPU timestamps look tiny to the game's controller (0085). If Lichii's figure holds
+here, this is about 1.8x the pixels in every full-size target. Use it for one A/B at most. Not run.
+Syntax checked with clang only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/file_sys/patch_manager.cpp b/src/core/file_sys/patch_manager.cpp
+index 4fd7dc6c71..1245039624 100644
+--- a/src/core/file_sys/patch_manager.cpp
++++ b/src/core/file_sys/patch_manager.cpp
+@@ -7,7 +7,10 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cstring>
++#include <optional>
++#include <string_view>
+ 
+ #include "common/assert.h"
+ #include "common/hex_util.h"
+@@ -45,6 +48,85 @@ constexpr std::array<const char*, 14> EXEFS_FILE_NAMES{
+     "subsdk3", "subsdk4",   "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
+ };
+ 
++// From Lichii 99ac3d5955 (PR 124, Zortos). Off here: see BuiltinPatchesEnabled.
++struct BuiltinPatch {
++    std::string_view name;
++    u64 title_id;
++    std::string_view module;
++    std::string_view build_id;
++    size_t module_offset;
++    u32 original;
++    u32 replacement;
++};
++
++constexpr std::array BUILTIN_PATCHES{
++    // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
++    // instead of following the GPU-time controller.
++    BuiltinPatch{
++        .name = "Max Resolution (built-in)",
++        .title_id = 0x0400486024DEC000,
++        .module = "main",
++        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
++        .module_offset = 0x805BD0,
++        .original = 0x360041E8,    // tbz w8, #0, 0x80640c
++        .replacement = 0x1400020F, // b 0x80640c
++    },
++};
++
++// EDEN_NX2_OOT_MAX_RESOLUTION=1 applies the table. Lichii has it on by default; here it is opt-in,
++// because the bigger render targets come out of the same memory pool that ends a session.
++[[nodiscard]] bool BuiltinPatchesEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_OOT_MAX_RESOLUTION");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++// `nso` is the module as loaded, `out` the same with the user's mods applied.
++void ApplyBuiltinPatches(std::vector<u8>& out, const std::vector<u8>& nso, std::string_view name,
++                         std::string_view build_id, u64 title_id) {
++    if (!BuiltinPatchesEnabled()) {
++        return;
++    }
++    for (const auto& patch : BUILTIN_PATCHES) {
++        if (patch.title_id != title_id || patch.module != name) {
++            continue;
++        }
++        if (patch.build_id != build_id) {
++            LOG_INFO(Loader, "    - Skipping \"{}\": build id {} is not {}", patch.name, build_id,
++                     patch.build_id);
++            continue;
++        }
++        const size_t offset = sizeof(Loader::NSOHeader) + patch.module_offset;
++        const auto word_at = [offset](const std::vector<u8>& data) -> std::optional<u32> {
++            if (data.size() < offset + sizeof(u32)) {
++                return std::nullopt;
++            }
++            u32 word;
++            std::memcpy(&word, data.data() + offset, sizeof(word));
++            return word;
++        };
++        const auto original = word_at(nso);
++        if (original != patch.original) {
++            LOG_WARNING(Loader, "    - Skipping \"{}\": {}+{:#x} holds {:#010x}, expected {:#010x}",
++                        patch.name, name, patch.module_offset, original.value_or(0),
++                        patch.original);
++            continue;
++        }
++        if (const auto modded = word_at(out); modded != patch.original) {
++            LOG_INFO(Loader,
++                     "    - Skipping \"{}\": a user mod already patched {}+{:#x} to {:#010x}, "
++                     "the mod's patch is used",
++                     patch.name, name, patch.module_offset, modded.value_or(0));
++            continue;
++        }
++        std::memcpy(out.data() + offset, &patch.replacement, sizeof(patch.replacement));
++        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" at {}+{:#x}", patch.name, name,
++                 patch.module_offset);
++    }
++}
++
+ enum class TitleVersionFormat : u8 {
+     ThreeElements, ///< vX.Y.Z
+     FourElements,  ///< vX.Y.Z.W
+@@ -434,7 +516,10 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
+     const auto load_dir = GetModificationLoadRoot();
+     if (load_dir == nullptr) {
+         LOG_ERROR(Loader, "Cannot load mods for invalid title_id={:016X}", title_id);
+-        return nso;
++        // No mods folder is the usual case on the console: the built-in table does not need one.
++        auto unmodded = nso;
++        ApplyBuiltinPatches(unmodded, nso, name, build_id, title_id);
++        return unmodded;
+     }
+ 
+     auto patch_dirs = load_dir->GetSubdirectories();
+@@ -460,6 +545,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
+         }
+     }
+ 
++    ApplyBuiltinPatches(out, nso, name, build_id, title_id);
++
+     if (out.size() < sizeof(Loader::NSOHeader)) {
+         return nso;
+     }
+@@ -474,6 +561,13 @@ bool PatchManager::HasNSOPatch(const BuildID& build_id_, std::string_view name)
+ 
+     LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}", build_id, name);
+ 
++    if (BuiltinPatchesEnabled() &&
++        std::ranges::any_of(BUILTIN_PATCHES, [&](const BuiltinPatch& patch) {
++            return patch.title_id == title_id && patch.module == name;
++        })) {
++        return true;
++    }
++
+     const auto load_dir = GetModificationLoadRoot();
+     if (load_dir == nullptr) {
+         LOG_ERROR(Loader, "Cannot load mods for invalid title_id={:016X}", title_id);

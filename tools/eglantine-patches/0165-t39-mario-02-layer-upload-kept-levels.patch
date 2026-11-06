@@ -1,0 +1,146 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0370-mario-02-layer-upload-kept-levels.patch
+
+Source: 0370-mario-02-layer-upload-kept-levels.patch
+Core patch: goes in tools/eglantine-patches as 0182-... (after 0181). Paths are the submodule's.
+Needs 0180, whose DropTrimmedLevels it leaves in place (nothing is left for it to drop here).
+
+UploadLayers' branch for plain formats unswizzled each whole layer and threw the trimmed levels
+away afterwards. Mario Kart World's 8192x8192x68 BC6H array (0x820f9b0000) is 85.3 MiB a layer, so
+with EDEN_NX2_TEX_TRIM_MIB on it would still ask for 85 MiB of staging for every layer, in a pool
+whose largest free block is 2 MiB (run 52), and copy 85 MiB through swizzle_data_buffer. Now the
+guest read starts at the first level the host keeps and staging is sized from the kept levels:
+1.33 MiB a layer from level 3 on.
+
+No switch: an image with host_level_offset 0 takes the same path with the same sizes, and every
+image has that unless EDEN_NX2_TEX_TRIM_MIB is set (plain formats have no other trim).
+
+Checked on a Mac, not on the console: util.cpp and decoders.cpp compiled with a stub for boost's
+containers, and a test compares UnswizzleImage with first_level against the full unswizzle for
+BC6H, BC1, RGBA8 and R8 shapes: same copies, same bytes (a wrong start offset fails the test).
+vk_texture_cache_base.cpp, which instantiates the template, passes clang -fsyntax-only with stub
+headers. tools/prepare-vulkan-port.py reports the same two anchors with and without this patch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 158aee266e..f5eee1744c 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2230,7 +2230,14 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
+             // Plain formats: each layer unswizzled on its own into its layer of the image.
+             ImageInfo layer_info = image.info;
+             layer_info.resources.layers = 1;
+-            const size_t layer_size = CalculateUnswizzledSizeBytes(layer_info);
++            // Only the levels the host keeps (TrimmedHostInfo) are read and staged. Mario Kart
++            // World's 8192x8192x68 BC6H array is 85 MiB a layer and 1.3 from level 3 on: 85 MiB of
++            // staging for each layer is what a short pool refuses, one layer at a time.
++            const s32 first_level = static_cast<s32>(image.host_level_offset);
++            const size_t guest_skip =
++                first_level != 0 ? FullUploadSwizzles(image.info)[first_level].buffer_offset : 0;
++            const size_t guest_size = image.info.layer_stride - guest_skip;
++            const size_t layer_size = CalculateUnswizzledSizeBytes(layer_info, first_level);
+             auto staging = UploadStagingNow(runtime, layer_size * layers.size());
+             if (!staging) {
+                 UploadLayersInParts(image, layers);
+@@ -2240,11 +2247,12 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
+             for (size_t i = 0; i < layers.size(); ++i) {
+                 const GPUVAddr layer_addr = image.gpu_addr + u64{layers[i]} * image.info.layer_stride;
+                 Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
+-                    swizzle_data(*gpu_memory, layer_addr, image.info.layer_stride,
++                    swizzle_data(*gpu_memory, layer_addr + guest_skip, guest_size,
+                                  &swizzle_data_buffer);
+                 auto layer_copies =
+                     UnswizzleImage(*gpu_memory, layer_addr, layer_info, swizzle_data,
+-                                   staging->mapped_span.subspan(i * layer_size, layer_size));
++                                   staging->mapped_span.subspan(i * layer_size, layer_size),
++                                   first_level);
+                 for (BufferImageCopy copy : layer_copies) {
+                     copy.buffer_offset += i * layer_size;
+                     copy.image_subresource.base_layer = static_cast<s32>(layers[i]);
+@@ -2255,7 +2263,7 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
+             RenumberTrimmedLevels(image.host_level_offset, copies);
+             image.UploadMemory(*staging, copies);
+             ++images_uploaded;
+-            uploaded_bytes += u64{image.info.layer_stride} * layers.size();
++            uploaded_bytes += u64{guest_size} * layers.size();
+             ++layer_uploads;
+             return;
+         }
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index 9654021b95..1f57f5baea 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -604,6 +604,18 @@ u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept {
+     return NumBlocksPerLayer(info, tile_size) * info.resources.layers * BytesPerBlock(info.format);
+ }
+ 
++u32 CalculateUnswizzledSizeBytes(const ImageInfo& info, s32 first_level) noexcept {
++    if (first_level == 0 || info.type == ImageType::Buffer || info.type == ImageType::Linear) {
++        return CalculateUnswizzledSizeBytes(info);
++    }
++    const Extent2D tile_size = DefaultBlockSize(info.format);
++    u32 num_blocks = 0;
++    for (s32 level = first_level; level < info.resources.levels; ++level) {
++        num_blocks += NumBlocks(AdjustMipSize(info.size, level), tile_size);
++    }
++    return num_blocks * info.resources.layers * BytesPerBlock(info.format);
++}
++
+ bool AstcDataLooksOpaque(std::span<const u8> data) noexcept {
+     return Tegra::Texture::ASTC::IsOpaque(data);
+ }
+@@ -854,7 +866,8 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
+                                                                    GPUVAddr gpu_addr,
+                                                                    const ImageInfo& info,
+                                                                    std::span<const u8> input,
+-                                                                   std::span<u8> output) {
++                                                                   std::span<u8> output,
++                                                                   s32 first_level) {
+     const size_t guest_size_bytes = input.size_bytes();
+     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+     const Extent2D tile_size = DefaultBlockSize(info.format);
+@@ -890,13 +903,13 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
+                                             info.tile_width_spacing);
+     size_t guest_offset = 0;
+     u32 host_offset = 0;
+-    boost::container::small_vector<BufferImageCopy, 16> copies(num_levels);
++    boost::container::small_vector<BufferImageCopy, 16> copies(num_levels - first_level);
+ 
+-    for (s32 level = 0; level < num_levels; ++level) {
++    for (s32 level = first_level; level < num_levels; ++level) {
+         const Extent3D level_size = AdjustMipSize(size, level);
+         const u32 num_blocks_per_layer = NumBlocks(level_size, tile_size);
+         const u32 host_bytes_per_layer = num_blocks_per_layer << bpp_log2;
+-        copies[level] = BufferImageCopy{
++        copies[level - first_level] = BufferImageCopy{
+             .buffer_offset = host_offset,
+             .buffer_size = static_cast<size_t>(host_bytes_per_layer) * num_layers,
+             .buffer_row_length = Common::AlignUp(level_size.width, tile_size.width),
+diff --git a/src/video_core/texture_cache/util.h b/src/video_core/texture_cache/util.h
+index d91ee74c52..1737e7ff94 100644
+--- a/src/video_core/texture_cache/util.h
++++ b/src/video_core/texture_cache/util.h
+@@ -36,6 +36,9 @@ struct OverlapResult {
+ 
+ [[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;
+ 
++/// The same for the levels from first_level on: what UnswizzleImage writes with that first_level.
++[[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info, s32 first_level) noexcept;
++
+ [[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept;
+ 
+ /// True if no 16-byte ASTC block in `data` decodes to alpha below 1.
+@@ -99,9 +102,11 @@ struct UnswizzlePlan {
+ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
+                          std::span<u8> output);
+ 
++/// With first_level, for an image of one layer: `input` starts at that level of the guest image,
++/// and only the levels from there on are written to `output` and get a copy.
+ [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
+     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+-    std::span<const u8> input, std::span<u8> output);
++    std::span<const u8> input, std::span<u8> output, s32 first_level = 0);
+ 
+ /// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
+ /// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into

@@ -1,0 +1,227 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0390-upstream-01-mesh-points-and-lines.patch
+
+Source: 0390-upstream-01-mesh-points-and-lines.patch
+shader: EDEN_NX2_MESH_POINTS=1 compiles mesh programs that output points or lines
+
+Port of Djihads80/Eglantine 743d5bbaed (Frizti, branch fix/oot-blackscreen, 2026-11-05).
+GPL-3.0-or-later, as the core.
+
+The source commit: Ocarina's garden hedges draw mesh programs with topology 0 (SET_MESH_SHADER_A
+0x00040200, 32 points per group), whose pipelines failed with "Mesh output topology 0 is not
+implemented" and whose draws were skipped. Points (0) and lines (1) now use OutputPoints /
+OutputLinesEXT with PrimitivePointIndicesEXT / PrimitiveLineIndicesEXT. The map region holds one
+index byte per primitive vertex. Point programs write the fixed state point size first. Its own note:
+the pipelines build, the hedge leaves stay missing, their draws get a zero count from culling.
+
+Changed from the source:
+- Behind EDEN_NX2_MESH_POINTS=1. Unset, topology 0 and 1 are refused as today.
+- Refused whatever the switch says with EDEN_NX2_MESH_AS_COMPUTE=1. 0180 reads 3 map bytes per
+  primitive, keeps 3 corners each, draws a triangle list and hides unemitted primitives as
+  degenerate triangles. A point would land on the wrong bytes and be drawn as a triangle. So 0180's
+  "point and line topologies are refused earlier" stays true.
+- 0052's clamp of each index below the vertex count stays.
+- The point size constant is made only for point programs, so triangle programs emit the same
+  SPIR-V as before.
+
+Runs on the PS5: only where native mesh draws run, and those can freeze the console. Pool memory:
+none. No cache version bump: the switch is off and a refused program was never saved.
+
+Co-authored-by: Frizti <FriztiMouche@gmail.com>
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index 219165a4b2..3757bfd951 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -304,7 +304,9 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
+         ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices, program.mesh.max_vertices);
+         ctx.AddExecutionMode(main, spv::ExecutionMode::OutputPrimitivesEXT,
+                              program.mesh.max_primitives);
+-        ctx.AddExecutionMode(main, spv::ExecutionMode::OutputTrianglesEXT);
++        ctx.AddExecutionMode(main, program.mesh.topology == 0   ? spv::ExecutionMode::OutputPoints
++                                   : program.mesh.topology == 1 ? spv::ExecutionMode::OutputLinesEXT
++                                                                : spv::ExecutionMode::OutputTrianglesEXT);
+         break;
+     case Stage::TessellationControl:
+         execution_model = spv::ExecutionModel::TessellationControl;
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+index 61b2004b1c..084caa9a7a 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+@@ -384,9 +384,17 @@ void MeshEpilogue(EmitContext& ctx) {
+     const bool convert_depth{ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc &&
+                              Sirit::ValidId(ctx.output_position)};
+     const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
++    // Points need a size per vertex: the fixed state one, unless the program writes its own.
++    const bool points{mesh.PrimitiveVertices() == 1};
++    const Id point_size{points ? ctx.Const(ctx.runtime_info.fixed_state_point_size.value_or(1.0f))
++                               : Id{}};
+     for (u32 first = 0; first < mesh.max_vertices; first += threads) {
+         const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
+         const auto copy = [&] {
++            if (points) {
++                ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.mesh_point_size, vertex),
++                            point_size);
++            }
+             CopyLines(ctx, vertex, 0, vertex_lines, ctx.mesh_vertex_targets);
+             if (convert_depth) {
+                 ConvertDepth(ctx, vertex);
+@@ -399,14 +407,16 @@ void MeshEpilogue(EmitContext& ctx) {
+         }
+     }
+     const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
++    const u32 primitive_vertices{mesh.PrimitiveVertices()};
+     for (u32 first = 0; first < mesh.max_primitives; first += threads) {
+         const Id primitive{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
+         If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
+-            // Vertex indices: map bytes 4 + 3 * primitive.
+-            const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)),
+-                                     ctx.Const(4U))};
++            // Vertex indices: map bytes 4 + primitive_vertices * primitive.
++            const Id byte{ctx.OpIAdd(
++                ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(primitive_vertices)),
++                ctx.Const(4U))};
+             std::array<Id, 3> indices;
+-            for (u32 element = 0; element < 3; ++element) {
++            for (u32 element = 0; element < primitive_vertices; ++element) {
+                 const Id address{ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element))};
+                 // Below the vertex count, as Vulkan requires: map bytes the program left unwritten
+                 // hold whatever workgroup memory held.
+@@ -415,9 +425,14 @@ void MeshEpilogue(EmitContext& ctx) {
+                                        ? Clamped(ctx, index, mesh.max_vertices)
+                                        : index;
+             }
+-            const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, ctx.U32[3])};
++            const Id index_type{ctx.U32[primitive_vertices]};
++            const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, index_type)};
+             ctx.OpStore(ctx.OpAccessChain(output_indices, ctx.mesh_primitive_indices, primitive),
+-                        ctx.OpCompositeConstruct(ctx.U32[3], std::span<const Id>(indices)));
++                        primitive_vertices == 1
++                            ? indices[0]
++                            : ctx.OpCompositeConstruct(
++                                  index_type,
++                                  std::span<const Id>(indices.data(), primitive_vertices)));
+             CopyLines(ctx, primitive, ctx.mesh_primitive_base, primitive_lines,
+                       ctx.mesh_primitive_targets);
+         });
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 109be7dfad..0e704f45c7 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1854,7 +1854,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
+     mesh_attribute_words = (std::max)(
+         mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
+         1U);
+-    mesh_map_bytes = 4 + 3 * mesh_info.max_primitives;
++    mesh_map_bytes = 4 + mesh_info.PrimitiveVertices() * mesh_info.max_primitives;
+     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
+     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
+                                      std::nullopt, spv::StorageClass::Workgroup);
+@@ -1871,11 +1871,20 @@ void EmitContext::DefineMesh(const IR::Program& program) {
+ 
+     const Id vertex_count{Const(mesh_info.max_vertices)};
+     const Id primitive_count{Const(mesh_info.max_primitives)};
+-    mesh_primitive_indices =
+-        DefineVariable(*this, TypeArray(U32[3], primitive_count),
+-                       spv::BuiltIn::PrimitiveTriangleIndicesEXT, spv::StorageClass::Output);
++    const u32 primitive_vertices{mesh_info.PrimitiveVertices()};
++    mesh_primitive_indices = DefineVariable(
++        *this, TypeArray(U32[primitive_vertices], primitive_count),
++        primitive_vertices == 1   ? spv::BuiltIn::PrimitivePointIndicesEXT
++        : primitive_vertices == 2 ? spv::BuiltIn::PrimitiveLineIndicesEXT
++                                  : spv::BuiltIn::PrimitiveTriangleIndicesEXT,
++        spv::StorageClass::Output);
+     std::array<Id, IR::NUM_GENERICS> generics[2]{};
+-    Id point_size{}, primitive_layer{}, primitive_viewport{}, primitive_id_output{};
++    Id& point_size{mesh_point_size};
++    Id primitive_layer{}, primitive_viewport{}, primitive_id_output{};
++    if (primitive_vertices == 1) {
++        point_size = DefineVariable(*this, TypeArray(F32[1], vertex_count), spv::BuiltIn::PointSize,
++                                    spv::StorageClass::Output);
++    }
+     const auto per_primitive_builtin = [&](Id& variable, spv::BuiltIn builtin) {
+         if (!Sirit::ValidId(variable)) {
+             variable = DefineVariable(*this, TypeArray(U32[1], primitive_count), builtin,
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index ebf242f1ff..9bb4cd7781 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -385,6 +385,7 @@ public:
+     Id mesh_primitive_count{};
+     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
+     Id mesh_primitive_indices{};
++    Id mesh_point_size{}; ///< PointSize output array of a mesh program, if any
+     MeshInfo mesh_info{};
+     u32 mesh_threads{};
+     u32 mesh_attribute_words{};
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index e085eeed76..074dd9616b 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -237,6 +237,21 @@ void EmitGeometryPassthrough(IR::IREmitter& ir, const IR::Program& program,
+     ir.EndPrimitive(ir.Imm32(0));
+ }
+ 
++// EDEN_NX2_MESH_POINTS=1: mesh programs that output points (topology 0) or lines (1) compile; unset
++// they are refused as before and their draws stay skipped. Mesh draws as compute only know triangle
++// lists (fable-mesh-compute 0180: stride 3, degenerate triangles, a triangle-list readback), so with
++// EDEN_NX2_MESH_AS_COMPUTE=1 they stay refused whatever this says. A function-local static: env.txt
++// is read in main.
++bool MeshPointsAndLines() {
++    static const bool allowed = [] {
++        const char* const points = std::getenv("EDEN_NX2_MESH_POINTS");
++        const char* const as_compute = std::getenv("EDEN_NX2_MESH_AS_COMPUTE");
++        return points != nullptr && points[0] == '1' &&
++               (as_compute == nullptr || as_compute[0] != '1');
++    }();
++    return allowed;
++}
++
+ u32 GetOutputTopologyVertices(OutputTopology output_topology) {
+     switch (output_topology) {
+     case OutputTopology::PointList:
+@@ -414,7 +429,9 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
+         const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
+         program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
+         if (program.stage == Stage::Mesh) {
+-            if (program.mesh.topology != 4) {
++            if (program.mesh.topology != 4 &&
++                (!MeshPointsAndLines() ||
++                 (program.mesh.topology != 0 && program.mesh.topology != 1))) {
+                 throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
+                                               program.mesh.topology, shader_a);
+             }
+diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
+index 4e5fb5c6e4..fd4b9de337 100644
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -262,9 +262,14 @@ struct MeshInfo {
+     u32 payload_words{}; ///< Task output region / mesh input region, in 32-bit words
+     u32 max_vertices{};
+     u32 max_primitives{};
+-    u32 topology{}; ///< SET_MESH_SHADER_A output topology (4 = triangles)
++    u32 topology{}; ///< SET_MESH_SHADER_A output topology (0 = points, 1 = lines, 4 = triangles)
+     boost::container::static_vector<u32, 136> vertex_lines;
+     boost::container::static_vector<u32, 136> primitive_lines;
++
++    /// Vertex indices per primitive, which is also its byte count in the map region.
++    [[nodiscard]] u32 PrimitiveVertices() const noexcept {
++        return topology == 0 ? 1 : topology == 1 ? 2 : 3;
++    }
+ };
+ 
+ struct Info {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index f15e4c2a99..a61edf0430 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -293,6 +293,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+     default:
+         break;
+     }
++    if (program.stage == Shader::Stage::Mesh && program.mesh.topology == 0) {
++        info.fixed_state_point_size = point_size;
++    }
+     switch (key.state.topology) {
+     case Maxwell::PrimitiveTopology::Points:
+         info.input_topology = Shader::InputTopology::Points;

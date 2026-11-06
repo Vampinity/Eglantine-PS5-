@@ -1,0 +1,68 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0394-upstream-05-maps-on-the-back.patch
+
+Source: 0394-upstream-05-maps-on-the-back.patch
+gpu_thread: EDEN_NX2_MAP_ON_BACK=1 runs GPU memory maps on the split's back
+
+Port of the gpu_thread.cpp part of Djihads80/Eglantine 3087c1cf07 (kraibse, from Duck912 e3d8e9c605,
+#70, branch fix/oot-blackscreen, 2026-11-05). GPL-3.0-or-later, as the core.
+
+The source commit: the front used back-owned state after a drain. A drained back still submits from
+its idle hook (Scheduler::FlushDeferred), so a download recorded by the front met an empty command
+chunk: a read at null+0x10 in BufferCacheRuntime::CopyBuffer. The other sites of that commit are in
+this core already (0041, split-1 to split-3). Maps are the one left: UnmapMemory downloads, and
+run->func() still runs on the front after split.Drain().
+
+With the switch ThreadManager::Run wraps the map: the front runs the wrapper after its drain, as
+before, and the wrapper sends the map to the back and waits. The order is unchanged. Done there, not
+in the loop, so it stays clear of lichii-gpu-0210's Drain line.
+
+rebase-02 (EDEN_NX2_SPLIT_QUIET=1) closes the same race another way, by waiting for the idle hook.
+Its note warns that a WriteMemory from MapInOrder on the front keeps no GPU bytes beside it; run on
+the back, the owner check passes and it does. Both can be set.
+
+Changed from the source: behind the switch. Nothing on the map path calls Drain, which would hang on
+the back: read, not run. Unset, nothing changes.
+
+Runs on the PS5: same core path. Pool memory: none.
+
+Co-authored-by: kraibse <33869366+kraibse@users.noreply.github.com>
+Co-authored-by: Duck912 <350528965+Duck912@users.noreply.github.com>
+
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 403fb3c61f..40be436f07 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <chrono>
++#include <cstdlib>
+ #include <thread>
+ 
+ #include "common/assert.h"
+@@ -169,6 +170,24 @@ void ThreadManager::TickGPU(bool is_async) {
+ }
+ 
+ void ThreadManager::Run(std::function<void()>&& func, bool is_async, bool before_later_reads) {
++    // EDEN_NX2_MAP_ON_BACK=1: GPU memory maps unmap caches (UnmapMemory downloads), the back's state,
++    // and a drained back still submits from its idle hook. The front runs this wrapper after its
++    // drain, as it would the map: the map itself goes to the back, and the front waits for it.
++    static const bool map_on_back = [] {
++        const char* const value = std::getenv("EDEN_NX2_MAP_ON_BACK");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (before_later_reads && map_on_back) {
++        func = [work = std::move(func)]() mutable {
++            auto& split = VideoCommon::GpuSplit::Get();
++            if (split.Active()) {
++                split.DeferFunction(std::move(work));
++                split.Drain();
++            } else {
++                work();
++            }
++        };
++    }
+     PushCommand(RunCommand{std::move(func), before_later_reads}, false, is_async);
+ }
+ 

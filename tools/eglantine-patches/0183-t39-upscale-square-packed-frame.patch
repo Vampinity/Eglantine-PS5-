@@ -1,0 +1,172 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0405-upscale-square-packed-frame.patch
+
+Source: 0405-upscale-square-packed-frame.patch
+frame (EDEN_NX2_UPSCALE_SQUARE)
+
+Ocarina of Time's network reads one 1920x1080 E5B9G9R9 image (cbuf0+0xc0) and stores one
+B10G11R11 image (+0xd0), run81 and run82. With its HMMA rejected, the stand-in copies the first
+to the second as it stands. Run83 is that copy: a pale world, fog score median 77 ("same-size
+copy 0x8113971000 format 32 1920x1080 -> 0x81252ff000 format 33", "plain copy").
+
+Lichii PR 143 (open, Intel Arc, Mesa ANV, nothing measured on AMD) reports the same pair in the
+same slots, and that the image holds the square root of each tonemapped channel: against the
+pass that writes the tonemapped frame it fits gamma 2.0, scale 1.00, median error 0.0002. The
+network squares it back, so a plain copy shows 0.25 as 0.5, a white haze. Its SrcCopySquare and
+blit_color_square.frag are taken over as they stand, so a later merge stays clean.
+
+EDEN_NX2_UPSCALE_SQUARE=1: a stand-in copy whose source is E5B9G9R9 squares each colour channel,
+logged once per program ("Upscale fallback for program ...: squares its E5B9G9R9 input"). Every
+other source keeps its operation. Unset: the same operation as before on every copy. The only
+difference is one small shader module created at start and never used.
+
+This is the one test left from the E5B9G9R9 idea (console/notes/e5-white-hypothesis.md). The file
+name is the one that idea was given: no render target format changes here. The core never asks
+for E5B9G9R9 as a colour target (maxwell_to_vk.cpp:219), and the driver refuses it anyway.
+
+Expect less white, not none. Squaring run83's captured frames offline took the fog median from
+77 to 58, against 30 on Linux, and PR 143 still sees haze outdoors. Whether our image holds
+square roots has not been measured.
+
+Checked: applies after 0001-0404 and after black-world-06. Clang syntax check, PS5 target, no
+warnings: kepler_compute.cpp, blit_image.cpp, fermi_2d.cpp, vk_texture_cache.cpp, with five
+shader headers unrelated to this stubbed. The shader compiles with the build's glslangValidator
+flags and passes spirv-val. Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+ src/video_core/engines/fermi_2d.h               |  3 +++
+ src/video_core/engines/kepler_compute.cpp       | 17 +++++++++++++++--
+ src/video_core/host_shaders/CMakeLists.txt      |  1 +
+ .../host_shaders/blit_color_square.frag         | 16 ++++++++++++++++
+ src/video_core/renderer_vulkan/blit_image.cpp   | 13 +++++++++----
+ src/video_core/renderer_vulkan/blit_image.h     |  1 +
+ 6 files changed, 45 insertions(+), 6 deletions(-)
+ create mode 100644 src/video_core/host_shaders/blit_color_square.frag
+
+diff --git a/src/video_core/engines/fermi_2d.h b/src/video_core/engines/fermi_2d.h
+index 04a12fd351..ba4c25a35a 100644
+--- a/src/video_core/engines/fermi_2d.h
++++ b/src/video_core/engines/fermi_2d.h
+@@ -73,6 +73,9 @@ public:
+         // Not a hardware operation: a copy that decodes sRGB-encoded values to linear, for the
+         // nx2 upscale fallback standing in for a program that decodes its output.
+         SrcCopySrgbToLinear = 7,
++        // Not a hardware operation either: a copy that squares each colour channel, for the nx2
++        // upscale fallback standing in for a program whose input stores their square roots.
++        SrcCopySquare = 8,
+     };
+ 
+     enum class MemoryLayout : u32 {
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index ec4873f184..c9bac5de23 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -1292,9 +1292,22 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
+                  known->second ? "decodes sRGB like the program" : "plain copy");
+     }
++    // EDEN_NX2_UPSCALE_SQUARE=1: Ocarina of Time's packed frame holds the square root of each
++    // tonemapped channel and its network squares it back (Lichii PR 143, measured on Intel:
++    // gamma 2.0, scale 1.00). A plain copy shows 0.25 as 0.5, a white veil over the whole scene.
++    static const bool square_frame = std::getenv("EDEN_NX2_UPSCALE_SQUARE") != nullptr;
++    const bool square_copy = square_frame && shared_exponent_input;
++    if (square_copy) {
++        static std::unordered_set<GPUVAddr> reported;
++        if (reported.insert(program).second) {
++            LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: squares its E5B9G9R9 input",
++                     program);
++        }
++    }
+     const Fermi2D::Config config{
+-        .operation = known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
+-                                   : Fermi2D::Operation::SrcCopy,
++        .operation = square_copy     ? Fermi2D::Operation::SrcCopySquare
++                     : known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
++                                     : Fermi2D::Operation::SrcCopy,
+         .filter = Fermi2D::Filter::Bilinear,
+         .must_accelerate = true,
+         .dst_x0 = 0,
+diff --git a/src/video_core/host_shaders/CMakeLists.txt b/src/video_core/host_shaders/CMakeLists.txt
+index bc3d3db54c..f851a2e368 100644
+--- a/src/video_core/host_shaders/CMakeLists.txt
++++ b/src/video_core/host_shaders/CMakeLists.txt
+@@ -19,6 +19,7 @@ set(SHADER_FILES
+     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_float.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_srgb_to_linear.frag
++    ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_square.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_2d.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_msaa.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/blit_depth.frag
+diff --git a/src/video_core/host_shaders/blit_color_square.frag b/src/video_core/host_shaders/blit_color_square.frag
+new file mode 100644
+index 0000000000..2d212d7b84
+--- /dev/null
++++ b/src/video_core/host_shaders/blit_color_square.frag
+@@ -0,0 +1,16 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#version 450
++
++layout(binding = 0) uniform sampler2D tex;
++
++layout(location = 0) in vec2 texcoord;
++layout(location = 0) out vec4 color;
++
++// Copy of a source that stores the square root of each color channel: squares them back,
++// alpha unchanged.
++void main() {
++    const vec4 value = textureLod(tex, texcoord, 0);
++    color = vec4(value.rgb * value.rgb, value.a);
++}
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+index 4a274b2915..6d91041559 100644
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -12,6 +12,7 @@
+ #include "common/div_ceil.h"
+ #include "common/settings.h"
+ #include "video_core/host_shaders/blit_color_float_frag_spv.h"
++#include "video_core/host_shaders/blit_color_square_frag_spv.h"
+ #include "video_core/host_shaders/blit_color_srgb_to_linear_frag_spv.h"
+ #include "video_core/host_shaders/blit_color_msaa_frag_spv.h"
+ #include "video_core/host_shaders/blit_depth_frag_spv.h"
+@@ -708,6 +709,7 @@ BlitImageHelper::BlitImageHelper(const Device& device_, Scheduler& scheduler_,
+       temporal_upscale_frag(BuildShader(device, TEMPORAL_UPSCALE_FRAG_SPV)),
+       temporal_sharpen_frag(BuildShader(device, TEMPORAL_SHARPEN_FRAG_SPV)),
+       blit_color_srgb_to_linear_frag(BuildShader(device, BLIT_COLOR_SRGB_TO_LINEAR_FRAG_SPV)),
++      blit_color_square_frag(BuildShader(device, BLIT_COLOR_SQUARE_FRAG_SPV)),
+       blit_color_msaa_frag(BuildShader(device, BLIT_COLOR_MSAA_FRAG_SPV)),
+       blit_depth_stencil_frag(device.IsExtShaderStencilExportSupported()
+                              ? BuildShader(device, VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV)
+@@ -1409,10 +1411,13 @@ VkPipeline BlitImageHelper::FindOrEmplaceColorPipeline(const BlitImagePipelineKe
+     }
+     blit_color_keys.push_back(key);
+ 
+-    const bool srgb_to_linear =
+-        key.operation == Tegra::Engines::Fermi2D::Operation::SrcCopySrgbToLinear;
+-    const std::array stages = MakeStages(
+-        *full_screen_vert, srgb_to_linear ? *blit_color_srgb_to_linear_frag : *blit_color_to_color_frag);
++    using Operation = Tegra::Engines::Fermi2D::Operation;
++    const VkShaderModule fragment = key.operation == Operation::SrcCopySrgbToLinear
++                                        ? *blit_color_srgb_to_linear_frag
++                                    : key.operation == Operation::SrcCopySquare
++                                        ? *blit_color_square_frag
++                                        : *blit_color_to_color_frag;
++    const std::array stages = MakeStages(*full_screen_vert, fragment);
+     const VkPipelineColorBlendAttachmentState blend_attachment{
+         .blendEnable = VK_FALSE,
+         .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+diff --git a/src/video_core/renderer_vulkan/blit_image.h b/src/video_core/renderer_vulkan/blit_image.h
+index a1c802848b..c54b3435b4 100644
+--- a/src/video_core/renderer_vulkan/blit_image.h
++++ b/src/video_core/renderer_vulkan/blit_image.h
+@@ -243,6 +243,7 @@ private:
+     vk::ShaderModule temporal_upscale_frag;
+     vk::ShaderModule temporal_sharpen_frag;
+     vk::ShaderModule blit_color_srgb_to_linear_frag;
++    vk::ShaderModule blit_color_square_frag;
+     vk::ShaderModule blit_color_msaa_frag;
+     vk::ShaderModule blit_depth_stencil_frag;
+     vk::ShaderModule blit_depth_frag;

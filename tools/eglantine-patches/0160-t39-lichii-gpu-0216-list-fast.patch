@@ -1,0 +1,144 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0354-lichii-gpu-0216-list-fast.patch
+
+Source: 0354-lichii-gpu-0216-list-fast.patch
+dma_pusher: skip the writer wait once written pages settle (EDEN_NX2_LIST_FAST, off by default)
+
+Core patch. Paths are the submodule's. Needs 0211 before it.
+
+Source: zortos293/Lichii PR 179 (tibzejoker), head 3ce0ab7106, GPL-3.0-or-later.
+
+Before each GP entry the front waits for queued compute and copies, because they may write the list
+for the first time. =1 skips that once no page was newly marked for 2 s. =2 still waits and logs
+each entry the skip would have read too early. The PR's =2 skips as well; ours does not.
+Stricter than the PR: nothing counts as settled before the first written page, also in a new session.
+
+Lichii logged 0 misses in 590,000 entries, in one scene. That says little about other scenes.
+
+Runs on the PS5: yes.
+Hang: =2 cannot add one. =1 can: a miss is a stale command list. Stale draw arguments lost the device
+in Fast Fusion, and a narrower list wait crashed Mario Kart on this console. Use =1 only after whole
+sessions of =2 with no miss, and never on Mario Kart. Pool memory: none.
+Checked: PS5-target syntax compile before the review changes, Mac-target after them. Not run.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 9561d522d4..dc410984be 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -101,6 +101,46 @@ static bool ListDrainFull() {
+     return full;
+ }
+ 
++// EDEN_NX2_LIST_FAST, from Lichii PR 179 (zortos293/Lichii, head 3ce0ab7106). The wait for queued
++// compute and copies before each entry only finds a list page that work writes for the first time:
++// once no page was newly written for 2 s, =1 takes the set of written pages as settled and skips
++// it. =2 still waits and logs each entry the skip would have read too early (the PR's =2 skips
++// too). A miss is a stale command list: Fast Fusion's stale draw arguments lost the device, and a
++// narrower wait crashed Mario Kart World on the console (docs/MKW-TITLE-FPS.md). Keep to =2 until
++// a whole session logs no miss.
++static int ListFastMode() {
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_LIST_FAST");
++        return value == nullptr ? 0 : value[0] - '0';
++    }();
++    return mode;
++}
++
++bool DmaPusher::WrittenPagesSettled() {
++    const u64 marks = Tegra::g_nx2_new_written_pages.load(std::memory_order_relaxed);
++    const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++    if (marks != list_fast_marks) {
++        list_fast_marks = marks;
++        list_fast_since = now;
++        return false;
++    }
++    // No page written yet is not settled: the first dispatch's list would be read too early.
++    return marks != 0 && now - list_fast_since >= 2'000'000'000ULL;
++}
++
++void DmaPusher::NoteListFastCheck(GPUVAddr address, bool written) {
++    static std::atomic<u64> checks{};
++    static std::atomic<u64> misses{};
++    const u64 count = checks.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (written && misses.fetch_add(1, std::memory_order_relaxed) < 16) {
++        LOG_WARNING(HW_GPU, "List fast check: entry at {:#x} became GPU-written", address);
++    }
++    if ((count & 0xffff) == 0) {
++        LOG_INFO(HW_GPU, "List fast check: {} waits, {} misses", count,
++                 misses.load(std::memory_order_relaxed));
++    }
++}
++
+ bool DmaPusher::Step() {
+     if (!ib_enable || dma_pushbuffer.empty()) {
+         return false;
+@@ -221,10 +261,16 @@ bool DmaPusher::Step() {
+         // billions of instances and lost the device loading a race).
+         bool gpu_written =
+             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+-            gpu_written =
+-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
++        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
++            const int list_fast = ListFastMode();
++            const bool settled = list_fast != 0 && WrittenPagesSettled();
++            if (!(settled && list_fast == 1) && VideoCommon::GpuSplit::Get().WaitForWriters()) {
++                gpu_written =
++                    IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
++                if (settled) {
++                    NoteListFastCheck(dma_state.dma_get, gpu_written);
++                }
++            }
+         }
+         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
+         // safe read below would flush (with the split, the front can't tell: it reads memory
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index 7b9320d3b9..6167f2150f 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -213,6 +213,11 @@ public:
+     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+     /// Whether the entry lies on device pages the GPU has written (NX2).
+     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
++    /// EDEN_NX2_LIST_FAST: whether no page was newly marked GPU-written for 2 s.
++    bool WrittenPagesSettled();
++    void NoteListFastCheck(GPUVAddr address, bool written);
++    u64 list_fast_marks{};
++    u64 list_fast_since{};
+     /// Copies the list's words from memory again, as of suspension count `now`.
+     void RefreshSnapshot(CommandList& list, u64 now);
+     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
+diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
+index 42705ab708..afd3f82b90 100644
+--- a/src/video_core/nx2.h
++++ b/src/video_core/nx2.h
+@@ -29,6 +29,9 @@ inline std::atomic<bool> g_nx2_ampere{false};
+ inline constexpr u64 Nx2WrittenPageBits = 12;
+ inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
+ 
++/// Bumped when a page is marked GPU-written for the first time (EDEN_NX2_LIST_FAST).
++inline std::atomic<u64> g_nx2_new_written_pages{};
++
+ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
+     if (size == 0) {
+         return;
+@@ -41,7 +44,9 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
+         const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
+         auto& word = g_nx2_gpu_written_pages[page / 64];
+         if ((word.load(std::memory_order_relaxed) & mask) != mask) {
+-            word.fetch_or(mask, std::memory_order_relaxed);
++            if ((word.fetch_or(mask, std::memory_order_relaxed) & mask) != mask) {
++                g_nx2_new_written_pages.fetch_add(1, std::memory_order_relaxed);
++            }
+         }
+         page += bits;
+     }
+@@ -97,6 +102,7 @@ inline void Nx2ClearGpuWrittenPages() {
+         word.store(0, std::memory_order_relaxed);
+     }
+     g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);
++    g_nx2_new_written_pages.store(0, std::memory_order_relaxed);
+ }
+ 
+ [[nodiscard]] inline bool Nx2IsGpuWritten(u64 device_address) {

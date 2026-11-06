@@ -29,6 +29,8 @@
 #include "core/perf_stats.h"
 #include "video_core/renderer_base.h"
 #include "video_core/gpu_split.h"
+extern "C" bool eden_page_reuse;  // headless/dynarmic/page_reuse_pass.inc
+extern "C" unsigned long long eden_page_reuse_groups, eden_page_reuse_accesses;
 
 // Match the SDK native application's shim: Mesa's C TLS is initialized by
 // compiler-rt; it has no additional C++ per-thread initializer.
@@ -701,6 +703,11 @@ void GraphicsWindow::OnFrameDisplayed() {
 #endif
                 Eden::Performance::ReportVulkan();
                 Eden::Performance::ReportGuestRun();
+                Eden::Performance::ReportOwnThread("present");
+                if (eden_page_reuse)
+                    std::printf("EDEN_JIT_PAGE_REUSE groups=%llu accesses=%llu\n",
+                                __atomic_load_n(&eden_page_reuse_groups, __ATOMIC_RELAXED),
+                                __atomic_load_n(&eden_page_reuse_accesses, __ATOMIC_RELAXED));
 #ifdef EDEN_DEV_PROFILE
                 // Composite runs on the GPU thread, so its owner CPU clock is valid here.
                 Eden::Performance::ReportGpuThread(frame_total);

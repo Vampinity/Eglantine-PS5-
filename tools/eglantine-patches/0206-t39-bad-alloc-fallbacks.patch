@@ -1,0 +1,186 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0181-bad-alloc-fallbacks.patch
+
+Source: 0181-bad-alloc-fallbacks.patch
+Moved by hand: the serialization job now takes upstream's is_mesh capture and mesh cache file inside the try
+
+Core patch: goes in tools/eglantine-patches as 0181-..., after fable-mem-02 (0180), whose
+texture_cache.h it builds on. Paths are the submodule's.
+
+Run 57 (next14, 333 s): the heap could not grow (EDEN_HEAP_FAILURE requested=10856440 reason=2),
+operator new threw on VkPipelineSerialization while one pipeline was written to the disk cache,
+nothing on that thread caught it, and std::terminate ended the session with the pool at 9 MiB
+free. The same end waits in the pipeline builders and on the GPU thread's image uploads
+(unswizzle or conversion scratch of tens of MiB in one piece); the asynchronous decode (0086,
+0090) and the buffer paths (0131) were covered already.
+
+Now the work the exception was in is dropped and the session goes on:
+- the three serialization jobs (a graphics or compute pipeline's disk cache entry, the driver
+  cache flush): logged, the entry is written at a later start; flush_in_flight is cleared;
+- CreateGraphicsPipeline / CreateComputePipeline: nullptr, as for a Shader::Exception (the
+  draws of that pipeline are skipped, the game goes on);
+- RefreshContents' upload of one image: the image keeps what it shows until the guest writes it
+  again, logged.
+Image refusals: EDEN_NX2_UNBACKED_LIMIT is 0 by default on the console (main.cpp) since next12,
+so a refused image already goes to the unbacked fallback and does not end the session; nothing
+added there. A bad_alloc on the guest cores or in the host's own threads is not covered.
+
+Switch: EDEN_NX2_BAD_ALLOC_ENDS=1 in env.txt ends the session as before (the exception is
+rethrown). Not compiled, not run.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 595e19623e..8ecab2903a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -328,6 +328,25 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+     return info;
+ }
+ 
++// EDEN_NX2_BAD_ALLOC_ENDS=1: a std::bad_alloc on the pipeline threads ends the session, as it did
++// (the thread has nobody to catch it; run 57 ended so on VkPipelineSerialization at 333 s, writing
++// one pipeline to the disk cache with the heap unable to grow). Otherwise the work it was in is
++// dropped: a pipeline not written to the disk cache (built again next start), the driver cache not
++// flushed this time, a pipeline not built (its draws are skipped), and the session goes on.
++[[nodiscard]] bool BadAllocEnds() {
++    static const bool ends = [] {
++        const char* value = std::getenv("EDEN_NX2_BAD_ALLOC_ENDS");
++        return value != nullptr && value[0] == '1';
++    }();
++    return ends;
++}
++void SurviveBadAlloc(const char* where) {
++    if (BadAllocEnds()) {
++        throw std::bad_alloc{};
++    }
++    LOG_ERROR(Render_Vulkan, "No memory for {}: dropped, the session goes on", where);
++}
++
+ size_t GetTotalPipelineWorkers() {
+     const size_t max_core_threads =
+         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+@@ -1233,11 +1252,15 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
+     pipelines_since_flush = 0;
+     last_flush = now;
+     serialization_thread.QueueWork([this] {
+-        SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+-                                     CACHE_VERSION);
+-        size_t size = 0;
+-        vulkan_pipeline_cache.Read(&size, nullptr);
+-        last_cache_size.store(size, std::memory_order_relaxed);
++        try {
++            SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
++                                         CACHE_VERSION);
++            size_t size = 0;
++            vulkan_pipeline_cache.Read(&size, nullptr);
++            last_cache_size.store(size, std::memory_order_relaxed);
++        } catch (const std::bad_alloc&) {
++            SurviveBadAlloc("the driver pipeline cache flush");
++        }
+         flush_in_flight.store(false, std::memory_order_release);
+     });
+ }
+@@ -1594,6 +1617,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     }
+     LOG_ERROR(Render_Vulkan, "{}", exception.what());
+     return nullptr;
++} catch (const std::bad_alloc&) {
++    SurviveBadAlloc("a graphics pipeline");
++    return nullptr;
+ }
+ 
+ namespace {
+@@ -1648,16 +1674,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     disk_pipelines.insert(graphics_key.Hash());
+     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs),
+                                     is_mesh] {
+-        boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
+-            env_ptrs;
+-        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+-            if (key.unique_hashes[index] != 0) {
+-                env_ptrs.push_back(&envs[index]);
++        try {
++            boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
++                env_ptrs;
++            for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
++                if (key.unique_hashes[index] != 0) {
++                    env_ptrs.push_back(&envs[index]);
++                }
+             }
++            SerializePipeline(key, env_ptrs,
++                              is_mesh ? mesh_pipeline_cache_filename : pipeline_cache_filename,
++                              CACHE_VERSION, is_mesh);
++        } catch (const std::bad_alloc&) {
++            SurviveBadAlloc("a graphics pipeline's disk cache entry");
+         }
+-        SerializePipeline(key, env_ptrs,
+-                          is_mesh ? mesh_pipeline_cache_filename : pipeline_cache_filename,
+-                          CACHE_VERSION, is_mesh);
+     });
+     QueueVulkanPipelineCacheFlush();
+     return pipeline;
+@@ -1681,8 +1711,12 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+         return pipeline;
+     }
+     serialization_thread.QueueWork([this, key, env_ = std::move(env)] {
+-        SerializePipeline(key, std::array<const GenericEnvironment*, 1>{&env_},
+-                          pipeline_cache_filename, CACHE_VERSION);
++        try {
++            SerializePipeline(key, std::array<const GenericEnvironment*, 1>{&env_},
++                              pipeline_cache_filename, CACHE_VERSION);
++        } catch (const std::bad_alloc&) {
++            SurviveBadAlloc("a compute pipeline's disk cache entry");
++        }
+     });
+     QueueVulkanPipelineCacheFlush();
+     return pipeline;
+@@ -1760,6 +1794,9 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+ } catch (const Shader::Exception& exception) {
+     LOG_ERROR(Render_Vulkan, "{}", exception.what());
+     return nullptr;
++} catch (const std::bad_alloc&) {
++    SurviveBadAlloc("a compute pipeline");
++    return nullptr;
+ }
+ 
+ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 28a33ec989..2ecf45611c 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1933,13 +1933,28 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     ++images_uploaded;
+     uploaded_bytes += image.guest_size_bytes;
+     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+-    if (!UploadInChunks(image)) {
+-        if (auto staging = UploadStagingNow(runtime, MapSizeBytes(image))) {
+-            UploadImageContents(image, *staging);
+-            runtime.InsertUploadMemoryBarrier();
+-        } else if (!UploadInChunks(image, 0)) {
+-            UploadLater(image);
++    try {
++        if (!UploadInChunks(image)) {
++            if (auto staging = UploadStagingNow(runtime, MapSizeBytes(image))) {
++                UploadImageContents(image, *staging);
++                runtime.InsertUploadMemoryBarrier();
++            } else if (!UploadInChunks(image, 0)) {
++                UploadLater(image);
++            }
+         }
++    } catch (const std::bad_alloc&) {
++        // No memory for one image's unswizzle or conversion scratch (tens of MiB in one piece, on
++        // the GPU thread, where nothing caught it). The image keeps what it shows until the guest
++        // writes it again, and the session goes on; EDEN_NX2_BAD_ALLOC_ENDS=1 ends it as before.
++        static const bool ends = [] {
++            const char* value = std::getenv("EDEN_NX2_BAD_ALLOC_ENDS");
++            return value != nullptr && value[0] == '1';
++        }();
++        if (ends) {
++            throw;
++        }
++        LOG_ERROR(HW_GPU, "No memory to upload the image at {:#x}: kept as it is", image.gpu_addr);
++        runtime.TransitionImageLayout(image);
+     }
+     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
+     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1

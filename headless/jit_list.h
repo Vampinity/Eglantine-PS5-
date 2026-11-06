@@ -53,6 +53,7 @@ extern "C" void* eden_jit_list_open();
 extern "C" void eden_jit_list_close(void* handle);
 extern "C" int eden_jit_precompile(void* handle, unsigned long long location);
 extern "C" std::size_t eden_jit_history(void* handle, unsigned long long* out, std::size_t capacity);
+extern "C" bool eden_jit_keep_history;
 #endif
 
 namespace Eden::JitList {
@@ -134,7 +135,9 @@ inline std::vector<Value> Load(const std::string& path, const BuildId& build) {
 class Session {
 public:
     void Start(Value program, const BuildId& build, Value code_start, Value image) {
-        if (!enabled.load(std::memory_order_relaxed)) return;
+        // Only a block list reads the group's history: 8 bytes a block, up to 32 MiB.
+        eden_jit_keep_history = enabled.load(std::memory_order_relaxed);
+        if (!eden_jit_keep_history) return;
         handle_ = eden_jit_list_open();
         if (!handle_) {
             std::puts("EDEN_JIT_LIST unavailable (a 32-bit game, or no shared application JIT)");

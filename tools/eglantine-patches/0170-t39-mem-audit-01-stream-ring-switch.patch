@@ -1,0 +1,145 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0383-mem-audit-01-stream-ring-switch.patch
+
+Source: 0383-mem-audit-01-stream-ring-switch.patch
+Core patch, on core16 (through 0181). Paths are the submodule's.
+
+The ring is 128 MiB on the console: all 44 EDEN_REFUSED_STAGING stream lines of run62 print the
+real member, and it is a dedicated allocation (VMA blocks are 16 MiB here), so a smaller ring
+really goes back. 64 gives 64 MiB back, 32 gives 96.
+
+EDEN_STREAM_RING_MIB=<16..128> in env.txt. Unset, or out of range, as before; try 64 first.
+Replaces fable-trick-09 (EDEN_STREAM_BUFFER_MIB, in no stack): do not use both.
+
+The ring keeps its 16 regions, so the fence checks and the wrap do not change, only how often
+they run. The real GetStreamBuffer/WaitForStream, run against a model GPU at 128/64/32/16 MiB,
+handed out no range still in flight.
+
+What it costs: a region is 1/16 of the ring. Uploads over a region go through a staging buffer,
+which can be refused, and those buffers hold memory for a while, so part of the gain can come
+back. Under 16 MiB a region would be less than the 1 MiB UploadInChunks falls back to, hence the
+floor. A full ring also reaches the wait that ends the command buffer in a draw's setup more often.
+
+Async decode slices were a fixed 8 MiB, which is one region only at 128 MiB. They now stay within
+a region, or they would need a staging buffer just when the pool has none and hold their decoded
+data while waiting. Unset on the console a region is 8 MiB, so nothing changes.
+
+Syntax-compiled for the PS5 target with warnings on, TextureCache instantiated for Vulkan and
+OpenGL, through prepare-vulkan-port.py (same skipped anchors as before). Not built, not run on the
+console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 80a941377c..f6f66674de 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <utility>
+ #include <vector>
+ 
+@@ -78,13 +79,37 @@ size_t GetStreamBufferSize(const Device& device) {
+     }
+     return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
+ }
++
++// EDEN_STREAM_RING_MIB=<16..128>: a smaller stream ring, in whole MiB. It is taken whole at the
++// start of a session. It keeps its NUM_SYNCS regions at any size, so the fence checks and the wait
++// when it wraps do not change: only how often they come. An upload over one region goes through a
++// staging buffer, which can be refused, so under 16 MiB a region would be less than the 1 MiB
++// UploadInChunks falls back to. Only ever lowers what GetStreamBufferSize chose.
++// Unset, the size is what it was.
++size_t StreamRingSize(size_t chosen) {
++    const char* const value = std::getenv("EDEN_STREAM_RING_MIB");
++    if (value == nullptr) {
++        return chosen;
++    }
++    constexpr unsigned long long MinMiB = 16;
++    const unsigned long long mib = std::strtoull(value, nullptr, 10);
++    if (mib < MinMiB || mib > (MAX_STREAM_BUFFER_SIZE >> 20)) {
++        LOG_WARNING(Render_Vulkan, "EDEN_STREAM_RING_MIB={} is not {} to {}: ignored", value, MinMiB,
++                    MAX_STREAM_BUFFER_SIZE >> 20);
++        return chosen;
++    }
++    const size_t ring = (std::min)(chosen, static_cast<size_t>(mib) << 20);
++    LOG_INFO(Render_Vulkan, "Stream ring {} MiB, regions of {} KiB", ring >> 20,
++             (ring / StagingBufferPool::NUM_SYNCS) >> 10);
++    return ring;
++}
+ } // Anonymous namespace
+ 
+ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
+                                      Scheduler& scheduler_)
+     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
+-      stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
+-                                                                   StagingBufferPool::NUM_SYNCS} {
++      stream_buffer_size{StreamRingSize(GetStreamBufferSize(device))},
++      region_size{stream_buffer_size / StagingBufferPool::NUM_SYNCS} {
+     VkBufferCreateInfo stream_ci = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .pNext = nullptr,
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 4faecc5bea..1aceca5eb0 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2657,6 +2657,18 @@ void TextureCache<P>::ReportMemory() {
+ constexpr size_t UPLOAD_SLICE_BYTES = size_t{8} << 20;
+ constexpr size_t UPLOAD_FRAME_BYTES = size_t{32} << 20;
+ 
++// A slice has to fit a region: 8 MiB is one of a 128 MiB ring, and a smaller ring
++// (EDEN_STREAM_RING_MIB) has smaller regions. Over one it would need a staging buffer, just when
++// the pool has none, and the decode would wait with its data held.
++template <typename Runtime>
++[[nodiscard]] size_t UploadSliceLimit(Runtime& runtime) {
++    if constexpr (requires { runtime.UploadSliceBytes(); }) {
++        return (std::min)(UPLOAD_SLICE_BYTES, runtime.UploadSliceBytes());
++    } else {
++        return UPLOAD_SLICE_BYTES;
++    }
++}
++
+ // The next slice of `copies`: whole layers, at most `limit` bytes but at least one layer. The
+ // layers of a copy sit back to back in its buffer range (ConvertedLayout gives its size).
+ template <typename Copies>
+@@ -2718,7 +2730,8 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+         ConvertedLayout(image.info, zero_copies);
+         RenumberTrimmedLevels(image.host_level_offset, zero_copies);
+         // With no staging buffer the image only goes without its clear until the decode lands.
+-        if (out_size <= UPLOAD_SLICE_BYTES) {
++        const size_t slice_limit = UploadSliceLimit(runtime);
++        if (out_size <= slice_limit) {
+             if (auto staging = TryUploadStaging(runtime, out_size)) {
+                 std::memset(staging->mapped_span.data(), 0, out_size);
+                 image.UploadMemory(*staging, zero_copies);
+@@ -2727,7 +2740,7 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+             }
+         } else {
+             // Every slice reads the same zeros: one buffer the size of the largest slice.
+-            size_t zero_bytes = UPLOAD_SLICE_BYTES;
++            size_t zero_bytes = slice_limit;
+             for (const BufferImageCopy& copy : zero_copies) {
+                 zero_bytes = (std::max)(zero_bytes, copy.buffer_size /
+                                         static_cast<size_t>(copy.image_subresource.num_layers));
+@@ -2821,7 +2834,8 @@ void TextureCache<P>::TickAsyncDecode() {
+             i = async_decodes.erase(i);
+             continue;
+         }
+-        if (MapSizeBytes(image) > UPLOAD_SLICE_BYTES) {
++        const size_t slice_limit = UploadSliceLimit(runtime);
++        if (MapSizeBytes(image) > slice_limit) {
+             if (async_decode->next_copy == 0 && async_decode->next_layer == 0) {
+                 ConvertedLayout(image.info, async_decode->copies);
+             }
+@@ -2829,7 +2843,7 @@ void TextureCache<P>::TickAsyncDecode() {
+                 size_t next_copy = async_decode->next_copy;
+                 s32 next_layer = async_decode->next_layer;
+                 auto slice = NextUploadSlice(async_decode->copies, next_copy, next_layer,
+-                                             UPLOAD_SLICE_BYTES);
++                                             slice_limit);
+                 size_t bytes = 0;
+                 for (const BufferImageCopy& part : slice) {
+                     bytes += part.buffer_size;

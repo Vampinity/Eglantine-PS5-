@@ -8,6 +8,7 @@
 #include "common/logging.h"
 #include "gameplay_test.h"
 #include "input_common/input_poller.h"
+#include "test_harness.h"
 #include <utility>
 
 namespace {
@@ -322,8 +323,10 @@ void Pad::Consume(std::size_t player, std::span<const ps5::pad::Data> samples) {
     // Player 1's states go to the recording before the substitutions below take them for usable
     // or not (gameplay_test.h): replaying puts them back through the same substitutions.
     const bool recording = player == 0 && GameplayTest::Recording();
+    const bool test_recording = player == 0 && TestHarness::Recording();  // test_harness.h
     for (const auto& raw : samples) {
         if (recording) GameplayTest::Record(raw);
+        if (test_recording) TestHarness::Record(raw);
         auto sample = is_usable(raw) ? raw : neutral_data(raw.timestamp_us);
         // The shortcuts work from every controller.
         constexpr ButtonMask menu_chord = kButtonTouchPad | kButtonL1;

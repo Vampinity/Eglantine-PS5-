@@ -29,6 +29,29 @@ int64_t sceKernelGetDirectMemorySize(void);
 #define EDEN_DIRECT_STEP ((int64_t)2 << 20)       /* blocks at the top are placed in 2 MiB steps */
 #define EDEN_DIRECT_SMALL ((size_t)2 << 20)       /* a thread's stack; the driver's zero block */
 
+/* What is out of the pool, by size: under 2 MiB, 2 MiB, up to 32 MiB, more. Every request of the
+ * program and the driver passes here, so the reports can say what the owners they name leave out
+ * (at a refusal in run 53 they named 10.8 GiB of 12.1). */
+static atomic_ullong eden_direct_bytes[4], eden_direct_blocks[4];
+
+static unsigned eden_direct_class(size_t size) {
+  return size < EDEN_DIRECT_SMALL ? 0 : size == EDEN_DIRECT_SMALL ? 1 : size <= ((size_t)32 << 20) ? 2 : 3;
+}
+static int eden_direct_take(int64_t from, int64_t to, size_t size, size_t alignment, int type, int64_t *start) {
+  const int result = __real_sceKernelAllocateDirectMemory(from, to, size, alignment, type, start);
+  if (result == 0) {
+    atomic_fetch_add_explicit(&eden_direct_bytes[eden_direct_class(size)], size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&eden_direct_blocks[eden_direct_class(size)], 1, memory_order_relaxed);
+  }
+  return result;
+}
+void eden_direct_ledger(unsigned long long *bytes, unsigned long long *blocks) {
+  for (unsigned i = 0; i < 4; ++i) {
+    bytes[i] = atomic_load_explicit(&eden_direct_bytes[i], memory_order_relaxed);
+    blocks[i] = atomic_load_explicit(&eden_direct_blocks[i], memory_order_relaxed);
+  }
+}
+
 static atomic_flag eden_direct_lock = ATOMIC_FLAG_INIT;
 static int64_t eden_direct_floor;                 /* the lowest block taken at the top; 0: none yet */
 static int64_t eden_direct_holes[1024];           /* 2 MiB blocks given back above the floor */
@@ -43,12 +66,12 @@ static void eden_direct_release(void) { atomic_flag_clear_explicit(&eden_direct_
 int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
   const int64_t total = sceKernelGetDirectMemorySize();
   const int64_t bytes = (int64_t)size;
-  if (bytes <= 0 || total <= 0) return __real_sceKernelAllocateDirectMemory(0, total, size, alignment, type, start);
+  if (bytes <= 0 || total <= 0) return eden_direct_take(0, total, size, alignment, type, start);
   eden_direct_acquire();
   /* A block given back earlier left a hole of its size. */
   while (size == EDEN_DIRECT_SMALL && eden_direct_hole_count != 0) {
     const int64_t hole = eden_direct_holes[--eden_direct_hole_count];
-    if (__real_sceKernelAllocateDirectMemory(hole, hole + bytes, size, alignment, type, start) == 0) {
+    if (eden_direct_take(hole, hole + bytes, size, alignment, type, start) == 0) {
       eden_direct_release();
       return 0;
     }
@@ -58,19 +81,19 @@ int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
   for (unsigned tries = 0; tries < 512 && next >= bytes; ++tries) {
     const int64_t at = (next - bytes) / EDEN_DIRECT_STEP * EDEN_DIRECT_STEP;
     next = at;
-    if (__real_sceKernelAllocateDirectMemory(at, at + bytes, size, alignment, type, start) == 0) {
+    if (eden_direct_take(at, at + bytes, size, alignment, type, start) == 0) {
       eden_direct_floor = at;
       eden_direct_release();
       return 0;
     }
   }
   eden_direct_release();
-  return __real_sceKernelAllocateDirectMemory(0, total, size, alignment, type, start);
+  return eden_direct_take(0, total, size, alignment, type, start);
 }
 
 /* As the system places it: for what a session takes and gives back. */
 int eden_direct_low(size_t size, size_t alignment, int type, int64_t *start) {
-  return __real_sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, alignment, type, start);
+  return eden_direct_take(0, sceKernelGetDirectMemorySize(), size, alignment, type, start);
 }
 
 /* The Vulkan driver makes its command ring (16 MiB) and, right after it, the ring's marker page
@@ -102,12 +125,14 @@ int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, 
   if (from == 0 && start && to >= sceKernelGetDirectMemorySize() &&
       (size == EDEN_DIRECT_SMALL || eden_direct_driver_keeps(size, __builtin_return_address(0))))
     return eden_direct_high(size, alignment, type, start);
-  return __real_sceKernelAllocateDirectMemory(from, to, size, alignment, type, start);
+  return eden_direct_take(from, to, size, alignment, type, start);
 }
 
 int __wrap_sceKernelReleaseDirectMemory(int64_t start, size_t size) {
   const int result = __real_sceKernelReleaseDirectMemory(start, size);
   if (result != 0) return result;
+  atomic_fetch_sub_explicit(&eden_direct_bytes[eden_direct_class(size)], size, memory_order_relaxed);
+  atomic_fetch_sub_explicit(&eden_direct_blocks[eden_direct_class(size)], 1, memory_order_relaxed);
   eden_direct_acquire();
   if (size == EDEN_DIRECT_SMALL && eden_direct_floor != 0 && start >= eden_direct_floor &&
       eden_direct_hole_count < sizeof(eden_direct_holes) / sizeof(eden_direct_holes[0]))

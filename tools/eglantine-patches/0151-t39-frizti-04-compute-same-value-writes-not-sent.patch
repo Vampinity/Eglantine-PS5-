@@ -1,0 +1,190 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0334-frizti-04-compute-same-value-writes-not-sent.patch
+
+Source: 0334-frizti-04-compute-same-value-writes-not-sent.patch
+kepler_compute: plain writes that keep a register's value stay on the front (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone, and with frizti-01 in either order.
+
+Source: Frizti/Lichii 516ba08ce5, 4ddc1a058d, 763f3abbc0 (Dr. Sergio, Lichii PR 166) and 5c173ca274
+(Frizti), GPL-3.0-or-later.
+
+EDEN_NX2_COMPUTE_SAME=1. Macros replay the QMD fields for every dispatch. Each write is a ring entry
+and a call on the back that stores a word, mostly the word already there. With the switch the front
+drops those, for plain registers it has sent once. Both threads do less. No number from the source.
+
+Also under the switch: the front's copy of 0xb0 follows an inline QMD launch, as on the back. And
+EDEN_NX2_SPLIT_VERIFY=1 compares the front's compute registers with the back's every 4096 macro calls
+and logs differences. Use it for the first run. Only "Split front compute register" lines judge this
+switch: the same variable turns on the 3D check, which has its own lines.
+
+Changed from the source: only the drop. Its tagged sink entries and ring pairs are left out, they
+would touch the ring's format for less. The switch is read when the front starts, as Frizti fixed.
+Verify skips code_loc, see below, which the source would report as a false difference.
+
+Runs on the PS5: yes, with macros on the first thread, which is what run 61 logs.
+Hang: no wait added. A wrong drop would leave a stale QMD field and a wrong dispatch. By the code only
+the plain path writes these registers on the back, with one exception: DispatchNativeCompute sets
+regs.code_loc from the QMD before every use, so a dropped write there changes nothing.
+Pool memory: none (448 bytes per compute engine).
+Checked: PS5-target syntax compile. Not run. Verify's comparison has never run either.
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 3d02011a41..b8572f132e 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -1267,8 +1267,37 @@ struct KeplerCompute::FrontState {
+     bool compute_uploaded{};
+     u32 bind_pointer{};
+     MacroEngine* macro{}; ///< Without a native context: the one macro engine
++    bool drop_same{};     ///< EDEN_NX2_COMPUTE_SAME, read once
++    /// Plain registers (native_plain_methods) this front sent a write to: the back stored the value
++    /// in both native_registers and regs, so `registers` holds what both hold.
++    std::bitset<0xe00> plain_sent;
++    u64 calls{}; ///< Macro calls, for EDEN_NX2_SPLIT_VERIFY
+ };
+ 
++namespace {
++
++// EDEN_NX2_COMPUTE_SAME=1: a plain compute register write that keeps the register's value is not
++// sent to the back. Macros replay the QMD fields for every dispatch, and each one was a ring entry
++// and a CallMethod that stores the same word. Only plain registers: nothing but that store happens
++// on the back, and only the plain path writes them there. With EDEN_NX2_SPLIT_VERIFY set, the
++// front's copy is compared with the back's every 4096 macro calls.
++// From Frizti/Lichii 516ba08ce5 and 4ddc1a058d (Dr. Sergio, Lichii PR 166), compute part, without
++// its tagged sink entries. Read when the front starts: env.txt is applied in main.
++bool ComputeDropSame() {
++    static const bool drop = [] {
++        const char* value = std::getenv("EDEN_NX2_COMPUTE_SAME");
++        return value != nullptr && value[0] == '1';
++    }();
++    return drop;
++}
++
++bool ComputeFrontVerify() {
++    static const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
++    return verify;
++}
++
++} // Anonymous namespace
++
+ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
+     if (!front) [[unlikely]] {
+         // Copy the back's state and take the macros over while it is idle.
+@@ -1282,6 +1311,7 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
+         front->compute_uploaded = native_compute_uploaded;
+         front->bind_pointer = native_bind_pointer;
+         front->macro = native_macro;
++        front->drop_same = ComputeDropSame();
+         front_macros = true;
+     }
+     return *front;
+@@ -1294,6 +1324,20 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
+     }
+     fs.registers[method] = argument;
+     switch (method) {
++    case 0x107:
++        // An inline QMD whose destination is mapped launches through ProcessNativeMethod(0xb0, 3)
++        // on the back, which leaves 3 in 0xb0 (0xad is restored). From Frizti/Lichii 763f3abbc0
++        // (Dr. Sergio) and 5c173ca274 (Frizti). Here only with the switch on.
++        if (fs.drop_same) {
++            const GPUVAddr address =
++                ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
++            const u32 control = fs.registers[0xa7];
++            if (memory_manager.IsFullyMappedRange(address, 256) &&
++                ((control & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12)))) {
++                fs.registers[0xb0] = 3;
++            }
++        }
++        break;
+     case 0x45:
+         FrontMacroEngine(fs).ClearCode(argument);
+         break;
+@@ -1354,10 +1398,54 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
+         }
+         return;
+     }
++    if (FrontDropsWrite(fs, method, argument)) {
++        return;
++    }
+     FrontApply(fs, method, argument);
+     split.Method(this, method, argument, is_last_call, segment);
+ }
+ 
++bool KeplerCompute::FrontDropsWrite(FrontState& fs, u32 method, u32 argument) {
++    if (!fs.drop_same || method >= native_plain_methods.size() || !native_plain_methods[method]) {
++        return false;
++    }
++    if (fs.plain_sent[method] && fs.registers[method] == argument) {
++        return true;
++    }
++    fs.plain_sent[method] = true;
++    return false;
++}
++
++void KeplerCompute::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
++    split.Drain();
++    static u64 checks{};
++    static u64 differences{};
++    ++checks;
++    for (u32 i = 0; i < 0xe00; ++i) {
++        // Dropped writes rely on regs holding what native_registers holds. Not code_loc:
++        // DispatchNativeCompute sets it in regs alone, from the QMD, before every use.
++        const bool code_loc = i == KEPLER_COMPUTE_REG_INDEX(code_loc.address_high) ||
++                              i == KEPLER_COMPUTE_REG_INDEX(code_loc.address_low);
++        const bool regs_differ = fs.plain_sent[i] && !code_loc && i < Regs::NUM_REGS &&
++                                 regs.reg_array[i] != native_registers[i];
++        if (fs.registers[i] == native_registers[i] && !regs_differ) {
++            continue;
++        }
++        if (differences++ < 64) {
++            LOG_WARNING(HW_GPU, "Split front compute register {:#x}: front {:#x}, back {:#x}{}", i,
++                        fs.registers[i], native_registers[i],
++                        regs_differ ? fmt::format(" (back regs {:#x})", regs.reg_array[i])
++                                    : std::string{});
++        }
++        fs.registers[i] = native_registers[i];
++        fs.plain_sent[i] = false;
++    }
++    if ((checks & 63) == 1) {
++        LOG_INFO(HW_GPU, "Split front compute register checks: {} done, {} differences", checks,
++                 differences);
++    }
++}
++
+ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
+                                          u32 method, const u32* base_start, u32 amount,
+                                          u32 methods_pending, const GPUVAddr* segment) {
+@@ -1400,6 +1488,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
+             if (address >= 0xe00) {
+                 return false;
+             }
++            if (FrontDropsWrite(fs, address, value)) {
++                return true;
++            }
+             FrontApply(fs, address, value);
+             split.MacroWrite(this, address, value);
+             return true;
+@@ -1413,6 +1504,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
+     fs.executing_macro.reset();
+ #endif
+     fs.parameters.clear();
++    if (fs.drop_same && ComputeFrontVerify() && (++fs.calls & 4095) == 0) [[unlikely]] {
++        FrontVerify(split, fs);
++    }
+ }
+ 
+ } // namespace Tegra::Engines
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+index 5eeb03e3f3..eca391240f 100644
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -277,6 +277,8 @@ private:
+     MacroEngine& FrontMacroEngine(FrontState& state);
+     std::span<u32> FrontMacroPositions(FrontState& state);
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
++    bool FrontDropsWrite(FrontState& state, u32 method, u32 argument);
++    void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+     std::unique_ptr<FrontState> front;
+     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
+ 

@@ -129,6 +129,11 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #endif
 #include "profiles.h"
 #include "stop_limit.h"
+#include "test_harness.h"
+extern "C" bool eden_page_reuse;  // headless/dynarmic/page_reuse_pass.inc
+extern "C" bool eden_free_moves, eden_alloc_r13;  // headless/dynarmic/reg_alloc.cmake
+extern "C" bool eden_plain_ordered_reads;  // headless/CMakeLists.txt
+extern "C" bool eden_fcmp_adc, eden_light_dmb, eden_checkbit_flags;  // headless/dynarmic/fast_paths.cmake
 namespace Common {
 void SetGuestMemoryFine(bool on) noexcept;
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
@@ -381,10 +386,12 @@ int main(int argc, char** argv) {
         // Whether Eden's large tables can be sparse on this console (src/memory_pages.cpp),
         // decided now: every session's log says it, with or without a game.
         (void)Common::SparseTablesAvailable();
+        bool stop_limit_restart = false;
         {
             // A game that would not stop made the app start again (stop_limit.h): this log says so.
             const std::string note = Eden::LogFile("stop-limit.txt");
-            if (std::remove(note.c_str()) == 0)
+            stop_limit_restart = std::remove(note.c_str()) == 0;
+            if (stop_limit_restart)
                 Eden::Report("exit", "The last game did not stop (or finish loading) within ten seconds of being "
                                      "asked to, so EglantinePS5 started again");
             Eden::StopLimit::Start(note);
@@ -511,6 +518,10 @@ int main(int argc, char** argv) {
             Eden::DevelopmentInput::IgnoreExisting(left_behind);
         }
 #endif
+#else
+        // Only a test run (EDEN_TEST_BOOT, below) starts a title by itself in a release.
+        bool autoboot_pending = false;
+        std::string development_id;
 #endif
         setenv("EDEN_NX2_SPARSE_UNBACKED", "1", 1);
         setenv("EDEN_HOST_RESERVE_TRANSFER", "1", 1);
@@ -531,17 +542,72 @@ int main(int argc, char** argv) {
                 std::printf("EDEN_ENV %s\n", entry.c_str());
             }
         }
+        // Test runs (test_harness.h): nothing happens here without an EDEN_TEST_ setting.
+        Eden::TestHarness::Start();
+        if (const std::string& title = Eden::TestHarness::BootTitle(); !title.empty()) {
+            // As for the development title, and for a game that had to be left behind as well:
+            // the launcher opens with what it has to say, and the title is not booted into again.
+            // A start the computer did not ask for (test_harness.h) or a forwarded game: no boot.
+            const char* const skip = !Eden::TestHarness::BootArmed() ? "not_armed" :
+                                     !last_crash.report.empty() ? "crash" :
+                                     stop_limit_restart ? "stop_limit" :
+                                     !forwarded_game.empty() ? "forwarded" : nullptr;
+            if (!skip) {
+                development_id = title;
+                autoboot_pending = true;
+                Eden::TestHarness::MarkBooted();
+                Eden::Report("test", ("EDEN_TEST boot title=" + title).c_str());
+            } else {
+                Eden::Report("test", (std::string{"EDEN_TEST boot_skipped reason="} + skip).c_str());
+            }
+        }
         // The console's defaults for the core's switches (env.txt above wins). Without a fastmem
         // arena every guest read of a GPU-tracked page is a call; a Switch 2 title's reads of
         // pages with nothing to flush answer on the guest core instead of waiting for the GPU
         // thread, as they do with fastmem (Mario Kart World's title screen: 13 -> 20 FPS). The
         // three waits poll 300 us before sleeping: a wake-up here is a system call on both sides.
+        // Test build: the limit of refused images in 2 s is off. Refused uploads and downloads no
+        // longer end the session, and at the pace of runs 44 and 45 the limit would end it within
+        // a second instead, before showing what these patches do. env.txt EDEN_NX2_UNBACKED_LIMIT=8
+        // brings it back. "limit 0" in stderr shows this took effect.
         for (const auto& [name, value] : {std::pair{"EDEN_NX2_UNSAFE_PREEMPTIVE_READS", "1"},
                                           std::pair{"EDEN_PS5_READ_SPIN_US", "300"},
                                           std::pair{"EDEN_PS5_GPU_SPIN_US", "300"},
-                                          std::pair{"EDEN_PS5_WORKER_SPIN_US", "300"}}) {
+                                          std::pair{"EDEN_PS5_WORKER_SPIN_US", "300"},
+                                          std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"}}) {
             setenv(name, value, 0);
         }
+        // Nearby A64 accesses share one page lookup (headless/dynarmic/page-reuse.cmake). The pass
+        // only acts on the direct table, EDEN_JIT_TABLE=1.
+        if (const char* const reuse = std::getenv("EDEN_JIT_PAGE_REUSE"); reuse && reuse[0] == '1')
+            eden_page_reuse = true;
+        // JIT code generation, read before the first block compiles. EDEN_JIT_CODEGEN=1 turns all
+        // six on; a switch of its own wins, so EDEN_JIT_R13=0 takes one out of the set.
+        {
+            const char* const all = std::getenv("EDEN_JIT_CODEGEN");
+            const auto chosen = [all](const char* name) {
+                const char* const own = std::getenv(name);
+                return own ? own[0] == '1' : all && all[0] == '1';
+            };
+            eden_free_moves = chosen("EDEN_JIT_FREE_MOVES");
+            eden_alloc_r13 = chosen("EDEN_JIT_R13");
+            eden_plain_ordered_reads = chosen("EDEN_JIT_PLAIN_ORDERED");
+            eden_fcmp_adc = chosen("EDEN_JIT_FCMP_ADC");
+            eden_light_dmb = chosen("EDEN_JIT_LIGHT_DMB");
+            eden_checkbit_flags = chosen("EDEN_JIT_CHECKBIT_FLAGS");
+            std::printf("EDEN_JIT_CODEGEN free_moves=%d r13=%d plain_ordered=%d fcmp_adc=%d light_dmb=%d "
+                        "checkbit_flags=%d page_reuse=%d\n", eden_free_moves, eden_alloc_r13,
+                        eden_plain_ordered_reads, eden_fcmp_adc, eden_light_dmb, eden_checkbit_flags,
+                        eden_page_reuse);
+        }
+        // Where a frame goes, from a normal build (performance.h, perf_report).
+        if (const char* const report = std::getenv("EDEN_PERF_REPORT"); report && report[0] == '1') {
+            Eden::Performance::perf_report = true;
+            Eden::Performance::vulkan_cost_enabled = true;
+        }
+        // The texture collector decides from the pool's shortness as it did (performance.h).
+        if (const char* const pool = std::getenv("EDEN_NX2_TC_POOL_PRESSURE"); pool && pool[0] == '1')
+            Eden::Performance::texture_usage_from_images = false;
 #ifdef EDEN_MKW_DIAGNOSTICS
         // Temporary capture for the Mario Kart World loading-screen investigation.
         const auto diagnostic_capture_dir = Eden::LogFile("mkw-gpfifo-" + std::to_string(getpid()));
@@ -567,6 +633,10 @@ int main(int argc, char** argv) {
         Eden::Multiplayer::RoomClient rooms;
         for (;;) {
         Eden::StopLimit::End();  // whatever game ran before is gone
+        if (Eden::TestHarness::QuitAsked()) {
+            Eden::Report("exit", "Closed by test-quit");
+            return 0;
+        }
 #ifdef EDEN_PS5_OPENGL
         std::error_code trim_error;
         const auto cache_entries = Eden::ReadNativeDirectory(native_shader_cache, trim_error);
@@ -609,7 +679,6 @@ int main(int argc, char** argv) {
         } else {
         guest_fault_retries = 0;
         forwarded_session = false;
-#if defined(EDEN_DEV_PROFILE) || defined(EDEN_DEV_ROM_ID)
         if (std::exchange(autoboot_pending, false)) {
 #if defined(EDEN_DEV_ROM_ID) && !defined(EDEN_DEV_PROFILE)
         compatibility_probe = true;
@@ -644,10 +713,6 @@ int main(int argc, char** argv) {
             Eden::BootTrace::Line("opening the launcher");
             selected_game = SelectEglantinePS5Game(rooms, launch_error);
         }
-#else
-        Eden::BootTrace::Line("opening the launcher");
-        selected_game = SelectEglantinePS5Game(rooms, launch_error);
-#endif
         Eden::BootTrace::Line("launcher closed: %s", selected_game.empty() ? "no game (quit)" : "a game was chosen");
         }
         if (selected_game.empty()) {
@@ -720,6 +785,23 @@ int main(int argc, char** argv) {
         const uint64_t game_title = 0;
 #endif
         Eden::session_title.store(game_title);
+        if (game_title) {
+            // env-<title id>.txt in the app folder (env-0400c3f00006e000.txt): env.txt's lines for
+            // this game alone, read now that the game is known and before the core reads its
+            // switches. A later line wins over env.txt. No file, no change. Mario Kart World can
+            // then have its texture trims without another game getting them. The core keeps a
+            // switch's first value for the life of the process, so leave the app between games.
+            char title_environment[40];
+            std::snprintf(title_environment, sizeof(title_environment), "env-%016llx.txt",
+                          static_cast<unsigned long long>(game_title));
+            std::ifstream environment(Eden::AppFile(title_environment));
+            for (std::string entry; std::getline(environment, entry);) {
+                const auto split = entry.find('=');
+                if (entry.empty() || entry[0] == '#' || split == std::string::npos || split == 0) continue;
+                setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
+                std::printf("EDEN_ENV_TITLE %s\n", entry.c_str());
+            }
+        }
         const unsigned cycles = game ? 1 : 3;
         const bool devices = EDEN_DEVICE_FRONTEND;
         if (game) {
@@ -1142,11 +1224,17 @@ int main(int argc, char** argv) {
             // every session at their exact values (above), so one that is not chosen is off.
             const auto speed = Eden::LoadPerformance(eden_game_title_id(guest));
 #ifdef PS5_NATIVE
-            // Donkey Kong Bananza and Mario Kart World run short of memory: written slots with many
-            // pages of zeroes keep only the others (576 MiB of Bananza's 4.3 GiB were such pages), and
-            // a write makes one whole.
-            ::Common::SetGuestMemoryFine(eden_game_title_id(guest) == 0x040074A01BF12000ULL ||
-                                         eden_game_title_id(guest) == 0x0400C3F00006E000ULL);
+            // Donkey Kong Bananza, Ocarina of Time and Mario Kart World run short of memory: written
+            // slots with many pages of zeroes keep only the others (576 MiB of Bananza's 4.3 GiB were
+            // such pages), and a write makes one whole. A value from env.txt wins, for any game
+            // (EDEN_CRAM_FINE=0 or 1).
+            {
+                const auto fine_title = eden_game_title_id(guest);
+                bool fine = fine_title == 0x040074A01BF12000ULL || fine_title == 0x0400486024DEC000ULL ||
+                            fine_title == 0x0400C3F00006E000ULL;
+                if (const char* chosen = std::getenv("EDEN_CRAM_FINE")) fine = chosen[0] != '0';
+                ::Common::SetGuestMemoryFine(fine);
+            }
 #endif
             Settings::values.use_asynchronous_shaders = speed.async_shaders;
             if (speed.fast_gpu) {
@@ -1158,6 +1246,20 @@ int main(int argc, char** argv) {
             if (speed.unsafe_dma) Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
             Settings::values.use_reactive_flushing.SetValue(speed.reactive_flushing);
             Settings::values.skip_cpu_inner_invalidation.SetValue(speed.skip_invalidation);
+            {
+                // Eden's gpu_fence_behavior has no setting here: EDEN_GPU_FENCE in env.txt
+                // (immediate, balanced or accurate) chooses it, every session, like the levels
+                // above. Unset or anything else: Default.
+                auto fence = Settings::GpuFenceBehavior::Default;
+                if (const char* chosen = std::getenv("EDEN_GPU_FENCE")) {
+                    const std::string_view name{chosen};
+                    if (name == "immediate") fence = Settings::GpuFenceBehavior::Immediate;
+                    if (name == "balanced") fence = Settings::GpuFenceBehavior::Balanced;
+                    if (name == "accurate") fence = Settings::GpuFenceBehavior::Accurate;
+                }
+                Settings::values.gpu_fence_behavior.SetValue(fence);
+                std::printf("EDEN_GPU_FENCE %u\n", unsigned(fence));
+            }
             // The block list is off unless the settings turn it on (block-list.txt in the app
             // folder still does, further down).
             if (!dev_block_list) Eden::JitList::enabled = speed.block_list;
@@ -1437,9 +1539,10 @@ int main(int argc, char** argv) {
 #if defined(EDEN_DEV_PROFILE) || defined(EDEN_DEV_ROM_ID)
                         // The runner's stand-in for the press: its input commands are read only
                         // once the game runs.
-                        const bool asked = std::remove(Eden::AppFile("leave-loading.txt").c_str()) == 0;
+                        const bool asked = std::remove(Eden::AppFile("leave-loading.txt").c_str()) == 0 ||
+                                           Eden::TestHarness::QuitAsked();
 #else
-                        const bool asked = false;
+                        const bool asked = Eden::TestHarness::QuitAsked();
 #endif
                         if (pad->TakeReturnToMenu() || asked) {
                             Eden::Report("exit", "Touchpad + L1 while the game loads: leaving as soon as it can be stopped");
@@ -1655,6 +1758,8 @@ int main(int argc, char** argv) {
                 [[maybe_unused]] double session_seconds = 0;  // guest-fault relaunch (PS5 only)
                 std::jthread input_worker;
                 if (pad) input_worker = std::jthread([&](std::stop_token stop) {
+                    // Empty without EDEN_TEST_SCRIPT and EDEN_TEST_RECORD (test_harness.h).
+                    Eden::TestHarness::Session test_session{pad->Mapping(), session_start, guest, game_title};
 #ifdef EDEN_DEV_PROFILE
                     // The timed input replay drives the profile's own title (EDEN_DEV_PROFILE_TITLE);
                     // other development titles take runner commands (compat-input.txt).
@@ -1781,12 +1886,14 @@ int main(int argc, char** argv) {
 #ifdef EDEN_DEV_PROFILE
                         if (!timed_replay) {
 #endif
+                        const auto test_sample = test_session.Sample();
 #if defined(EDEN_DEV_ROM_ID) || defined(MKW_DIAGNOSTIC_INPUT)
-                        if (!development_input.active) { UpdateGrips(system, *pad); pad->Poll(); }
+                        if (!development_input.active && !test_sample) { UpdateGrips(system, *pad); pad->Poll(); }
 #else
                         UpdateGrips(system, *pad);
-                        pad->Poll();
+                        if (!test_sample) pad->Poll();
 #endif
+                        if (test_sample) pad->Consume({&*test_sample, 1});
 #if defined(EDEN_DEV_ROM_ID) || defined(MKW_DIAGNOSTIC_INPUT)
                         const auto command_now = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1863,6 +1970,12 @@ int main(int argc, char** argv) {
                             std::lock_guard lock(completion->mutex);
                             completion->return_to_menu = true;
                             completion->room_lost = room_lost;
+                            completion->wake.notify_one();
+                            break;
+                        }
+                        if (Eden::TestHarness::QuitAsked()) {
+                            std::lock_guard lock(completion->mutex);
+                            completion->return_to_menu = true;
                             completion->wake.notify_one();
                             break;
                         }

@@ -1,0 +1,126 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0343-heap-05-kernel-resource-cap.patch
+
+Source: 0343-heap-05-kernel-resource-cap.patch
+Core patch: tools/eglantine-patches, next free number after 0181 (0185 if in order).
+
+EDEN_HEAP_SITE "47 MiB in 1 blocks: ... 2796c1 2fe834 2fe54c 2e3ff2" is vector<u8>::__append in
+KDynamicPageManager::Initialize from KSecureSystemResource::Initialize from KProcess::Initialize: the
+first large block. The manager backs the title's system resource with host memory and zeroes it. Only
+kernel memory blocks and block infos come out of it here: KPageTableBase's page table use is commented
+out, the guest's page tables being host tables.
+
+EDEN_KERNEL_RESOURCE_MIB=<N> (at least 4) backs N MiB of it; the guest still sees the size it asked
+for. Unset: as now. 8 saves 39 MiB. The log gains "EDEN_KERNEL_RESOURCE N MiB of M MiB of pages used at
+most" at each MiB (no line: under 1 MiB), with or without the switch, and an error line once if the
+pages run out, which would reach the guest as out of resource. The kernel's own page manager writes the
+same line, with another M. What Ocarina of Time really uses is not known: read that line.
+
+clang -fsyntax-only with Boost 1.90 passes (x86-64 host). Not compiled for the console, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/hle/kernel/k_dynamic_page_manager.h b/src/core/hle/kernel/k_dynamic_page_manager.h
+index 16bd61a98a..e2ab686018 100644
+--- a/src/core/hle/kernel/k_dynamic_page_manager.h
++++ b/src/core/hle/kernel/k_dynamic_page_manager.h
+@@ -9,6 +9,7 @@
+ #include <vector>
+ 
+ #include "common/alignment.h"
++#include "common/logging.h"
+ #include "core/hle/kernel/k_page_bitmap.h"
+ #include "core/hle/kernel/k_spin_lock.h"
+ #include "core/hle/kernel/k_typed_address.h"
+@@ -106,6 +107,12 @@ public:
+         // Find a random free block.
+         s64 soffset = m_page_bitmap.FindFreeBlock(true);
+         if (soffset < 0) [[unlikely]] {
++            // EglantinePS5: what a small EDEN_KERNEL_RESOURCE_MIB would show as a guest failure.
++            if (!m_said_full) {
++                m_said_full = true;
++                LOG_ERROR(Kernel, "EDEN_KERNEL_RESOURCE all {} MiB of the pages are in use",
++                          PagesInMiB(m_count));
++            }
+             return nullptr;
+         }
+ 
+@@ -115,6 +122,13 @@ public:
+         m_page_bitmap.ClearBit(offset);
+         m_peak = (std::max)(m_peak, (++m_used));
+ 
++        // EglantinePS5: what the title's resource really takes, for EDEN_KERNEL_RESOURCE_MIB.
++        if (m_peak >= m_reported_peak + ReportPages) [[unlikely]] {
++            m_reported_peak = m_peak;
++            LOG_INFO(Kernel, "EDEN_KERNEL_RESOURCE {} MiB of {} MiB of pages used at most",
++                     PagesInMiB(m_peak), PagesInMiB(m_count));
++        }
++
+         return GetPointer<PageBuffer>(m_aligned_address) + offset;
+     }
+ 
+@@ -157,10 +171,18 @@ public:
+     }
+ 
+ private:
++    static constexpr size_t ReportPages = (1 << 20) / PageSize;
++    // Rounded up: the bitmap takes a page, and 8 MiB of memory would read as 7.
++    static constexpr size_t PagesInMiB(size_t pages) {
++        return (pages * sizeof(PageBuffer) + (1 << 20) - 1) >> 20;
++    }
++
+     KSpinLock m_lock;
+     KPageBitmap m_page_bitmap;
+     size_t m_used{};
+     size_t m_peak{};
++    size_t m_reported_peak{};
++    bool m_said_full{};
+     size_t m_count{};
+     KVirtualAddress m_address{};
+     KVirtualAddress m_aligned_address{};
+diff --git a/src/core/hle/kernel/k_system_resource.cpp b/src/core/hle/kernel/k_system_resource.cpp
+index fb664eb57a..446e47a6ef 100644
+--- a/src/core/hle/kernel/k_system_resource.cpp
++++ b/src/core/hle/kernel/k_system_resource.cpp
+@@ -4,12 +4,17 @@
+ // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++
++#include "common/literals.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_scoped_resource_reservation.h"
+ #include "core/hle/kernel/k_system_resource.h"
+ 
+ namespace Kernel {
+ 
++using namespace Common::Literals;
++
+ Result KSecureSystemResource::Initialize(KernelCore& kernel, size_t size, KResourceLimit* resource_limit, KMemoryManager::Pool pool) {
+     // Set members.
+     m_resource_limit = resource_limit;
+@@ -45,9 +50,21 @@ Result KSecureSystemResource::Initialize(KernelCore& kernel, size_t size, KResou
+     auto* resource =
+         kernel.System().DeviceMemory().GetPointer<KPageTableManager::RefCount>(resource_paddr);
+ 
++    // EglantinePS5: the page manager backs its pages with host memory, zeroed and all of it real
++    // on the console: Ocarina of Time's title asks for 47 MiB, one large block of the heap, and
++    // only the memory blocks and block infos of the kernel's own tables come out of it (the page
++    // tables are host tables here). EDEN_KERNEL_RESOURCE_MIB=<N> gives it N MiB (at least 4); the
++    // guest still sees the size it asked for. EDEN_KERNEL_RESOURCE in the log says what is used.
++    size_t managed_size = m_resource_size - rc_size;
++    if (const char* const chosen = std::getenv("EDEN_KERNEL_RESOURCE_MIB")) {
++        const size_t asked = static_cast<size_t>(std::strtoull(chosen, nullptr, 10)) << 20;
++        if (asked >= (4_MiB) && asked < managed_size) {
++            managed_size = asked;
++        }
++    }
++
+     // Initialize slab heaps.
+-    m_dynamic_page_manager.Initialize(m_resource_address + rc_size, m_resource_size - rc_size,
+-                                      PageSize);
++    m_dynamic_page_manager.Initialize(m_resource_address + rc_size, managed_size, PageSize);
+     m_page_table_heap.Initialize(std::addressof(m_dynamic_page_manager), 0, resource);
+     m_memory_block_heap.Initialize(std::addressof(m_dynamic_page_manager), 0);
+     m_block_info_heap.Initialize(std::addressof(m_dynamic_page_manager), 0);

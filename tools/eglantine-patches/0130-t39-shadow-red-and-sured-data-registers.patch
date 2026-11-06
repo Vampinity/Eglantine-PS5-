@@ -1,0 +1,45 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0142-shadow-red-and-sured-data-registers.patch
+
+Source: 0142-shadow-red-and-sured-data-registers.patch
+shader: shadow the data registers of RED and SURED
+
+0084 (Lichii PR 100 and 65): the check that decides on shadow registers skips bits 32-39
+unless the opcode is listed, and RED (0x98e) and SURED (0x59f) were not. A data register
+in the reserved range then read the lowering's own uniform mirror instead of the guest
+value, with no error.
+
+Added here, unlike the PR: PrepareRegisterPressure's own cases. Lichii already has them
+in register_pressure.h; ours had neither, so the check alone would have rejected those
+programs with "native program uses lowering scratch registers". Operands copied from
+Lichii's table at f356d39ba. A RED or SURED whose address register was reserved failed
+with that same error before and now lowers.
+
+Lichii could not tie this to a visible symptom in Ocarina either.
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 2c20cdd69f..9ab1693045 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -98,6 +98,11 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     case 0x321: operand(16, input.Bits(74, 2) + 1); operand(24); operand(32); break;
+     case 0x322: operand(24); operand(32, input.Bits(74, 2) + 1); break;
+     case 0x927: operand(24); operand(32); break;
++    case 0x59f: operand(24, 2); operand(32); break;
++    case 0x98e:
++        operand(24, input.Bits(72, 1) ? 2 : 1);
++        operand(32, input.Bits(73, 3) == 2 || input.Bits(73, 3) == 5 ? 2 : 1);
++        break;
+     case 0x202: case 0x243: operand(16); operand(32); break;
+     case 0x812: case 0x824: case 0x831: case 0x424: case 0x624:
+         operand(16); operand(24); operand(64); break;
+@@ -266,7 +271,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+         bool requires_shadow = false;
+         for (u32 bit : {16U, 24U, 32U, 64U}) {
+             if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xf66 &&
+-                opcode != 0x988 && opcode != 0x986 && opcode != 0x927) continue;
++                opcode != 0x988 && opcode != 0x986 && opcode != 0x927 && opcode != 0x98e &&
++                opcode != 0x59f) continue;
+             const u32 reg = insn.Bits(bit, 8);
+             if (reg >= shadow_boundary && reg < 255) requires_shadow = true;
+         }

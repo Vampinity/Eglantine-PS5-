@@ -1,0 +1,72 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0323-rebase-04-descriptor-tables.patch
+
+Source: 0323-rebase-04-descriptor-tables.patch
+texture_cache: size descriptor tables to their limit
+
+Port of PR #277 (nowhere02, Djihads80/Eglantine, open), commit in refs/pull/277. GPL-3.0-or-later,
+as the core. Our tree also has bound_ids, which the PR does not know, so those grow with it.
+
+Every descriptor table took at least 0x80001 entries: 16 MiB, plus 2 MiB of ids. Up to four tables
+per GPU channel (graphics and compute, images and samplers), and run60's log shows channels 2, 3 and
+5 at least. Now a table holds the next power of two above its limit and never shrinks. Changed from
+the PR: never more than the old rounding gave. Plain bit_ceil is larger for some limits (0x100000
+needed 72 MiB against 54), and this build runs out of memory. The most a table saves is 18 MiB, at
+a small limit; at 0x7ffff and up it saves nothing.
+
+Every reader stops at current_limit first (GetSamplerId, VisitImageView, DEBUG_ASSERT in Read), so
+entries past the limit are never touched. Switch, added for next18: EDEN_NX2_TIGHT_DESCRIPTOR_TABLES=1,
+default off. Unset, the sizes and the resizing are as before.
+
+Proven: the arithmetic, and that next14's DescriptorTable::Refresh adds 0x80001 (0x15af2f8).
+Not proven: how much this gives back. The EDEN_HEAP_SITE lines of run57 and run61 show no 16 MiB
+vector from Refresh, and that is not explained. If a game's limit is large the saving is smaller.
+
+Core patch. Nothing here has run on a console.
+
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index c34083cf20..d9e65c85e0 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -7,6 +7,8 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <bit>
++#include <cstdlib>
+ #include <cstring>
+ #include <vector>
+ 
+@@ -70,15 +72,25 @@ public:
+     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
+         current_gpu_addr = gpu_addr;
+         current_limit = limit;
+-        // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
+-        // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
+-        const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
+-        read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
++        // EDEN_NX2_TIGHT_DESCRIPTOR_TABLES=1: round up geometrically. Growth stays amortized without
++        // 16 MiB for every small table (0x80001 entries of 32 bytes, plus 2 MiB of ids, is the
++        // minimum otherwise). Never past the old rounding to 0x80000, which is the smaller one for
++        // some large limits, and such a table never shrinks.
++        static const bool tight = [] {
++            const char* const value = std::getenv("EDEN_NX2_TIGHT_DESCRIPTOR_TABLES");
++            return value != nullptr && value[0] == '1';
++        }();
++        const size_t old_rounding = ((limit + 0x80000) & (~0x7ffff)) + 1;
++        const size_t num_descriptors =
++            tight ? (std::min)(std::bit_ceil(static_cast<size_t>(limit) + 1), old_rounding)
++                  : old_rounding;
++        if (!tight || descriptors.size() < num_descriptors) {
++            read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
++            descriptors.resize(num_descriptors);
++            bound_ids.resize(num_descriptors, Id{0});
++        }
+         ClearReadDescriptors();
+         invalidated = false;
+-        //
+-        descriptors.resize(num_descriptors);
+-        bound_ids.resize(num_descriptors, Id{0});
+     }
+ 
+     std::vector<u64> read_descriptors;

@@ -1,0 +1,40 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0153-guard-clear-uploads-against-lower-left-scissors.patch
+
+Source: 0153-guard-clear-uploads-against-lower-left-scissors.patch
+skip, which is 0146 here (Lichii PR 141, Kajcsi).
+
+Vulkan GetScissorState reflects the Y interval around surface_clip.height and
+clamps negative bounds to zero. With a lower-left window origin a scissor
+whose raw Y interval looks full can clear no rows after that transform.
+Require the transformed interval to start at zero and cover the new render
+target before suppressing its guest upload; otherwise RefreshContents runs as
+before.
+
+Changed from the source: placed inside 0146's use_scissor block, so the
+scissor-enable test is the block's own.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/texture_cache/texture_cache.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index d3b60d4800..49e9f15911 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3122,6 +3122,15 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+                 scissor.max_y < height) {
+                 return false;
+             }
++            using WindowOrigin = Tegra::Engines::Maxwell3D::Regs::WindowOrigin;
++            if (regs.window_origin.mode != WindowOrigin::Mode::UpperLeft) {
++                // Vulkan flips Y around surface_clip.height, then clamps both bounds to zero.
++                // Require the transformed interval to start at zero and cover the new image.
++                const u32 clip_height = regs.surface_clip.height;
++                if (scissor.max_y < clip_height || clip_height - scissor.min_y < height) {
++                    return false;
++                }
++            }
+         }
+         // The clear covers the framebuffer's render area, the smallest bound target.
+         for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {

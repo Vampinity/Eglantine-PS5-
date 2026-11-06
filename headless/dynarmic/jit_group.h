@@ -35,6 +35,9 @@
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/ir/location_descriptor.h"
 
+// Whether `history` is kept (headless/jit_list.h turns it off without a block list).
+extern "C" bool eden_jit_keep_history;
+
 namespace Dynarmic::Backend::X64 {
 
 // Guards a group's maps. Critical sections are short (a lookup, or registering one block) and
@@ -135,7 +138,7 @@ public:
         result = it->second;
         if (!inserted)
             return false;
-        if (history.size() < history_limit)
+        if (eden_jit_keep_history && history.size() < history_limit)
             history.push_back(location.Value());
         ranges.AddRange(boost::icl::discrete_interval<u64>::closed(first, last), location);
         for (const PendingSite& pending : own_sites) {

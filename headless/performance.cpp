@@ -10,6 +10,7 @@
 #include <string>
 #include <set>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cpuid.h>
@@ -39,6 +40,8 @@ namespace Common {
 void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept;
 // Address space Eden's sparse tables span and the memory they hold (src/memory_pages.cpp).
 void SparseUsage(std::size_t* reserved, std::size_t* committed) noexcept;
+// The memory behind the JIT's code caches (src/memory_pages.cpp).
+void CodeRangeUsage(std::size_t* reserved, std::size_t* committed) noexcept;
 } // namespace Common
 
 #ifdef PS5_NATIVE
@@ -172,18 +175,34 @@ void CheckWorkerTopology() {
     std::array<unsigned, 5> cores{};
     unsigned count = 0;
     bool changed = false;
+    // Why a probe stopped short (EDEN_WORKER_PROBE): every run on firmware 12.40 reports one
+    // distinct core, so nothing is pinned there and the log has never said why.
+    unsigned probed = 0, stopped_at = 64, shift = 0, first_id = 0, last_id = 0;
+    int refused = 0;
+    bool bad_level = false;
     for (unsigned cpu = 0; cpu < 64; ++cpu) {
         if (!CPU_ISSET(cpu, &original)) continue;
         cpuset_t one{};
         CPU_SET(cpu, &one);
-        if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &one)) break;
+        if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &one)) {
+            refused = errno;
+            stopped_at = cpu;
+            break;
+        }
         changed = true;
         unsigned a, b, c, d;
         __cpuid_count(0xb, 0, a, b, c, d);
         // Architectural SMT level: x2APIC ID above the SMT shift identifies
         // the physical core. Do not assume OS CPU numbering matches APIC IDs.
-        if (!b || ((c >> 8) & 0xff) != 1 || (a & 31) >= 16) break;
+        if (!b || ((c >> 8) & 0xff) != 1 || (a & 31) >= 16) {
+            bad_level = true;
+            stopped_at = cpu;
+            break;
+        }
         const unsigned core = d >> (a & 31);
+        if (probed++ == 0) first_id = d;
+        last_id = d;
+        shift = a & 31;
         cpu_core[cpu] = static_cast<int>(core);
         if (count == cores.size() ||
             std::find(cores.begin(), cores.begin() + count, core) != cores.begin() + count) continue;
@@ -196,6 +215,29 @@ void CheckWorkerTopology() {
             cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &restored) ||
             std::memcmp(&original, &restored, 8))
             throw std::runtime_error("Cannot restore topology-probe thread affinity");
+    }
+    unsigned long long allowed_mask = 0;
+    for (unsigned cpu = 0; cpu < 64; ++cpu)
+        if (CPU_ISSET(cpu, &original)) allowed_mask |= 1ULL << cpu;
+    std::printf("EDEN_WORKER_PROBE allowed=%llx probed=%u stopped_at=%u refused=%d bad_level=%d shift=%u "
+                "first_id=%u last_id=%u\n", allowed_mask, probed, stopped_at, refused, int(bad_level), shift,
+                first_id, last_id);
+    // EDEN_PS5_PIN=pairs: when the probe found too few cores, take CPUs 2n and 2n+1 as one core's
+    // two threads (the layout tools/check-worker-affinity.py models) and pin as a console that
+    // passes the probe does. Off by default: the layout is an assumption, not a reading.
+    const char* const pin = std::getenv("EDEN_PS5_PIN");
+    if (count != cores.size() && pin != nullptr && std::strcmp(pin, "pairs") == 0) {
+        count = 0;
+        cpu_core.fill(-1);
+        for (unsigned cpu = 0; cpu < 64; ++cpu) {
+            if (!CPU_ISSET(cpu, &original)) continue;
+            const unsigned core = cpu / 2;
+            cpu_core[cpu] = static_cast<int>(core);
+            if (count == cores.size() ||
+                std::find(cores.begin(), cores.begin() + count, core) != cores.begin() + count) continue;
+            cores[count] = core;
+            worker_cpus[count++] = cpu;
+        }
     }
     worker_topology_ready = count == cores.size();
     topology_allowed = original;
@@ -257,9 +299,13 @@ void PlaceSecondary(const char* name) {
         std::printf("EDEN_WORKER_PLACED name=%s mask=%llx error=%d\n", name, cpus, result ? errno : 0);
 }
 void PinWorker(unsigned index, cpuset_t& affinity) {
-    if (!worker_topology_ready || index >= worker_cpus.size()) return;
+    if (index >= worker_cpus.size()) return;
+    // EDEN_PS5_PLACE names a CPU itself, so it needs no topology (ready=0 made it do nothing for
+    // CPUCore_0-3 and GPU, while it did work for every other thread).
+    const unsigned long long over = PlacementOverride(names[index]);
+    if (!worker_topology_ready && over == 0) return;
     unsigned cpu = worker_cpus[index];
-    if (const unsigned long long over = PlacementOverride(names[index]); over != 0) {
+    if (over != 0) {
         cpu = static_cast<unsigned>(__builtin_ctzll(over));
     }
     if (!CPU_ISSET(cpu, topology_allowed_valid ? &topology_allowed : &affinity)) return;
@@ -356,6 +402,17 @@ void CheckCpuClocks() {
 }
 }
 
+void ReportOwnThread(const char* name) {
+    if (!perf_report.load(std::memory_order_relaxed) || !owner_cpu_clock_valid) return;
+    static long long last_cpu = 0, last_mono = 0;
+    const long long cpu = ClockNs(CLOCK_THREAD_CPUTIME_ID), mono = ClockNs(CLOCK_MONOTONIC);
+    if (last_mono != 0)
+        std::printf("EDEN_PERF_THREAD name=%s cpu_ms=%lld wall_ms=%lld\n", name, (cpu - last_cpu) / 1000000LL,
+                    (mono - last_mono) / 1000000LL);
+    last_cpu = cpu;
+    last_mono = mono;
+}
+
 void SetSecondaryPlacement(bool enabled) {
 #ifdef PS5_NATIVE
     placement_secondary.store(enabled, std::memory_order_relaxed);
@@ -390,8 +447,13 @@ extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
 extern "C" void eden_heap_page_usage(std::size_t* free_pages, std::size_t* idle_arenas, std::size_t* live)
     __attribute__((weak));
+extern "C" void eden_heap_growth_report(void) __attribute__((weak));
+extern "C" void eden_heap_arena_report(void) __attribute__((weak));
+extern "C" void eden_heap_name_thread(const char* name) __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
+extern "C" void eden_guest_memory_report(void) __attribute__((weak));
+extern "C" void eden_guest_memory_pool_short(int is_short) __attribute__((weak));
 #ifdef PS5_NATIVE
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
 extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
@@ -399,9 +461,97 @@ extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::in
 // The allocated region at or after an offset (flag 1: find the next one).
 struct DirectMemoryRegion { std::int64_t start; std::int64_t end; std::int32_t type; };
 extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemoryRegion*, std::size_t);
+extern "C" std::int32_t sceKernelAvailableFlexibleMemorySize(std::size_t*);
+extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long* blocks) __attribute__((weak));
+// The allocator's blocks and what is in use of them (vulkan_memory_allocator.cpp).
+extern "C" void eden_vma_usage(unsigned long long* blocks, unsigned long long* used) __attribute__((weak));
+#ifdef EDEN_PS5_RADV
+// The driver's own line (tools/patch-radv-memory-report.py), by the name isolate-radv.py gives it.
+// Not weak: a driver built without it stops the link here, not the package check (check_package.py).
+extern "C" void eden_radv_private_radv_ps5_memory_report_now(void);
+#endif
+// What is out of the pool by size (src/direct_memory.c) beside what the owners say they hold, and
+// what the second pool has left: the flexible size in sce_sys/param.json is decided from this line
+// (the same call as ProsperoEden's launch line). A release build imports one more kernel function.
+static void ReportLedger() {
+    if (!eden_direct_ledger) return;
+    unsigned long long bytes[4]{}, blocks[4]{};
+    eden_direct_ledger(bytes, blocks);
+    std::size_t span = 0, guest = 0, tables = 0, code = 0, reserve = 0, target = 0, flexible = 0;
+    ::Common::GuestMemoryUsage(&span, &guest);
+    ::Common::SparseUsage(&span, &tables);
+    ::Common::CodeRangeUsage(&span, &code);
+    if (eden_guest_memory_reserve) eden_guest_memory_reserve(&reserve, &target);
+    const bool known = sceKernelAvailableFlexibleMemorySize(&flexible) == 0;
+    std::fprintf(stderr, "EDEN_POOL_LEDGER out of the pool: %llu MiB in %llu blocks under 2 MiB, %llu in %llu of 2 MiB, "
+                 "%llu in %llu up to 32 MiB, %llu in %llu larger; guest %zu reserve %zu heap %zu jit %zu tables %zu MiB; "
+                 "flexible free %lld MiB\n",
+                 bytes[0] >> 20, blocks[0], bytes[1] >> 20, blocks[1], bytes[2] >> 20, blocks[2], bytes[3] >> 20, blocks[3],
+                 guest >> 20, reserve >> 20, (eden_heap_committed ? eden_heap_committed() : std::size_t{0}) >> 20,
+                 code >> 20, tables >> 20, known ? static_cast<long long>(flexible >> 20) : -1LL);
+    // RADV_PS5_MEMORY_REPORT=1: out of the pool, less the owners above, less this, is the driver's
+    // own buffers and the rest, every 20 s and not only at a refusal. Without it nothing here runs:
+    // this is on the GPU thread, and the question below can refresh the allocator's budget.
+    const char* const memory_report = std::getenv("RADV_PS5_MEMORY_REPORT");
+    if (memory_report && memory_report[0] == '1') {
+        if (eden_vma_usage) {
+            unsigned long long vma_blocks = 0, vma_used = 0;
+            eden_vma_usage(&vma_blocks, &vma_used);
+            std::fprintf(stderr, "EDEN_VMA_USAGE blocks %llu MiB, %llu MiB of it in use\n", vma_blocks >> 20, vma_used >> 20);
+        }
+#ifdef EDEN_PS5_RADV
+        eden_radv_private_radv_ps5_memory_report_now();
+#endif
+    }
+}
 #endif
 
 #ifdef PS5_NATIVE
+// EDEN_MEMORY_REPORT_THREAD=1: the low-memory burst report and the heap trim run on a thread of
+// their own instead of the GPU thread (RefreshFreeMemory below). The report only reads the
+// service's slot table, which its own keeper and scanner threads change under it today too, and
+// the heap trim takes the allocator's locks like any free; neither needs the GPU thread. One
+// worker, started at the first request, never joined: the process ends with _exit.
+static bool OffThreadReportsEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_MEMORY_REPORT_THREAD");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+void RegisterWorker(const char* name);
+static void QueueOffThreadReport(bool report, bool trim) {
+    struct Pending {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool report{}, trim{}, started{};
+    };
+    static Pending* const pending = new Pending;  // outlives every static destructor
+    {
+        std::scoped_lock lock{pending->mutex};
+        pending->report |= report;
+        pending->trim |= trim;
+        if (!pending->started) {
+            pending->started = true;
+            std::thread([] {
+                RegisterWorker("MemoryReport");
+                for (;;) {
+                    bool do_report, do_trim;
+                    {
+                        std::unique_lock lock{pending->mutex};
+                        pending->changed.wait(lock, [] { return pending->report || pending->trim; });
+                        do_report = pending->report;
+                        do_trim = pending->trim;
+                        pending->report = pending->trim = false;
+                    }
+                    if (do_report && eden_guest_memory_report) eden_guest_memory_report();
+                    if (do_trim) TrimHeap("the pool is short");
+                }
+            }).detach();
+        }
+    }
+    pending->changed.notify_one();
+}
 // The largest free block of direct memory is what the next graphics allocation needs. Looked at
 // again every 100 ms; called on the GPU thread by the texture collector (KeepDirtyTextures).
 static std::atomic<unsigned long long> largest_free_block{0};
@@ -418,6 +568,14 @@ static void RefreshFreeMemory() {
     std::size_t held = 0, target = 0;
     if (eden_guest_memory_reserve) eden_guest_memory_reserve(&held, &target);
     const PoolView view = ViewOfPool(known, largest, held, target);
+    // The pool itself, not view.short_memory: that turns true when the reserve is down to half, and
+    // would keep the keeper from ever filling it again. Short under 1 GiB and over only at 1.5 GiB:
+    // filling the reserve takes up to 512 MiB, and the largest block must not fall under the mark again.
+    static std::atomic<bool> pool_short{false};
+    if (known) pool_short.store(largest < kShortMemory ||
+                                (pool_short.load(std::memory_order_relaxed) && largest < kShortMemory + kShortMemory / 2),
+                                std::memory_order_relaxed);
+    if (eden_guest_memory_pool_short) eden_guest_memory_pool_short(pool_short.load(std::memory_order_relaxed));
     largest_free_block.store(known ? (view.free != 0 ? view.free : 1) : 0, std::memory_order_relaxed);
     graphics_memory_short.store(view.short_memory, std::memory_order_relaxed);
     // The pool, the guest's memory and the heap in stderr.log every 20 s, to see what holds it.
@@ -432,12 +590,30 @@ static void RefreshFreeMemory() {
                      largest >> 20, int(view.short_memory), guest_held >> 20,
                      kernel_memory ? kernel_memory() >> 20 : 0ULL);
         ReportHeap("every 20 s");
+        ReportLedger();
     }
+    // The last burst of a session falls between two reports of the guest's memory (every 30 s):
+    // who wrote it, while the pool's largest block is nearly gone (every 5 s at most).
+    static std::atomic<long long> burst_ns{0};
+    const bool burst_due = known && largest < (std::size_t{256} << 20) && eden_guest_memory_report &&
+                           now - burst_ns.load(std::memory_order_relaxed) >= 5'000'000'000;
+    if (burst_due) burst_ns.store(now, std::memory_order_relaxed);
     // The heap's empty spaces go back to the pool while it is short (every 2 s at most).
     static std::atomic<long long> trimmed_ns{0};
-    if (view.short_memory && now - trimmed_ns.load(std::memory_order_relaxed) >= 2'000'000'000) {
-        trimmed_ns.store(now, std::memory_order_relaxed);
-        TrimHeap("the pool is short");
+    const bool trim_due = view.short_memory && now - trimmed_ns.load(std::memory_order_relaxed) >= 2'000'000'000;
+    if (trim_due) trimmed_ns.store(now, std::memory_order_relaxed);
+    // EDEN_MEMORY_REPORT_THREAD=1 (env.txt): both run on their own thread. This function runs on
+    // the GPU thread (the texture collector asks for the free memory), and the burst report walks
+    // every slot of the guest's memory: with the pool short, run108 had a 120 to 134 ms frame in
+    // nearly every 5 s window where the clean stretch had 44 to 52 ms, and the frame rate fell from
+    // 27 to 19 to 24. Off: as before, on the calling thread.
+    if (burst_due || trim_due) {
+        if (OffThreadReportsEnabled()) {
+            QueueOffThreadReport(burst_due, trim_due);
+        } else {
+            if (burst_due) eden_guest_memory_report();
+            if (trim_due) TrimHeap("the pool is short");
+        }
     }
 }
 // A write to the guest's memory waiting for a block (src/guest_memory_service.inc, WaitForBlock): the game's own
@@ -493,6 +669,19 @@ void ReportHeap(const char* why) {
                      free_pages >> 20, idle_arenas >> 20, live >> 20);
     }
     if (eden_heap_sites_report) eden_heap_sites_report();
+    if (eden_heap_growth_report) eden_heap_growth_report();
+    // What holds the room, arena by arena: it asks every one of them, so at the first refusals
+    // once in 30 s at most, and then once in 2 minutes, to keep the end of a session in the log.
+    static std::atomic<long long> arenas_ns{0};
+    static std::atomic<unsigned> arena_reports{0};
+    const long long now = NowNs();
+    long long last = arenas_ns.load(std::memory_order_relaxed);
+    const long long gap = arena_reports.load(std::memory_order_relaxed) < 3 ? 30'000'000'000 : 120'000'000'000;
+    if (eden_heap_arena_report && std::strstr(why, "refused") && (last == 0 || now - last >= gap) &&
+        arenas_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        arena_reports.fetch_add(1, std::memory_order_relaxed);
+        eden_heap_arena_report();
+    }
 }
 
 std::size_t TrimHeap(const char* why) {
@@ -504,6 +693,74 @@ std::size_t TrimHeap(const char* why) {
         ReportHeap(text);
     }
     return returned;
+}
+
+// Refusals come in bursts, and a refused staging buffer is asked for twice: the first 32 reports at
+// most ten a second, then one every 5 s, so the last moments of a long session are still reported.
+bool RefusalReportDue() {
+    static std::atomic<unsigned> reports{0};
+    static std::atomic<long long> last_ns{0};
+    const long long now = NowNs();
+    const long long last = last_ns.load(std::memory_order_relaxed);
+    const long long gap = reports.load(std::memory_order_relaxed) < 32 ? 100'000'000 : 5'000'000'000;
+    if (last != 0 && now - last < gap) return false;
+    last_ns.store(now, std::memory_order_relaxed);
+    reports.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+extern "C" void eden_guest_memory_growth(void) __attribute__((weak));
+void ReportPool() {
+#ifdef PS5_NATIVE
+    // All that is free: the largest block of a range, then of what lies on each side of it. This
+    // needs only the call a release build already makes: sceKernelDirectMemoryQuery is used by
+    // ReportGpuThread alone, which only a profile build calls, so a release build does not import it.
+    const std::int64_t total = sceKernelGetDirectMemorySize();
+    struct Range { std::int64_t from, to; };
+    std::array<Range, 64> ranges;
+    std::size_t pending = 0;
+    if (total > 0) ranges[pending++] = {0, total};
+    std::size_t free_bytes = 0, largest = 0, from_2_mib = 0, from_16_mib = 0;
+    unsigned blocks = 0, asked = 0;
+    bool cut_short = false;
+    while (pending != 0) {
+        const Range range = ranges[--pending];
+        if (asked == 4096 || pending + 2 > ranges.size()) {
+            cut_short = true;
+            break;
+        }
+        ++asked;
+        std::int64_t start = 0;
+        std::size_t size = 0;
+        if (sceKernelAvailableDirectMemorySize(range.from, range.to, 0x4000, &start, &size) != 0 || size == 0) continue;
+        // Whether the kernel clips the block to the range is not documented here: keep it inside.
+        const std::int64_t end = std::min(start + static_cast<std::int64_t>(size), range.to);
+        start = std::max(start, range.from);
+        if (end <= start) continue;
+        size = static_cast<std::size_t>(end - start);
+        ++blocks;
+        free_bytes += size;
+        largest = std::max(largest, size);
+        if (size >= (std::size_t{2} << 20)) from_2_mib += size;
+        if (size >= (std::size_t{16} << 20)) from_16_mib += size;
+        // The smaller side is looked at first, which keeps the list short however the blocks lie.
+        Range first{range.from, start}, second{end, range.to};
+        if (first.to - first.from < second.to - second.from) std::swap(first, second);
+        if (first.to - first.from >= 0x4000) ranges[pending++] = first;
+        if (second.to - second.from >= 0x4000) ranges[pending++] = second;
+    }
+    std::size_t held = 0, target = 0;
+    if (eden_guest_memory_reserve) eden_guest_memory_reserve(&held, &target);
+    const auto kernel_memory = guest_kernel_memory.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "EDEN_REFUSED_POOL %lld MiB in all, %s%zu MiB free in %u blocks after %u questions: the largest "
+                 "%zu MiB, %zu MiB in blocks of 2 MiB or more, %zu MiB of 16 MiB or more; the guest's reserve holds %zu of "
+                 "%zu MiB, %u writes wait for a block; the kernel maps %llu MiB\n",
+                 static_cast<long long>(total >> 20), cut_short ? "at least " : "", free_bytes >> 20, blocks, asked,
+                 largest >> 20, from_2_mib >> 20, from_16_mib >> 20, held >> 20, target >> 20,
+                 eden_guest_memory_wanted ? eden_guest_memory_wanted() : 0u, kernel_memory ? kernel_memory() >> 20 : 0ULL);
+    ReportLedger();
+#endif
+    if (eden_guest_memory_growth) eden_guest_memory_growth();
 }
 
 extern "C" void eden_vma_probe(unsigned) __attribute__((weak));
@@ -777,6 +1034,7 @@ void RegisterWorker(const char* name) {
     MkwNativeSample::Register(name);
 #endif
     Eden::Crash::NameThread(name);  // a crash report names the thread
+    if (eden_heap_name_thread) eden_heap_name_thread(name);  // and the heap's reports
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
     Eden::Stall::NoteThread(name);
 #endif

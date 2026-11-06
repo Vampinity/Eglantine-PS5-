@@ -1,0 +1,121 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0404-black-world-05-upscale-own-handles-only.patch
+
+Source: 0404-black-world-05-upscale-own-handles-only.patch
+its own store, nothing else (EDEN_NX2_UPSCALE_HANDLES_ONLY)
+
+Run81 (T23, Handheld, Max Resolution, trace): the gameplay network (first HMMA at 0xc00) reads
+one image, cbuf0+0xc0 = 0x8113971000 1920x1080 E5B9G9R9 (format 32), and stores one, +0xd0 =
+0x81252ff000 1920x1080 B10G11R11 (format 33). No other handle. Without a same-size rule the
+stand-in found no pair in them, fell to the cbuf0 scan and blitted a 256x256 image onto a
+512x512 one (131.7 s), later a 64x36 onto a 128x72 one (193.6 s): the speckled 8-pixel cells and
+blurred limbs of Robin's clip, while the real output stayed unwritten and the world black.
+
+EDEN_NX2_UPSCALE_HANDLES_ONLY=1: a program whose own read and store are one size is copied from
+that read to that store, E5B9G9R9 through the existing source-format override into B10G11R11,
+and never takes another image of the input's size, the Bananza slots or the cbuf0 scan. A
+dispatch where its own handles form no pair is skipped (logged "own handles form no pair,
+nothing copied" in the trace). Programs whose own pair upscales, the movies' last pass, keep the
+old path. Same-size own pairs are allowed with the switch, so EDEN_NX2_UPSCALE_SAME_SIZE is not
+needed beside it.
+
+Against SAME_SIZE alone: the copy is the same (r@0xc0 -> w@0xd0, 32 -> 33); the difference is
+what happens on a dispatch where the own pair is not readable: SAME_SIZE falls back to the scans
+and blits unrelated images, this does nothing. Default off: nothing changes. Clang syntax check,
+no warnings, after black-world-01..04. Not built, not run.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/kepler_compute.cpp | 32 ++++++++++++++++++-----
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 7364d0c455..ec4873f184 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -952,6 +952,17 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     // found its pair (run75). Only the program's own handles may pair same-size images: in the
+     // cbuf0 scans below any two same-size images of one format would do.
+     static const bool same_size_ok = std::getenv("EDEN_NX2_UPSCALE_SAME_SIZE") != nullptr;
++    // EDEN_NX2_UPSCALE_HANDLES_ONLY=1: a program whose own read and store handles hold images of
++    // one size (a 1:1 network: Ocarina of Time at Max Resolution reads one 1920x1080 E5B9G9R9
++    // image through cbuf0+0xc0 and stores one 1920x1080 B10G11R11 image through +0xd0, run81) is
++    // copied from its own read to its own store and nothing else: no other image of the input's
++    // size, no Bananza slots, no cbuf0 scan. Run81's scan paired a 256x256 with a 512x512 image,
++    // then a 64x36 with a 128x72 one, and blitted those while the real output stayed black. A
++    // dispatch where such a program's own handles form no pair is skipped. Programs whose own
++    // pair upscales (the movies' last pass) keep the old path. Same-size own pairs are allowed.
++    static const bool handles_only = std::getenv("EDEN_NX2_UPSCALE_HANDLES_ONLY") != nullptr;
++    const bool own_same_size = same_size_ok || handles_only;
++    static std::unordered_set<GPUVAddr> own_pair_programs; // 1:1 networks seen so far
+     // EDEN_NX2_UPSCALE_STEADY=1 (run75, Docked: that program's pair was found at 106 s and the
+     // world showed, then it was lost again while the program kept being dispatched; the log has no
+     // per-dispatch data): the program's own handle slots that last gave a pair are tried first on
+@@ -1035,7 +1046,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             if (const auto it = remembered.find(program_address); it != remembered.end()) {
+                 const auto from = image_at(it->second.read_slot, true);
+                 const auto to = image_at(it->second.store_slot, true);
+-                if (upscale_pair(from, to, false, same_size_ok)) {
++                if (upscale_pair(from, to, false, own_same_size)) {
+                     input = from;
+                     output = to;
+                     input_slot = it->second.read_slot;
+@@ -1050,7 +1061,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             // Same-size pairs: the drawn frame (E5B9G9R9, Ocarina of Time) first. Of the program's
+             // other reads of the output's size, one of its format may be its own last output (a
+             // temporal network's history): copying that would leave the output as it started.
+-            if (same_size_ok) {
++            if (own_same_size) {
+                 for (const u32 read : reads) {
+                     const auto from = image_at(read, true);
+                     if (from && from->format == Texture::TextureFormat::E5B9G9R9 &&
+@@ -1066,7 +1077,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             for (const bool same_format : {true, false}) {
+                 for (const u32 read : reads) {
+                     const auto from = image_at(read, true);
+-                    if (upscale_pair(from, to, same_format, same_size_ok) &&
++                    if (upscale_pair(from, to, same_format, own_same_size) &&
+                         (!input || u64{from->Width()} * from->Height() > u64{input->Width()} * input->Height())) {
+                         input = from;
+                         output = to;
+@@ -1083,6 +1094,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         }
+         const bool same_size_pair = input && output && input->Width() == output->Width() &&
+                                     input->Height() == output->Height();
++        if (handles_only && same_size_pair) own_pair_programs.insert(program_address);
+         if (same_size_pair) {
+             static std::unordered_set<GPUVAddr> reported;
+             if (reported.insert(program_address).second) {
+@@ -1123,14 +1135,22 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             break;
+         }
+     }
++    // A 1:1 network (EDEN_NX2_UPSCALE_HANDLES_ONLY) gets nothing but its own pair.
++    const bool own_guard = handles_only && own_pair_programs.contains(program_address) &&
++                           !upscale_pair(input, output, false, true);
++    if (own_guard) {
++        input.reset();
++        output.reset();
++        step = "own handles form no pair, nothing copied";
++    }
+     // Donkey Kong Bananza's slots, after the program's own handles: other titles keep unrelated
+     // images there.
+-    if (!upscale_pair(input, output, false, same_size_ok)) {
++    if (!own_guard && !upscale_pair(input, output, false, same_size_ok)) {
+         input = image(0x60);
+         output = image(0x70);
+         step = "Bananza slots";
+     }
+-    if (!upscale_pair(input, output, false, same_size_ok)) {
++    if (!own_guard && !upscale_pair(input, output, false, same_size_ok)) {
+         input.reset();
+         output.reset();
+         step = "cbuf0 scan";
+@@ -1201,7 +1221,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+                    : std::string{"none"};
+     };
+     if (trace && (!input || !output)) {
+-        trace_outcome(fmt::format("no pair (tic limit {}, cbuf0 size {:#x}):{}",
++        trace_outcome(fmt::format("no pair ({}; tic limit {}, cbuf0 size {:#x}):{}", step,
+                                   static_cast<u32>(regs.tic.limit), cbuf.size.Value(),
+                                   slots_text(false)));
+     }

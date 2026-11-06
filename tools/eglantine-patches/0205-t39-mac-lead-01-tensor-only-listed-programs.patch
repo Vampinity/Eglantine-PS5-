@@ -1,0 +1,75 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0395-mac-lead-01-tensor-only-listed-programs.patch
+
+Source: 0395-mac-lead-01-tensor-only-listed-programs.patch
+Moved by hand: the list check sits after upstream's new title_tensor/EDEN_NX2_TENSOR=0 mode choice; upstream lowers Ocarina's networks by default now
+
+shader: EDEN_NX2_TENSOR_ONLY lowers only the listed HMMA programs
+
+EDEN_NX2_TENSOR_ONLY=<hex offset>,...: with EDEN_NX2_TENSOR set, a program is lowered only when its
+first HMMA is at one of these byte offsets, the "instruction" of the rejection log. The offsets are
+the same in run62, run66, run68 and run70, though the code addresses move. The rest stay rejected
+with "matrix multiply" in the error, so they keep the stand-in. Unset, nothing changes.
+
+Why: 10 of Ocarina's 11 rejected programs are the movie library's NDVE filter. They match nxnative
+#1375/#1376: 10 programs, 13 dispatches, three of them twice. run68 reaches the stand-in for all of
+them. run60 built exactly these 10 (10 "Compute pipeline built" lines) and never reached the 11th,
+so its 15.7 s frame, 17 fps and stop came from NDVE alone. nxnative measures NDVE as 1.1/255 from a
+plain copy on the movies. With this patch rebase-01 can be tried on the 11th alone:
+
+  EDEN_NX2_TENSOR=compact
+  EDEN_NX2_TENSOR_ONLY=ad0
+
+Guess, not proven: that ad0 is what Kokiri's luma 0.29 against 0.10 depends on, and that gameplay
+runs no NDVE program. Unknown: ad0's cost.
+
+Checked off the console: a harness on this header with HMMA at the logged offsets. Unset, the
+program is rejected as before; ONLY without TENSOR too; TENSOR=compact or 1 with ONLY=ad0 lowers a
+program with HMMAs at ad0 and b00 and rejects b30 and 43c0 with "matrix multiply" in the error.
+PS5-target clang syntax check. Applies on core16, and after rebase-01.
+
+Core patch. Nothing here has run on a console.
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 058a855da3..341df1baeb 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -12,6 +12,7 @@
+ #include <bit>
+ #include <span>
+ #include <optional>
++#include <string>
+ #include <string_view>
+ #include <vector>
+ #include "common/common_types.h"
+@@ -208,6 +209,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+     bool main_exited = false;
+     bool computed_branch = false; // a jump table: the program ends at its self-branch, not an EXIT
+     bool uses_uniform_bank = false;
++    bool hmma_program_listed = false; // EDEN_NX2_TENSOR_ONLY passed this program's first HMMA
+     const bool uses_async_copy = std::any_of(code.begin(), code.end(), [](const auto& instruction) {
+         return instruction.Bits(0, 12) == 0xfae;
+     });
+@@ -1616,6 +1618,22 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                                      : (tensor || title_tensor) ? "1"
+                                                                 : nullptr;
+             if (!mode) return fail(index, "native matrix multiply (set EDEN_NX2_TENSOR to emulate)");
++            // EDEN_NX2_TENSOR_ONLY=<hex offset>,...: lower only programs whose first HMMA is at one of
++            // these byte offsets (the "instruction" of the rejection log, the same in every run).
++            // The others stay rejected, so they keep the stand-in. Ocarina of Time: ad0 is the one
++            // program outside its movie library; the movie filter NDVE is 43c0, 1eb0, 790, 3440,
++            // 9f0, 2c40, ef0, 9a0, 1bb0 and b30, close to a plain copy on nxnative (#1375).
++            static const std::string tensor_only = [] {
++                const char* const text = std::getenv("EDEN_NX2_TENSOR_ONLY");
++                return text ? "," + std::string{text} + "," : std::string{};
++            }();
++            if (!tensor_only.empty() && !hmma_program_listed) {
++                const std::string offset = fmt::format(",{:x},", index * sizeof(Instruction));
++                if (tensor_only.find(offset) == std::string::npos) {
++                    return fail(index, "native matrix multiply (not in EDEN_NX2_TENSOR_ONLY)");
++                }
++                hmma_program_listed = true;
++            }
+             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8), c = insn.Bits(64, 8);
+             const u32 shape = insn.words[2] & ~0xffU;
+             const u32 depth = shape == 0 ? 8U : 16U;

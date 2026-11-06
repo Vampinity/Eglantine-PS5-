@@ -1,0 +1,45 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0314-fog-05-iadd32-overflow-bound.patch
+
+Source: 0314-fog-05-iadd32-overflow-bound.patch
+Core patch, for tools/eglantine-patches as 0194.
+
+Port of Orchid 1ba451213 (MythosOfs), from exploitizm/Eglantine c2f9811073. For
+negative a the bound is INT32_MIN - a, not INT32_MAX - a. SPIR-V only here; the
+source also changes GLSL, which the console does not use.
+
+Switch: EDEN_NX2_IADD32_OVERFLOW=1, ours; the source has none. Default off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+  .../backend/spirv/emit_spirv_integer.cpp              | 11 ++++++++++-
+  1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_integer.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_integer.cpp
+index 7c9a233fb8..a355e4193b 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_integer.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_integer.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++
+ #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+ 
+@@ -50,7 +52,14 @@ Id EmitIAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
+         const Id sub_a{ctx.OpISub(ctx.U32[1], ctx.Const(s32_max), a)};
+ 
+         const Id positive_test{ctx.OpSGreaterThan(ctx.U1, b, sub_a)};
+-        const Id negative_test{ctx.OpSLessThan(ctx.U1, b, sub_a)};
++        // For negative a the bound is INT32_MIN - a, not INT32_MAX - a. EDEN_NX2_IADD32_OVERFLOW=1.
++        static const bool exact_bound = [] {
++            const char* const value = std::getenv("EDEN_NX2_IADD32_OVERFLOW");
++            return value != nullptr && value[0] != '0';
++        }();
++        constexpr u32 s32_min{static_cast<u32>((std::numeric_limits<s32>::min)())};
++        const Id negative_bound{exact_bound ? ctx.OpISub(ctx.U32[1], ctx.Const(s32_min), a) : sub_a};
++        const Id negative_test{ctx.OpSLessThan(ctx.U1, b, negative_bound)};
+         const Id carry_flag{ctx.OpSelect(ctx.U1, is_positive, positive_test, negative_test)};
+         overflow->SetDefinition(carry_flag);
+         overflow->Invalidate();

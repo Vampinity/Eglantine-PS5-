@@ -1,0 +1,237 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0406-black-world-06-upscale-small-source-and-rt-trace.patch
+
+Source: 0406-black-world-06-upscale-small-source-and-rt-trace.patch
+ring (EDEN_NX2_UPSCALE_SOURCE_SIZE), EDEN_NX2_TRACE_RT
+
+Runs 81-84 (T23, Handheld, Max Resolution) and run79-picture-stages.md: the clean world was a
+960x540 B10G11R11 image stretched onto the network's 1920x1080 output (run82 line 6001); the
+480x270 images showed limbs; the speckles were a 256x256 onto a 512x512. All came from the blind
+cbuf0 scan reading two fixed words of the network's constant buffer, +0xa0 = 24576 and +0xb8 =
+12288 (an address and a size), as TIC numbers: whenever the game's per-frame TIC ring had just
+passed those numbers (+0xc0 stood at 24588, 24586, 12337 at the first pairs) they named a live
+image and the picture changed. No resolution drop, no location.
+
+EDEN_NX2_UPSCALE_SOURCE_SIZE=<width>x<height>, or "half": for a 1:1 network (own read and store
+of one size), the copy's source is an image of that size in the output's format, looked for among
+the game's own TIC entries within 256 of the network's input entry (its per-frame ring), the one
+nearest that entry; kept per program and re-read every dispatch while it names the same image;
+the own pair's copy when there is none. Such a program never takes the Bananza slots or the cbuf0
+scan (EDEN_NX2_UPSCALE_HANDLES_ONLY is implied for it). The candidates found are logged on change:
+"960x540 format 33 candidates near tic 24588: tic 24590 0x... tic 24601 0x...". Replaces the
+EDEN_NX2_UPSCALE_QUARTER of the earlier black-world-06, which took 480x270 from the same two words.
+
+Trace: with EDEN_NX2_UPSCALE_TRACE=1 a "source (<step>): <address> WxH format F tic N; own +0xc0
+tic N <address>, out +0xd0 <address>" line, logged on each change with a cap of 64 per program,
+separate from the size-only outcome line, so a same-size source change and the ring's position are
+visible too.
+
+EDEN_NX2_TRACE_RT=<width>x<height>[,...]: describes draws into render targets of these sizes like
+the after-upscale trace (render target, vertex and pixel program, the fragment stage's sampled
+images, blend), the first 48 of each size and then every 500th. Use 960x540,1920x1080: what writes
+the 960x540 image and what it samples, and the 1920x1080 draws into the network's input memory
+with their format code.
+
+All unset: nothing changes. Clang syntax check, no warnings, after black-world-01..05. Not built,
+not run.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/kepler_compute.cpp     | 113 +++++++++++++++++-
+ .../renderer_vulkan/vk_rasterizer.cpp         |  26 ++++
+ 2 files changed, 136 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index c9bac5de23..0e7f81e0a3 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -963,6 +963,26 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     static const bool handles_only = std::getenv("EDEN_NX2_UPSCALE_HANDLES_ONLY") != nullptr;
+     const bool own_same_size = same_size_ok || handles_only;
+     static std::unordered_set<GPUVAddr> own_pair_programs; // 1:1 networks seen so far
++    // EDEN_NX2_UPSCALE_SOURCE_SIZE=<width>x<height>, or "half" (the output's size over 2): for a
++    // 1:1 network, the copy's source is an image of that size in the output's format, looked for
++    // among the game's own TIC entries near the network's input entry (its per-frame ring: run82's
++    // 24588, 24586 and 12337 at cbuf0+0xc0), not among the words of cbuf0. Run82's clean world was
++    // a 960x540 B10G11R11 image (line 6001) that the blind scan met by chance: it read two fixed
++    // words at +0xa0 and +0xb8, 24576 and 12288 (an address and a size), as TIC numbers, and
++    // paired whatever the ring had just put there; a 480x270 image from the same mistake showed
++    // limbs only. The image found is kept per program and re-read each dispatch; without one, the
++    // own pair's copy. Such a program never takes the Bananza slots or the cbuf0 scan.
++    static const std::pair<u32, u32> source_size = [] {
++        const char* value = std::getenv("EDEN_NX2_UPSCALE_SOURCE_SIZE");
++        if (value == nullptr) return std::pair<u32, u32>{0, 0};
++        if (std::string_view{value} == "half") return std::pair<u32, u32>{1, 1};
++        char* end = nullptr;
++        const u32 width = static_cast<u32>(std::strtoul(value, &end, 10));
++        const u32 height = *end == 'x' ? static_cast<u32>(std::strtoul(end + 1, nullptr, 10)) : 0;
++        return std::pair<u32, u32>{width, height};
++    }();
++    const bool small_source = source_size.first != 0 && source_size.second != 0;
++    const bool no_scans = handles_only || small_source;
+     // EDEN_NX2_UPSCALE_STEADY=1 (run75, Docked: that program's pair was found at 106 s and the
+     // world showed, then it was lost again while the program kept being dispatched; the log has no
+     // per-dispatch data): the program's own handle slots that last gave a pair are tried first on
+@@ -1029,6 +1049,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         fortunes_weave = upscale_pair(input, output);
+         step = "Fortune's Weave slots";
+     }
++    u32 input_slot = 0, output_slot = 0; // the own pair's handle slots, 0 when another step paired
+     if (!upscale_pair(input, output)) {
+         // The images the program itself uses: textures it reads and the surface it stores to
+         // through cbuf0 handles (Ocarina of Time's gameplay network reads +0xc0, writes +0xd0).
+@@ -1036,7 +1057,6 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         const auto [reads, stores] = NativeImageHandles(program_address);
+         input.reset();
+         output.reset();
+-        u32 input_slot = 0, output_slot = 0;
+         struct RememberedPair {
+             u32 read_slot;
+             u32 store_slot;
+@@ -1135,14 +1155,81 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             break;
+         }
+     }
+-    // A 1:1 network (EDEN_NX2_UPSCALE_HANDLES_ONLY) gets nothing but its own pair.
+-    const bool own_guard = handles_only && own_pair_programs.contains(program_address) &&
++    // A 1:1 network (EDEN_NX2_UPSCALE_HANDLES_ONLY, EDEN_NX2_UPSCALE_SOURCE_SIZE) gets nothing but
++    // its own pair, or the small source below.
++    const bool own_guard = no_scans && own_pair_programs.contains(program_address) &&
+                            !upscale_pair(input, output, false, true);
+     if (own_guard) {
+         input.reset();
+         output.reset();
+         step = "own handles form no pair, nothing copied";
+     }
++    const bool own_same_size_pair = input && output && input_slot != 0 &&
++                                    input->Width() == output->Width() &&
++                                    input->Height() == output->Height();
++    u32 own_read_index = 0;
++    if (own_same_size_pair) {
++        own_read_index = memory_manager.Read<u32>(cbuf_address + input_slot) & 0xfffff;
++        if (no_scans) own_pair_programs.insert(program_address);
++    }
++    struct SmallSource {
++        u32 tic_index;
++        Texture::TICEntry tic;
++    };
++    std::optional<SmallSource> small;
++    if (small_source && own_same_size_pair) {
++        const u32 want_width = source_size.first == 1 ? output->Width() / 2 : source_size.first;
++        const u32 want_height = source_size.first == 1 ? output->Height() / 2 : source_size.second;
++        const auto fits = [&](const Texture::TICEntry& tic) {
++            return tic.Address() != 0 && tic.IsBlockLinear() && tic.format == output->format &&
++                   tic.Width() == want_width && tic.Height() == want_height;
++        };
++        static std::unordered_map<GPUVAddr, SmallSource> kept;
++        if (const auto it = kept.find(program_address); it != kept.end()) {
++            const auto tic = GetTICEntry(it->second.tic_index);
++            if (fits(tic) && tic.Address() == it->second.tic.Address() &&
++                memory_manager.IsFullyMappedRange(tic.Address(), 4096)) {
++                small = SmallSource{it->second.tic_index, tic};
++                step = "small source kept";
++            } else {
++                kept.erase(it);
++            }
++        }
++        if (!small) {
++            // The game's per-frame TIC entries lie near the network's own: 256 either side.
++            const u32 limit = static_cast<u32>(regs.tic.limit);
++            const u32 first = own_read_index > 256 ? own_read_index - 256 : 0;
++            const u32 last = std::min(own_read_index + 256, limit);
++            std::string candidates;
++            u32 best_distance = ~0U;
++            for (u32 index = first; index <= last; ++index) {
++                const GPUVAddr tic_address = regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry);
++                if (!memory_manager.IsFullyMappedRange(tic_address, sizeof(Texture::TICEntry))) continue;
++                const auto tic = GetTICEntry(index);
++                if (!fits(tic) || !memory_manager.IsFullyMappedRange(tic.Address(), 4096)) continue;
++                candidates += fmt::format(" tic {} {:#x}", index, tic.Address());
++                const u32 distance = index > own_read_index ? index - own_read_index : own_read_index - index;
++                if (distance < best_distance) {
++                    best_distance = distance;
++                    small = SmallSource{index, tic};
++                }
++            }
++            if (small) {
++                kept[program_address] = *small;
++                step = "small source";
++                static std::unordered_map<GPUVAddr, std::pair<std::string, u32>> last_candidates;
++                auto& [previous, count] = last_candidates[program_address];
++                if (previous != candidates && count < 64) {
++                    ++count;
++                    previous = candidates;
++                    LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}x{} format {} candidates near tic {}:{}",
++                             program_address, want_width, want_height,
++                             static_cast<u32>(output->format.Value()), own_read_index, candidates);
++                }
++            }
++        }
++        if (small) input = small->tic;
++    }
+     // Donkey Kong Bananza's slots, after the program's own handles: other titles keep unrelated
+     // images there.
+     if (!own_guard && !upscale_pair(input, output, false, same_size_ok)) {
+@@ -1406,6 +1493,26 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     const bool done = upscale_temporally() ||
+                       rasterizer->AccelerateSurfaceCopy(source, surface(*output), config);
+     VideoCommon::g_blit_source_format.reset();
++    if (trace) {
++        // The source, with addresses and the own input's TIC number: logged on each change, at
++        // most 64 lines per program (the trace line above leaves addresses out on purpose).
++        static std::unordered_map<GPUVAddr, std::pair<std::string, u32>> last_source;
++        std::string text = fmt::format("source ({}): {:#x} {}x{} format {}", step, input->Address(),
++                                       input->Width(), input->Height(),
++                                       static_cast<u32>(input->format.Value()));
++        if (small) text += fmt::format(" tic {}", small->tic_index);
++        if (input_slot != 0) {
++            text += fmt::format("; own +{:#x} tic {} {:#x}, out +{:#x} {:#x}", input_slot,
++                                own_read_index,
++                                GetTICEntry(own_read_index).Address(), output_slot, output->Address());
++        }
++        auto& [previous, count] = last_source[program_address];
++        if (previous != text && count < 64) {
++            ++count;
++            previous = text;
++            LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program_address, previous);
++        }
++    }
+     if (trace) {
+         // The first pair of a program comes with its handle inventory: what the network reads.
+         static std::unordered_set<GPUVAddr> inventoried;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index dae972c80a..3378a24be7 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -862,6 +862,32 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+             Tegra::Engines::g_nx2_trace_draws_after_upscale = 1;
+         }
+     }
++    // EDEN_NX2_TRACE_RT=<width>x<height>[,<width>x<height>...]: describe draws into render targets
++    // of these sizes the same way (the first 48 of each size, then every 500th): what writes a
++    // 480x270 image and what it samples, or which full-size draws sample it (Ocarina of Time).
++    static const std::vector<std::pair<u32, u32>> trace_rt = [] {
++        std::vector<std::pair<u32, u32>> sizes;
++        for (const char* cursor = std::getenv("EDEN_NX2_TRACE_RT"); cursor && *cursor;) {
++            char* end = nullptr;
++            const u32 width = static_cast<u32>(std::strtoul(cursor, &end, 10));
++            if (end == cursor || *end != 'x') break;
++            const u32 height = static_cast<u32>(std::strtoul(end + 1, &end, 10));
++            sizes.emplace_back(width, height);
++            cursor = *end == ',' ? end + 1 : end;
++        }
++        return sizes;
++    }();
++    if (!trace_rt.empty()) {
++        const auto& regs = maxwell3d->regs;
++        for (size_t i = 0; i < trace_rt.size(); ++i) {
++            if (regs.rt[0].width != trace_rt[i].first || regs.rt[0].height != trace_rt[i].second) continue;
++            static std::array<u32, 8> traced{};
++            u32& count = traced[i % traced.size()];
++            if (count < 48 || count % 500 == 0) Tegra::Engines::g_nx2_trace_draws_after_upscale = 1;
++            ++count;
++            break;
++        }
++    }
+     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
+         --Tegra::Engines::g_nx2_trace_draws_after_upscale;
+         const auto& regs = maxwell3d->regs;

@@ -12,6 +12,15 @@ builds on the following projects, each under its own license.
   simpleini, sirit, SPIRV-Headers, Vulkan-Headers, Vulkan-Utility-Libraries,
   Vulkan Memory Allocator, ENet, frozen, cpp-httplib, nlohmann/json, and the time
   zone data. Each keeps its upstream license.
+- **[ProsperoEden](https://github.com/Swordpdf/ProsperoEden)**, GPL-3.0-or-later. Ported JIT work
+  by Rockiu0: the direct page table (`headless/jit-page-table.cmake`, PR 188, commit
+  b94216347b9a), by way of heydemoura/EglantinePS5 033e453471 (Heyde Moura);
+  page reuse (`headless/dynarmic/page-reuse.cmake`, `page_reuse_pass.inc`, the same PR);
+  free-register moves, R13, plain ordered reads and `headless/dynarmic/fast_paths.cmake` (PR 189,
+  commit 64a1ee754a3b);
+  and from heydemoura/EglantinePS5, native MME dispatch (`headless/macro_native*`,
+  `tools/check-macro-native*`, 9206f0adf9, adapted from ProsperoEden; instruction streams appear
+  only as SHA-256 signatures).
 - **[Zortos Eglantine fork](https://github.com/zortos293/Eglantine)**,
   GPL-3.0-or-later. Referenced directly by the `Eglantine` submodule, including its
   core, native shader, readback, service, runtime and test changes. The maintained
@@ -20,7 +29,9 @@ builds on the following projects, each under its own license.
 - **[Catch2](https://github.com/catchorg/Catch2)**, BSL-1.0. Used by the focused
   host regression check at the version and source hash pinned by the core.
 - **[FFmpeg](https://ffmpeg.org)**, LGPL-2.1-or-later. Built from Eden's pinned
-  source with only the H.264, VP8 and VP9 decoders.
+  source with only the H.264, VP8, VP9 and libdav1d (AV1) decoders.
+- **[dav1d](https://code.videolan.org/videolan/dav1d)** 1.5.1, BSD-2-Clause. AV1 decoding
+  for Switch 2 titles' movies, through FFmpeg.
 - **[OpenSSL](https://www.openssl.org)**, Apache-2.0, and
   **[zlib](https://zlib.net)**, zlib license. Taken from the
   [pacbrew](https://github.com/ps5-payload-dev/pacbrew-repo) PS5 packages.

@@ -1,0 +1,105 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0182-no-mesh-pipelines-for-skipped-draws.patch
+
+Source: 0182-no-mesh-pipelines-for-skipped-draws.patch
+Core patch, for tools/eglantine-patches after 0181. Ours, no source to credit.
+
+EDEN_NX2_NO_MESH drops a task/mesh draw only after CurrentGraphicsPipeline has built its pipeline.
+So every session translates these pipelines on the GPU thread and hands them to the driver, for
+draws that are thrown away. They are never stored either (next patch), so it happens again each
+run. That is the burst on entering the forest:
+
+  run 57: 83 built in the first 10 s, all 83 task/mesh, 1917 ms
+  run 58: 98, 95 task/mesh, 1979 ms
+  run 61: 106, 103 task/mesh, 2195 ms
+  run 62: 103, all 103 task/mesh, 2198 ms; at least 165 task/mesh in the session, 4088 ms of 5802 ms
+
+(A build counts as task/mesh when "Task program"/"Mesh program" lines come before it in the log.
+Those lines stop after 256, so later ones are not counted: run 62's 165 is a floor.)
+
+Switch: EDEN_NX2_NO_MESH_BUILD=1, together with EDEN_NX2_NO_MESH. Default off, the old behaviour.
+It does nothing with EDEN_NX2_NO_MESH_FILE, which can turn those draws back on and then needs the
+pipelines, and nothing without EDEN_NX2_NO_MESH.
+
+With it, PrepareDraw leaves before the lookup: no shader refresh, no key, no pipeline. The draw
+ends as before: nothing recorded, submitted stays false, and the same "Draw skipped
+(EDEN_NX2_NO_MESH)" line, which run-report.py counts. Dirty::Shaders stays set, so the next draw
+refreshes the shaders. IsMeshEnabled on a native program is what makes GraphicsEnvironment give
+the Task/Mesh stage, so these are the draws IsMeshPipeline would have dropped.
+
+One order changes: TryNx2IndirectReset ran before the old drop and does not run now. It only
+matches one 11-instruction vertex program, which would not be bound with mesh mode on. Read, not
+run.
+
+Memory: expected to give back driver memory (the comment in EvictUnusedPipelines says about 0.45 MB
+a pipeline, measured on another title). Not measured. Not run on a console. Syntax checked with
+clang (stubs for the SDK).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 46eb87afe3..eeb0af5445 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -665,6 +665,15 @@ bool PreloadAllPipelines() {
+ }
+ } // Anonymous namespace
+ 
++bool DropMeshDrawsBeforeBuild() {
++    static const bool drop = [] {
++        const char* value = std::getenv("EDEN_NX2_NO_MESH_BUILD");
++        return value != nullptr && value[0] == '1' && std::getenv("EDEN_NX2_NO_MESH") != nullptr &&
++               std::getenv("EDEN_NX2_NO_MESH_FILE") == nullptr;
++    }();
++    return drop;
++}
++
+ PipelineCache::~PipelineCache() {
+     SaveUsedPipelines();
+     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 32657561e2..f0db1d9f5e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -93,6 +93,10 @@ class Scheduler;
+ 
+ using VideoCommon::ShaderInfo;
+ 
++/// EDEN_NX2_NO_MESH_BUILD=1 together with EDEN_NX2_NO_MESH: task/mesh draws are dropped before their
++/// pipeline is built. Not with EDEN_NX2_NO_MESH_FILE, which can turn those draws back on.
++[[nodiscard]] bool DropMeshDrawsBeforeBuild();
++
+ struct ShaderPools {
+     void ReleaseContents() {
+         flow_block.ReleaseContents();
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index eee79b26f5..fc6f91d354 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -415,6 +415,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         gpu_memory->FlushCaching();
+     }
+ 
++    // EDEN_NX2_NO_MESH drops a task/mesh draw further down, after its pipeline was translated on
++    // this thread. With EDEN_NX2_NO_MESH_BUILD=1 no pipeline is looked up or built for it. Only
++    // native programs run as task and mesh stages (GraphicsEnvironment's mesh_slot).
++    const bool drop_mesh_draw{DropMeshDrawsBeforeBuild() && maxwell3d->regs.IsMeshEnabled() &&
++                              maxwell3d->GetNativeMacroEngine().native_turing};
+     const auto report_failure = [&](std::string_view reason) {
+         static std::set<std::tuple<u64, u64, std::string_view>> seen;
+         const auto& regs = maxwell3d->regs;
+@@ -427,10 +432,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     };
+     GraphicsPipeline* const pipeline{[&] {
+         Profile::Scope scope{Profile::Zone::PipelineLookup};
++        if (drop_mesh_draw) {
++            return static_cast<GraphicsPipeline*>(nullptr);
++        }
+         return pipeline_cache.CurrentGraphicsPipeline();
+     }()};
+     if (!pipeline) {
+-        report_failure("no pipeline");
++        report_failure(drop_mesh_draw ? "EDEN_NX2_NO_MESH" : "no pipeline");
+         return;
+     }
+     if (!is_indexed && TryNx2IndirectReset()) {

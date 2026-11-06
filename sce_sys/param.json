@@ -36,6 +36,7 @@
   "titleId": "PPSA98515",
   "versionFileUri": "",
   "kernel": {
-    "cpuPageTableSize": 134217728
+    "cpuPageTableSize": 134217728,
+    "flexibleMemorySize": 335544320
   }
 }

@@ -1,0 +1,31 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0433-mesh-keep-device-address.patch
+
+Source: 0433-mesh-keep-device-address.patch
+compute
+
+Without descriptor buffers the feature was dropped, so EDEN_NX2_MESH_AS_COMPUTE=1 turned itself off
+and run156's draws took the native mesh path. Only that switch changes anything.
+ src/video_core/vulkan_common/vulkan_device.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index d9d0117f05..d69140d6c0 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -754,7 +754,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+         extensions.buffer_device_address = false;
+     } else
+ #endif
+-    if (!extensions.descriptor_buffer) {
++    // EDEN_NX2_MESH_AS_COMPUTE=1: the mesh scratch region is reached by device address, so the
++    // feature stays on for it. Run156 logged "the device has no buffer device addresses" and the
++    // draws went down the native mesh path instead.
++    const char* const mesh_as_compute = std::getenv("EDEN_NX2_MESH_AS_COMPUTE");
++    const bool mesh_wants_device_address = mesh_as_compute != nullptr &&
++                                           mesh_as_compute[0] == '1' &&
++                                           features.buffer_device_address.bufferDeviceAddress;
++    if (!extensions.descriptor_buffer && !mesh_wants_device_address) {
+         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
+                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+     }

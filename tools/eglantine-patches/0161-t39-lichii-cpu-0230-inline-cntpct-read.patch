@@ -1,0 +1,214 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0360-lichii-cpu-0230-inline-cntpct-read.patch
+
+Source: 0360-lichii-cpu-0230-inline-cntpct-read.patch
+Core patch. Paths are the submodule's. Applies on core16 alone or in the lichii-cpu order.
+
+Source: zortos293/Lichii PR 161, commit d51b04d80a, GPL-3.0-or-later. Rewritten for this core. PR 161
+was still open on 6 Nov.
+
+EDEN_NX2_INLINE_CNTPCT=1: MRS CNTPCT_EL0 becomes RDTSC and one multiply in the block, instead of a
+host call into CoreTiming::GetClockTicks and WallClock::GetCNTPCT. Unset, the code is as before.
+EDEN_NX2_CNTPCT_PAUSE=0 still turns the polling pause off.
+
+Changed from Lichii:
+- PR 161 bakes &m_cb->m_last_cntpct into the code. With our shared JIT (headless/dynarmic/
+  jit_group.h) any core runs code another core compiled, so one core's field would be read and
+  written by all of them. The last read lives in A64JitState and is reached through the JIT state
+  register, the way shared-jit.cmake moved TPIDR and the monitor slots.
+- No base_rdtsc: this core's GetUptime is the raw counter, so the base is 0 and guest values are
+  the same as the callback's. WallClock::GuestCNTPCTFactor gives the factor.
+- Not the skip of the pause on non-SMT hosts: the console has SMT, and that test would be false.
+- Default off here.
+
+Same guard as PR 161: a wall clock, CpuClock::Normal, no sync_core_speed. WallClock::IsNative is
+replaced by the factor being 0 when the counter is not invariant.
+
+Console figures: EDEN_PERF_CLOCK says invariant=1 tsc_hz=1596300000 native=1, and
+EDEN_PERF_CLOCK_READ gives 26 ns a read for lfence, rdtsc, lfence and the multiply.
+
+Risk: the fences go and nothing replaces them. RDTSC can run ahead of earlier loads and stores, so a
+guest that stamps on one core and reads the clock on another can see time step back. How far is a
+guess: a few ticks of 32 ns when a cache miss is in the way. ISB does not help: on x64 it ends the
+block and emits no fence (hook_isb is off). PR 161 has the same gap.
+
+Pool memory: none. 8 bytes per core.
+
+Checked on the Mac: headless cmake anchors pass (host and PS5 mode), and dynarmic built for x86-64
+with the frontend's derived sources ran under Rosetta: callback path unchanged, value equals
+high(tsc * factor) between two host reads, 26 live guest registers survive, polling loop ends,
+four JITs of one group run the same blocks at once. Not run on the console.
+
+diff --git a/src/common/cpu_features.cpp b/src/common/cpu_features.cpp
+index c7f6e6f036..c304281f7a 100644
+--- a/src/common/cpu_features.cpp
++++ b/src/common/cpu_features.cpp
+@@ -438,6 +438,14 @@ u64 WallClock::NsToTicks(std::chrono::nanoseconds ns) const {
+ }
+ #endif
+ 
++u64 WallClock::GuestCNTPCTFactor() const {
++#if defined(ARCHITECTURE_x86_64)
++    return invariant ? cntpct_rdtsc_factor.load(std::memory_order_relaxed) : 0;
++#else
++    return 0;
++#endif
++}
++
+ u64 WallClock::CPUTickToGuestCNTPCT(u64 cpu_tick) const {
+     return MultiplyAndDivide64(cpu_tick, GetGuestCNTFRQ(), CPUTickFreq);
+ }
+diff --git a/src/common/cpu_features.h b/src/common/cpu_features.h
+index 31be2dc956..6eb3d5c987 100644
+--- a/src/common/cpu_features.h
++++ b/src/common/cpu_features.h
+@@ -30,6 +30,9 @@ public:
+     /// Sets the guest counter's frequency: CNTFRQ, or Switch2CNTFRQ for Switch 2 titles (their SDK
+     /// converts ticks with a constant 31.25 MHz). Called at boot, before guest code runs.
+     void SetGuestCNTFRQ(u64 frequency);
++    /// The factor GetCNTPCT multiplies the host counter by (0.64 fixed point), or 0 when guest
++    /// ticks do not come from one multiply of the raw counter.
++    [[nodiscard]] u64 GuestCNTPCTFactor() const;
+ 
+     /// @returns The guest counter's frequency (CNTFRQ_EL0).
+     [[nodiscard]] u64 GetGuestCNTFRQ() const {
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index c5be4d2520..3711b53450 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -9,6 +9,7 @@
+ #if defined(_M_X64) || defined(__x86_64__)
+ #include <immintrin.h>
+ #endif
++#include "common/cpu_features.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+ #include "core/arm/dynarmic/arm_dynarmic_64.h"
+@@ -169,6 +170,17 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
+     return std::max<s64>(m_parent.m_system.CoreTiming().downcount, 0);
+ }
+ 
++namespace {
++/// EDEN_NX2_CNTPCT_PAUSE=0 turns the pause in a guest's CNTPCT polling loop off.
++bool ShouldPauseCntpctSpins() {
++    static const bool pause_spins = [] {
++        const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
++        return value == nullptr || value[0] != '0';
++    }();
++    return pause_spins;
++}
++} // namespace
++
+ u64 DynarmicCallbacks64::GetCNTPCT() {
+     const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
+     // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
+@@ -176,11 +188,7 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
+     // GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
+     // other are such a loop: pause, which hands the core's resources to the sibling thread for a
+     // moment. The guest sees the same counter. EDEN_NX2_CNTPCT_PAUSE=0 turns it off.
+-    static const bool pause_spins = [] {
+-        const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
+-        return value == nullptr || value[0] != '0';
+-    }();
+-    if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
++    if (ShouldPauseCntpctSpins() && ticks - m_last_cntpct < m_spin_ticks) {
+ #if defined(_M_X64) || defined(__x86_64__)
+         _mm_pause();
+         _mm_pause();
+@@ -279,6 +287,23 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // Timing
+     config.wall_clock_cntpct = m_uses_wall_clock;
+     config.enable_cycle_counting = !m_uses_wall_clock;
++    // EDEN_NX2_INLINE_CNTPCT=1: guest counter reads stay in generated code (a read costs one
++    // RDTSC instead of a call, two LFENCEs and the spills around them). Only where CoreTiming's
++    // GetClockTicks is that one multiply: a wall clock on a host counter with one rate, and no
++    // scaling for a CPU clock setting or for the emulated speed. Lichii PR 161, commit d51b04d80a
++    // (there on by default; here off until the console has run it).
++    if (m_uses_wall_clock && Settings::values.cpu_clock.GetValue() == Settings::CpuClock::Normal &&
++        !Settings::values.sync_core_speed.GetValue()) {
++        static const bool inline_cntpct = [] {
++            const char* value = std::getenv("EDEN_NX2_INLINE_CNTPCT");
++            return value != nullptr && value[0] == '1';
++        }();
++        if (inline_cntpct) {
++            config.inline_cntpct_factor = Common::g_wall_clock.GuestCNTPCTFactor();
++            config.inline_cntpct_spin_ticks =
++                ShouldPauseCntpctSpins() ? static_cast<std::uint32_t>(m_cb->m_spin_ticks) : 0;
++        }
++    }
+ 
+     // Code cache size
+ #if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 40610d7094..699b333d30 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -577,6 +577,34 @@ void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
+ }
+ 
+ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
++    // Lichii PR 161 (zortos293/Lichii, commit d51b04d80a), GPL-3.0-or-later: the counter without
++    // leaving generated code. No HostCall: nothing is spilled, and the guest's read costs one
++    // RDTSC and one multiply. Like WallClock::GetCNTPCT, minus its two LFENCEs.
++    if (conf.wall_clock_cntpct && conf.inline_cntpct_factor != 0) {
++        const Xbyak::Reg64 low = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
++        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
++        const Xbyak::Reg64 factor = ctx.reg_alloc.ScratchGpr(code);
++        code.rdtsc();
++        code.shl(result, 32);
++        code.or_(low, result);
++        code.mov(factor, conf.inline_cntpct_factor);
++        code.mul(factor); // rdx = the high half of tsc * factor: MultiplyHigh
++        if (conf.inline_cntpct_spin_ticks != 0) {
++            // DynarmicCallbacks64::GetCNTPCT's polling test, on this core's own last read.
++            Xbyak::Label no_pause;
++            const auto last = qword[code.ABI_JIT_PTR + offsetof(A64JitState, cntpct_last)];
++            code.mov(low, result);
++            code.sub(low, last);
++            code.mov(last, result);
++            code.cmp(low, conf.inline_cntpct_spin_ticks);
++            code.jae(no_pause);
++            code.pause();
++            code.pause();
++            code.L(no_pause);
++        }
++        ctx.reg_alloc.DefineValue(code, inst, result);
++        return;
++    }
+     ctx.reg_alloc.HostCall(code, inst);
+     if (!conf.wall_clock_cntpct) {
+         code.UpdateTicks();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
+index c3d8b04d1e..fbdee902d4 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
+@@ -53,6 +53,10 @@ struct A64JitState {
+     // Exclusive state
+     u8 exclusive_state = 0;
+     u32 rsb_ptr = 0;
++    // The last inline CNTPCT_EL0 read of this core (A64EmitX64::EmitA64GetCNTPCT). It lives here
++    // and not behind a pointer in the code: with EglantinePS5's shared JIT any core runs code
++    // another core compiled.
++    u64 cntpct_last = 0;
+     std::array<u64, RSB_SIZE> rsb_location_descriptors;
+     std::array<u64, RSB_SIZE> rsb_codeptrs;
+ 
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 859aeba709..41c140de87 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -293,6 +293,14 @@ struct UserConfig {
+     /// to avoid writting certain unnecessary code only needed for cycle timers.
+     bool wall_clock_cntpct = false;
+ 
++    /// EglantinePS5: when not zero, MRS CNTPCT_EL0 reads the host TSC in generated code and
++    /// multiplies it by this 0.64 fixed point factor, instead of calling GetCNTPCT. Needs
++    /// wall_clock_cntpct, and a host counter that runs at one rate on every core.
++    std::uint64_t inline_cntpct_factor = 0;
++    /// With inline_cntpct_factor: two reads on a core closer than this many guest ticks are a
++    /// polling loop, and the second one pauses. Zero never pauses.
++    std::uint32_t inline_cntpct_spin_ticks = 0;
++
+     /// This allows accurately emulating protection fault handlers. If true, we check
+     /// for exit after every data memory access by the emulated program.
+     bool check_halt_on_memory_access = false;

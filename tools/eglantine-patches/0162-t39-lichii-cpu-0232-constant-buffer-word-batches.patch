@@ -1,0 +1,251 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0362-lichii-cpu-0232-constant-buffer-word-batches.patch
+
+Source: 0362-lichii-cpu-0232-constant-buffer-word-batches.patch
+Core patch. Paths are the submodule's. Applies on core16 alone or in the lichii-cpu order.
+
+Source: zortos293/Lichii PR 184, commit 4a0bc9a007, with bfc3eb523d for the device page limit,
+GPL-3.0-or-later. Only the constant buffer part. CallMethodFast is left out: it saves a few
+predicted branches per method.
+
+EDEN_NX2_CB_BATCH=1: GpuSplit::Execute looks ahead over up to 64 single writes to const_buffer.buffer
+and hands them to Maxwell3D::CallConstBufferWords, one page table walk and one memcpy. Off with
+EDEN_NX2_3D_HISTORY, EDEN_NX2_3D_METHODS and EDEN_NX2_GPU_PROFILE. Falls back to one by one over a
+device page, at the buffer's end, or inside a macro. Sparse memory stays word by word, and the
+accumulator gets the same ranges as before.
+
+Only runs with the split GPU thread (fast GPU on). Helps only if GPUBack is the limit, which nobody
+has measured for Ocarina.
+
+Pool memory: none. 512 bytes of stack.
+
+Checked: PS5-target syntax compile of gpu_split and maxwell_3d and memory_manager, no errors. Lichii's
+equivalence test needs all of video_core and was not run here. Not run.
+
+diff --git a/src/video_core/engines/engine_interface.h b/src/video_core/engines/engine_interface.h
+index 83dbf13059..82121f5273 100644
+--- a/src/video_core/engines/engine_interface.h
++++ b/src/video_core/engines/engine_interface.h
+@@ -44,6 +44,9 @@ public:
+     }
+ 
+     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
++    /// A Maxwell3D whose single constant buffer writes GpuSplit's back may take together
++    /// (EDEN_NX2_CB_BATCH=1, Maxwell3D::CallConstBufferWords).
++    bool batch_constant_words{};
+     std::vector<std::pair<u32, u32>> method_sink{};
+     GPUVAddr current_dma_segment;
+     bool current_dirty{};
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index c38689a1d5..3f04c80ef0 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -35,6 +35,9 @@ namespace Tegra::Engines {
+ /// First register id that is actually a Macro call.
+ constexpr u32 MacroRegistersStart = 0xE00;
+ 
++// EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't model).
++static const bool g_trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
++
+ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
+     : draw_manager()
+     , memory_manager{memory_manager_}
+@@ -50,6 +53,13 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
+     execution_mask.reset();
+     for (size_t i = 0; i < execution_mask.size(); i++)
+         execution_mask[i] = IsMethodExecutable(u32(i));
++    // Off with the tools that want to see each write.
++    static const bool batch_words = [] {
++        const char* value = std::getenv("EDEN_NX2_CB_BATCH");
++        return value != nullptr && value[0] == '1';
++    }();
++    batch_constant_words = batch_words && !record_write_history &&
++                           !g_trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
+ }
+ 
+ Maxwell3D::~Maxwell3D() = default;
+@@ -453,9 +463,6 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
+     draw_manager.DrawDeferred(*this);
+ }
+ 
+-// EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't model).
+-static const bool g_trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
+-
+ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
+     static std::array<bool, Regs::NUM_REGS> seen{};
+     if (method < seen.size() && !seen[method]) {
+@@ -464,6 +471,35 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
+     }
+ }
+ 
++// Lichii PR 184 (commit 4a0bc9a007, with bfc3eb523d for the page limit): macros write constant
++// buffers a word at a time, and each word walked the GPU page table on its own.
++void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
++                                     u32 count) {
++    const u32 offset = regs.const_buffer.offset;
++    const u64 bytes = u64{count} * sizeof(u32);
++    const GPUVAddr address = regs.const_buffer.Address();
++    // Keep per-word translation across device pages and per-word clipping at buffer limits.
++    if (executing_macro != 0 || address == 0 || offset > regs.const_buffer.size ||
++        bytes > regs.const_buffer.size - offset ||
++        bytes > Core::DEVICE_PAGESIZE - ((address + offset) & Core::DEVICE_PAGEMASK)) {
++        for (u32 i = 0; i < count; ++i) {
++            CallMethod(system, methods[i], arguments[i], true);
++        }
++        return;
++    }
++    std::array<u32, 64> values;
++    const bool replay = shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay;
++    for (u32 i = 0; i < count; ++i) {
++        values[i] = replay ? shadow_state.reg_array[methods[i]] : arguments[i];
++    }
++    // As CallMethod for each word: the first may issue a deferred draw, before any upload.
++    for (u32 i = 0; i < count; ++i) {
++        ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
++    }
++    memory_manager.WriteWordsCached(address + offset, values.data(), count);
++    regs.const_buffer.offset += static_cast<u32>(bytes);
++}
++
+ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+     // It is an error to write to a register other than the current macro's ARG register before
+     // it has finished execution.
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index add968a20d..aba49b547d 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3202,6 +3202,11 @@ public:
+     /// Write multiple values to the register identified by method.
+     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+ 
++    /// GpuSplit's back (batch_constant_words): CallMethod for each of up to 64 single writes to
++    /// the constant buffer data registers, uploaded in one memory write within a device page.
++    void CallConstBufferWords(Core::System& system, const u32* methods, const u32* arguments,
++                              u32 count);
++
+     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
+     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
+     /// registers and sends the register writes to the back thread.
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 57a6431093..8bd6761fb4 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -22,6 +22,7 @@
+ #include "common/thread.h"
+ #include "core/core.h"
+ #include "video_core/engines/engine_interface.h"
++#include "video_core/engines/maxwell_3d.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_profile.h"
+@@ -313,7 +314,7 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
+     });
+ }
+ 
+-size_t GpuSplit::Execute(const u64* entry) {
++size_t GpuSplit::Execute(const u64* entry, size_t words) {
+     const u64 head = entry[0];
+     switch (static_cast<Kind>(head & 0xf)) {
+     case Kind::Wrap:
+@@ -325,6 +326,36 @@ size_t GpuSplit::Execute(const u64* entry) {
+         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+         const u32 argument = static_cast<u32>(head >> 32);
+         auto* const engine = back_engine;
++        if (engine->batch_constant_words && (head & HasSegment) == 0) {
++            // Single constant buffer words in a row (macros write them one by one) go up in one
++            // write. They are executable: each entry would only consume the sink first.
++            using Tegra::Engines::Maxwell3D;
++            constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
++            if (method - cb_data < 16) {
++                std::array<u32, 64> methods;
++                std::array<u32, 64> arguments;
++                methods[0] = method;
++                arguments[0] = argument;
++                u32 count = 1;
++                while (count < methods.size() && count < words) {
++                    const u64 next = entry[count];
++                    const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
++                    if (static_cast<Kind>(next & 0xf) != Kind::Method || (next & HasSegment) != 0 ||
++                        next_method - cb_data >= 16) {
++                        break;
++                    }
++                    methods[count] = next_method;
++                    arguments[count] = static_cast<u32>(next >> 32);
++                    ++count;
++                }
++                if (count > 1) {
++                    engine->ConsumeSink(*system);
++                    static_cast<Maxwell3D*>(engine)->CallConstBufferWords(
++                        *system, methods.data(), arguments.data(), count);
++                    return count;
++                }
++            }
++        }
+         if ((head & Direct) != 0) {
+             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+             engine->ConsumeSink(*system);
+@@ -420,7 +451,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         g_back_busy.store(true, std::memory_order_relaxed);
+         while (read_position != available) {
+             const size_t index = read_position & RingMask;
+-            const size_t size = Execute(&ring[index]);
++            const size_t size =
++                Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
+             read_position += size != 0 ? size : RingWords - index;
+             if (hook_requested.load(std::memory_order_relaxed) &&
+                 idle_hook != nullptr) [[unlikely]] {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 82f08ecb7b..4de1a05232 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -198,7 +198,8 @@ private:
+     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
+ 
+     void BackLoop(std::stop_token stop_token);
+-    size_t Execute(const u64* entry);
++    /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
++    size_t Execute(const u64* entry, size_t words);
+ 
+     Core::System* system{};
+     bool active{};
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 3e6378b445..ecb7b2331e 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -538,6 +538,23 @@ void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buf
+     accumulator.Add(gpu_dest_addr, size);
+ }
+ 
++void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count) {
++    const std::size_t size = count * sizeof(u32);
++    // Words on Switch 2 sparse memory go one at a time, as Nx2BackSparseWrite saw them.
++    if (gpu_dest_addr + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
++        gpu_dest_addr < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed)) {
++        for (std::size_t i = 0; i < count; ++i) {
++            WriteBlockCached(gpu_dest_addr + i * sizeof(u32), words + i, sizeof(u32));
++        }
++        return;
++    }
++    WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true);
++    // The accumulator merges word by word differently from one range: keep its ranges.
++    for (std::size_t i = 0; i < count; ++i) {
++        accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));
++    }
++}
++
+ void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
+                                 VideoCommon::CacheType which) const {
+     auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index 7d068d0207..e966e9628c 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -118,6 +118,8 @@ public:
+     /// without a translation per word.
+     void ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count) const;
+     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
++    /// WriteBlockCached of count words in a row, as one memory write.
++    void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
+ 
+     /**
+      * Checks if a gpu region can be simply read with a pointer.

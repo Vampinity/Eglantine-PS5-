@@ -1,0 +1,119 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0410-net-01-tensor-background.patch
+
+Source: 0410-net-01-tensor-background.patch
+matrix program until it is built
+
+T26 can already run Ocarina of Time's Max Resolution network with two env lines, no patch. Checked
+off the console on the real program, from the game's own agl_ndsr_vr_light.pck at 0x1be00: 1456
+instructions, 192 HMMA, the first at 0xc00. Lichii's lowering of those bytes hashes to
+6bd913e1f34e83eb, the program in the PS5 Linux log, and with 0x1b00 shared and 128x1x1 threads to
+that log's pipeline 77aceefc7a77c554. This tree with EDEN_NX2_TENSOR=compact and
+EDEN_NX2_TENSOR_ONLY=c00 lowers it to 3131 instructions. Against Lichii's 3071 only the 15 gathers
+differ, by reading R2 and R3 where Lichii loads the same two constants, and one branch offset. The
+real translator and SPIR-V backend then give 192 TensorMulAdd, 15 gathers with constant offsets and
+SPIR-V that spirv-val accepts. Pointer tables on or off give the same module.
+
+What is left is what a first run costs. Runtime compute pipelines build on a worker, but
+ComputePipeline::Configure records a wait for it, so the scheduler stops with every frame behind
+it: 12 s in the PS5 Linux log, 15.7 s in run60. If the driver refuses the pipeline the dispatch is
+skipped with no stand-in, and the output image keeps what it held.
+
+EDEN_NX2_TENSOR_BACKGROUND=1: while a software matrix program's pipeline is not built, and for good
+if the driver refused it, RasterizerVulkan::DispatchCompute throws a text with "matrix multiply" in
+it. KeplerCompute::DispatchNativeCompute then runs the stand-in, as for a rejected program. No
+freeze, the stand-in's picture meanwhile, and one line when the program takes over: "Software
+matrix pipeline ready: the program itself runs now". A new Shader::Info flag, uses_software_matrix,
+set with TensorMulAdd, names these programs. The SPIR-V of the network is byte for byte the same.
+
+Risk that stays: one graphics queue, no preemption. A dispatch that never ends blocks everything
+until RADV calls the device lost after 10 s without progress (RADV_PS5_STALL_NS). This program has
+no backward branch, its helper loop runs 8 times, and all six barriers lie outside its one branch
+region, with its only early EXIT after them. That is read from the code, not run.
+
+Off: one static bool test per compute dispatch, nothing else. Clang syntax check on the PS5 target,
+exit 0, no warning in the changed lines. Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+ .../ir_opt/collect_shader_info_pass.cpp            |  1 +
+ src/shader_recompiler/shader_info.h                |  1 +
+ .../renderer_vulkan/vk_compute_pipeline.h          | 10 ++++++++++
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp   | 20 ++++++++++++++++++++
+ 4 files changed, 32 insertions(+)
+
+diff --git a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+index 85919bac42..1ef3851fdc 100644
+--- a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
++++ b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+@@ -491,6 +491,7 @@ void VisitUsages(Info& info, IR::Inst& inst) {
+         info.uses_rescaling_uniform = true;
+         break;
+     case IR::Opcode::TensorMulAdd:
++        info.uses_software_matrix = true;
+         info.uses_subgroup_shuffles = true;
+         info.uses_fp32_denorms_preserve = true;
+         info.uses_subgroup_invocation_id = true;
+diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
+index 894ae47011..5985d13517 100644
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -290,6 +290,7 @@ struct Info {
+     bool uses_is_helper_invocation{};
+     bool uses_subgroup_invocation_id{};
+     bool uses_subgroup_shuffles{};
++    bool uses_software_matrix{};
+     bool uses_quad_shuffles{};
+     std::array<bool, 30> uses_patches{};
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index fba0519b58..82b39107fb 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -56,6 +56,16 @@ public:
+         return static_cast<bool>(pipeline);
+     }
+ 
++    /// The program runs HMMA through the SPIR-V helper.
++    [[nodiscard]] bool UsesSoftwareMatrix() const noexcept {
++        return info.uses_software_matrix;
++    }
++
++    /// Built, and the driver took it. A worker may still be on it: Configure would wait.
++    [[nodiscard]] bool IsRunnable() const noexcept {
++        return is_built.load(std::memory_order::acquire) && IsBound();
++    }
++
+ private:
+     const Device& device;
+     vk::PipelineCache& pipeline_cache;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 4f6f119cdd..2b77339c71 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1360,6 +1360,26 @@ void RasterizerVulkan::DispatchCompute() {
+         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
+         return;
+     }
++    // EDEN_NX2_TENSOR_BACKGROUND=1: a software matrix program's pipeline already builds on a
++    // worker, but Configure holds the scheduler until it is done, with every frame behind it:
++    // about 12 s for Ocarina of Time's network on PS5 Linux. Until it is built, and for good if
++    // the driver refuses it, this dispatch counts as rejected. "matrix multiply" in the text sends
++    // KeplerCompute to the upscale stand-in, which is what ran before the program was lowered.
++    static const bool tensor_background = [] {
++        const char* const value = std::getenv("EDEN_NX2_TENSOR_BACKGROUND");
++        return value != nullptr && value[0] != '0';
++    }();
++    if (tensor_background && kepler_compute->IsNativeMode() && pipeline->UsesSoftwareMatrix()) {
++        static bool held{};
++        if (!pipeline->IsRunnable()) {
++            held = true;
++            throw Shader::RuntimeError("native matrix multiply pipeline not ready, stand-in draws");
++        }
++        if (held) {
++            held = false;
++            LOG_INFO(Render_Vulkan, "Software matrix pipeline ready: the program itself runs now");
++        }
++    }
+     if (TimedAb::Get().Active() && TimedAb::Get().SkipDispatch(pipeline_cache.LastComputeHash())) {
+         return;
+     }

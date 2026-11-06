@@ -1,0 +1,66 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0411-net-02-tensor-sync.patch
+
+Source: 0411-net-02-tensor-sync.patch
+software matrix program run alone
+
+The first run of Ocarina of Time's network on the console (EDEN_NX2_TENSOR=compact) has one
+risk the code cannot remove: a dispatch that never ends on the one graphics queue, which RADV
+turns into a device loss after 10 s without progress, and which has frozen the PS5 before. What
+the emulator can do is keep nothing queued behind the unproven dispatch and say which one it was.
+
+EDEN_NX2_TENSOR_SYNC=<n>: for the first n dispatches of a program with TensorMulAdd (Shader::Info
+uses_software_matrix, net-01), DispatchCompute submits the command buffer right after recording
+the dispatch and waits for the GPU on the GPU thread, logging "Software matrix dispatch i of n:
+XxYxZ groups, GPU done after N ms". A dispatch that hangs stops in this wait; with
+EDEN_NX2_HANG_WATCH=1 the stall report after 3 s names the compute pipeline, before the device
+loss. A pipeline that is unbuilt or refused never gets here (EDEN_NX2_TENSOR_BACKGROUND sends
+those to the stand-in first), so a wait that returns is a dispatch that ran. After n the program
+runs as every other. Cost while watched: one GPU drain per dispatch, about one per frame.
+Unset or 0: nothing changes.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ .../renderer_vulkan/vk_rasterizer.cpp         | 30 +++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 3378a24be7..bf217280f0 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1420,6 +1420,36 @@ void RasterizerVulkan::DispatchCompute() {
+         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+     });
+     SubmitNx2ListCopies();
++    // EDEN_NX2_TENSOR_SYNC=<n> (unset or 0: off): the first n dispatches of a software matrix
++    // program (Ocarina of Time's network, EDEN_NX2_TENSOR=compact) each run alone. The command
++    // buffer is submitted right after the dispatch and this thread waits for the GPU, so nothing
++    // is queued behind the dispatch while it is unproven, and each one logs its groups and its
++    // GPU time. A dispatch that never ends hangs in this wait: with EDEN_NX2_HANG_WATCH=1 the
++    // stall report after 3 s names the compute pipeline before RADV declares the device lost at
++    // 10 s. A refused or unbuilt pipeline never reaches here (EDEN_NX2_TENSOR_BACKGROUND, above),
++    // so a wait that ends is a dispatch that ran. After n dispatches the program runs unwatched.
++    static const u32 tensor_sync = [] {
++        const char* const value = std::getenv("EDEN_NX2_TENSOR_SYNC");
++        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
++    }();
++    if (tensor_sync != 0 && kepler_compute->IsNativeMode() && pipeline->UsesSoftwareMatrix()) {
++        static u32 synced{};
++        if (synced < tensor_sync) {
++            ++synced;
++            const auto start = std::chrono::steady_clock::now();
++            const u64 tick = scheduler.Flush();
++            scheduler.Wait(tick);
++            const double ms = std::chrono::duration<double, std::milli>(
++                                  std::chrono::steady_clock::now() - start)
++                                  .count();
++            LOG_INFO(Render_Vulkan,
++                     "Software matrix dispatch {} of {}: {}x{}x{} groups, GPU done after {:.1f} ms",
++                     synced, tensor_sync, dim[0], dim[1], dim[2], ms);
++            if (synced == tensor_sync) {
++                LOG_INFO(Render_Vulkan, "Software matrix dispatches run unwatched from here");
++            }
++        }
++    }
+ 
+     // Log compute dispatch
+     if (GPU::Logging::IsActive() &&

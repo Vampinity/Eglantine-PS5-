@@ -1,0 +1,137 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0408-mk-01-log-failed-macro-parameters.patch
+
+Source: 0408-mk-01-log-failed-macro-parameters.patch
+capped
+
+Run85 (Mario Kart World, T23 env) is the only run of 125 with failed macros: 150 lines
+"Native MME (JIT) failed: start=0x1e6, consumed=6/6, error=instruction limit exceeded" from
+62.8 s, two of start=0x21a, and between them draws skipped for counts that decode as floats.
+The app was gone 11 s later with no report. The line says nothing about what the macro was
+given, so it cannot tell a macro fed garbage from a macro that runs a wrong loop.
+
+FailedMacroParameters() in macro.cpp adds ", parameters=<hex words>" (at most 64) to the three
+failure lines that lacked them: the JIT and the interpreter in MacroEngine::Execute, and the
+split front's JIT in maxwell_3d.cpp, where fs.parameters still holds the call's words because
+the JIT reads them in place. Capped at 16 failures per start address and 128 in all; the plain
+line continues after. The compute engine's line already carried its parameters. No switch: a
+failed macro is already an error line.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/maxwell_3d.cpp |  7 +++++--
+ src/video_core/macro.cpp              | 29 +++++++++++++++++++++++----
+ src/video_core/macro.h                |  8 ++++++++
+ 3 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 3f04c80ef0..8125859f54 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1183,8 +1183,11 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+             });
+         if (!result.success) {
+             engine.native_execution_failed = true;
+-            LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}",
+-                      start, result.consumed, parameter_count, result.error);
++            // fs.parameters still holds the call's words (the JIT reads them in place); words a
++            // MME_DMA_READ_FIFOED appended during the call follow them.
++            LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}{}",
++                      start, result.consumed, parameter_count, result.error,
++                      FailedMacroParameters(start, fs.parameters));
+         }
+     }
+     fs.parameters.clear();
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index eab0f9ee50..a01a757e86 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -4,13 +4,17 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdlib>
++#include <unordered_map>
+ #include <unordered_set>
+ #include <cstring>
+ #include <fstream>
++#include <mutex>
+ #include <optional>
+ #include <span>
++#include <string>
+ 
+ #include <fstream>
+ #include <variant>
+@@ -1383,6 +1387,21 @@ void MacroEngine::RecordBananzaTerrainDepthDraw(Engines::Maxwell3D& maxwell3d, u
+     }
+ }
+ 
++std::string FailedMacroParameters(u32 start, std::span<const u32> parameters) {
++    // The GPU thread and the split front both run macros.
++    static std::mutex mutex;
++    static std::unordered_map<u32, u32> failures_by_start;
++    static u32 failures_shown = 0;
++    std::scoped_lock lock{mutex};
++    if (failures_shown >= 128 || failures_by_start[start]++ >= 16) {
++        return {};
++    }
++    ++failures_shown;
++    const auto shown = parameters.first(std::min<size_t>(parameters.size(), 64));
++    return fmt::format(", parameters={:08x}{}", fmt::join(shown, ","),
++                       shown.size() < parameters.size() ? ",..." : "");
++}
++
+ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
+                           std::span<const u32> parameters) {
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+@@ -1576,8 +1595,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+                 emit);
+             if (!result.success) {
+                 native_execution_failed = true;
+-                LOG_ERROR(HW_GPU, "Native MME (JIT) failed: start={:#x}, consumed={}/{}, error={}",
+-                          method, result.consumed, parameters.size(), result.error);
++                LOG_ERROR(HW_GPU, "Native MME (JIT) failed: start={:#x}, consumed={}/{}, error={}{}",
++                          method, result.consumed, parameters.size(), result.error,
++                          FailedMacroParameters(method, parameters));
+             }
+             return;
+         }
+@@ -1638,8 +1658,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+                 std::ofstream dump("native-mme-" + std::to_string(method) + ".bin", std::ios::binary);
+                 dump.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
+             }
+-            LOG_ERROR(HW_GPU, "Native MME failed: start={:#x}, pc={:#x}, consumed={}/{}, error={}",
+-                      method, result.pc, result.consumed, parameters.size(), result.error);
++            LOG_ERROR(HW_GPU, "Native MME failed: start={:#x}, pc={:#x}, consumed={}/{}, error={}{}",
++                      method, result.pc, result.consumed, parameters.size(), result.error,
++                      FailedMacroParameters(method, parameters));
+         }
+         return;
+     }
+diff --git a/src/video_core/macro.h b/src/video_core/macro.h
+index 298a6def72..125e62bf31 100644
+--- a/src/video_core/macro.h
++++ b/src/video_core/macro.h
+@@ -16,6 +16,7 @@ namespace Tegra {
+ class TuringMacroJit;
+ }
+ #include <span>
++#include <string>
+ #include <variant>
+ #include <vector>
+ #include "common/container/unordered_map.h"
+@@ -32,6 +33,13 @@ namespace Engines {
+ class Maxwell3D;
+ }
+ 
++/// For the log line of a failed native macro: ", parameters=<hex words>" for the first 16
++/// failures of each start address and 128 in all, "" after that. Run85 (Mario Kart World) logged
++/// 150 failures of start=0x1e6, "instruction limit exceeded" with all 6 parameters consumed, and
++/// nothing to say whether the macro was fed garbage (the draws around them had float bits as
++/// counts) or ran a wrong loop. At most 64 words are shown.
++std::string FailedMacroParameters(u32 start, std::span<const u32> parameters);
++
+ namespace Macro {
+ constexpr std::size_t NUM_MACRO_REGISTERS = 8;
+ enum class Operation : u32 {

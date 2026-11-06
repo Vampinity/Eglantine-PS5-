@@ -1,0 +1,301 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0417-speed-09-invalidation-filter.patch
+
+Source: 0417-speed-09-invalidation-filter.patch
+GPU-write invalidations of pages they never held
+
+Port of zortos293/Lichii PR 250 (thibaut, 2e5d6d6ebd), behind a switch. The GPU's own cached
+guest writes (WriteBlockCached: constant buffer data, every draw) are invalidated in the texture,
+buffer, query and pipeline caches at the next draw (FlushCaching -> InnerInvalidation). The
+texture, query and shader caches only visit the objects registered on those pages, and constant
+buffer memory holds none: each call still took the cache's lock and walked its page tables, about
+88k times a second in Ocarina of Time on the source's machine (+3.4%, 52.0 -> 53.6 fps, RTX 4090).
+
+EDEN_NX2_INVALIDATION_FILTER=1: each of the three keeps a PageFilter, one bit per 4 KiB device
+page it ever registered an object on (images, cached queries, shaders), never cleared. A write
+whose pages have no bit set cannot concern that cache, so InnerInvalidation skips it. The buffer
+cache is still always told. Changed from the source: the filter's words (2 MiB per cache) are
+allocated only with the switch; without it Mark does nothing and Any answers true, so the four
+caches are told as before and the cost is one pointer test per call.
+
+On the console this runs on the back thread (engine methods), inside the 60% of its time that is
+not idle (run108). Not measured there. Clang syntax check clean on vk_rasterizer.cpp,
+shader_cache.cpp, vk_texture_cache_base.cpp and vk_query_cache.cpp.
+ src/video_core/CMakeLists.txt                 |  1 +
+ src/video_core/page_filter.h                  | 95 +++++++++++++++++++
+ src/video_core/query_cache/query_cache.h      |  1 +
+ src/video_core/query_cache/query_cache_base.h |  4 +
+ .../renderer_vulkan/vk_rasterizer.cpp         | 24 ++++-
+ src/video_core/shader_cache.cpp               |  1 +
+ src/video_core/shader_cache.h                 |  4 +
+ src/video_core/texture_cache/texture_cache.h  |  2 +
+ .../texture_cache/texture_cache_base.h        |  4 +
+ 9 files changed, 132 insertions(+), 4 deletions(-)
+ create mode 100644 src/video_core/page_filter.h
+
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 18d1e68e35..58eecc1baa 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -106,6 +106,7 @@ add_library(video_core STATIC
+     gpu_thread.h
+     guest_memory.h
+     invalidation_accumulator.h
++    page_filter.h
+     memory_manager.cpp
+     memory_manager.h
+     native_qmd.h
+diff --git a/src/video_core/page_filter.h b/src/video_core/page_filter.h
+new file mode 100644
+index 0000000000..b6984899bc
+--- /dev/null
++++ b/src/video_core/page_filter.h
+@@ -0,0 +1,95 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <cstdlib>
++#include <memory>
++
++#include "common/common_types.h"
++
++namespace VideoCommon {
++
++/// EDEN_NX2_INVALIDATION_FILTER=1: the GPU's own cached writes (constant buffer data, every draw)
++/// are invalidated in the texture, query and shader caches at the next draw. Those caches only
++/// visit objects registered on the written pages, and constant buffer memory holds none, so each
++/// call took the cache's lock and walked its page tables for nothing (Lichii PR 250, thibaut:
++/// about 88k times a second in Ocarina of Time, +3.4% on a 4090). With the switch each cache keeps
++/// a PageFilter and InnerInvalidation skips the caches whose pages were never registered.
++/// Unset: no filter is allocated, every cache is told as before.
++inline bool InvalidationFilterEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_INVALIDATION_FILTER");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++/// The 4 KiB device pages a cache has ever registered objects on. Bits are never cleared, so a
++/// clear bit proves the cache holds nothing there and an invalidation of those pages does nothing.
++/// Without the switch there are no words: Mark does nothing and Any answers true.
++class PageFilter {
++public:
++    PageFilter() {
++        if (InvalidationFilterEnabled()) {
++            words = std::make_unique<std::atomic<u64>[]>(NumWords);
++        }
++    }
++
++    void Mark(u64 address, u64 size) {
++        if (!words || size == 0) {
++            return;
++        }
++        const u64 first = address >> PageBits;
++        const u64 last = (address + size - 1) >> PageBits;
++        if (last >= NumWords * 64) {
++            overflow.store(true, std::memory_order_relaxed);
++            return;
++        }
++        for (u64 page = first; page <= last;) {
++            const u64 bit = page % 64;
++            const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
++            const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << bit;
++            auto& word = words[page / 64];
++            if ((word.load(std::memory_order_relaxed) & mask) != mask) {
++                word.fetch_or(mask, std::memory_order_relaxed);
++            }
++            page += count;
++        }
++    }
++
++    /// Whether the cache may hold objects on [address, address + size).
++    [[nodiscard]] bool Any(u64 address, u64 size) const {
++        if (!words) {
++            return true;
++        }
++        if (size == 0) {
++            return false;
++        }
++        const u64 first = address >> PageBits;
++        const u64 last = (address + size - 1) >> PageBits;
++        if (last >= NumWords * 64 || overflow.load(std::memory_order_relaxed)) {
++            return true;
++        }
++        for (u64 page = first; page <= last;) {
++            const u64 bit = page % 64;
++            const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
++            const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << bit;
++            if (words[page / 64].load(std::memory_order_relaxed) & mask) {
++                return true;
++            }
++            page += count;
++        }
++        return false;
++    }
++
++private:
++    static constexpr u64 PageBits = 12;
++    static constexpr u64 NumWords = (u64{1} << (36 - PageBits)) / 64; // 2 MiB of bits
++    std::unique_ptr<std::atomic<u64>[]> words;
++    std::atomic<bool> overflow{};
++};
++
++} // namespace VideoCommon
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+index 60ca50eb1f..ac9a471e64 100644
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -330,6 +330,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     {
+         std::scoped_lock lock(cache_mutex);
+         auto it1 = cached_queries.try_emplace(cont_addr);
++        page_filter.Mark(cpu_addr, 16);
+         auto& sub_container = it1.first->second;
+         auto it_current = sub_container.find(base);
+         if (it_current == sub_container.end()) {
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+index 5a60e42986..e344ccd8e9 100644
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -18,6 +18,7 @@
+ #include "common/common_types.h"
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/page_filter.h"
+ #include "video_core/query_cache/query_base.h"
+ #include "video_core/query_cache/types.h"
+ 
+@@ -41,6 +42,9 @@ class QueryCacheBase : public VideoCommon::ChannelSetupCaches<VideoCommon::Chann
+     using RuntimeType = typename Traits::RuntimeType;
+ 
+ public:
++    /// Device pages this cache ever registered queries on (InnerInvalidation skips the rest).
++    VideoCommon::PageFilter page_filter;
++
+     union QueryLocation {
+         BitField<27, 5, u32> stream_id;
+         BitField<0, 27, u32> query_id;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index bf217280f0..4f6f119cdd 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1619,7 +1619,19 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+         return;
+     }
+-    {
++    // EDEN_NX2_INVALIDATION_FILTER=1 (page_filter.h, Lichii PR 250): the GPU's own cached writes
++    // are mostly constant buffer data, where no image, query or shader was ever registered; each
++    // cache's PageFilter says so without its lock. The buffer cache is always told. Unset, every
++    // filter answers true.
++    const auto any = [&](const VideoCommon::PageFilter& filter) {
++        for (const auto& [addr, size] : sequences) {
++            if (filter.Any(addr, size)) {
++                return true;
++            }
++        }
++        return false;
++    };
++    if (any(texture_cache.page_filter)) {
+         std::scoped_lock lock{texture_cache.mutex};
+         for (const auto& [addr, size] : sequences) {
+             texture_cache.WriteMemory(addr, size);
+@@ -1631,10 +1643,14 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+             buffer_cache.WriteMemory(addr, size);
+         }
+     }
+-    for (const auto& [addr, size] : sequences) {
+-        query_cache.InvalidateRegion(addr, size);
++    if (any(query_cache.page_filter)) {
++        for (const auto& [addr, size] : sequences) {
++            query_cache.InvalidateRegion(addr, size);
++        }
++    }
++    if (any(pipeline_cache.page_filter)) {
++        pipeline_cache.InvalidateRegions(sequences);
+     }
+-    pipeline_cache.InvalidateRegions(sequences);
+ }
+ 
+ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
+index 5d41dc9697..8858cbac0d 100644
+--- a/src/video_core/shader_cache.cpp
++++ b/src/video_core/shader_cache.cpp
+@@ -264,6 +264,7 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t
+ 
+     const VAddr addr_end = addr + size;
+     Entry* const entry = NewEntry(addr, addr_end, data.get());
++    page_filter.Mark(addr, size);
+ 
+     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
+     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
+diff --git a/src/video_core/shader_cache.h b/src/video_core/shader_cache.h
+index 7c370e217c..0b6a23dec3 100644
+--- a/src/video_core/shader_cache.h
++++ b/src/video_core/shader_cache.h
+@@ -17,6 +17,7 @@
+ #include <vector>
+ 
+ #include "common/common_types.h"
++#include "video_core/page_filter.h"
+ #include <ranges>
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+@@ -61,6 +62,9 @@ class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelI
+     };
+ 
+ public:
++    /// Device pages this cache ever registered shaders on (InnerInvalidation skips the rest).
++    VideoCommon::PageFilter page_filter;
++
+     /// @brief Removes shaders inside a given region
+     /// @note Checks for ranges
+     /// @param addr Start address of the invalidation
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 28f56411f5..db4220dcfc 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3839,6 +3839,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     if (False(image.flags & ImageFlagBits::Sparse)) {
+         auto map_id =
+             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
++        page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
+         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
+                        [this, map_id](u64 page) { page_table[page].push_back(map_id); });
+         image.map_view_id = map_id;
+@@ -3848,6 +3849,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     ForEachSparseSegment(
+         image, [this, image_id, &sparse_maps](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+             auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
++            page_filter.Mark(cpu_addr, size);
+             ForEachCPUPage(cpu_addr, size,
+                            [this, map_id](u64 page) { page_table[page].push_back(map_id); });
+             sparse_maps.push_back(map_id);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 4e00f376a9..339e80b35d 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -19,6 +19,7 @@
+ #include <unordered_map>
+ #include "common/container/unordered_map.h"
+ #include "common/container/unordered_set.h"
++#include "video_core/page_filter.h"
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+ #include <boost/container/static_vector.hpp>
+@@ -232,6 +233,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     };
+ 
+ public:
++    /// Device pages this cache ever registered images on (InnerInvalidation skips the rest).
++    VideoCommon::PageFilter page_filter;
++
+     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
+ 
+     /// Notify the cache that a new frame has been queued

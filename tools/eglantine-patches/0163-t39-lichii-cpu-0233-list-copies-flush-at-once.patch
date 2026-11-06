@@ -1,0 +1,45 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0363-lichii-cpu-0233-list-copies-flush-at-once.patch
+
+Source: 0363-lichii-cpu-0233-list-copies-flush-at-once.patch
+Core patch. Paths are the submodule's. Applies on core16 alone or in the lichii-cpu order.
+
+Source: zortos293/Lichii PR 161, commit 3985ac21c6, GPL-3.0-or-later. PR 161 was still open on 6 Nov.
+
+EDEN_NX2_LIST_COPY_FLUSH=1: SubmitNx2ListCopies flushes at once instead of asking DeferFlush.
+ReadGpuWrittenCommands waits for these copies. Without this the front does not wait out the window:
+WaitSubmittedTick asks the back through the idle hook, and the back flushes after its current ring
+entry. So this is not needed for a longer window, it only removes that step, which matters when the
+entry is long (a shader translation). Goes with:
+
+    EDEN_NX2_FENCE_FLUSH_US=5000
+    EDEN_NX2_LIST_COPY_FLUSH=1
+
+The window switch and EDEN_NX2_FLUSH_DRAWS already exist in core16; PR 161's 5000 and 4096 are
+defaults there and only env.txt lines here.
+
+Pool memory: none itself. A longer window holds staging memory for a few ms more.
+
+Checked: PS5-target syntax compile of the derived vulkan_rasterizer.cpp, 0 errors. Not run.
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 8113eb1cd4..dae972c80a 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1436,7 +1436,15 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
+ void RasterizerVulkan::FlushAll() {}
+ 
+ void RasterizerVulkan::SubmitNx2ListCopies() {
+-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
++    // EDEN_NX2_LIST_COPY_FLUSH=1: command list copies go at once, whatever the fence window
++    // (EDEN_NX2_FENCE_FLUSH_US). Deferred, the front must ask the back for them (idle hook), and
++    // the back answers after its current ring entry. Lichii PR 161, commit 3985ac21c6.
++    static const bool at_once = [] {
++        const char* value = std::getenv("EDEN_NX2_LIST_COPY_FLUSH");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) &&
++        (at_once || !scheduler.DeferFlush())) {
+         scheduler.Flush();
+     }
+ }

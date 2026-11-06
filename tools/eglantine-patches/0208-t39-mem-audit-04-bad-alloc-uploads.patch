@@ -1,0 +1,172 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0385-mem-audit-04-bad-alloc-uploads.patch
+
+Source: 0385-mem-audit-04-bad-alloc-uploads.patch
+Moved by hand: applies unchanged once 0181 and 0382 are in
+
+Core patch, on core16 (through 0181). Paths are the submodule's.
+
+Same rule as 0181: the image keeps what it shows until the guest writes it again, and the session
+goes on. EDEN_NX2_BAD_ALLOC_ENDS=1 in env.txt ends it as before. There is no separate switch: the
+only change without it is on a bad_alloc, which ended the session.
+
+Covered now: RefreshSparseLayers, RefreshSparseTiles and UploadWrittenLayers in RefreshContents,
+and the RefreshSparseTiles that PrepareImage calls after backing an image whole.
+
+0181's own try could not work for the swizzle scratch, for two reasons found here:
+
+- GuestMemory::Read was noexcept and grows the scratch. A bad_alloc there is std::terminate, past
+  any catch. Every upload giving it &swizzle_data_buffer goes through it when guest memory is not
+  contiguous. Tested on the real headers: SIGABRT before, caught after.
+- ScratchBuffer::resize_destructive set the new capacity before allocating. Caught, the buffer
+  then claimed 8 MiB on a 1 MiB allocation and the next upload wrote past its end. Tested the same
+  way. On success both orders do the same, with the same peak.
+
+The two 0181 branches now share KeepContentsAfterBadAlloc, so the rule sits in one place.
+
+Not covered: a bad_alloc in QueueAsyncUnswizzle's queue, in BindSparseLayers on the modification
+path, or in the cold-hint list after the upload (all small), and the download paths: Read no longer
+terminates there, but nothing catches it, so they end as they did.
+
+Syntax-compiled for the PS5 target with warnings on, TextureCache instantiated for Vulkan and
+OpenGL, through prepare-vulkan-port.py (same skipped anchors as before). Not built, not run on the
+console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/common/scratch_buffer.h b/src/common/scratch_buffer.h
+index cad1506922..fcbd1a22c9 100644
+--- a/src/common/scratch_buffer.h
++++ b/src/common/scratch_buffer.h
+@@ -76,8 +76,10 @@ public:
+     /// The previously held data will be destroyed if a reallocation occurs.
+     void resize_destructive(size_type size) {
+         if (size > buffer_capacity) {
++            // Allocate first: a caller that catches the failure must not be left with the new
++            // capacity on the old, smaller buffer, or the next resize writes past its end.
++            buffer = std::make_unique_for_overwrite<T[]>(size);
+             buffer_capacity = size;
+-            buffer = std::make_unique_for_overwrite<T[]>(buffer_capacity);
+         }
+         last_requested_size = size;
+     }
+diff --git a/src/core/guest_memory.h b/src/core/guest_memory.h
+index a753f51a4e..147b2c4d69 100644
+--- a/src/core/guest_memory.h
++++ b/src/core/guest_memory.h
+@@ -115,8 +115,8 @@ public:
+         m_addr_changed = true;
+     }
+ 
+-    std::span<T> Read(u64 addr, std::size_t size,
+-                      Common::ScratchBuffer<T>* backup = nullptr) noexcept {
++    // Not noexcept: growing the backup can throw, and it would end the session past any catch.
++    std::span<T> Read(u64 addr, std::size_t size, Common::ScratchBuffer<T>* backup = nullptr) {
+         m_addr = addr;
+         m_size = size;
+         if (m_size == 0) {
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 5ee22b2876..1d07174211 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1873,16 +1873,22 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         TrackImage(image, image_id);
+     }
+ 
+-    if (True(image.flags & ImageFlagBits::SparseLayers)) {
+-        RefreshSparseLayers(image);
+-        return;
+-    }
+-    if (True(image.flags & ImageFlagBits::SparseTiles)) {
+-        RefreshSparseTiles(image);
+-        return;
+-    }
+-    if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
+-        runtime.InsertUploadMemoryBarrier();
++    // Vectors, staging and unswizzle scratch, as for a whole image further down.
++    try {
++        if (True(image.flags & ImageFlagBits::SparseLayers)) {
++            RefreshSparseLayers(image);
++            return;
++        }
++        if (True(image.flags & ImageFlagBits::SparseTiles)) {
++            RefreshSparseTiles(image);
++            return;
++        }
++        if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
++            runtime.InsertUploadMemoryBarrier();
++            return;
++        }
++    } catch (const std::bad_alloc&) {
++        KeepContentsAfterBadAlloc(image);
+         return;
+     }
+     image.dirty_layers.clear();
+@@ -1952,17 +1958,8 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         }
+     } catch (const std::bad_alloc&) {
+         // No memory for one image's unswizzle or conversion scratch (tens of MiB in one piece, on
+-        // the GPU thread, where nothing caught it). The image keeps what it shows until the guest
+-        // writes it again, and the session goes on; EDEN_NX2_BAD_ALLOC_ENDS=1 ends it as before.
+-        static const bool ends = [] {
+-            const char* value = std::getenv("EDEN_NX2_BAD_ALLOC_ENDS");
+-            return value != nullptr && value[0] == '1';
+-        }();
+-        if (ends) {
+-            throw;
+-        }
+-        LOG_ERROR(HW_GPU, "No memory to upload the image at {:#x}: kept as it is", image.gpu_addr);
+-        runtime.TransitionImageLayout(image);
++        // the GPU thread, where nothing caught it).
++        KeepContentsAfterBadAlloc(image);
+     }
+     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
+     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1
+@@ -1981,6 +1978,19 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     }
+ }
+ 
++template <class P>
++void TextureCache<P>::KeepContentsAfterBadAlloc(Image& image) {
++    static const bool ends = [] {
++        const char* value = std::getenv("EDEN_NX2_BAD_ALLOC_ENDS");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (ends) {
++        throw;
++    }
++    LOG_ERROR(HW_GPU, "No memory to upload the image at {:#x}: kept as it is", image.gpu_addr);
++    runtime.TransitionImageLayout(image);
++}
++
+ template <class P>
+ void TextureCache<P>::UploadLater(Image& image) {
+     static u64 times = 0;
+@@ -4323,7 +4333,11 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool
+                          image.gpu_addr);
+                 if (BackSparseTilesWhole(image)) {
+                     image.dirty_ranges.clear();
+-                    RefreshSparseTiles(image);
++                    try {
++                        RefreshSparseTiles(image);
++                    } catch (const std::bad_alloc&) {
++                        KeepContentsAfterBadAlloc(image);
++                    }
+                 } else {
+                     LOG_ERROR(HW_GPU,
+                               "Sparse tiled image {:#x}: out of memory backing it whole, the GPU "
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 339e80b35d..9d5c9c2749 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -181,6 +181,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     /// without its contents for now, and its next use tries again.
+     void UploadLater(Image& image);
+ 
++    /// In a catch of std::bad_alloc from an image's upload: the image keeps what it shows until
++    /// the guest writes it again, and the session goes on. EDEN_NX2_BAD_ALLOC_ENDS=1 rethrows.
++    void KeepContentsAfterBadAlloc(Image& image);
++
+     /// UploadLayers found no staging buffer for all of `layers`: half as many at a time.
+     void UploadLayersInParts(Image& image, std::span<const u32> layers);
+ 

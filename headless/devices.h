@@ -79,6 +79,7 @@ public:
     // Which DualSense button presses each of the game's buttons (button_mapping.h), for every
     // controller. Set before the first poll of a session.
     void SetMapping(const ButtonMapping& value) { mapping = ValidMapping(value) ? value : kDefaultMapping; }
+    const ButtonMapping& Mapping() const { return mapping; }
     // How a player's controller is used: as usual, or in place of a single left or right Joy-Con.
     // A single Joy-Con has one stick and one cluster of four buttons, and its game reads nothing
     // else. Held upright, Consume makes the whole DualSense that Joy-Con: the shapes are its four

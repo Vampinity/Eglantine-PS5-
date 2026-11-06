@@ -15,6 +15,86 @@ function(eden_reg_alloc_require source anchor what)
     endif()
 endfunction()
 
+# Register choice in the emitted code. Operates on eden_ra_source (reg_alloc.cpp).
+macro(eden_reg_alloc_codegen)
+    # Code generation below: ported from Swordpdf/ProsperoEden PR 189, commit 64a1ee754a3b (Rockiu0),
+    # GPL-3.0-or-later. Opt-in here: the flags are off until main.cpp reads env.txt.
+    # A register an emitter needs (RAX for the flags of a compare, the ABI registers of a call...)
+    # that still holds a value has it moved out of the way. Upstream always moves it to a stack
+    # slot, and the next use loads it back: in a large game's hottest blocks, stack spill traffic
+    # was about 8% of the samples. A general-purpose value now goes to a free general-purpose
+    # register when there is one (a register move, which Zen 2 eliminates at rename), callee-saved
+    # ones first so a host call's caller-saved sweep does not move it again; the stack otherwise,
+    # as before. SelectARegister already places values in any free register, so this adds no new
+    # kind of placement. EDEN_JIT_FREE_MOVES=1 (main.cpp) turns it on; off is upstream's spill.
+    set(eden_ra_move [==[void RegAlloc::MoveOutOfTheWay(BlockOfCode& code, HostLoc reg) noexcept {
+    ASSERT(!LocInfo(reg).IsLocked());
+    if (!LocInfo(reg).IsEmpty()) {
+        SpillRegister(code, reg);
+    }
+}
+]==])
+    eden_reg_alloc_require("${eden_ra_source}" "${eden_ra_move}" "reg_alloc.cpp MoveOutOfTheWay")
+    string(REPLACE "${eden_ra_move}" [==[extern "C" {
+bool eden_free_moves = false;
+bool eden_alloc_r13 = false;
+bool eden_plain_ordered_reads = false;  // headless/CMakeLists.txt, ordered reads
+bool eden_fcmp_adc = false, eden_light_dmb = false, eden_checkbit_flags = false;  // fast_paths.cmake
+unsigned long long eden_dmb_dropped = 0, eden_checkbit_fused = 0;  // fast_paths.cmake
+unsigned long long eden_free_moves_done = 0, eden_free_moves_spilled = 0;
+}
+
+void RegAlloc::MoveOutOfTheWay(BlockOfCode& code, HostLoc reg) noexcept {
+    ASSERT(!LocInfo(reg).IsLocked());
+    if (!LocInfo(reg).IsEmpty()) {
+        // ProsperoEden: a free general-purpose register before a stack slot (reg_alloc.cmake).
+        // Only the emitter's GPR set (gpr_order); RBP, R14, R15 and RSP stay out, as in
+        // SelectARegister, and R13 under the same switch as there.
+        if (HostLocIsGPR(reg) && __atomic_load_n(&eden_free_moves, __ATOMIC_RELAXED)) {
+            static constexpr HostLoc order[] = {
+                HostLoc::RBX, HostLoc::R12, HostLoc::R13, HostLoc::RSI, HostLoc::RDI, HostLoc::R8, HostLoc::R9,
+                HostLoc::R10, HostLoc::R11, HostLoc::RCX, HostLoc::RDX, HostLoc::RAX,
+            };
+            for (const HostLoc to : order) {
+                if (to != reg && gpr_order.test(size_t(to)) && hostloc_info[size_t(to)].IsEmpty() &&
+                    (to != HostLoc::R13 || __atomic_load_n(&eden_alloc_r13, __ATOMIC_RELAXED))) {
+                    Move(code, to, reg);
+                    __atomic_fetch_add(&eden_free_moves_done, 1, __ATOMIC_RELAXED);
+                    return;
+                }
+            }
+        }
+        __atomic_fetch_add(&eden_free_moves_spilled, 1, __ATOMIC_RELAXED);
+        SpillRegister(code, reg);
+    }
+}
+]==] eden_ra_source "${eden_ra_source}")
+    # R13 holds the fastmem base when a JIT has one; the A64 and A32 emitters then leave it out of
+    # their GPR set, and otherwise keep it in. SelectARegister still skipped it in every case, so
+    # A64 blocks (fastmem off on the console) had 11 allocatable GPRs instead of 12. Nothing else
+    # writes R13 inside blocks with fastmem off (it is only loaded by GenRCP when fastmem is set,
+    # and saved/restored with the other callee-saved registers around RunCode), so R13 is now
+    # handed out whenever the requested set contains it. EDEN_JIT_R13=1 (main.cpp) turns it on.
+    set(eden_ra_select [==[            } else if (i == HostLoc::RBP || (i >= HostLoc::R13 && i <= HostLoc::R15)) {
+]==])
+    eden_reg_alloc_require("${eden_ra_source}" "${eden_ra_select}" "reg_alloc.cpp SelectARegister")
+    string(REPLACE "${eden_ra_select}" [==[            } else if (i == HostLoc::RBP || (i >= HostLoc::R14 && i <= HostLoc::R15) ||
+                       (i == HostLoc::R13 && !__atomic_load_n(&eden_alloc_r13, __ATOMIC_RELAXED))) {
+]==] eden_ra_source "${eden_ra_source}")
+    string(PREPEND eden_ra_source "extern \"C\" bool eden_alloc_r13;  // ProsperoEden (reg_alloc.cmake)\n")
+endmacro()
+
+# The same, for a core whose allocator does not take the bookkeeping below.
+macro(eden_reg_alloc_codegen_only)
+    file(READ "${PROJECT_SOURCE_DIR}/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp" eden_ra_source)
+    eden_reg_alloc_codegen()
+    write_derived("${PORT_BUILD_DIR}/reg_alloc.cpp" "${eden_ra_source}")
+    get_target_property(eden_ra_sources dynarmic SOURCES)
+    list(FILTER eden_ra_sources EXCLUDE REGEX "(^|/)backend/x64/reg_alloc\\.cpp$")
+    set_property(TARGET dynarmic PROPERTY SOURCES "${eden_ra_sources}")
+    target_sources(dynarmic PRIVATE "${PORT_BUILD_DIR}/reg_alloc.cpp")
+endmacro()
+
 macro(eden_reg_alloc_sources)
     set(eden_ra_dir "${PROJECT_SOURCE_DIR}/src/dynarmic/src/dynarmic/backend/x64")
     file(READ "${eden_ra_dir}/reg_alloc.h" eden_ra_header)
@@ -120,6 +200,7 @@ macro(eden_reg_alloc_sources)
     return found;
 }
 ]==] eden_ra_source "${eden_ra_source}")
+    eden_reg_alloc_codegen()
     write_derived("${PORT_BUILD_DIR}/reg_alloc.cpp" "${eden_ra_source}")
     get_target_property(eden_ra_sources dynarmic SOURCES)
     list(FILTER eden_ra_sources EXCLUDE REGEX "(^|/)backend/x64/reg_alloc\\.cpp$")

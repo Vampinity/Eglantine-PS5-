@@ -23,12 +23,37 @@
             const size_t bytes = image.unswizzled_size_bytes;
             if (pending.size() == 16 || bytes > batch_limit - batch_bytes)
                 finish_batch();
-            auto map = runtime.DownloadStagingBuffer(bytes);
+            auto staged = runtime.TryDownloadStagingBuffer(bytes);
+            if (!staged && !pending.empty()) {
+                // Finishing the batch frees its buffers, and the pool hands those out even in the
+                // pause after a refusal.
+                finish_batch();
+                staged = runtime.TryDownloadStagingBuffer(bytes);
+            }
+            const bool kept_buffer = !staged;
+            if (kept_buffer) {
+                // No staging buffer: the pool's small buffer of its own, one image at a time. A
+                // larger image stays marked and the next read asks again; this read sees what
+                // guest memory holds.
+                const auto kept = runtime.ReservedDownloadBuffer();
+                if (bytes > kept.mapped_span.size()) {
+                    static u64 times = 0;
+                    if (++times; (times & (times - 1)) == 0) { // the 1st, 2nd, 4th, 8th ... time
+                        LOG_WARNING(HW_GPU, "No staging buffer to download the image at {:#x}, {} "
+                                            "times so far", image.gpu_addr, times);
+                    }
+                    image.flags |= ImageFlagBits::GpuModified;
+                    FlushOnNextRead(image);
+                    continue;
+                }
+                staged = kept;
+            }
+            auto map = *staged;
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             pending.emplace_back(image_id, std::move(map));
             // Oversized images retain the original one-image allocation/wait.
-            if (bytes >= batch_limit) {
+            if (bytes >= batch_limit || kept_buffer) {
                 finish_batch();
             } else {
                 batch_bytes += bytes;

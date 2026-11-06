@@ -1,0 +1,258 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0180-texture-mip-trim.patch
+
+Source: 0180-texture-mip-trim.patch
+Core patch: goes in tools/eglantine-patches as 0180-... (after 0170). Paths are the submodule's.
+
+The host keeps mip levels from host_level_offset on (TrimmedHostInfo, ImageFlagBits::TrimmedLevels),
+until now only for ASTC arrays the GPU decodes whose RGBA8 copy exceeds 1 GiB (Mario Kart World's
+8192x8192x68, to 256 MiB on the console). EDEN_NX2_TEX_TRIM_MIB=<MiB> extends the rule, off unless
+set: a 2D array of a compressed format (ASTC or BCn; render targets are never compressed) with at
+least EDEN_NX2_TEX_TRIM_LAYERS layers (2) whose host copy would take more than the limit keeps one
+level less, at most EDEN_NX2_TEX_TRIM_LEVELS (1) below the GPU-decode trim. Host bytes: ASTC as
+BC1/BC3 (RGBA8 when not re-compressed), another format at its size.
+
+The upload paths that did not know the offset now drop the copies of levels the host does not
+keep before any conversion (ConvertImage and ConvertedLayout take the guest level's size from the
+level number) and renumber the rest right before the upload: UploadImageContents (converted and
+plain), UploadLayers (plain), QueueAsyncDecode and TickAsyncDecode (both upload paths, the zero
+fill too). The GPU-decode path was adapted already; the GPU BCn transcode is not, so arrays it
+would take are left alone. Views already map guest to host levels; GPU copies and chunked uploads
+already skip trimmed images; the collector counts the host image (0078).
+
+Estimates (the top level is three quarters of a mip chain), with EDEN_NX2_TEX_TRIM_MIB=128:
+- Ocarina of Time, 1365x1365x90 x11 levels: 287 MiB (BC3) -> ~72, 152 MiB (BC1) -> ~38:
+  about 330 MiB back for the two arrays the refusal reports name.
+- Mario Kart World, 8192x8192x68 x12 levels after the GPU-decode trim: 342 -> ~85, 2x94 -> 2x23:
+  about 400 MiB. Arithmetic from the refusal reports' sizes, not measured.
+Cost: the arrays sample one level blurrier at the nearest distance; a shader that asks for a level
+by number gets the one below it. Staging for the whole image is still asked for (MapSizeBytes):
+a follow-up could size it from the kept levels. Not compiled, not run.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 27269b5438..c880fb59f6 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -374,34 +374,109 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+ // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
+ // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
+ // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
++// EDEN_NX2_TEX_TRIM_MIB=<MiB> (off unless set): a compressed 2D texture array (ASTC or BCn, at
++// least EDEN_NX2_TEX_TRIM_LAYERS layers, default 2) whose host copy would take more than this
++// keeps one level less, at most EDEN_NX2_TEX_TRIM_LEVELS (default 1) below what the rule above
++// already dropped. Its top level is three quarters of the array: Ocarina of Time's 1365x1365x90
++// ASTC arrays hold 287 and 152 MiB as BC3 and BC1 and keep about 72 and 38; Mario Kart World's
++// 8192x8192x68 arrays, 342 and 2x94 MiB after the GPU-decode trim, about 85 and 2x23. Render
++// targets are never compressed, so none is touched. The same TrimmedLevels path as above: views,
++// uploads (UploadImageContents, UploadLayers, the asynchronous decode) and the collector's count
++// follow host_level_offset; a shader that asks for a level by number gets the one below it.
++[[nodiscard]] u64 TextureTrimLimit() {
++    static const u64 limit = [] {
++        const char* value = std::getenv("EDEN_NX2_TEX_TRIM_MIB");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
++    }();
++    return limit;
++}
++[[nodiscard]] u32 TextureTrimLevels() {
++    static const u32 levels = [] {
++        const char* value = std::getenv("EDEN_NX2_TEX_TRIM_LEVELS");
++        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 1U;
++    }();
++    return levels;
++}
++[[nodiscard]] u32 TextureTrimLayers() {
++    static const u32 layers = [] {
++        const char* value = std::getenv("EDEN_NX2_TEX_TRIM_LAYERS");
++        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 2U;
++    }();
++    return layers;
++}
++// The host bytes of `info`'s levels from `skip` on, as the host keeps them: ASTC as BC1 or BC3
++// (RGBA8 when not re-compressed), another format at its own size.
++[[nodiscard]] u64 HostBytesFromLevel(const ImageInfo& info, u32 skip) {
++    u64 numerator = 1, denominator = 1;
++    if (IsPixelFormatASTC(info.format)) {
++        const auto recompression = Settings::GetAstcRecompression();
++        if (recompression == Settings::AstcRecompression::Uncompressed) {
++            numerator = 4;
++        } else if (recompression == Settings::AstcRecompression::Bc1 || info.astc_opaque) {
++            denominator = 2;
++        }
++    } else {
++        numerator = VideoCore::Surface::BytesPerBlock(info.format);
++        denominator = u64{VideoCore::Surface::DefaultBlockWidth(info.format)} *
++                      VideoCore::Surface::DefaultBlockHeight(info.format);
++    }
++    u64 texels = 0;
++    for (s32 level = static_cast<s32>(skip); level < info.resources.levels; ++level) {
++        texels += u64{(std::max)(info.size.width >> level, 1U)} * (std::max)(info.size.height >> level, 1U);
++    }
++    return texels * static_cast<u64>(info.resources.layers) * numerator / denominator;
++}
++
+ [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
+     level_offset = 0;
+-    if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
+-        return info;
++    const bool decoded_on_gpu = WillUseAcceleratedAstcDecode(device, info) && info.type == ImageType::e2D;
++    if (decoded_on_gpu) {
++        const auto decoded_bytes = [&](u32 skip) {
++            u64 bytes = 0;
++            for (s32 level = static_cast<s32>(skip); level < info.resources.levels; ++level) {
++                bytes += u64{(std::max)(info.size.width >> level, 1U)} *
++                         (std::max)(info.size.height >> level, 1U) * 4;
++            }
++            return bytes * info.resources.layers;
++        };
++        if (decoded_bytes(0) > (u64{1} << 30)) {
++            const u64 limit = TrimmedAstcArrayLimit(device);
++            while (level_offset + 1 < static_cast<u32>(info.resources.levels) &&
++                   decoded_bytes(level_offset) > limit) {
++                ++level_offset;
++            }
++            LOG_WARNING(Render_Vulkan, "{}x{}x{} ASTC image would be {} MiB decoded; keeping mip levels {}+ ({}x{})",
++                        info.size.width, info.size.height, info.resources.layers, decoded_bytes(0) >> 20,
++                        level_offset, (std::max)(info.size.width >> level_offset, 1U),
++                        (std::max)(info.size.height >> level_offset, 1U));
++        }
+     }
+-    const auto decoded_bytes = [&](u32 skip) {
+-        u64 bytes = 0;
+-        for (s32 level = static_cast<s32>(skip); level < info.resources.levels; ++level) {
+-            bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+-                     (std::max)(info.size.height >> level, 1U) * 4;
++    // The opt-in trim: on top of the GPU-decode one, or for an array the CPU converts or uploads as
++    // it is (the GPU BCn transcode's uploads are not adapted to a trim).
++    const u64 trim = TextureTrimLimit();
++    if (trim != 0 && info.type == ImageType::e2D && info.num_samples == 1 &&
++        info.resources.layers >= static_cast<s32>(TextureTrimLayers()) &&
++        (IsPixelFormatASTC(info.format) || IsPixelFormatBCn(info.format)) &&
++        (level_offset != 0 || (!decoded_on_gpu && !WillUseGpuBcnTranscode(device, info)))) {
++        const u32 before = level_offset;
++        while (level_offset - before < TextureTrimLevels() &&
++               level_offset + 1 < static_cast<u32>(info.resources.levels) &&
++               HostBytesFromLevel(info, level_offset) > trim) {
++            ++level_offset;
++        }
++        if (level_offset != before) {
++            LOG_WARNING(Render_Vulkan, "{}x{}x{} array of {} MiB on the host over EDEN_NX2_TEX_TRIM_MIB: keeping mip levels {}+ ({} MiB)",
++                        info.size.width, info.size.height, info.resources.layers, HostBytesFromLevel(info, before) >> 20,
++                        level_offset, HostBytesFromLevel(info, level_offset) >> 20);
+         }
+-        return bytes * info.resources.layers;
+-    };
+-    if (decoded_bytes(0) <= (u64{1} << 30)) {
+-        return info;
+     }
+-    const u64 limit = TrimmedAstcArrayLimit(device);
+-    while (level_offset + 1 < static_cast<u32>(info.resources.levels) &&
+-           decoded_bytes(level_offset) > limit) {
+-        ++level_offset;
++    if (level_offset == 0) {
++        return info;
+     }
+     ImageInfo host = info;
+     host.size.width = (std::max)(info.size.width >> level_offset, 1U);
+     host.size.height = (std::max)(info.size.height >> level_offset, 1U);
+     host.resources.levels -= static_cast<s32>(level_offset);
+-    LOG_WARNING(Render_Vulkan, "{}x{}x{} ASTC image would be {} MiB decoded; keeping mip levels {}+ ({}x{})",
+-                info.size.width, info.size.height, info.resources.layers, decoded_bytes(0) >> 20,
+-                level_offset, host.size.width, host.size.height);
+     return host;
+ }
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 49e9f15911..db86637d72 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2234,6 +2234,8 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
+                     copies.push_back(copy);
+                 }
+             }
++            DropTrimmedLevels(image.host_level_offset, copies);
++            RenumberTrimmedLevels(image.host_level_offset, copies);
+             image.UploadMemory(*staging, copies);
+             ++images_uploaded;
+             uploaded_bytes += u64{image.info.layer_stride} * layers.size();
+@@ -2266,6 +2268,31 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
+     }
+ }
+ 
++// A host image that keeps only guest levels >= offset (ImageFlagBits::TrimmedLevels): the copies
++// of the levels it does not keep go, and the ones left name host levels. Dropped before a
++// conversion (ConvertImage and ConvertedLayout read the guest level's size from the level number),
++// renumbered right before the upload.
++template <typename Copies>
++void DropTrimmedLevels(u32 offset, Copies& copies) {
++    if (offset == 0) {
++        return;
++    }
++    copies.erase(std::remove_if(copies.begin(), copies.end(),
++                                [offset](const BufferImageCopy& copy) {
++                                    return copy.image_subresource.base_level < static_cast<s32>(offset);
++                                }),
++                 copies.end());
++}
++template <typename Copies>
++void RenumberTrimmedLevels(u32 offset, Copies& copies) {
++    if (offset == 0) {
++        return;
++    }
++    for (BufferImageCopy& copy : copies) {
++        copy.image_subresource.base_level -= static_cast<s32>(offset);
++    }
++}
++
+ template <class P>
+ template <typename StagingBuffer>
+ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) {
+@@ -2303,10 +2330,14 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
+     if (True(image.flags & ImageFlagBits::Converted)) {
+         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
+         auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, unswizzle_data_buffer);
++        DropTrimmedLevels(image.host_level_offset, copies);
+         ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
++        RenumberTrimmedLevels(image.host_level_offset, copies);
+         image.UploadMemory(staging, copies);
+     } else {
+-        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);
++        auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);
++        DropTrimmedLevels(image.host_level_offset, copies);
++        RenumberTrimmedLevels(image.host_level_offset, copies);
+         image.UploadMemory(staging, copies);
+     }
+ }
+@@ -2634,6 +2665,7 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     std::vector<u8> local_unswizzle_data_buffer(image.unswizzled_size_bytes, 0);
+     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+     auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
++    DropTrimmedLevels(image.host_level_offset, copies);
+     const size_t out_size = MapSizeBytes(image);
+     if (False(image.flags & ImageFlagBits::ZeroFilled)) {
+         // Until the decode lands (a second or more while title 1 streams ~40 textures a second)
+@@ -2642,6 +2674,7 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+         image.flags |= ImageFlagBits::ZeroFilled;
+         auto zero_copies = copies;
+         ConvertedLayout(image.info, zero_copies);
++        RenumberTrimmedLevels(image.host_level_offset, zero_copies);
+         // With no staging buffer the image only goes without its clear until the decode lands.
+         if (out_size <= UPLOAD_SLICE_BYTES) {
+             if (auto staging = TryUploadStaging(runtime, out_size)) {
+@@ -2773,6 +2806,7 @@ void TextureCache<P>::TickAsyncDecode() {
+                     part.buffer_offset = offset;
+                     offset += part.buffer_size;
+                 }
++                RenumberTrimmedLevels(image.host_level_offset, slice);
+                 image.UploadMemory(*staging, slice);
+                 has_uploads = true;
+                 upload_budget -= (std::min)(upload_budget, bytes);
+@@ -2789,6 +2823,7 @@ void TextureCache<P>::TickAsyncDecode() {
+             }
+             std::memcpy(staging->mapped_span.data(), async_decode->decoded_data.data(),
+                         async_decode->decoded_data.size());
++            RenumberTrimmedLevels(image.host_level_offset, async_decode->copies);
+             image.UploadMemory(*staging, async_decode->copies);
+             has_uploads = true;
+         }

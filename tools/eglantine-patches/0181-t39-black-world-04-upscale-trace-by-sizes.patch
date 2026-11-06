@@ -1,0 +1,102 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0403-black-world-04-upscale-trace-by-sizes.patch
+
+Source: 0403-black-world-04-upscale-trace-by-sizes.patch
+(catches a world that comes and goes)
+
+Run75 (Docked) showed a live world only in its last ~35 s, right after eight new compute
+pipelines (414-433 s) and unbacked 2560x1440 render targets (435 s); run79 (Handheld) showed one
+near 440 s, where the texture cache made 1,888 then 4,127 images in 600 frames and frames ran to
+684 ms. Neither has an upscale line near the flip: the per-program lines log once, and the trace
+had no lines left. The likeliest flip is the game's own resolution path: under such a load the 3D
+size drops, the network (1:1 at Max Resolution) becomes an upscale, the stand-in finds a pair the
+usual way and the world shows; back at 1:1 there is no pair and the frame is black again.
+
+The trace texts now carry sizes and formats only (addresses rotate every frame and would use the
+lines up), 64 lines per program, so a change of the network's input size is one line each way:
+"program handles: 1600x900 format 32 -> 1920x1080 format 33, blitted" against "no pair (...):
+r@0xc0 1920x1080 format 32 ... w@0xd0 1920x1080 format 33". The once-per-program handle inventory
+keeps the addresses. Default behaviour unchanged. Clang syntax check, no warnings; not built, not
+run.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/kepler_compute.cpp | 24 ++++++++++++++---------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index b7e1e00df4..7364d0c455 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -1148,19 +1148,22 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             }
+         }
+     }
+-    // The trace: one line per change of a program's outcome, at most 24 per program (T21's one
+-    // cap of 256 lines went to the ten movie programs before gameplay began).
++    // The trace: one line per change of a program's outcome, at most 64 per program (T21's one
++    // cap of 256 lines went to the ten movie programs before gameplay began). The text names
++    // sizes and formats, not addresses: a game's output images rotate every frame, and a world
++    // that comes and goes with the game's own resolution (an upscale pair when the 3D size
++    // drops under load, none at 1:1) must show as a change of sizes, not drown in addresses.
+     const auto trace_outcome = [&](std::string text) {
+         static std::unordered_map<GPUVAddr, std::pair<std::string, u32>> last;
+         auto& [previous, count] = last[program_address];
+-        if (previous == text || count >= 24) return;
++        if (previous == text || count >= 64) return;
+         ++count;
+         previous = std::move(text);
+         LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program_address, previous);
+     };
+     // The program's own handle slots as they stand at this dispatch: what the network reads and
+     // writes (sizes and formats), and why a slot gives no image.
+-    const auto slots_text = [&]() {
++    const auto slots_text = [&](bool addresses) {
+         const auto [reads, stores] = NativeImageHandles(program_address);
+         std::string text;
+         u32 listed = 0;
+@@ -1168,7 +1171,8 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             if (listed++ >= 12) return;
+             const u32 handle = memory_manager.Read<u32>(cbuf_address + slot);
+             const u32 tic_index = handle & 0xfffff;
+-            text += fmt::format(" {}@{:#x} tic {}", kind, slot, tic_index);
++            text += addresses ? fmt::format(" {}@{:#x} tic {}", kind, slot, tic_index)
++                              : fmt::format(" {}@{:#x}", kind, slot);
+             if (handle == 0) {
+                 text += " (zero)";
+                 return;
+@@ -1181,7 +1185,8 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+                 return;
+             }
+             const auto tic = GetTICEntry(tic_index);
+-            text += fmt::format(" {:#x} {}x{} format {}{}", tic.Address(), tic.Width(), tic.Height(),
++            if (addresses) text += fmt::format(" {:#x}", tic.Address());
++            text += fmt::format(" {}x{} format {}{}", tic.Width(), tic.Height(),
+                                 static_cast<u32>(tic.format.Value()),
+                                 tic.IsBlockLinear() ? "" : " pitch");
+         };
+@@ -1191,13 +1196,14 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         return text;
+     };
+     const auto describe = [](const std::optional<Texture::TICEntry>& tic) {
+-        return tic ? fmt::format("{:#x} {}x{} format {}", tic->Address(), tic->Width(), tic->Height(),
++        return tic ? fmt::format("{}x{} format {}", tic->Width(), tic->Height(),
+                                  static_cast<u32>(tic->format.Value()))
+                    : std::string{"none"};
+     };
+     if (trace && (!input || !output)) {
+         trace_outcome(fmt::format("no pair (tic limit {}, cbuf0 size {:#x}):{}",
+-                                  static_cast<u32>(regs.tic.limit), cbuf.size.Value(), slots_text()));
++                                  static_cast<u32>(regs.tic.limit), cbuf.size.Value(),
++                                  slots_text(false)));
+     }
+     const auto skip = [&](std::string_view reason) {
+         static std::unordered_set<GPUVAddr> reported;
+@@ -1373,7 +1379,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         const bool first = inventoried.insert(program_address).second;
+         trace_outcome(fmt::format("{}: {} -> {}, {}{}{}", step, describe(input), describe(output),
+                                   done ? "blitted" : "not accelerated", first ? "; handles:" : "",
+-                                  first ? slots_text() : std::string{}));
++                                  first ? slots_text(true) : std::string{}));
+     }
+     if (checked[program_address]++ == sample_at) {
+         const u64 size = u64{output->Width()} * output->Height() * 4;

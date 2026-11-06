@@ -1,0 +1,127 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0402-black-world-03-upscale-trace-per-program.patch
+
+Source: 0402-black-world-03-upscale-trace-per-program.patch
+network's handle inventory
+
+T21 (runs 78, 79): EDEN_NX2_UPSCALE_TRACE's one cap of 256 lines was used up at 35-39 s by the ten
+movie programs, because the text carried the cbuf0 address, which changes every dispatch. Not one
+line was left for the gameplay program (first HMMA at 0xc00), whose outcomes were the point.
+Likewise EDEN_NX2_SAMPLE_AT (20th blit) and EDEN_NX2_TRACE_AFTER_UPSCALE (30th blit) count all
+programs together, so the movies' blits spent them before gameplay.
+
+- The trace text no longer names the cbuf0 address, and each program gets up to 24 lines of its
+  own.
+- A program's first paired outcome also lists its handle inventory: every texture handle the
+  program reads and every surface it stores to, with address, size and format ("; handles:
+  r@0xc0 tic 1234 0x8114001000 2560x1440 format 32 ... w@0xd0 ..."). That names what the
+  network reads besides the drawn frame (a history, a 1920x1080 image, motion vectors) and so
+  which image run75's one-time plain copy can have shown.
+- The 20th-blit sampling and the 30th-blit draw trace (40 draws after the upscale, with their
+  render targets and sampled handles: what the game reads after the network) count per program.
+
+Behaviour without the switches is unchanged. Clang syntax check, no warnings, on the T20 tree
+with black-world-01 and 02. Not built, not run.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/kepler_compute.cpp | 54 ++++++++++++++---------
+ 1 file changed, 32 insertions(+), 22 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 8c4cbc3090..b7e1e00df4 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -1148,26 +1148,21 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             }
+         }
+     }
+-    // The trace: one line per change of a program's outcome.
++    // The trace: one line per change of a program's outcome, at most 24 per program (T21's one
++    // cap of 256 lines went to the ten movie programs before gameplay began).
+     const auto trace_outcome = [&](std::string text) {
+-        static std::unordered_map<GPUVAddr, std::string> last;
+-        static u32 lines{};
+-        std::string& previous = last[program_address];
+-        if (previous == text || lines >= 256) return;
+-        ++lines;
++        static std::unordered_map<GPUVAddr, std::pair<std::string, u32>> last;
++        auto& [previous, count] = last[program_address];
++        if (previous == text || count >= 24) return;
++        ++count;
+         previous = std::move(text);
+         LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program_address, previous);
+     };
+-    const auto describe = [](const std::optional<Texture::TICEntry>& tic) {
+-        return tic ? fmt::format("{:#x} {}x{} format {}", tic->Address(), tic->Width(), tic->Height(),
+-                                 static_cast<u32>(tic->format.Value()))
+-                   : std::string{"none"};
+-    };
+-    if (trace && (!input || !output)) {
+-        // Why not: the program's own handle slots, as they stand at this dispatch.
++    // The program's own handle slots as they stand at this dispatch: what the network reads and
++    // writes (sizes and formats), and why a slot gives no image.
++    const auto slots_text = [&]() {
+         const auto [reads, stores] = NativeImageHandles(program_address);
+-        std::string text = fmt::format("no pair (tic limit {}, cbuf0 {:#x} size {:#x}):",
+-                                       static_cast<u32>(regs.tic.limit), cbuf_address, cbuf.size.Value());
++        std::string text;
+         u32 listed = 0;
+         const auto describe_slot = [&](char kind, u32 slot) {
+             if (listed++ >= 12) return;
+@@ -1193,7 +1188,16 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         for (const u32 read : reads) describe_slot('r', read);
+         for (const u32 store : stores) describe_slot('w', store);
+         if (reads.empty() && stores.empty()) text += " no handles in the program's code";
+-        trace_outcome(std::move(text));
++        return text;
++    };
++    const auto describe = [](const std::optional<Texture::TICEntry>& tic) {
++        return tic ? fmt::format("{:#x} {}x{} format {}", tic->Address(), tic->Width(), tic->Height(),
++                                 static_cast<u32>(tic->format.Value()))
++                   : std::string{"none"};
++    };
++    if (trace && (!input || !output)) {
++        trace_outcome(fmt::format("no pair (tic limit {}, cbuf0 size {:#x}):{}",
++                                  static_cast<u32>(regs.tic.limit), cbuf.size.Value(), slots_text()));
+     }
+     const auto skip = [&](std::string_view reason) {
+         static std::unordered_set<GPUVAddr> reported;
+@@ -1281,7 +1285,9 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         const char* value = std::getenv("EDEN_NX2_SAMPLE_AT");
+         return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 20U;
+     }();
+-    if (static u32 sampled{}; sampled++ == sample_at) {
++    // Per program: the movie programs' blits used the one count up before gameplay (T21).
++    static std::unordered_map<GPUVAddr, u32> sampled, checked, blits;
++    if (sampled[program_address]++ == sample_at) {
+         const auto sample = [&](const Texture::TICEntry& tic) {
+             const u64 size = u64{tic.Width()} * tic.Height() * 4;
+             if (const auto device = memory_manager.GpuToCpuAddress(tic.Address())) {
+@@ -1362,10 +1368,14 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+                       rasterizer->AccelerateSurfaceCopy(source, surface(*output), config);
+     VideoCommon::g_blit_source_format.reset();
+     if (trace) {
+-        trace_outcome(fmt::format("{}: {} -> {}, {}", step, describe(input), describe(output),
+-                                  done ? "blitted" : "not accelerated"));
+-    }
+-    if (static u32 checked{}; checked++ == sample_at) {
++        // The first pair of a program comes with its handle inventory: what the network reads.
++        static std::unordered_set<GPUVAddr> inventoried;
++        const bool first = inventoried.insert(program_address).second;
++        trace_outcome(fmt::format("{}: {} -> {}, {}{}{}", step, describe(input), describe(output),
++                                  done ? "blitted" : "not accelerated", first ? "; handles:" : "",
++                                  first ? slots_text() : std::string{}));
++    }
++    if (checked[program_address]++ == sample_at) {
+         const u64 size = u64{output->Width()} * output->Height() * 4;
+         if (const auto device = memory_manager.GpuToCpuAddress(output->Address())) {
+             rasterizer->FlushRegion(*device, size, VideoCommon::CacheType::All);
+@@ -1386,7 +1396,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         const char* value = std::getenv("EDEN_NX2_TRACE_AFTER_UPSCALE");
+         return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 30U;
+     }();
+-    if (static u32 count{}; ++count == trace_at) g_nx2_trace_draws_after_upscale = 40;
++    if (++blits[program_address] == trace_at) g_nx2_trace_draws_after_upscale = 40;
+     static u32 logged{};
+     if (logged++ < 4) {
+         LOG_INFO(HW_GPU, "Upscale fallback {:#x} {}x{} block {}/{}/{} -> {:#x} {}x{} block {}/{}/{} levels {}: {}",

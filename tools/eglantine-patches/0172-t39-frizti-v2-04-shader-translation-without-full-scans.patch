@@ -1,0 +1,116 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0388-frizti-v2-04-shader-translation-without-full-scans.patch
+
+Source: 0388-frizti-v2-04-shader-translation-without-full-scans.patch
+shader: find visited blocks and sibling order without full list scans (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone.
+
+Source: Frizti/Lichii f8f29b5769 (Lichii #71, by Zortos with capy-ai), the shader part only.
+
+EDEN_NX2_SHADER_FAST_SCAN=1. CFG::InspectVisitedBlocks scanned every block of the function for each
+label, and AreOrdered walked every statement after the right sibling, so both grew with the square
+of the program size. On PC one 253k-word Kirby compute shader took 1.6 s, a third in each. Blocks
+never overlap, so an ordered lookup finds the one that holds pc, and walking from both siblings at
+once costs only the shorter walk. Same answers, less time.
+
+Why here: pipelines translate on the GPU thread, and each one stalls it; Zen 2 pays more per scan.
+Ocarina's share is unknown: its programs are smaller than that Kirby shader.
+
+Changed from the source: off by default, there always on. Old code kept for the switch. Includes
+<cstdlib> and <iterator>, which the new lines use.
+
+Runs on the PS5: same core path.
+Hang: none. AreOrdered stops at the list end either way, a finite walk.
+Pool memory: none.
+Checked: applies on core16. PS5-target syntax compile of both files, no errors. Same logic against the
+old scans: AreOrdered 38,024 pairs, block lookup 1.2 million queries, 0 differences. These tests ran
+the logic on plain containers, not boost's intrusive ones. Not run on the console.
+
+Co-authored-by: Zortos <zortosdev@proton.me>
+Co-authored-by: capy-ai[bot] <230910855+capy-ai[bot]@users.noreply.github.com>
+
+diff --git a/src/shader_recompiler/frontend/maxwell/control_flow.cpp b/src/shader_recompiler/frontend/maxwell/control_flow.cpp
+index 9fb30df664..f657c23c8d 100644
+--- a/src/shader_recompiler/frontend/maxwell/control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/control_flow.cpp
+@@ -5,6 +5,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <iterator>
+ #include <array>
+ #include <optional>
+ #include <string>
+@@ -256,8 +258,24 @@ void CFG::AnalyzeLabel(FunctionId function_id, Label& label) {
+ bool CFG::InspectVisitedBlocks(FunctionId function_id, const Label& label) {
+     const Location pc{label.address};
+     Function& function{functions[function_id]};
+-    const auto it{
+-        std::ranges::find_if(function.blocks, [pc](auto& block) { return block.Contains(pc); })};
++    // EDEN_NX2_SHADER_FAST_SCAN=1: blocks never overlap, so only the last one starting at or
++    // before pc can contain it. A function-local static: env.txt is read in main.
++    static const bool fast_scan = [] {
++        const char* const value = std::getenv("EDEN_NX2_SHADER_FAST_SCAN");
++        return value != nullptr && value[0] == '1';
++    }();
++    auto it{function.blocks.end()};
++    if (fast_scan) {
++        it = function.blocks.upper_bound(pc, Compare{});
++        if (it == function.blocks.begin() || !std::prev(it)->Contains(pc)) {
++            it = function.blocks.end();
++        } else {
++            --it;
++        }
++    } else {
++        it = std::ranges::find_if(function.blocks,
++                                  [pc](auto& block) { return block.Contains(pc); });
++    }
+     if (it == function.blocks.end()) {
+         // Address has not been visited
+         return false;
+diff --git a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+index 7a31d035d1..6d97f95dd5 100644
+--- a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <memory>
+ #include <string>
+ #include "common/container/unordered_map.h"
+@@ -299,6 +300,31 @@ Node SiblingFromNephew(Node uncle, Node nephew) noexcept {
+ 
+ bool AreOrdered(Node left_sibling, Node right_sibling) noexcept {
+     const Node end{right_sibling->up->children.end()};
++    // EDEN_NX2_SHADER_FAST_SCAN=1: walk forward from both siblings at once. Whichever meets the
++    // other or the end first decides, so the cost is the shorter walk.
++    static const bool fast_scan = [] {
++        const char* const value = std::getenv("EDEN_NX2_SHADER_FAST_SCAN");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (fast_scan) {
++        if (left_sibling == right_sibling) {
++            return false;
++        }
++        for (Node left = left_sibling, right = right_sibling;;) {
++            if (++right == left_sibling) {
++                return false;
++            }
++            if (right == end) {
++                return true;
++            }
++            if (++left == right_sibling) {
++                return true;
++            }
++            if (left == end) {
++                return false;
++            }
++        }
++    }
+     for (auto it = right_sibling; it != end; ++it) {
+         if (it == left_sibling) {
+             return false;

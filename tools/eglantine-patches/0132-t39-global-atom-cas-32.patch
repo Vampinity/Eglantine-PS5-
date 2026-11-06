@@ -1,0 +1,478 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0144-global-atom-cas-32.patch
+
+Source: 0144-global-atom-cas-32.patch
+shader_recompiler: implement 32-bit global ATOM.CAS
+
+compute shader using it failed to build (FINAL FANTASY RESONANCE there).
+
+ATOM.CAS Rd, [Ra + imm], Rb compares the word with Rb, stores Rb+1 on a match and returns
+the old word. Adds GlobalAtomicCompareExchange32 and StorageAtomicCompareExchange32, the
+global-to-storage step with both operands, SPIR-V OpAtomicCompareExchange and GLSL
+atomicCompSwap. GLASM, 64-bit CAS, ATOMS.CAS and SUATOM.CAS still throw.
+
+META_TABLE and NUM_ARGS were sized by hand (539 here); they are sized by NUM_OPCODES now.
+
+Changed from the PR: our routing of untracked global atomics is a different one
+(global_atomic_funcs, define_body with three callback arguments), so the routed CAS is
+written against it. Its address and operands arrive as Ids, as in our other global
+atomics. As in the PR, a CAS with no matching buffer reports success, so that a guest
+retry loop cannot spin for ever.
+
+This is the Switch 1 style Maxwell path: the Ampere lowering emits no ATOM.CAS, so
+Ocarina and Mario Kart World do not reach it through lowered programs.
+
+diff --git a/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h b/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
+index 1d369a4128..994d46f9e3 100644
+--- a/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
++++ b/src/shader_recompiler/backend/glasm/emit_glasm_instructions.h
+@@ -408,6 +408,7 @@ void EmitStorageAtomicXor32(EmitContext& ctx, IR::Inst& inst, const IR::Value& b
+                             ScalarU32 offset, ScalarU32 value);
+ void EmitStorageAtomicExchange32(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                                  ScalarU32 offset, ScalarU32 value);
++void EmitStorageAtomicCompareExchange32(EmitContext& ctx);
+ void EmitStorageAtomicIAdd64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                              ScalarU32 offset, Register value);
+ void EmitStorageAtomicSMin64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+@@ -469,6 +470,7 @@ void EmitGlobalAtomicAnd32(EmitContext& ctx);
+ void EmitGlobalAtomicOr32(EmitContext& ctx);
+ void EmitGlobalAtomicXor32(EmitContext& ctx);
+ void EmitGlobalAtomicExchange32(EmitContext& ctx);
++void EmitGlobalAtomicCompareExchange32(EmitContext& ctx);
+ void EmitGlobalAtomicIAdd64(EmitContext& ctx);
+ void EmitGlobalAtomicSMin64(EmitContext& ctx);
+ void EmitGlobalAtomicUMin64(EmitContext& ctx);
+diff --git a/src/shader_recompiler/backend/glasm/emit_glasm_memory.cpp b/src/shader_recompiler/backend/glasm/emit_glasm_memory.cpp
+index 4425c5bc9c..207279980b 100644
+--- a/src/shader_recompiler/backend/glasm/emit_glasm_memory.cpp
++++ b/src/shader_recompiler/backend/glasm/emit_glasm_memory.cpp
+@@ -557,6 +557,14 @@ void EmitGlobalAtomicExchange32(EmitContext&) {
+     throw NotImplementedException("GLASM instruction");
+ }
+ 
++void EmitGlobalAtomicCompareExchange32(EmitContext&) {
++    throw NotImplementedException("GLASM instruction");
++}
++
++void EmitStorageAtomicCompareExchange32(EmitContext&) {
++    throw NotImplementedException("GLASM instruction");
++}
++
+ void EmitGlobalAtomicIAdd64(EmitContext&) {
+     throw NotImplementedException("GLASM instruction");
+ }
+diff --git a/src/shader_recompiler/backend/glsl/emit_glsl_atomic.cpp b/src/shader_recompiler/backend/glsl/emit_glsl_atomic.cpp
+index 376a058277..14acc7b2a3 100644
+--- a/src/shader_recompiler/backend/glsl/emit_glsl_atomic.cpp
++++ b/src/shader_recompiler/backend/glsl/emit_glsl_atomic.cpp
+@@ -175,6 +175,14 @@ void EmitStorageAtomicExchange32(EmitContext& ctx, IR::Inst& inst, const IR::Val
+                ctx.var_alloc.Consume(offset), value);
+ }
+ 
++/// Stores value if the storage word equals comparator; returns the old word.
++void EmitStorageAtomicCompareExchange32(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
++                                        const IR::Value& offset, std::string_view comparator,
++                                        std::string_view value) {
++    ctx.AddU32("{}=atomicCompSwap({}_ssbo{}[{}>>2],{},{});", inst, ctx.stage_name, binding.U32(),
++               ctx.var_alloc.Consume(offset), comparator, value);
++}
++
+ void EmitStorageAtomicIAdd64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                              const IR::Value& offset, std::string_view value) {
+     LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
+@@ -441,6 +449,10 @@ void EmitGlobalAtomicExchange32(EmitContext&) {
+     throw NotImplementedException("GLSL Instruction");
+ }
+ 
++void EmitGlobalAtomicCompareExchange32(EmitContext&) {
++    throw NotImplementedException("GLSL Instruction");
++}
++
+ void EmitGlobalAtomicIAdd64(EmitContext&) {
+     throw NotImplementedException("GLSL Instruction");
+ }
+diff --git a/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h b/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
+index 0fec2dee6c..0df361b59b 100644
+--- a/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
++++ b/src/shader_recompiler/backend/glsl/emit_glsl_instructions.h
+@@ -478,6 +478,9 @@ void EmitStorageAtomicXor32(EmitContext& ctx, IR::Inst& inst, const IR::Value& b
+                             const IR::Value& offset, std::string_view value);
+ void EmitStorageAtomicExchange32(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                                  const IR::Value& offset, std::string_view value);
++void EmitStorageAtomicCompareExchange32(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
++                                        const IR::Value& offset, std::string_view comparator,
++                                        std::string_view value);
+ void EmitStorageAtomicIAdd64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                              const IR::Value& offset, std::string_view value);
+ void EmitStorageAtomicSMin64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+@@ -539,6 +542,7 @@ void EmitGlobalAtomicAnd32(EmitContext& ctx);
+ void EmitGlobalAtomicOr32(EmitContext& ctx);
+ void EmitGlobalAtomicXor32(EmitContext& ctx);
+ void EmitGlobalAtomicExchange32(EmitContext& ctx);
++void EmitGlobalAtomicCompareExchange32(EmitContext& ctx);
+ void EmitGlobalAtomicIAdd64(EmitContext& ctx);
+ void EmitGlobalAtomicSMin64(EmitContext& ctx);
+ void EmitGlobalAtomicUMin64(EmitContext& ctx);
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+index 704c886df4..28f0d1245b 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+@@ -256,6 +256,16 @@ Id EmitStorageAtomicExchange32(EmitContext& ctx, const IR::Value& binding, const
+     return StorageAtomicU32(ctx, binding, offset, value, &Sirit::Module::OpAtomicExchange);
+ }
+ 
++/// Stores value if the storage word equals comparator; returns the old word.
++Id EmitStorageAtomicCompareExchange32(EmitContext& ctx, const IR::Value& binding,
++                                      const IR::Value& offset, Id comparator, Id value) {
++    const Id pointer{StoragePointer(ctx, ctx.storage_types.U32, &StorageDefinitions::U32, binding,
++                                    offset, sizeof(u32))};
++    const auto [scope, semantics]{AtomicArgs(ctx)};
++    return ctx.OpAtomicCompareExchange(ctx.U32[1], pointer, scope, semantics, semantics, value,
++                                       comparator);
++}
++
+ Id EmitStorageAtomicIAdd64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                            Id value) {
+     return StorageAtomicU64(ctx, binding, offset, value, &Sirit::Module::OpAtomicIAdd,
+@@ -469,6 +479,15 @@ Id EmitGlobalAtomicExchange32(EmitContext& ctx, Id address, Id value) {
+     return GlobalAtomic(ctx, EmitContext::GlobalAtomic::Exchange, ctx.U32[1], address, value);
+ }
+ 
++/// Global compare-exchange through the routing function; returns the old word.
++Id EmitGlobalAtomicCompareExchange32(EmitContext& ctx, Id address, Id comparator, Id value) {
++    if (!Sirit::ValidId(ctx.atomic_cas_global_func_u32)) {
++        throw NotImplementedException("SPIR-V Instruction");
++    }
++    return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_cas_global_func_u32, address, comparator,
++                              value);
++}
++
+ Id EmitGlobalAtomicIAdd64(EmitContext&) {
+     throw NotImplementedException("SPIR-V Instruction");
+ }
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+index 325dc22a2f..37f8e05b07 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+@@ -372,6 +372,8 @@ Id EmitStorageAtomicXor32(EmitContext& ctx, const IR::Value& binding, const IR::
+                           Id value);
+ Id EmitStorageAtomicExchange32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                                Id value);
++Id EmitStorageAtomicCompareExchange32(EmitContext& ctx, const IR::Value& binding,
++                                      const IR::Value& offset, Id comparator, Id value);
+ Id EmitStorageAtomicIAdd64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                            Id value);
+ Id EmitStorageAtomicSMin64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+@@ -433,6 +435,7 @@ Id EmitGlobalAtomicAnd32(EmitContext& ctx, Id address, Id value);
+ Id EmitGlobalAtomicOr32(EmitContext& ctx, Id address, Id value);
+ Id EmitGlobalAtomicXor32(EmitContext& ctx, Id address, Id value);
+ Id EmitGlobalAtomicExchange32(EmitContext& ctx, Id address, Id value);
++Id EmitGlobalAtomicCompareExchange32(EmitContext& ctx, Id address, Id comparator, Id value);
+ Id EmitGlobalAtomicIAdd64(EmitContext& ctx);
+ Id EmitGlobalAtomicSMin64(EmitContext& ctx);
+ Id EmitGlobalAtomicUMin64(EmitContext& ctx);
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 196f21d1aa..54cdc7ec80 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1084,11 +1084,13 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+         }
+     };
+     std::array<bool, static_cast<size_t>(Count)> used{};
++    bool uses_compare_exchange = false;
+     for (const IR::Block* const block : program.blocks) {
+         for (const IR::Inst& inst : block->Instructions()) {
+             if (const auto kind = kind_of(inst.GetOpcode())) {
+                 used[static_cast<size_t>(*kind)] = true;
+             }
++            uses_compare_exchange |= inst.GetOpcode() == IR::Opcode::GlobalAtomicCompareExchange32;
+         }
+     }
+     const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+@@ -1146,6 +1148,22 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+         OpFunctionEnd();
+         global_atomic_funcs[index] = func_id;
+     }
++    if (uses_compare_exchange) {
++        const Id func_id{OpFunction(U32[1], spv::FunctionControlMask::MaskNone,
++                                    TypeFunction(U32[1], U64, U32[1], U32[1]))};
++        const Id addr{OpFunctionParameter(U64)};
++        const Id comparator{OpFunctionParameter(U32[1])};
++        const Id value{OpFunctionParameter(U32[1])};
++        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
++                    [&](Id pointer, Id, Id) {
++                        OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope, zero, zero,
++                                                              value, comparator));
++                    });
++        // No buffer matched: report success so a guest CAS retry loop cannot spin forever.
++        OpReturnValue(comparator);
++        OpFunctionEnd();
++        atomic_cas_global_func_u32 = func_id;
++    }
+ }
+ 
+ void EmitContext::DefineRescalingInput(const Info& info) {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index a47a903ae7..ea47ceb214 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -348,6 +348,7 @@ public:
+         IAdd, SMin, UMin, SMax, UMax, Inc, Dec, And, Or, Xor, Exchange, AddF32, Count,
+     };
+     std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> global_atomic_funcs{};
++    Id atomic_cas_global_func_u32{};
+ 
+     bool need_input_position_indirect{};
+     Id input_position{};
+diff --git a/src/shader_recompiler/frontend/ir/ir_emitter.cpp b/src/shader_recompiler/frontend/ir/ir_emitter.cpp
+index 7c4efc8a29..2a20ac2646 100644
+--- a/src/shader_recompiler/frontend/ir/ir_emitter.cpp
++++ b/src/shader_recompiler/frontend/ir/ir_emitter.cpp
+@@ -1548,6 +1548,12 @@ U32U64 IREmitter::GlobalAtomicExchange(const U64& pointer_offset, const U32U64&
+     }
+ }
+ 
++/// Stores value at the address if the word there equals comparator; returns the old word.
++U32 IREmitter::GlobalAtomicCompareExchange(const U64& pointer_offset, const U32& comparator,
++                                           const U32& value) {
++    return Inst<U32>(Opcode::GlobalAtomicCompareExchange32, pointer_offset, comparator, value);
++}
++
+ F32 IREmitter::GlobalAtomicF32Add(const U64& pointer_offset, const Value& value,
+                                   const FpControl control) {
+     return Inst<F32>(Opcode::GlobalAtomicAddF32, Flags{control}, pointer_offset, value);
+diff --git a/src/shader_recompiler/frontend/ir/ir_emitter.h b/src/shader_recompiler/frontend/ir/ir_emitter.h
+index bca5ad425f..672c5960e7 100644
+--- a/src/shader_recompiler/frontend/ir/ir_emitter.h
++++ b/src/shader_recompiler/frontend/ir/ir_emitter.h
+@@ -289,6 +289,8 @@ public:
+     [[nodiscard]] U32U64 GlobalAtomicOr(const U64& pointer_offset, const U32U64& value);
+     [[nodiscard]] U32U64 GlobalAtomicXor(const U64& pointer_offset, const U32U64& value);
+     [[nodiscard]] U32U64 GlobalAtomicExchange(const U64& pointer_offset, const U32U64& value);
++    [[nodiscard]] U32 GlobalAtomicCompareExchange(const U64& pointer_offset, const U32& comparator,
++                                                  const U32& value);
+ 
+     [[nodiscard]] F32 GlobalAtomicF32Add(const U64& pointer_offset, const Value& value,
+                                          const FpControl control = {});
+diff --git a/src/shader_recompiler/frontend/ir/microinstruction.cpp b/src/shader_recompiler/frontend/ir/microinstruction.cpp
+index a579ed1057..0d10b28eb2 100644
+--- a/src/shader_recompiler/frontend/ir/microinstruction.cpp
++++ b/src/shader_recompiler/frontend/ir/microinstruction.cpp
+@@ -65,6 +65,7 @@ Inst::~Inst() {
+     }
+ }
+ 
++/// Returns true when the instruction must be kept even if its result is unused
+ bool Inst::MayHaveSideEffects() const noexcept {
+     switch (op) {
+     case Opcode::ConditionRef:
+@@ -132,6 +133,7 @@ bool Inst::MayHaveSideEffects() const noexcept {
+     case Opcode::GlobalAtomicOr32:
+     case Opcode::GlobalAtomicXor32:
+     case Opcode::GlobalAtomicExchange32:
++    case Opcode::GlobalAtomicCompareExchange32:
+     case Opcode::GlobalAtomicIAdd64:
+     case Opcode::GlobalAtomicSMin64:
+     case Opcode::GlobalAtomicUMin64:
+@@ -168,6 +170,7 @@ bool Inst::MayHaveSideEffects() const noexcept {
+     case Opcode::StorageAtomicOr32:
+     case Opcode::StorageAtomicXor32:
+     case Opcode::StorageAtomicExchange32:
++    case Opcode::StorageAtomicCompareExchange32:
+     case Opcode::StorageAtomicIAdd64:
+     case Opcode::StorageAtomicSMin64:
+     case Opcode::StorageAtomicUMin64:
+diff --git a/src/shader_recompiler/frontend/ir/opcodes.cpp b/src/shader_recompiler/frontend/ir/opcodes.cpp
+index 03192d4dc9..edefd61275 100644
+--- a/src/shader_recompiler/frontend/ir/opcodes.cpp
++++ b/src/shader_recompiler/frontend/ir/opcodes.cpp
+@@ -10,7 +10,7 @@ namespace Shader::IR {
+ 
+ namespace Detail {
+ 
+-OpcodeMeta META_TABLE[539] = {
++OpcodeMeta META_TABLE[NUM_OPCODES] = {
+ #define OPCODE(name_token, type_token, ...)                                                        \
+     {                                                                                              \
+         .name{#name_token},                                                                        \
+@@ -21,7 +21,7 @@ OpcodeMeta META_TABLE[539] = {
+ #undef OPCODE
+ };
+ 
+-u8 NUM_ARGS[539] = {
++u8 NUM_ARGS[NUM_OPCODES] = {
+ #define OPCODE(name_token, type_token, ...) u8(CalculateNumArgsOf(Opcode::name_token)),
+ #include "opcodes.inc"
+ #undef OPCODE
+diff --git a/src/shader_recompiler/frontend/ir/opcodes.h b/src/shader_recompiler/frontend/ir/opcodes.h
+index dc7dffa130..c9a081cdd5 100644
+--- a/src/shader_recompiler/frontend/ir/opcodes.h
++++ b/src/shader_recompiler/frontend/ir/opcodes.h
+@@ -22,6 +22,12 @@ enum class Opcode {
+ #undef OPCODE
+ };
+ 
++inline constexpr size_t NUM_OPCODES = 0
++#define OPCODE(...) +1
++#include "opcodes.inc"
++#undef OPCODE
++    ;
++
+ namespace Detail {
+ struct OpcodeMeta {
+     std::string_view name;
+@@ -57,12 +63,12 @@ static constexpr Type F64x2{Type::F64x2};
+ static constexpr Type F64x3{Type::F64x3};
+ static constexpr Type F64x4{Type::F64x4};
+ 
+-extern OpcodeMeta META_TABLE[539];
++extern OpcodeMeta META_TABLE[NUM_OPCODES];
+ constexpr size_t CalculateNumArgsOf(Opcode op) noexcept {
+     const auto& arg_types = META_TABLE[size_t(op)].arg_types;
+     return size_t(std::distance(arg_types.begin(), std::ranges::find(arg_types, Type::Void)));
+ }
+-extern u8 NUM_ARGS[539];
++extern u8 NUM_ARGS[NUM_OPCODES];
+ } // namespace Detail
+ 
+ /// Get return type of an opcode
+diff --git a/src/shader_recompiler/frontend/ir/opcodes.inc b/src/shader_recompiler/frontend/ir/opcodes.inc
+index d36b8e1352..890db69209 100644
+--- a/src/shader_recompiler/frontend/ir/opcodes.inc
++++ b/src/shader_recompiler/frontend/ir/opcodes.inc
+@@ -366,6 +366,7 @@ OPCODE(GlobalAtomicAnd32,                                   U32,            U64,
+ OPCODE(GlobalAtomicOr32,                                    U32,            U64,            U32,                                                            )
+ OPCODE(GlobalAtomicXor32,                                   U32,            U64,            U32,                                                            )
+ OPCODE(GlobalAtomicExchange32,                              U32,            U64,            U32,                                                            )
++OPCODE(GlobalAtomicCompareExchange32,                       U32,            U64,            U32,            U32,                                            )
+ OPCODE(GlobalAtomicIAdd64,                                  U64,            U64,            U64,                                                            )
+ OPCODE(GlobalAtomicSMin64,                                  U64,            U64,            U64,                                                            )
+ OPCODE(GlobalAtomicUMin64,                                  U64,            U64,            U64,                                                            )
+@@ -403,6 +404,7 @@ OPCODE(StorageAtomicAnd32,                                  U32,            U32,
+ OPCODE(StorageAtomicOr32,                                   U32,            U32,            U32,            U32,                                            )
+ OPCODE(StorageAtomicXor32,                                  U32,            U32,            U32,            U32,                                            )
+ OPCODE(StorageAtomicExchange32,                             U32,            U32,            U32,            U32,                                            )
++OPCODE(StorageAtomicCompareExchange32,                      U32,            U32,            U32,            U32,            U32,                            )
+ OPCODE(StorageAtomicIAdd64,                                 U64,            U32,            U32,            U64,                                            )
+ OPCODE(StorageAtomicSMin64,                                 U64,            U32,            U32,            U64,                                            )
+ OPCODE(StorageAtomicUMin64,                                 U64,            U32,            U32,            U64,                                            )
+diff --git a/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp
+index 75087777dd..6cd738cbb3 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/atomic_operations_global_memory.cpp
+@@ -201,6 +201,25 @@ void TranslatorVisitor::ATOM(u64 insn) {
+     GlobalAtomic(*this, atom.dest_reg, atom.operand_reg, offset, atom.size, atom.op, true);
+ }
+ 
++/// ATOM.CAS Rd, [Ra + imm], Rb: if the word equals Rb, store Rb+1; Rd gets the old word.
++void TranslatorVisitor::ATOM_cas(u64 insn) {
++    union {
++        u64 raw;
++        BitField<0, 8, IR::Reg> dest_reg;
++        BitField<20, 8, IR::Reg> compare_reg;
++        BitField<49, 3, u64> size;
++    } const atom{insn};
++    if (atom.size != 0) {
++        throw NotImplementedException("ATOM.CAS size {}", atom.size.Value());
++    }
++    const IR::U64 offset{AtomOffset(*this, insn)};
++    // The register after R254 is RZ; IR::Reg arithmetic refuses to step onto it.
++    const IR::Reg value_reg{atom.compare_reg == IR::Reg::R254 ? IR::Reg::RZ
++                                                               : atom.compare_reg + 1};
++    X(atom.dest_reg,
++      ir.GlobalAtomicCompareExchange(offset, X(atom.compare_reg), X(value_reg)));
++}
++
+ void TranslatorVisitor::RED(u64 insn) {
+     union {
+         u64 raw;
+diff --git a/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp b/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp
+index 369af8e03a..02553558a8 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate/impl/not_implemented.cpp
+@@ -15,10 +15,6 @@ namespace Shader::Maxwell {
+     throw NotImplementedException("Instruction {} is not implemented", opcode);
+ }
+ 
+-void TranslatorVisitor::ATOM_cas(u64) {
+-    ThrowNotImplemented(Opcode::ATOM_cas);
+-}
+-
+ void TranslatorVisitor::ATOMS_cas(u64) {
+     ThrowNotImplemented(Opcode::ATOMS_cas);
+ }
+diff --git a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+index c212a25d37..6bf28fa380 100644
+--- a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
++++ b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+@@ -388,6 +388,7 @@ void VisitUsages(Info& info, IR::Inst& inst) {
+     case IR::Opcode::GlobalAtomicOr32:
+     case IR::Opcode::GlobalAtomicXor32:
+     case IR::Opcode::GlobalAtomicExchange32:
++    case IR::Opcode::GlobalAtomicCompareExchange32:
+     case IR::Opcode::GlobalAtomicIAdd64:
+     case IR::Opcode::GlobalAtomicSMin64:
+     case IR::Opcode::GlobalAtomicUMin64:
+@@ -630,6 +631,7 @@ void VisitUsages(Info& info, IR::Inst& inst) {
+     case IR::Opcode::StorageAtomicOr32:
+     case IR::Opcode::StorageAtomicXor32:
+     case IR::Opcode::StorageAtomicExchange32:
++    case IR::Opcode::StorageAtomicCompareExchange32:
+         info.used_storage_buffer_types |= IR::Type::U32;
+         break;
+     case IR::Opcode::LoadStorage64:
+diff --git a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+index be8fe61570..a6ede6f9e2 100644
+--- a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
++++ b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+@@ -96,6 +96,7 @@ bool IsGlobalMemory(const IR::Inst& inst) {
+     case IR::Opcode::GlobalAtomicOr32:
+     case IR::Opcode::GlobalAtomicXor32:
+     case IR::Opcode::GlobalAtomicExchange32:
++    case IR::Opcode::GlobalAtomicCompareExchange32:
+     case IR::Opcode::GlobalAtomicIAdd64:
+     case IR::Opcode::GlobalAtomicSMin64:
+     case IR::Opcode::GlobalAtomicUMin64:
+@@ -148,6 +149,7 @@ bool IsGlobalMemoryWrite(const IR::Inst& inst) {
+     case IR::Opcode::GlobalAtomicOr32:
+     case IR::Opcode::GlobalAtomicXor32:
+     case IR::Opcode::GlobalAtomicExchange32:
++    case IR::Opcode::GlobalAtomicCompareExchange32:
+     case IR::Opcode::GlobalAtomicIAdd64:
+     case IR::Opcode::GlobalAtomicSMin64:
+     case IR::Opcode::GlobalAtomicUMin64:
+@@ -232,6 +234,8 @@ IR::Opcode GlobalToStorage(IR::Opcode opcode) {
+         return IR::Opcode::StorageAtomicXor32;
+     case IR::Opcode::GlobalAtomicExchange32:
+         return IR::Opcode::StorageAtomicExchange32;
++    case IR::Opcode::GlobalAtomicCompareExchange32:
++        return IR::Opcode::StorageAtomicCompareExchange32;
+     case IR::Opcode::GlobalAtomicIAdd64:
+         return IR::Opcode::StorageAtomicIAdd64;
+     case IR::Opcode::GlobalAtomicSMin64:
+@@ -581,6 +585,16 @@ void ReplaceAtomic(IR::Block& block, IR::Inst& inst, const IR::U32& storage_inde
+     inst.ReplaceUsesWith(value);
+ }
+ 
++/// Replace a global compare-exchange with its storage buffer equivalent, keeping both operands
++void ReplaceAtomicCompareExchange(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
++                                  const IR::U32& offset) {
++    const IR::Opcode new_opcode{GlobalToStorage(inst.GetOpcode())};
++    const auto it{IR::Block::InstructionList::s_iterator_to(inst)};
++    const IR::Value value{&*block.PrependNewInst(
++        it, new_opcode, {storage_index, offset, inst.Arg(1), inst.Arg(2)})};
++    inst.ReplaceUsesWith(value);
++}
++
+ /// Replace a global memory instruction with its storage buffer equivalent
+ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
+              const IR::U32& offset) {
+@@ -638,6 +652,8 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
+     case IR::Opcode::GlobalAtomicMaxF16x2:
+     case IR::Opcode::GlobalAtomicMaxF32x2:
+         return ReplaceAtomic(block, inst, storage_index, offset);
++    case IR::Opcode::GlobalAtomicCompareExchange32:
++        return ReplaceAtomicCompareExchange(block, inst, storage_index, offset);
+     default:
+         throw InvalidArgument("Invalid global memory opcode {}", inst.GetOpcode());
+     }

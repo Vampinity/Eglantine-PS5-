@@ -12,7 +12,8 @@ namespace Eden::Display {
 // Settings > Video > Output resolution: 1920x1080, 2560x1440 or 3840x2160, set before a session's
 // renderer starts. It is the size of the game's frame after its upscaling filter. The OpenGL
 // renderer's surface has that size and the console scales it to the TV; the Vulkan renderer's
-// frame has that size and is copied to the driver's 3840x2160 output (scaled when it is smaller).
+// frame has that size and so has the driver's output, the mode headless/vulkan_surface.cpp picks
+// (with EDEN_VULKAN_FULL_FRAMEBUFFERS=1 the output stays 3840x2160 and the frame is scaled to it).
 inline std::atomic<int> output_width{1920};
 inline std::atomic<int> output_height{1080};
 // 60 or 120, set before a session's renderer starts.

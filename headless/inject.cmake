@@ -10,6 +10,7 @@ cmake_language(DEFER CALL add_eden_headless)
 # copy). This runs before any target exists, so the folder leads every include path: a source
 # file that saw the original would mix two ways of committing the same table.
 include_directories(BEFORE "${CMAKE_BINARY_DIR}/headless/sparse")
+include_directories(BEFORE "${CMAKE_BINARY_DIR}/headless/macro-native")
 # The program names its sources in log lines and assertions. In a console build they are written
 # relative to the trees they come from (src/..., build/..., headless/...), not with the folders of
 # the machine that built it: a package must not carry those. Before any target exists, so it holds

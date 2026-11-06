@@ -1,0 +1,132 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0332-frizti-02-oot-dynamic-fps.patch
+
+Source: 0332-frizti-02-oot-dynamic-fps.patch
+loader: Dynamic FPS for Ocarina of Time at load (EDEN_NX2_OOT_DYNAMIC_FPS=1, off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone. Does not need lichii-shaders-0202.
+
+Source: Frizti/Lichii 765659af4c (Frizti), GPL-3.0-or-later. The patch itself is by Dark (Eglantine
+Dev); Frizti's commit says he bundled it with Dark's permission. If next17 is ever published, ask Dark
+too. Only a 4-byte call and a 120-byte routine are in the source: no game data.
+
+The game advances by a fixed step each frame, so at run 62's 42 ms frames it plays at about 80% speed.
+That step, 1/30 s, is what Frizti's commit says; nobody here has read it from the game.
+With the switch its step follows the measured time. This adds no frames. It makes the game play at
+full speed down to 20 fps; below that the 50 ms cap slows it again.
+
+What the routine does, from its disassembly: repeats the instruction it replaces, reads the system
+counter, caps the frame time at 50 ms, smooths it by 1/8, uses it if it is over 3% above the game's
+own step. Two words of state sit near the module's end, main+0x4e9fe00. Run 62's module is 0x4ea0000
+long, so they are inside it and start at zero (the console's loader zeroes everything past the data).
+That they lie past the BSS is inferred, not read: the log line prints where the BSS ends, and it must
+be at or below 0x4e9fe00. The routine reads CNTPCT and CNTFRQ, and both follow the 31.25 MHz guest
+counter of Switch 2 titles (core.cpp, arm_dynarmic_64.cpp; run 62 logs that rate), so the cap stays
+50 ms.
+
+Changed from the source: written in the loader, next to the Mario Kart patches, not in the built-in
+table. So it needs no mods folder and no second copy of the module, which the console's loader makes
+when PatchNSO runs. Refused unless the title, the module and the build id match, and the routine must
+lie inside the code segment.
+
+Runs on the PS5: yes. Run 62's main has this build id, E0F3CCFA...3348.
+Hang: none added. The log line shows the word replaced; Frizti's table does not check it. Expect
+0x1e201828, fdiv s8, s1, s0, the routine's first instruction. Any other word: stop and look.
+Risk: game logic at a longer step is only tested on PC. Wall-clock progress is faster, so memory may
+run out sooner by the clock, not by the distance walked.
+Pool memory: none.
+Checked: bytes equal Frizti's; disassembled with llvm-mc; the bl lands on the routine; a model of the
+routine gives 100% speed at 24 and 30 fps, 50% at 10 fps. PS5-target syntax compile. The console port's
+nso.cpp anchors still match. Not run.
+
+diff --git a/src/core/loader/nso.cpp b/src/core/loader/nso.cpp
+index c4260d2ba2..922be51a53 100644
+--- a/src/core/loader/nso.cpp
++++ b/src/core/loader/nso.cpp
+@@ -5,7 +5,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <array>
+ #include <cinttypes>
++#include <cstdlib>
+ #include <cstring>
+ #include <span>
+ #include <vector>
+@@ -47,6 +49,63 @@ static_assert(sizeof(MODHeader) == 0x1c, "MODHeader has incorrect size.");
+ constexpr u32 PageAlignSize(u32 size) {
+     return static_cast<u32>((size + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK);
+ }
++
++// Dynamic FPS for The Legend of Zelda: Ocarina of Time, by Dark (Eglantine Dev), from Frizti/Lichii
++// 765659af4c (Frizti, bundled there with his permission). The game steps its world by a fixed
++// 1/30 s per frame, so at 42 ms a frame it runs at about 80% speed. One instruction at main+0x6e6cc4
++// becomes a call to a routine in the padding after the code: it repeats that instruction, reads the
++// system counter, caps the time since the last frame at 50 ms, smooths it by 1/8 and uses it as the
++// step when that is more than 3% over the game's own. Its two words of state sit at main+0x4e9fe00,
++// zero at load and past the BSS by the look of it (the log line says where the BSS ends). Written
++// without the patch table Frizti extends, so this needs neither the mods folder nor
++// lichii-shaders-0202.
++constexpr u64 OcarinaProgramId = 0x0400486024DEC000;
++constexpr std::array<u8, 20> OcarinaMainBuildId{0xE0, 0xF3, 0xCC, 0xFA, 0xF5, 0x00, 0x65,
++                                                0xAE, 0x4E, 0xA0, 0x1E, 0xB5, 0xAE, 0xB1,
++                                                0x3B, 0x1A, 0x45, 0xDA, 0x33, 0x48};
++constexpr size_t OcarinaFrameStepSite = 0x6E6CC4;
++constexpr size_t OcarinaDynamicFpsSite = 0x3C46200;
++constexpr std::array<u8, 4> OcarinaDynamicFpsCall{0x4F, 0x7D, 0xD5, 0x94}; // bl 0x3c46200
++constexpr std::array<u8, 120> OcarinaDynamicFpsCode{
++    0x28, 0x18, 0x20, 0x1E, 0xCA, 0x92, 0x00, 0xB0, 0x4A, 0x01, 0x38, 0x91,
++    0x2B, 0xE0, 0x3B, 0xD5, 0x4C, 0x01, 0x40, 0xF9, 0x4B, 0x01, 0x00, 0xF9,
++    0xCC, 0x02, 0x00, 0xB4, 0x6B, 0x01, 0x0C, 0xCB, 0x0D, 0xE0, 0x3B, 0xD5,
++    0x8E, 0x02, 0x80, 0xD2, 0xAE, 0x09, 0xCE, 0x9A, 0x7F, 0x01, 0x0E, 0xEB,
++    0xCB, 0x81, 0x8B, 0x9A, 0x4C, 0x05, 0x40, 0xF9, 0x4C, 0x00, 0x00, 0xB5,
++    0xEC, 0x03, 0x0B, 0xAA, 0x6E, 0x01, 0x0C, 0xCB, 0x8C, 0x0D, 0x8E, 0x8B,
++    0x4C, 0x05, 0x00, 0xF9, 0x82, 0x01, 0x23, 0x9E, 0xA3, 0x01, 0x23, 0x9E,
++    0x42, 0x18, 0x23, 0x1E, 0x42, 0x08, 0x21, 0x1E, 0xC3, 0x00, 0x00, 0x1C,
++    0x03, 0x09, 0x23, 0x1E, 0x40, 0x20, 0x23, 0x1E, 0x4D, 0x00, 0x00, 0x54,
++    0x48, 0x40, 0x20, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x0A, 0xD7, 0x83, 0x3F,
++};
++
++// EDEN_NX2_OOT_DYNAMIC_FPS=1. `image` starts at the module's first byte, `code_size` is the size of
++// its executable segment. The build id says the bytes are the ones the patch was written for.
++void ApplyOcarinaDynamicFps(std::span<u8> image, const NSOHeader& header, u64 code_size) {
++    const char* const setting = std::getenv("EDEN_NX2_OOT_DYNAMIC_FPS");
++    if (setting == nullptr || setting[0] != '1') {
++        return;
++    }
++    if (!std::equal(OcarinaMainBuildId.begin(), OcarinaMainBuildId.end(),
++                    header.build_id.begin())) {
++        LOG_WARNING(Loader, "Ocarina of Time: Dynamic FPS skipped, not the build it was made for");
++        return;
++    }
++    constexpr size_t routine_end = OcarinaDynamicFpsSite + OcarinaDynamicFpsCode.size();
++    if (routine_end > code_size || routine_end > image.size()) {
++        LOG_WARNING(Loader, "Ocarina of Time: Dynamic FPS skipped, code ends at {:#x}", code_size);
++        return;
++    }
++    u32 replaced{};
++    std::memcpy(&replaced, image.data() + OcarinaFrameStepSite, sizeof(replaced));
++    std::memcpy(image.data() + OcarinaFrameStepSite, OcarinaDynamicFpsCall.data(),
++                OcarinaDynamicFpsCall.size());
++    std::memcpy(image.data() + OcarinaDynamicFpsSite, OcarinaDynamicFpsCode.data(),
++                OcarinaDynamicFpsCode.size());
++    const auto& data = header.segments[2];
++    LOG_INFO(Loader, "Ocarina of Time: Dynamic FPS on (main+{:#x} held {:#010x}, BSS ends at {:#x})",
++             OcarinaFrameStepSite, replaced, u64{data.location} + data.size + data.bss_size);
++}
+ } // Anonymous namespace
+ 
+ bool NSOHeader::IsSegmentCompressed(size_t segment_num) const {
+@@ -187,6 +246,12 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
+         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+     }
+ 
++    if (name == "main" && process.GetProgramId() == OcarinaProgramId) {
++        ApplyOcarinaDynamicFps(std::span<u8>{codeset.memory}.subspan(module_start), nso_header,
++                               u64{nso_header.segments[0].location} +
++                                   PageAlignSize(nso_header.segments[0].size));
++    }
++
+     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
+     // 30 FPS mode, or let it choose dynamically using the whole frame time (CPU + GPU wait).
+     // Match the instruction sequence instead of relying on a title-version-specific address.

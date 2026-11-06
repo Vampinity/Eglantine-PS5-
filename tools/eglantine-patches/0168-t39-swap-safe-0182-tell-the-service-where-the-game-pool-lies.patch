@@ -1,0 +1,46 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0380-swap-safe-0182-tell-the-service-where-the-game-pool-lies.patch
+
+Source: 0380-swap-safe-0182-tell-the-service-where-the-game-pool-lies.patch
+The guest's memory service may arm only the game's application pool, and only
+the kernel knows where that lies. eden_guest_swap_pool is called once the memory
+manager is up. Weak, like eden_guest_swap_active (patch 0125): a build without
+the PS5 frontend skips the call, and the PS5 link defines it, so it leaves no
+undefined weak symbol for headless/check_package.py.
+
+Goes with swap-safe-frontend-03. Telling it changes nothing by itself. No pool
+memory.
+
+Source: no upstream PR or commit. From the run 59 analysis.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/hle/kernel/kernel.cpp b/src/core/hle/kernel/kernel.cpp
+index 9e6ccc2d89..2a9b1a7735 100644
+--- a/src/core/hle/kernel/kernel.cpp
++++ b/src/core/hle/kernel/kernel.cpp
+@@ -50,6 +50,10 @@
+ #include "core/hle/service/sm/sm.h"
+ #include "core/memory.h"
+ 
++// PS5 port (src/guest_memory_service.inc): where the game's pool lies in the guest's backing.
++extern "C" void eden_guest_swap_pool(std::uint64_t offset, std::uint64_t bytes) noexcept
++    __attribute__((weak));
++
+ namespace Kernel {
+ 
+ // Can only be used by a single implementation PER THREAD
+@@ -749,6 +753,13 @@ struct KernelCore::Impl {
+         const auto& management_region = memory_layout->GetPoolManagementRegion();
+         ASSERT(management_region.GetEndAddress() != 0);
+         memory_manager->Initialize(management_region.GetAddress(), management_region.GetSize());
++
++        // PS5 port: only the game's own pool may lose its mapping for a while. The slab heaps and
++        // the other pools hold objects of this kernel and what the emulator reads all the time.
++        if (eden_guest_swap_pool) {
++            const auto pool = memory_layout->GetKernelApplicationPoolRegionPhysicalExtents();
++            eden_guest_swap_pool(pool.GetAddress() - Core::DramMemoryMap::Base, pool.GetSize());
++        }
+     }
+ 
+     void InitializeHackSharedMemory(KernelCore& kernel) {

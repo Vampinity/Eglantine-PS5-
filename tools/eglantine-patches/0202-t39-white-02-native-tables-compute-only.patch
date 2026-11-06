@@ -1,0 +1,77 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0424-white-02-native-tables-compute-only.patch
+
+Source: 0424-white-02-native-tables-compute-only.patch
+Moved by hand: applies unchanged once 0312 (table pools) is in; it comes after it in the series
+
+tables for compute programs only
+
+Every outdoor PS5 run of Ocarina has the native pointer tables off (EDEN_NX2_NATIVE_TABLES=0),
+and the white haze is ranked first on them (track-white-remaining.md). The one run with them on,
+run56, died translating mesh programs. =0 drops every pointer read through memory a constant
+buffer pointer points to, for every stage; graphics programs pay for those in every draw's
+bindings, compute programs only in their own.
+
+EDEN_NX2_NATIVE_TABLES=compute keeps those pointers for compute programs and takes the =0 path
+for vertex, fragment, task and mesh programs: NativeTablesEnabled() takes the program's stage at
+its one caller, the candidate filter in NativePointerCandidates(). Unset or any other value stays
+on, 0 stays off. Nothing changes without the switch.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ .../global_memory_to_storage_buffer_pass.cpp  | 27 +++++++++++++++----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+index 3a78733069..9d8c26c1e9 100644
+--- a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
++++ b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+@@ -12,6 +12,7 @@
+ #include <deque>
+ #include <map>
+ #include <optional>
++#include <string_view>
+ #include <tuple>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -1100,12 +1101,28 @@ void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u3
+ /// (indirect_offset), neither table entries nor single ones: those accesses go to the other
+ /// searches. On by default. The classifications are still asked for, so a pipeline list holds
+ /// the same answers in both modes.
+-bool NativeTablesEnabled() {
+-    static const bool enabled = [] {
++/// EDEN_NX2_NATIVE_TABLES=compute: those pointers for compute programs only; vertex, fragment,
++/// task and mesh programs take the =0 path. The table entries themselves were already compute
++/// only (below); this also keeps graphics programs from the single pointers read through a
++/// pointer, the part of a tables run that costs memory in every draw's bindings. A run with
++/// tables on dies on memory (run56, translating mesh programs): this says whether the compute
++/// side alone changes the picture.
++bool NativeTablesEnabled(Stage stage) {
++    enum class Mode { Off, Compute, On };
++    static const Mode mode = [] {
+         const char* const value = std::getenv("EDEN_NX2_NATIVE_TABLES");
+-        return value == nullptr || value[0] != '0';
++        if (value == nullptr) {
++            return Mode::On;
++        }
++        if (value[0] == '0') {
++            return Mode::Off;
++        }
++        if (std::string_view{value} == "compute") {
++            return Mode::Compute;
++        }
++        return Mode::On;
+     }();
+-    return enabled;
++    return mode == Mode::On || (mode == Mode::Compute && stage == Stage::Compute);
+ }
+ 
+ /// Native programs: every constant buffer pointer the low address can come from, following only
+@@ -1217,7 +1234,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
+             // table per object type: every slot whose table entry is a pointer). Those are table
+             // candidates, bound only in the bindings the other storage buffers leave free.
+             const auto add = [&](const StorageBufferAddr& pointer, bool table) {
+-                if (!NativeTablesEnabled() ||
++                if (!NativeTablesEnabled(env.ShaderStage()) ||
+                     std::ranges::find(candidates, pointer) != candidates.end()) {
+                     return;
+                 }

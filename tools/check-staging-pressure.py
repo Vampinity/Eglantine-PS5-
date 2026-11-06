@@ -7,7 +7,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 cache = Path((root / '.local/headless-cache').read_text().strip())
 source = (cache / 'native-local/headless/vulkan_staging_buffer_pool.cpp').read_text()
-start = source.index('void StagingBufferPool::ReleaseCompleted() {')
+start = source.index('std::uint64_t StagingBufferPool::ReleaseCompleted() {')
 end = source.index('\nvoid StagingBufferPool::TickFrame()', start)
 body = source[start:end]
 code = r'''
@@ -36,7 +36,7 @@ struct StagingBufferPool {
         bool IsFree(std::uint64_t tick) const { return tick <= completed; }
     } scheduler;
     StagingBuffersCache device_local_cache, upload_cache, download_cache;
-    void ReleaseCompleted();
+    std::uint64_t ReleaseCompleted();
 };
 ''' + body + r'''
 int main() {

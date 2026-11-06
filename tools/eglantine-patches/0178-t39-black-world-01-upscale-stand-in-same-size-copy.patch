@@ -1,0 +1,138 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0400-black-world-01-upscale-stand-in-same-size-copy.patch
+
+Source: 0400-black-world-01-upscale-stand-in-same-size-copy.patch
+(EDEN_NX2_UPSCALE_SAME_SIZE)
+
+Ocarina of Time with its Max Resolution patch in Handheld renders 3D at the output's 1920x1080.
+Its network's last pass (first HMMA at 0xc00, rejected) then reads and writes 1920x1080 images.
+The stand-in only accepted pairs the output enlarges (to_width > from_width), found none,
+logged "no input/output image pair in the program's handles or cbuf0+0x80..0x11c", and the
+dispatch was dropped: the output image stayed black while the HUD, drawn later, showed
+(run74). The same program in Docked still upscales 1920x1080 to 2560x1440 and found its pair
+(run75, "plain copy" at 106 s).
+
+EDEN_NX2_UPSCALE_SAME_SIZE=1: among the program's own read and store handles a pair of one
+size counts too. The drawn frame (E5B9G9R9) is taken first: another read of the output's size
+and format may be the network's own last output (a temporal network's history), and copying
+that would leave the output as it started. A same-size pair keeps its input (the 0048 swap for
+"an image only rejected passes fill" does not apply to a drawn frame), and is logged once:
+"Upscale fallback for program ...: same-size copy ... -> ...". The title-4, Fortune's Weave,
+Bananza and blind cbuf0 scans keep asking for an upscale: there any two same-size images of
+one format would pair. Unset, nothing changes.
+
+Lichii (nx2 5a50f50) never reaches this: it lowers HMMA in software for every program
+(lower_to_maxwell.h 0x23c "software warp expansion", emit_spirv_tensor.cpp), which is our
+EDEN_NX2_TENSOR=compact form, so on Linux the network itself ran.
+
+Checked: clang syntax check against the T20 tree (e736dfd + 0001-0399). Not built, not run.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/kepler_compute.cpp | 51 ++++++++++++++++++++---
+ 1 file changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 9eb5943beb..161cc7247a 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -949,8 +949,17 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     };
+     // An upscale keeps the aspect ratio and scales by at most 4: anything else (a 4x4 lookup
+     // table, a 120x67 luminance image) is another image the program happens to use.
++    // EDEN_NX2_UPSCALE_SAME_SIZE=1: the program's own read and store handles may also pair images
++    // of one size. Ocarina of Time with its Max Resolution patch in Handheld renders 3D at the
++    // output's 1920x1080, and its network (first HMMA at 0xc00) then reads and writes 1920x1080
++    // images: with upscales only, no pair was found, the dispatch was dropped and the output image
++    // stayed black (run74). The same program in Docked still upscales 1920x1080 to 2560x1440 and
++    // found its pair (run75). Only the program's own handles may pair same-size images: in the
++    // cbuf0 scans below any two same-size images of one format would do.
++    static const bool same_size_ok = std::getenv("EDEN_NX2_UPSCALE_SAME_SIZE") != nullptr;
+     const auto upscale_pair = [](const std::optional<Texture::TICEntry>& from,
+-                                 const std::optional<Texture::TICEntry>& to, bool same_format = true) {
++                                 const std::optional<Texture::TICEntry>& to, bool same_format = true,
++                                 bool same_size = false) {
+         if (!from || !to || (same_format && from->format != to->format) || from->Address() == 0 ||
+             to->Address() == 0 || from->Address() == to->Address() || !from->IsBlockLinear() ||
+             !to->IsBlockLinear())
+@@ -958,7 +967,9 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         const u64 from_width = from->Width(), from_height = from->Height();
+         const u64 to_width = to->Width(), to_height = to->Height();
+         const u64 cross_a = to_width * from_height, cross_b = to_height * from_width;
+-        return from_width >= 64 && to_width > from_width && to_width <= from_width * 4 &&
++        const bool scales = to_width > from_width ||
++                            (same_size && to_width == from_width && to_height == from_height);
++        return from_width >= 64 && scales && to_width <= from_width * 4 &&
+                (cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a) * 32 <= cross_a;
+     };
+     std::optional<Texture::TICEntry> input = image(0x90), output = image(0xa0);
+@@ -977,10 +988,24 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         output.reset();
+         for (const u32 store : stores) {
+             const auto to = image(store);
++            // Same-size pairs: the drawn frame (E5B9G9R9, Ocarina of Time) first. Of the program's
++            // other reads of the output's size, one of its format may be its own last output (a
++            // temporal network's history): copying that would leave the output as it started.
++            if (same_size_ok) {
++                for (const u32 read : reads) {
++                    const auto from = image(read);
++                    if (from && from->format == Texture::TextureFormat::E5B9G9R9 &&
++                        upscale_pair(from, to, false, true)) {
++                        input = from;
++                        output = to;
++                        break;
++                    }
++                }
++            }
+             for (const bool same_format : {true, false}) {
+                 for (const u32 read : reads) {
+                     const auto from = image(read);
+-                    if (upscale_pair(from, to, same_format) &&
++                    if (upscale_pair(from, to, same_format, same_size_ok) &&
+                         (!input || u64{from->Width()} * from->Height() > u64{input->Width()} * input->Height())) {
+                         input = from;
+                         output = to;
+@@ -990,15 +1015,29 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             }
+             if (input) break;
+         }
++        const bool same_size_pair = input && output && input->Width() == output->Width() &&
++                                    input->Height() == output->Height();
++        if (same_size_pair) {
++            static std::unordered_set<GPUVAddr> reported;
++            if (reported.insert(regs.code_loc.Address()).second) {
++                LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: same-size copy {:#x} format {} {}x{} -> {:#x} format {}",
++                         regs.code_loc.Address(), input->Address(),
++                         static_cast<u32>(input->format.Value()), input->Width(), input->Height(),
++                         output->Address(), static_cast<u32>(output->format.Value()));
++            }
++        }
+         // The last pass of a rejected network can read an image only the rejected passes fill
+         // (Ocarina of Time's title and movies): the frame is then another image of that size in
+         // cbuf0 that upscales to the same output, which is what the scan below used to find.
+         // EDEN_NX2_UPSCALE_KEEP_FRAME=1 leaves an E5B9G9R9 input alone. That is Ocarina of Time's
+         // gameplay frame: draws fill it (run68), so the reason above doesn't apply to it, and
+         // without this it gives way to a B10G11R11 image its handle scan doesn't list.
++        // A same-size pair keeps its input too: the frame it reads is drawn, not filled by
++        // rejected passes, and another image of that size is as likely the network's own output.
+         static const bool keep_drawn_frame = std::getenv("EDEN_NX2_UPSCALE_KEEP_FRAME") != nullptr;
+         const bool keep_input =
+-            keep_drawn_frame && input && input->format == Texture::TextureFormat::E5B9G9R9;
++            same_size_pair ||
++            (keep_drawn_frame && input && input->format == Texture::TextureFormat::E5B9G9R9);
+         for (u32 slot = 0x80; input && !keep_input && slot < 0x120; slot += 4) {
+             const auto from = memory_manager.Read<u32>(cbuf_address + slot) != 0 ? image(slot)
+                                                                                     : std::nullopt;
+@@ -1019,11 +1058,11 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     }
+     // Donkey Kong Bananza's slots, after the program's own handles: other titles keep unrelated
+     // images there.
+-    if (!upscale_pair(input, output, false)) {
++    if (!upscale_pair(input, output, false, same_size_ok)) {
+         input = image(0x60);
+         output = image(0x70);
+     }
+-    if (!upscale_pair(input, output, false)) {
++    if (!upscale_pair(input, output, false, same_size_ok)) {
+         input.reset();
+         output.reset();
+         for (u32 first = 0x80; first < 0x120 && !input; first += 4) {

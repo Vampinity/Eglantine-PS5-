@@ -1,0 +1,72 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0430-gfx-01-transcode-keep-cap.patch
+
+Source: 0430-gfx-01-transcode-keep-cap.patch
+decode images kept for reuse
+
+Core patch on core-t33 (T35 stack), off unless EDEN_NX2_TRANSCODE_KEEP_MIB is set.
+
+ASTC textures the GPU decodes and re-compresses (TranscodeAstcToBcn) each need a decode image of
+four bytes a texel for every level and layer. A finished one is kept for the next texture of its
+shape, up to 256 MiB, 60 frames. On the console that memory comes from the one pool: run 149 (Zelda,
+T34) died at a doorway loading screen with 3 MiB free, 233 ASTC textures transcoded in the last
+600 frames, and 242 to 593 MiB of device-local memory outside the image and buffer caches, where
+these decode images live. EDEN_NX2_TRANSCODE_KEEP_MIB=32 keeps 32 MiB of them: a decode image over
+the limit is destroyed once the GPU is past it, and the next texture of that shape makes a new one
+(263 us, a dedicated allocation). Unset, 256 MiB as before.
+
+Logs once "EDEN_NX2_TRANSCODE_KEEP_MIB=32: finished decode images are kept up to 32 MiB" and
+"Decode image over the kept limit: N dropped so far, M MiB; K MiB kept" as the count doubles.
+
+Trade: with the pool short, a decode image made fresh can be refused, and without
+EDEN_NX2_TRANSCODE_WAIT=1 the decode then lands in an image with nothing bound (a black texture); a
+kept one would have had its memory already. Set EDEN_NX2_TRANSCODE_WAIT=1 with it, so a refused
+decode waits for the texture's next use instead. Not built, not run.
+
+ .../renderer_vulkan/vk_texture_cache.cpp      | 26 ++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index f4c6dfaeed..5f15974a6a 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -2742,7 +2742,20 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
+ void TextureCacheRuntime::TickFrame() {
+     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
+     // Finished decode images wait for the next texture of their shape, up to this much memory.
+-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
++    // EDEN_NX2_TRANSCODE_KEEP_MIB=<MiB> (unset: 256, as before) lowers it. On the console the
++    // decode images of a loading screen's ASTC textures (four bytes a texel, every level) sat in
++    // the one pool next to the textures they made, just when the pool ran out. A decode image not
++    // kept is made again for the next texture of its shape (263 us, a dedicated allocation).
++    static const u64 MaxFreeTranscodeBytes = [] {
++        const char* const value = std::getenv("EDEN_NX2_TRANSCODE_KEEP_MIB");
++        if (value == nullptr) {
++            return u64{256} << 20;
++        }
++        const u64 mib = std::strtoull(value, nullptr, 10);
++        LOG_INFO(Render_Vulkan, "EDEN_NX2_TRANSCODE_KEEP_MIB={}: finished decode images are kept up to {} MiB",
++                 value, mib);
++        return mib << 20;
++    }();
+     const auto decode_bytes = [](const PendingTranscode& t) {
+         u64 bytes{};
+         for (u32 level = 0; level < t.levels; ++level) {
+@@ -2761,6 +2774,17 @@ void TextureCacheRuntime::TickFrame() {
+             done.unused_frames = 0;
+             free_bytes += bytes;
+             free_transcodes.push_back(std::move(done));
++        } else {
++            // Runs on the GPU thread; the log thins out as the count doubles.
++            static u64 dropped{};
++            static u64 dropped_bytes{};
++            ++dropped;
++            dropped_bytes += bytes;
++            if ((dropped & (dropped - 1)) == 0) {
++                LOG_INFO(Render_Vulkan,
++                         "Decode image over the kept limit: {} dropped so far, {} MiB; {} MiB kept",
++                         dropped, dropped_bytes >> 20, free_bytes >> 20);
++            }
+         }
+         pending_transcodes.pop_front();
+     }

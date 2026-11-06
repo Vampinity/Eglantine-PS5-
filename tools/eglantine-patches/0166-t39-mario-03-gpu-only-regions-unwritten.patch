@@ -1,0 +1,279 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0371-mario-03-gpu-only-regions-unwritten.patch
+
+Source: 0371-mario-03-gpu-only-regions-unwritten.patch
+Core patch: goes in tools/eglantine-patches as 0183-... (after 0182). Paths are the submodule's.
+
+nx2.h follows which blocks were written for sparse regions only. For a GPU-only region backed as
+it is written, Nx2SparseBlockIsWritten answers "written", because it does not know the region. Two
+things follow, both read from the source:
+- BackSparseWrite's rule that zeros over an empty block need no memory never applies there.
+- IsUnwrittenSparse never applies there. Mario Kart World's 8192x8192 RG16 image at 0x85f5fb0000
+  (341 MiB) and its 3072x3072x2 at 0x81783f0000 (96 MiB) are GPU-only and held whole, flags 0x70
+  in runs 45 and 52: not marked GPU-written at the end. None of the sparse images of that shape
+  reaches the top ten of the refusal report (under 36 MiB each).
+
+EDEN_NX2_GPU_ONLY_UNWRITTEN=1 (off unless set) has nx2.h follow those regions too. Zeros over a
+block nobody wrote then take none, and a colour texture of 32 MiB or more with mip levels over such
+blocks gets no memory until a write, by the path sparse regions use. Render targets have one level
+and are left alone: the first draw into such an image is lost. Sparse layers and tiles do not see
+these regions (Nx2InSparseRegion stays false).
+
+"Nobody wrote" has to count the GPU here, and a GPU-only region holds render targets whose contents
+never reach a block. So PrepareImage marks the region's blocks written at an image's first GPU
+write (the GPU-modified flag going on, not every draw). Without that, a mip-mapped texture joined
+over a render target came up unbacked and CopyImage dropped the target's contents. It only touches
+regions flagged gpu_only: with the switch off there are none and nothing changes.
+
+Ocarina of Time cannot be affected: LazyGpuOnlyRegions is false for it, so it has no such regions.
+
+Always on, logging only: one line for each region's first block, saying what the write held, and
+the every-64-blocks line now counts blocks taken by zeros and names the block. Runs 45 and 52 back
+1021 MiB in 0.6 s at the same point; this says where and whether it was zeros.
+
+Guess: whether those two images are unwritten when they are made, and whether that burst is zeros.
+If they are written, this saves nothing and changes nothing. A region is GPU-only because the GPU
+writes it, so expect the saving to end at the first such write: that draw or compute pass is lost
+and the image comes back backed (the log says "GPU write into unwritten sparse image"). A texture
+drawn into once would stay empty.
+
+Checked on a Mac, not on the console: a host test of nx2.h; the generated vk_texture_cache_cost.cpp,
+vk_texture_cache_base.cpp (the template) and nx2_gsv.h (through self_controller.cpp) pass clang
+-fsyntax-only with stub headers. tools/prepare-vulkan-port.py reports the same two anchors with and
+without this patch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index b13497d23e..313d2c101f 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -678,6 +678,9 @@ private:
+                     .blocks = std::vector<u8>(Common::DivCeil(size, SparseBlockSize)),
+                 };
+                 Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
++                if (FollowGpuOnlyBlocks()) {
++                    Tegra::Nx2SparseRegionCreated(start, size, SparseBlockSize, true);
++                }
+                 Tegra::Nx2AddSparseSpan(start, size);
+                 LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed as it is written",
+                          start, last);
+@@ -969,12 +972,27 @@ private:
+                         const u64 write_begin = (std::max)(gpu_address, block_begin);
+                         const u64 write_end = (std::min)(
+                             {end, block_begin + SparseBlockSize, start + region.size});
+-                        if (data != nullptr &&
+-                            IsAllZero(data + (write_begin - gpu_address), write_end - write_begin) &&
+-                            !Tegra::Nx2SparseBlockIsWritten(start, block)) {
++                        const bool zeros =
++                            data != nullptr &&
++                            IsAllZero(data + (write_begin - gpu_address), write_end - write_begin);
++                        if (zeros && !Tegra::Nx2SparseBlockIsWritten(start, block)) {
+                             zero_bytes += write_end - write_begin;
+                             continue;
+                         }
++                        // Which regions take the blocks, and from what: a line for each region,
++                        // and a count of zeros that got a block (they read zero without one).
++                        if (!std::exchange(region.logged, true)) {
++                            LOG_INFO(Service, "nx2:gpu {} region at {:#x} ({} MiB): first block for a "
++                                              "write of {} bytes at +{:#x}, {}",
++                                     region.gpu_only ? "GPU-only" : "sparse", start, region.size >> 20,
++                                     size, write_begin - start,
++                                     data == nullptr ? "contents unknown"
++                                     : zeros         ? "all zeros"
++                                                     : "with data");
++                        }
++                        if (zeros) {
++                            m_sparse_zero_blocks += 1;
++                        }
+                         region.blocks[block] = BlockPending;
+                         todo.push_back({start, block});
+                     } else if (region.blocks[block] == BlockPending) {
+@@ -1035,9 +1053,10 @@ private:
+                     m_sparse_backed_bytes += block_size;
+                     if (++m_sparse_blocks == 1 || (m_sparse_blocks % 64) == 0) {
+                         LOG_INFO(Service, "nx2:gpu {} sparse blocks backed ({} MiB); {} MiB of GPU-only "
+-                                          "memory in use, peak {} MiB",
++                                          "memory in use, peak {} MiB; {} of the blocks for zeros, "
++                                          "this one at {:#x}",
+                                  m_sparse_blocks, m_sparse_backed_bytes >> 20, m_gpu_only_bytes >> 20,
+-                                 m_gpu_only_peak >> 20);
++                                 m_gpu_only_peak >> 20, m_sparse_zero_blocks, block_address);
+                     }
+                 }
+             }
+@@ -1087,6 +1106,19 @@ private:
+         return lazy && Settings::GetCurrentProgramID() != 0x0400486024DEC000ULL;
+     }
+ 
++    // EDEN_NX2_GPU_ONLY_UNWRITTEN=1: nx2.h follows the blocks of GPU-only regions backed as they
++    // are written, as it does for sparse regions. Zeros over a block nobody wrote then need no
++    // memory there either (Nx2SparseBlockIsWritten says "written" for a region it does not know),
++    // and a large texture over such blocks gets none until they are written. Off, as before.
++    // The Legend of Zelda: Ocarina of Time has no such regions (LazyGpuOnlyRegions).
++    static bool FollowGpuOnlyBlocks() {
++        static const bool follow = [] {
++            const char* value = std::getenv("EDEN_NX2_GPU_ONLY_UNWRITTEN");
++            return value != nullptr && value[0] == '1';
++        }();
++        return follow;
++    }
++
+     static constexpr u32 SparseRegionFlag = 0x200; ///< Word 7 of 214 (0x60c arrays, 0xa0c pools)
+     static constexpr u64 SparseBlockSize = 4ULL << 20;
+     static constexpr u8 BlockEmpty = 0;
+@@ -1099,6 +1131,7 @@ private:
+         u64 size;
+         std::vector<u8> blocks; ///< BlockEmpty / Backed / Failed / Pending / Written per block
+         bool warned{};          ///< Logged that the pool ran out for its blocks
++        bool logged{};          ///< Logged the write that took its first block
+         bool tiles{};           ///< The game maps its own memory into it (216): no blocks
+         std::vector<bool> tile_pages; ///< Pages a tile maps, once `tiles`
+     };
+@@ -1106,6 +1139,7 @@ private:
+     u64 m_sparse_blocks{};       ///< Sparse blocks backed so far
+     u64 m_sparse_backed_bytes{}; ///< Sparse region memory given out so far
+     u64 m_sparse_zero_bytes{};   ///< Zeros written over unwritten sparse blocks, left out
++    u64 m_sparse_zero_blocks{};  ///< Blocks taken by writes of zeros (a region nx2.h does not follow)
+     u64 m_sparse_released_bytes{}; ///< Blocks given back once the game mapped tiles there
+ 
+     // nn::gpu::sdk::SparseMapRequest (216), filled from NvRm's nvgpu_as_remap_op.
+diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
+index afd3f82b90..afef35e8a2 100644
+--- a/src/video_core/nx2.h
++++ b/src/video_core/nx2.h
+@@ -199,6 +199,9 @@ struct Nx2SparseRegionState {
+     /// Once the game maps its own memory into the region (nx2:gpu 216): which tiles it maps.
+     /// Only those hold data then (writes elsewhere are dropped, as on the console).
+     std::vector<bool> mapped;
++    /// A GPU-only region backed as it is written (EDEN_NX2_GPU_ONLY_UNWRITTEN): only `written`
++    /// counts. Sparse layers and tiles leave it alone, it is no sparse region for them.
++    bool gpu_only{};
+ };
+ 
+ /// The granularity of the game's sparse tiles (nx2:gpu 216 maps 64 KiB pages).
+@@ -206,10 +209,12 @@ inline constexpr u64 Nx2SparseTileSize = 64ULL << 10;
+ inline std::mutex g_nx2_sparse_state_mutex;
+ inline std::map<u64, Nx2SparseRegionState> g_nx2_sparse_state;
+ 
+-inline void Nx2SparseRegionCreated(u64 gpu_address, u64 size, u64 block_size) {
++inline void Nx2SparseRegionCreated(u64 gpu_address, u64 size, u64 block_size,
++                                   bool gpu_only = false) {
+     std::scoped_lock lk{g_nx2_sparse_state_mutex};
+     g_nx2_sparse_state[gpu_address] = {size, block_size,
+-                                       std::vector<bool>((size + block_size - 1) / block_size)};
++                                       std::vector<bool>((size + block_size - 1) / block_size),
++                                       {}, gpu_only};
+ }
+ 
+ inline void Nx2SparseRegionDestroyed(u64 gpu_address) {
+@@ -304,12 +309,13 @@ inline bool Nx2InSparseRegion(u64 gpu_address, u64 size) {
+         return false;
+     }
+     --it;
+-    return gpu_address + size <= it->first + it->second.size;
++    return !it->second.gpu_only && gpu_address + size <= it->first + it->second.size;
+ }
+ 
+ /// The GPU renders into [gpu_address, +size): count its blocks as written, so images made there
+-/// later get memory (their contents live in the host image, not in guest memory).
+-inline void Nx2SparseMarkWritten(u64 gpu_address, u64 size) {
++/// later get memory (their contents live in the host image, not in guest memory). With
++/// gpu_only_regions, in GPU-only regions alone.
++inline void Nx2SparseMarkWritten(u64 gpu_address, u64 size, bool gpu_only_regions = false) {
+     if (size == 0 || gpu_address + size <= g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+         gpu_address >= g_nx2_sparse_high.load(std::memory_order_relaxed)) [[likely]] {
+         return;
+@@ -317,7 +323,8 @@ inline void Nx2SparseMarkWritten(u64 gpu_address, u64 size) {
+     std::scoped_lock lk{g_nx2_sparse_state_mutex};
+     for (auto& [start, region] : g_nx2_sparse_state) {
+         const u64 end = start + region.size;
+-        if (gpu_address >= end || gpu_address + size <= start) {
++        if ((gpu_only_regions && !region.gpu_only) || gpu_address >= end ||
++            gpu_address + size <= start) {
+             continue;
+         }
+         const u64 first = ((std::max)(gpu_address, start) - start) / region.block_size;
+@@ -328,8 +335,9 @@ inline void Nx2SparseMarkWritten(u64 gpu_address, u64 size) {
+     }
+ }
+ 
+-/// True when [gpu_address, +size) lies in one sparse region and none of it has been written.
+-inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
++/// True when [gpu_address, +size) lies in one region of the kind asked for and none of it has been
++/// written.
++inline bool Nx2RegionUnwritten(u64 gpu_address, u64 size, bool gpu_only) {
+     if (size == 0 || gpu_address + size <= g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+         gpu_address >= g_nx2_sparse_high.load(std::memory_order_relaxed)) [[likely]] {
+         return false;
+@@ -341,7 +349,7 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
+     }
+     --it;
+     const auto& [start, region] = *it;
+-    if (gpu_address + size > start + region.size) {
++    if (region.gpu_only != gpu_only || gpu_address + size > start + region.size) {
+         return false;
+     }
+     const u64 last = (gpu_address + size - 1 - start) / region.block_size;
+@@ -353,6 +361,16 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
+     return true;
+ }
+ 
++/// True when [gpu_address, +size) lies in one sparse region and none of it has been written.
++inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
++    return Nx2RegionUnwritten(gpu_address, size, false);
++}
++
++/// The same for a GPU-only region backed as it is written, when its blocks are followed.
++inline bool Nx2GpuOnlyUnwritten(u64 gpu_address, u64 size) {
++    return Nx2RegionUnwritten(gpu_address, size, true);
++}
++
+ /// GPU VA in the first page that mirrors a release at `address`, or 0.
+ inline u64 Nx2SemaphoreMirror(u64 address) {
+     for (const auto& region : g_nx2_semaphore_regions) {
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 3b8894f388..b2759ab2fd 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -186,8 +186,20 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+     }
+     constexpr u32 MinSize = 32U << 20;
+     const u32 size = VideoCommon::CalculateGuestSizeInBytes(info);
+-    return size >= MinSize && info.type != ImageType::e1D && info.type != ImageType::Buffer &&
+-           info.type != ImageType::Linear && Tegra::Nx2SparseUnwritten(gpu_addr, size);
++    if (size < MinSize || info.type == ImageType::e1D || info.type == ImageType::Buffer ||
++        info.type == ImageType::Linear) {
++        return false;
++    }
++    if (Tegra::Nx2SparseUnwritten(gpu_addr, size)) {
++        return true;
++    }
++    // EDEN_NX2_GPU_ONLY_UNWRITTEN=1: the same over a GPU-only region backed as it is written (title
++    // 1's 8192x8192 RG16 mask at 0x85f5fb0000, 341 MiB whole on the host). Only textures with mip
++    // levels: a render target has one level, and the first draw into an image like this is lost.
++    return info.resources.levels > 1 &&
++           VideoCore::Surface::GetFormatType(info.format) ==
++               VideoCore::Surface::SurfaceType::ColorTexture &&
++           Tegra::Nx2GpuOnlyUnwritten(gpu_addr, size);
+ }
+ 
+ // A large color array in a Switch 2 sparse region (title 1's terrain arrays: 13-26% of their
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index f5eee1744c..00e58d7b82 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -4166,6 +4166,13 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool
+             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
+             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+         }
++        // EDEN_NX2_GPU_ONLY_UNWRITTEN: what the GPU writes into an image with memory is in no block
++        // of a GPU-only region. Those blocks count as written from here on, or a mip-mapped texture
++        // joined over this render target would come up unbacked and take none of its contents.
++        // A region nx2.h does not follow (the switch off, any sparse region) is left as it is.
++        if (False(image.flags & ImageFlagBits::GpuModified)) {
++            Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes, true);
++        }
+         MarkModification(image);
+     }
+     lru_cache.Touch(image.lru_index, frame_tick);

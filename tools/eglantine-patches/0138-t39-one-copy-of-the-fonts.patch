@@ -1,0 +1,70 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0186-one-copy-of-the-fonts.patch
+
+Source: 0186-one-copy-of-the-fonts.patch
+Core patch: tools/eglantine-patches, next free number after 0181 (0186 if in order).
+
+EDEN_HEAP_SITE "34 MiB in 2 blocks": two IPlatformServiceManager::Impl of 0x11000c8 bytes, one for
+pl:s and one for pl:u (ns.cpp), each with the same 17 MiB of fonts. They share one Impl now, which goes
+with the second service, so a next session loads its fonts again; the built-in font memory is closed
+by the last of them. Saves 17 MiB. The data the guest reads does not change, so no switch.
+
+clang -fsyntax-only with Boost 1.90 passes (x86-64 host). Not compiled for the console, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/hle/service/ns/platform_service_manager.cpp b/src/core/hle/service/ns/platform_service_manager.cpp
+index 707fb9ac78..6cc83fe3f7 100644
+--- a/src/core/hle/service/ns/platform_service_manager.cpp
++++ b/src/core/hle/service/ns/platform_service_manager.cpp
+@@ -98,7 +98,7 @@ struct IPlatformServiceManager::Impl {
+ };
+ 
+ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const char* service_name_)
+-    : ServiceFramework{system_, service_name_}, impl{std::make_unique<Impl>()} {
++    : ServiceFramework{system_, service_name_} {
+     // clang-format off
+     static const FunctionInfo functions[] = {
+         {0, D<&IPlatformServiceManager::RequestLoad>, "RequestLoad"},
+@@ -123,6 +123,18 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
+     // clang-format on
+     RegisterHandlers(functions);
+ 
++    // pl:s and pl:u are made one after the other on one thread and hold the same data; it goes
++    // with the second of them, so a next session reads the fonts of its own NAND again.
++    static std::weak_ptr<Impl> loaded;
++    impl = loaded.lock();
++    if (impl != nullptr) {
++        return;
++    }
++    // Not make_shared: `loaded` would keep the 17 MiB after the session, the object and its
++    // counts being one block.
++    impl = std::shared_ptr<Impl>(new Impl());
++    loaded = impl;
++
+     auto& fsc = system.GetFileSystemController();
+ 
+     // Attempt to load shared font data from disk
+@@ -245,7 +257,7 @@ void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
+ }
+ 
+ IPlatformServiceManager::~IPlatformServiceManager() {
+-    if (impl->builtin_font_memory != nullptr) {
++    if (impl.use_count() == 1 && impl->builtin_font_memory != nullptr) {
+         impl->builtin_font_memory->Close(kernel);
+     }
+ }
+diff --git a/src/core/hle/service/ns/platform_service_manager.h b/src/core/hle/service/ns/platform_service_manager.h
+index ed5b1c1e39..79f461c34c 100644
+--- a/src/core/hle/service/ns/platform_service_manager.h
++++ b/src/core/hle/service/ns/platform_service_manager.h
+@@ -77,7 +77,8 @@ private:
+     void GetBuiltInFontData(HLERequestContext& ctx);
+ 
+     struct Impl;
+-    std::unique_ptr<Impl> impl;
++    /// One for pl:s and pl:u: the same fonts, 17 MiB of heap each.
++    std::shared_ptr<Impl> impl;
+ };
+ 
+ } // namespace NS

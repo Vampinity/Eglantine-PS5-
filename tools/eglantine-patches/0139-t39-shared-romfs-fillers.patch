@@ -1,0 +1,63 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0187-shared-romfs-fillers.patch
+
+Source: 0187-shared-romfs-fillers.patch
+Core patch: tools/eglantine-patches, next free number after 0181 (0187 if in order).
+
+The 106,496-block site, "df136 de734 2df087 2d40a3 84d564 431645", is make_shared<StaticVfsFile> in
+ConcatenatedVfsFile::MakeConcatenatedFile from CreateRomFS from AppLoader_NUP::ReadRomFS: one object for
+the padding of up to 15 bytes after most of the RomFS's 186,587 files. A filler of one length is the same
+read-only file, so there is one of each length now, and the map is made to its size instead of doubling
+past it (8.5 MiB for 6.8). Saves about 10 MiB and 110,000 blocks. Reads do not change, so no switch.
+
+Host check: 20,000 files with 6,236 gaps, one whole read and 200,000 random reads, old and new code
+give the expected bytes. Not compiled for the console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/file_sys/vfs/vfs_concat.cpp b/src/core/file_sys/vfs/vfs_concat.cpp
+index b5cc9a9e91..36136307db 100644
+--- a/src/core/file_sys/vfs/vfs_concat.cpp
++++ b/src/core/file_sys/vfs/vfs_concat.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <map>
+ #include <utility>
+ 
+ #include "common/assert.h"
+@@ -72,7 +73,17 @@ VirtualFile ConcatenatedVfsFile::MakeConcatenatedFile(
+     // Make the concatenation map from the input.
+     std::vector<ConcatenationEntry> concatenation_map;
+ 
+-    concatenation_map.reserve(files.size());
++    // A built RomFS has a gap of up to 15 bytes after most files, and a filler of each length is
++    // the same read-only file: a game of 186,587 files held about 110,000 of them, one heap block each
++    // (run 61). The map is made to size: doubling it left 8.5 MiB for 7.
++    std::size_t gaps = 0;
++    u64 next_offset = 0;
++    for (const auto& [offset, file] : files) {
++        gaps += offset > next_offset ? 1 : 0;
++        next_offset = offset + file->GetSize();
++    }
++    concatenation_map.reserve(files.size() + gaps);
++    std::map<u64, VirtualFile> fillers;
+     u64 last_offset = 0;
+ 
+     // Iteration of a multimap is ordered, so offset will be strictly non-decreasing.
+@@ -80,9 +91,13 @@ VirtualFile ConcatenatedVfsFile::MakeConcatenatedFile(
+         const auto size = file->GetSize();
+ 
+         if (offset > last_offset) {
++            VirtualFile& filler = fillers[offset - last_offset];
++            if (filler == nullptr) {
++                filler = std::make_shared<StaticVfsFile>(filler_byte, offset - last_offset);
++            }
+             concatenation_map.emplace_back(ConcatenationEntry{
+                 .offset = last_offset,
+-                .file = std::make_shared<StaticVfsFile>(filler_byte, offset - last_offset),
++                .file = filler,
+             });
+         }
+ 

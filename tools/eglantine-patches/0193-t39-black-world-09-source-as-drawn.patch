@@ -1,0 +1,52 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0421-black-world-09-source-as-drawn.patch
+
+Source: 0421-black-world-09-source-as-drawn.patch
+copies the frame as the drawn target
+
+Lichii PR 282 (03c3aa3d60, ProphetWild, "option to bypass Ocarina of Time's sharpening
+anti-aliasing network"): the network's output pass is replaced by a copy of render target 0 of the
+tonemap draw into the output pass's own B10G11R11 image, taken as B10G11R11, point filter, same
+size. On a 5090 the picture is clean (edges aliased as rendered), 41 to 50 fps.
+
+Our stand-in copies the same image, the one every draw into it writes with render-target code 0xe0
+(B10G11R11, run86's TRACE_RT), but reads it through the network's E5B9G9R9 TIC
+(g_blit_source_format), so the blit decodes the bits as shared-exponent floats: run83's and run86's
+heavy white. With EDEN_NX2_UPSCALE_SOURCE_AS_DRAWN=1 the E5B9G9R9 view is not forced and the
+source is the B10G11R11 image as the texture cache holds it, PR 282's copy. One line per program
+says so. Unset: the E5B9G9R9 view, as before. The square (EDEN_NX2_UPSCALE_SQUARE) still applies
+to the E5B9G9R9 input's format, so leave it unset with this.
+
+Clang syntax check clean on kepler_compute.cpp. Not built, not run.
+ src/video_core/engines/kepler_compute.cpp | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 0c66573bb6..7be36b0b10 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -1492,9 +1492,23 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+                                                      dlss_depth ? &*dlss_depth : nullptr,
+                                                      dlss_jitter, {1.0f, 1.0f});
+     };
+-    if (shared_exponent_input) {
++    // EDEN_NX2_UPSCALE_SOURCE_AS_DRAWN=1: the copy reads the frame as the render target the game
++    // drew (B10G11R11, code 0xe0 in every draw into it), not through the network's E5B9G9R9 TIC.
++    // Lichii PR 282 (03c3aa3d60) replaces the network's output pass with a copy of render target
++    // 0 of the tonemap draw, taken as B10G11R11, and gets a clean picture on a 5090; our stand-in
++    // copies the same image through the E5B9G9R9 view and gets the white (run83, run86). Same
++    // bits, two decodes: this takes PR 282's. Unset: the E5B9G9R9 view, as before.
++    static const bool source_as_drawn = std::getenv("EDEN_NX2_UPSCALE_SOURCE_AS_DRAWN") != nullptr;
++    if (shared_exponent_input && !source_as_drawn) {
+         VideoCommon::g_blit_source_format = VideoCore::Surface::PixelFormat::E5B9G9R9_FLOAT;
+     }
++    if (shared_exponent_input && source_as_drawn) {
++        static std::unordered_set<GPUVAddr> reported;
++        if (reported.insert(program_address).second) {
++            LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: reads its E5B9G9R9 input as the drawn B10G11R11 target",
++                     program_address);
++        }
++    }
+     const bool done = upscale_temporally() ||
+                       rasterizer->AccelerateSurfaceCopy(source, surface(*output), config);
+     VideoCommon::g_blit_source_format.reset();

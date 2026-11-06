@@ -1,0 +1,72 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0396-mac-lead-02-upscale-keep-drawn-frame.patch
+
+Source: 0396-mac-lead-02-upscale-keep-drawn-frame.patch
+video_core: EDEN_NX2_UPSCALE_KEEP_FRAME and _TRACE for Ocarina's gameplay stand-in
+
+EDEN_NX2_UPSCALE_KEEP_FRAME=1 keeps an E5B9G9R9 input in the stand-in upscale. Movies and the title
+are unchanged: their input is format 9 and is still replaced by the decoded picture.
+EDEN_NX2_UPSCALE_TRACE=1 logs each change of a program's input with sizes and formats, at most 64
+lines. Unset, nothing changes.
+
+Why: 0048 replaces an image "only the rejected passes fill". That holds for the movies. In gameplay
+the swap also fires: run40, 55, 62, 66 and 68 all log format 33 replacing 0x8113971000 format 32.
+run68 logs game draws into 0x8113971000 at 1920x1080, so that image is not filled only by rejected
+passes. kraibse's "as bright as the network's own output" check in 0040 predates 0048.
+
+The substitute is another image: its slot moves (+0xe8 in run68, +0xfc in run66) and its address too
+(0x8115776000, 0x8114456000, 0x8114487000). The handle scan of the program's code doesn't list it,
+or the search above the swap would have taken it first. What it holds is not known. The program's
+first dispatch at 76.9 s was not swapped, the swap was first logged at 79.4 s.
+
+Guess, not proven: the wrong image reaches the screen and this is part of the glitches on camera
+moves or of the white. The trace shows whether the input changes from frame to frame. The swap
+log stops at one line per program and the blit log at four lines, so no log shows it today.
+
+Checked off the console: PS5-target clang syntax check. Applies on core16, and after next18's 0210,
+0320 and 0334, the only later patches that touch this file or lower_to_maxwell.h.
+
+Core patch. Nothing here has run on a console.
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index b8572f132e..9eb5943beb 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -993,7 +993,13 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         // The last pass of a rejected network can read an image only the rejected passes fill
+         // (Ocarina of Time's title and movies): the frame is then another image of that size in
+         // cbuf0 that upscales to the same output, which is what the scan below used to find.
+-        for (u32 slot = 0x80; input && slot < 0x120; slot += 4) {
++        // EDEN_NX2_UPSCALE_KEEP_FRAME=1 leaves an E5B9G9R9 input alone. That is Ocarina of Time's
++        // gameplay frame: draws fill it (run68), so the reason above doesn't apply to it, and
++        // without this it gives way to a B10G11R11 image its handle scan doesn't list.
++        static const bool keep_drawn_frame = std::getenv("EDEN_NX2_UPSCALE_KEEP_FRAME") != nullptr;
++        const bool keep_input =
++            keep_drawn_frame && input && input->format == Texture::TextureFormat::E5B9G9R9;
++        for (u32 slot = 0x80; input && !keep_input && slot < 0x120; slot += 4) {
+             const auto from = memory_manager.Read<u32>(cbuf_address + slot) != 0 ? image(slot)
+                                                                                     : std::nullopt;
+             if (!upscale_pair(from, output) || from->Address() == input->Address() ||
+@@ -1034,6 +1040,22 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             }
+         }
+     }
++    // EDEN_NX2_UPSCALE_TRACE=1 logs each change of a program's input (at most 64 lines): the log
++    // below stops after four blits, so it never reaches Ocarina of Time's gameplay program.
++    if (static const bool trace = std::getenv("EDEN_NX2_UPSCALE_TRACE") != nullptr;
++        trace && input && output) {
++        static std::unordered_map<GPUVAddr, GPUVAddr> inputs;
++        static u32 changes{};
++        GPUVAddr& previous = inputs[regs.code_loc.Address()];
++        if (previous != input->Address() && changes < 64) {
++            ++changes;
++            LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: input {:#x} format {} {}x{}, output {:#x} format {} {}x{}",
++                     regs.code_loc.Address(), input->Address(), static_cast<u32>(input->format.Value()),
++                     input->Width(), input->Height(), output->Address(),
++                     static_cast<u32>(output->format.Value()), output->Width(), output->Height());
++        }
++        previous = input->Address();
++    }
+     const auto skip = [&](std::string_view reason) {
+         static std::unordered_set<GPUVAddr> reported;
+         if (reported.insert(regs.code_loc.Address()).second && reported.size() <= 64) {

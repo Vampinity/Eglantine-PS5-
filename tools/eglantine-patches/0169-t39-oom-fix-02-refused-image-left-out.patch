@@ -1,0 +1,241 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0381-oom-fix-02-refused-image-left-out.patch
+
+Source: 0381-oom-fix-02-refused-image-left-out.patch
+Core patch, for tools/eglantine-patches after 0211. Paths are the submodule's.
+
+Mario Kart World on next16 ended in JoinImages: vk::Exception through SlotVector<Image>::insert to
+terminate. The image was a sparse tiled one like the 8 before it. MakeImage asks for the sparse image
+first, and that was refused (EDEN_SPARSE_IMAGE, stderr line 204, before any mapping line), so it went
+on to MemoryAllocator::CreateImage. There `huge` is texels > 2^28 and 16384x16384 is exactly 2^28, so
+the real paths were tried, and refused: the kernel would not map it. CreateImage's last step, the
+unbacked sparse image, is the same request that had failed, so it failed too. "Format 9" in the log
+is VkFormat R8_UNORM and the earlier "format 12" is PixelFormat R8_UNORM: the same format.
+
+So an unbacked image cannot catch this one. It takes 172 mappings, which is what the kernel refused.
+A smaller stand-in image would need guest-sized views and attachments it cannot hold. What every
+caller of FindImage already handles is no image at all, the answer for an unmapped address:
+
+- A texture gets the null view and reads zero. VisitImageView keeps no view for the descriptor, and
+  TickFrame invalidates the tables when the pause ends, so the image is asked for again.
+- A render target is left out, as for address 0. FindRenderTargetView returned the null view here,
+  a path that could not be reached before: UpdateRenderTargets would prepare its missing image.
+- GetBlitImages gives nothing and the blit goes through guest memory.
+
+For an image that is written: nothing lies about holding the data. GPU writes while it is left out
+are lost. Guest memory keeps what the guest wrote, and the image is made and loaded from it at the
+next use once memory allows, as any new image. For 1 s nothing of the refused size or larger is asked
+for, because a refusal took 195 ms here with its reports.
+
+Only this insert is covered: the feedback shadow's insert and exceptions later in JoinImages still
+end the session. SlotVector::insert is noexcept on desktop builds, where this still terminates; the
+console's copy throws (headless/slot_vector_recovery.cmake).
+
+EDEN_NX2_IMAGE_REFUSED_ENDS=1 ends the session as before, and so does EDEN_NX2_UNBACKED_LIMIT other
+than 0, which is how a session asks to end on refused images.
+
+Proven: PS5-target syntax check with the SDK's libc++, -Wall -Wextra -Werror, real generated sources:
+vk_texture_cache_cost.cpp clean, vk_texture_cache_base.cpp (the Vulkan instantiation) only the three
+diagnostics already on other lines (248, 1344, 1345), and a static_assert that the requires branches
+are taken. prepare-vulkan-port.py skips the same 4 anchors with and without. The OpenGL instantiation
+could not be checked (no glad in the harness). Not linked, not run. A guess: how a game looks with
+such a texture missing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index b2759ab2fd..f4c6dfaeed 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1365,6 +1365,18 @@ void TextureCacheRuntime::Finish() {
+     scheduler.Finish();
+ }
+ 
++// EDEN_NX2_IMAGE_REFUSED_ENDS=1: an image with no memory ends the session, as it did. So does
++// EDEN_NX2_UNBACKED_LIMIT other than 0, which is how a session is asked to end on those.
++bool TextureCacheRuntime::ImageRefusalEnds() {
++    static const bool ends = [] {
++        const char* const asked = std::getenv("EDEN_NX2_IMAGE_REFUSED_ENDS");
++        const char* const limit = std::getenv("EDEN_NX2_UNBACKED_LIMIT");
++        return (asked != nullptr && asked[0] == '1') ||
++               (limit != nullptr && std::strtoul(limit, nullptr, 10) != 0);
++    }();
++    return ends;
++}
++
+ StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
+     return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index cc87a5c03e..a3c54dc251 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -67,6 +67,22 @@ public:
+ 
+     std::optional<StagingBufferRef> TryUploadStagingBuffer(size_t size, bool deferred = false);
+ 
++    /// Runs `make`, which makes an image, and says if it did: false when the device refused it
++    /// memory and an image with nothing bound too. On the console the exception reaches here
++    /// through the image's slot (headless/slot_vector_recovery.cmake).
++    template <typename Make>
++    [[nodiscard]] bool SurvivesImageRefusal(Make&& make) {
++        try {
++            make();
++            return true;
++        } catch (const vk::Exception& refused) {
++            if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY || ImageRefusalEnds()) {
++                throw;
++            }
++            return false;
++        }
++    }
++
+     /// The most UploadStagingBuffer always finds room for.
+     [[nodiscard]] size_t UploadSliceBytes() const noexcept;
+ 
+@@ -258,6 +274,9 @@ public:
+     std::optional<ASTCDecoderPass> astc_decoder_pass;
+     std::optional<BcEncoderPass> bc_encoder_pass;
+ 
++    /// Whether a refused image ends the session (SurvivesImageRefusal).
++    [[nodiscard]] static bool ImageRefusalEnds();
++
+     /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
+     /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.
+     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 00e58d7b82..4faecc5bea 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -488,6 +488,14 @@ void TextureCache<P>::TickFrame() {
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
++    if (refused_views && std::chrono::steady_clock::now() >= image_refused_until) {
++        refused_views = false;
++        for (size_t id : active_channel_ids) {
++            auto& channel_info = channel_storage[id];
++            channel_info.graphics_image_table.Invalidate();
++            channel_info.compute_image_table.Invalidate();
++        }
++    }
+     sentenced_images.Tick();
+     sentenced_image_index = (sentenced_image_index + 1) % TICKS_TO_DESTROY;
+     sentenced_image_bytes[sentenced_image_index] = 0;
+@@ -933,10 +941,19 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+         if (IsValidEntry(*gpu_memory, descriptor)) {
+             const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
+             if (is_new_tc) {
++                image_refused = false;
+                 pair->second = CreateImageView(descriptor);
+                 if (pair->second != NULL_IMAGE_VIEW_ID) {
+                     image_view_descriptors[pair->second].emplace_back(current_channel_id,
+                                                                       descriptor);
++                } else if (image_refused) {
++                    // The empty view is not kept for this descriptor, as it is for an unmapped
++                    // one: TickFrame has the tables read again, and the image is asked for again.
++                    image_refused = false;
++                    refused_views = true;
++                    channel_state->image_views.erase(pair);
++                    table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
++                    return NULL_IMAGE_VIEW_ID;
+                 }
+             }
+             PrepareImageView(pair->second, false, false);
+@@ -3003,6 +3020,9 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
+                  static_cast<u32>(info.format), info.block.width, info.block.height, info.block.depth);
+     }
+     const ImageId image_id = JoinImages(storage_info, gpu_addr, *cpu_addr);
++    if (!image_id) {
++        return ImageId{}; // Refused (JoinImages): nothing was made.
++    }
+     const Image& image = slot_images[image_id];
+     // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
+     const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
+@@ -3124,7 +3144,35 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             }
+         }
+     }
+-    const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
++    ImageId new_image_id{};
++    const auto make_image = [&] {
++        new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
++    };
++    if constexpr (requires { runtime.SurvivesImageRefusal(make_image); }) {
++        // The device has neither memory for this image nor one with nothing bound (Mario Kart
++        // World, 2026-11-06: the kernel refused the mappings with 1886 MiB in one piece). There is
++        // no image to give the caller, so it gets what an unmapped address gets: a texture reads
++        // zero, a render target is left out, a blit goes through guest memory. Nothing needs
++        // undoing (an overlap's Alias mark is only read to be cleared). What the GPU writes
++        // meanwhile is lost; guest memory keeps the guest's data, and a later use makes the image
++        // and loads it as any new image. For a moment nothing this size or larger is asked for.
++        constexpr auto RefusalPause = std::chrono::seconds(1);
++        const u64 image_bytes = CalculateGuestSizeInBytes(new_info);
++        const auto now = std::chrono::steady_clock::now();
++        const bool paused = now < image_refused_until && image_bytes >= image_refused_bytes;
++        if (paused || !runtime.SurvivesImageRefusal(make_image)) {
++            if (!paused) {
++                LOG_ERROR(HW_GPU, "No memory for the image at {:#x} ({}x{}, {} MiB): left out",
++                          gpu_addr, new_info.size.width, new_info.size.height, image_bytes >> 20);
++                image_refused_until = now + RefusalPause;
++                image_refused_bytes = image_bytes;
++            }
++            image_refused = true;
++            return ImageId{};
++        }
++    } else {
++        make_image();
++    }
+     Image& new_image = slot_images[new_image_id];
+ 
+     new_image.allocation_tick = frame_tick;
+@@ -3382,6 +3430,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
+             dst_id = InsertImage(dst_info, dst_addr, RelaxedOptions{});
+         }
+     } while (has_deleted_images);
++    if (!src_id || !dst_id) {
++        return std::nullopt; // Refused (JoinImages).
++    }
+     const ImageBase& src_image = slot_images[src_id];
+     const ImageBase& dst_image = slot_images[dst_id];
+     const bool native_bgr = runtime.HasNativeBgr();
+@@ -3397,6 +3448,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
+             src_id = FindOrInsertImage(src_info, src_addr, RelaxedOptions{});
+             dst_id = FindOrInsertImage(dst_info, dst_addr, RelaxedOptions{});
+         } while (has_deleted_images);
++        if (!src_id || !dst_id) {
++            return std::nullopt; // Refused (JoinImages).
++        }
+     }
+     return {BlitImages{
+         .dst_id = dst_id,
+@@ -3523,7 +3577,9 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
+     } while (has_deleted_images);
+     has_deleted_images = delete_state;
+     if (!image_id) {
+-        return NULL_IMAGE_VIEW_ID;
++        // Refused (JoinImages): no attachment, as for address 0. The null view would be taken for
++        // one, and it has no image to prepare.
++        return ImageViewId{};
+     }
+     Image& image = slot_images[image_id];
+     const ImageViewType view_type = RenderTargetImageViewType(info);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index c540fee609..4e00f376a9 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -577,6 +577,14 @@ private:
+     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
+ 
+     bool has_deleted_images = false;
++
++    /// Until when no image of image_refused_bytes or more is asked for (JoinImages).
++    std::chrono::steady_clock::time_point image_refused_until{};
++    u64 image_refused_bytes = 0;
++    /// The image just looked up was refused (VisitImageView keeps no view for it).
++    bool image_refused = false;
++    /// A descriptor went without its image: TickFrame has the tables read again.
++    bool refused_views = false;
+     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
+     /// skip the upload of a new target the clear overwrites whole.
+     bool clearing_render_targets = false;

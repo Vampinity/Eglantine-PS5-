@@ -1,0 +1,319 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0196-timed-ab-skip.patch
+
+Source: 0196-timed-ab-skip.patch
+Core patch, for tools/eglantine-patches as 0196. Ours, a diagnostic.
+
+EDEN_NX2_AB_SKIP=<seconds>;<phase>;<phase>... skips the draws and dispatches of each
+phase's programs in turn, so one stand-still minute tests several causes. It works
+from the running pipeline's hash, so it also reaches programs from the disk cache,
+which EDEN_NX2_REJECT_HASH cannot. The word d16 makes depth clears of a 1600x1600
+target clear to 0; a clear that was 0 already does not count as changed, and the log
+gives the depth the game asked for. Every phase change logs what was really skipped
+and the console's unix time. That clock ran about 48 s ahead of the OBS file names on
+5 November, nearly a whole 60 s round, so measure the offset before matching frames.
+EDEN_NX2_AB_LOG=1 names every program once with its targets. EDEN_NX2_BORDER_LOG=1
+names border colours that get rounded: the console runs without custom ones.
+
+The "Draw skipped" line also gains the target count and the depth target. That is
+the one change with no switch, and it only adds text to a log line. run-report.py
+reads that line, but only its unchanged start. Nothing else changes unless a variable
+is set.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+  .../renderer_vulkan/vk_pipeline_cache.cpp         |   1 +
+  .../renderer_vulkan/vk_pipeline_cache.h           |   6 +
+  src/video_core/renderer_vulkan/vk_rasterizer.cpp  | 175 +++++++++++++++++++-
+  .../renderer_vulkan/vk_texture_cache.cpp          |  19 +++
+  4 files changed, 197 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index eeb0af5445..c57f93db2e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -749,6 +749,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
+     if (!shader) {
+         return nullptr;
+     }
++    last_compute_hash = shader->unique_hash;
+     const auto& qmd{kepler_compute->launch_description};
+     const ComputePipelineCacheKey key{
+         .unique_hash = shader->unique_hash,
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index f0db1d9f5e..97d7522123 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -126,6 +126,11 @@ public:
+ 
+     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+ 
++    /// The program hash of the pipeline CurrentComputePipeline returned last
++    [[nodiscard]] u64 LastComputeHash() const noexcept {
++        return last_compute_hash;
++    }
++
+     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                            const VideoCore::DiskResourceLoadCallback& callback);
+ 
+@@ -182,6 +187,7 @@ private:
+     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
+ 
+     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
++    u64 last_compute_hash{};
+     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
+ 
+     ShaderPools main_pools;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index fc6f91d354..9cf143f16e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -392,6 +392,161 @@ bool MeshPipelineSkipped(const GraphicsPipeline& pipeline,
+     }
+     return skipped;
+ }
++// A timed A/B inside one run, for pictures the log can't judge.
++// EDEN_NX2_AB_SKIP=<seconds>;<phase>;<phase>...: each phase is a comma list of program hashes, as
++// the workaround and shader dumps name them (lower case, no 0x, lowest bit ignored: it is the
++// salt). An empty phase is the plain picture. A phase's draws and dispatches are skipped for
++// <seconds>, then the next phase runs, round and round. The word d16 in a phase also makes depth
++// clears of a 1600x1600 target clear to 0. Every change of phase logs what the last one really
++// skipped, and the console's wall clock, so a hash that matched nothing shows and frames can be
++// matched (a capture's own clock can differ: measure the offset, don't assume it).
++// Skipping a dispatch leaves its output as it was, so skip the pass that reads it where one exists.
++// EDEN_NX2_AB_LOG=1 names every program once, with its targets.
++class TimedAb {
++public:
++    static TimedAb& Get() {
++        static TimedAb instance;
++        return instance;
++    }
++
++    [[nodiscard]] bool Active() const {
++        return !phases.empty() || log_programs;
++    }
++
++    template <typename Hashes>
++    [[nodiscard]] bool SkipDraw(const Hashes& hashes, const Tegra::Engines::Maxwell3D::Regs& regs) {
++        std::scoped_lock lock{mutex};
++        Tick();
++        if (log_programs && seen.size() < 4096 && seen.insert(hashes[1] ^ (hashes[5] << 1)).second) {
++            LOG_INFO(HW_GPU,
++                     "EDEN_AB program vs {:016x} fs {:016x} rt0 {:#x} {}x{} format {:#x} targets {} "
++                     "zeta {:#x} {}x{} format {:#x} enabled {}",
++                     hashes[1], hashes[5], regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
++                     static_cast<u32>(regs.rt[0].format), regs.rt_control.count.Value(),
++                     regs.zeta.Address(), regs.zeta_size.width, regs.zeta_size.height,
++                     static_cast<u32>(regs.zeta.format), static_cast<u32>(regs.zeta_enable));
++        }
++        for (const u64 hash : hashes) {
++            if (hash != 0 && Matches(hash)) {
++                ++skipped_draws;
++                return true;
++            }
++        }
++        return false;
++    }
++
++    [[nodiscard]] bool SkipDispatch(u64 hash) {
++        std::scoped_lock lock{mutex};
++        Tick();
++        if (log_programs && seen.size() < 4096 && seen.insert(hash).second) {
++            LOG_INFO(HW_GPU, "EDEN_AB program cs {:016x}", hash);
++        }
++        if (Matches(hash)) {
++            ++skipped_dispatches;
++            return true;
++        }
++        return false;
++    }
++
++    [[nodiscard]] f32 ClearDepth(const Tegra::Engines::Maxwell3D::Regs& regs) {
++        if (phases.empty()) {
++            return regs.clear_depth;
++        }
++        std::scoped_lock lock{mutex};
++        if (!phases[current].clear_d16 || regs.zeta_size.width != 1600 ||
++            regs.zeta_size.height != 1600) {
++            return regs.clear_depth;
++        }
++        // A game that clears to 0 already gets no change: the count stays 0 and the log names the
++        // value it asked for, so a phase that did nothing can't be read as a result.
++        d16_asked = regs.clear_depth;
++        changed_clears += regs.clear_depth != 0.0f ? 1 : 0;
++        return 0.0f;
++    }
++
++private:
++    struct Phase {
++        std::vector<u64> hashes;
++        bool clear_d16 = false;
++    };
++
++    TimedAb() {
++        const char* const log = std::getenv("EDEN_NX2_AB_LOG");
++        log_programs = log != nullptr && log[0] != '0';
++        const char* const text = std::getenv("EDEN_NX2_AB_SKIP");
++        if (text == nullptr) {
++            return;
++        }
++        char* cursor = nullptr;
++        const unsigned long seconds = std::strtoul(text, &cursor, 10);
++        period = std::chrono::seconds{seconds != 0 ? seconds : 15};
++        while (*cursor == ';') {
++            ++cursor;
++            Phase phase;
++            while (*cursor != '\0' && *cursor != ';') {
++                if (std::string_view{cursor}.starts_with("d16") &&
++                    (cursor[3] == '\0' || cursor[3] == ',' || cursor[3] == ';')) {
++                    phase.clear_d16 = true;
++                    cursor += 3;
++                } else {
++                    char* end = nullptr;
++                    const u64 hash = std::strtoull(cursor, &end, 16);
++                    if (end == cursor) {
++                        break;
++                    }
++                    phase.hashes.push_back(hash | 1);
++                    cursor = end;
++                }
++                if (*cursor == ',') {
++                    ++cursor;
++                }
++            }
++            phases.push_back(std::move(phase));
++        }
++    }
++
++    [[nodiscard]] bool Matches(u64 hash) const {
++        return !phases.empty() &&
++               std::ranges::find(phases[current].hashes, hash | 1) != phases[current].hashes.end();
++    }
++
++    void Tick() {
++        if (phases.empty() || (++ticks & 63) != 0) {
++            return;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (start == std::chrono::steady_clock::time_point{}) {
++            start = now;
++        }
++        const size_t next = static_cast<size_t>((now - start) / period) % phases.size();
++        if (next == current) {
++            return;
++        }
++        const auto clock = std::chrono::duration_cast<std::chrono::seconds>(
++            std::chrono::system_clock::now().time_since_epoch());
++        LOG_WARNING(HW_GPU,
++                    "EDEN_AB phase {} ended: {} draws, {} dispatches skipped, {} clears changed "
++                    "(depth asked {}); phase {} starts at unix time {}",
++                    current, skipped_draws, skipped_dispatches, changed_clears, d16_asked, next,
++                    clock.count());
++        current = next;
++        skipped_draws = skipped_dispatches = changed_clears = 0;
++        d16_asked = -1.0f;
++    }
++
++    std::mutex mutex;
++    std::vector<Phase> phases;
++    std::set<u64> seen;
++    std::chrono::seconds period{15};
++    std::chrono::steady_clock::time_point start{};
++    size_t current = 0;
++    u64 ticks = 0;
++    u64 skipped_draws = 0;
++    u64 skipped_dispatches = 0;
++    u64 changed_clears = 0;
++    f32 d16_asked = -1.0f; ///< The depth the game last asked for in a d16 clear, -1 for none
++    bool log_programs = false;
++};
+ } // Anonymous namespace
+ 
+ template <typename Func>
+@@ -426,8 +581,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+         if (seen.size() < 64 && seen.emplace(vs, ps, reason).second) {
+-            LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,
+-                        regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
++            LOG_WARNING(HW_GPU,
++                        "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{} targets={} zeta={:#x} "
++                        "{}x{} enabled={}",
++                        reason, vs, ps, regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
++                        regs.rt_control.count.Value(), regs.zeta.Address(), regs.zeta_size.width,
++                        regs.zeta_size.height, static_cast<u32>(regs.zeta_enable));
+         }
+     };
+     GraphicsPipeline* const pipeline{[&] {
+@@ -475,6 +634,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         report_failure("EDEN_NX2_MESH_SKIP");
+         return;
+     }
++    if (TimedAb::Get().Active() &&
++        TimedAb::Get().SkipDraw(pipeline->Key().unique_hashes, maxwell3d->regs)) {
++        return;
++    }
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
+@@ -1144,11 +1307,12 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+                                      regs.stencil_front_func_mask, dst_region);
+     } else if (can_defer_clear) {
+         VkClearValue ds_value{};
+-        ds_value.depthStencil.depth = regs.clear_depth;
++        ds_value.depthStencil.depth = TimedAb::Get().ClearDepth(regs);
+         ds_value.depthStencil.stencil = regs.clear_stencil;
+         scheduler.DeferDepthStencilClear(framebuffer, ds_value);
+     } else {
+-        scheduler.Record([clear_depth = regs.clear_depth, clear_stencil = regs.clear_stencil,
++        scheduler.Record([clear_depth = TimedAb::Get().ClearDepth(regs),
++                          clear_stencil = regs.clear_stencil,
+                           clear_rect, aspect_flags](vk::CommandBuffer cmdbuf) {
+             VkClearAttachment attachment;
+             attachment.aspectMask = aspect_flags;
+@@ -1170,6 +1334,9 @@ void RasterizerVulkan::DispatchCompute() {
+         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
+         return;
+     }
++    if (TimedAb::Get().Active() && TimedAb::Get().SkipDispatch(pipeline_cache.LastComputeHash())) {
++        return;
++    }
+     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+     // Command list pages the dispatch writes are copied for the split's front right after it.
+     buffer_cache.Nx2CollectListCopies(true);
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index c880fb59f6..3b8894f388 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -97,6 +97,11 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+     }
+ }
+ 
++[[nodiscard]] bool ConvertBorderColorIsInexact(const std::array<float, 4>& color) {
++    return color != std::array<float, 4>{0, 0, 0, 0} && color != std::array<float, 4>{0, 0, 0, 1} &&
++           color != std::array<float, 4>{1, 1, 1, 1};
++}
++
+ [[nodiscard]] VkImageType ConvertImageType(const ImageType type) {
+     switch (type) {
+     case ImageType::e1D:
+@@ -4416,6 +4421,20 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
+         LOG_WARNING(Render_Vulkan, "VK_EXT_sampler_filter_minmax is required");
+         has_minmax_reduction = false;
+     }
++    // EDEN_NX2_BORDER_LOG=1: name the border colours a device without custom ones has to round.
++    if (samples_border && !device.IsCustomBorderColorUsable()) {
++        static const bool log_borders = [] {
++            const char* const value = std::getenv("EDEN_NX2_BORDER_LOG");
++            return value != nullptr && value[0] != '0';
++        }();
++        static std::vector<std::array<float, 4>> reported;
++        if (log_borders && ConvertBorderColorIsInexact(border_color) && reported.size() < 32 &&
++            std::find(reported.begin(), reported.end(), border_color) == reported.end()) {
++            reported.push_back(border_color);
++            LOG_WARNING(Render_Vulkan, "Border colour {} {} {} {} rounded to a standard one",
++                        border_color[0], border_color[1], border_color[2], border_color[3]);
++        }
++    }
+     has_custom_border_colors = samples_border && device.IsCustomBorderColorUsable();
+     needs_swizzle_mapping = has_custom_border_colors && device.NeedsBorderColorSwizzleMapping();
+ 

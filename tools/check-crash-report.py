@@ -323,7 +323,7 @@ def check(binary, console):
     status, out, err, reports, note = run(binary, 'again', console)
     report = reports[0].read_text()
     assert status == 43 and out == 'EXIT\n' and note == reports[0].name + ' 0\n', (status, out, note)
-    assert 'running: starting\n' in report and report.endswith('(it had just started again after a crash)\n')
+    assert 'running: starting\n' in report and report.endswith('then: the app closes\n')
     status, out, err, reports, note = run(binary, 'again-game', console)
     assert status == 42 and note.endswith(' 1\n'), (status, note)
 

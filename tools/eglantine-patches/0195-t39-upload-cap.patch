@@ -1,0 +1,89 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0427-upload-cap.patch
+
+Source: 0427-upload-cap.patch
+uploads and logs them
+
+Run149 crashed at a loading screen on one 3,316,524,576-byte request from ProcessExec, whose size
+is line_length_in times line_count. That is garbage in the registers, right after 31 failed macro
+calls. With the switch, a size above the cap drops that upload and logs what the registers held.
+This keeps the session alive and shows the values; it is not the cause.
+ src/video_core/engines/engine_upload.cpp | 28 ++++++++++++++++++++++++
+ src/video_core/engines/engine_upload.h   |  1 +
+ 2 files changed, 29 insertions(+)
+
+diff --git a/src/video_core/engines/engine_upload.cpp b/src/video_core/engines/engine_upload.cpp
+index 0ffdae8036..60ddb064c9 100644
+--- a/src/video_core/engines/engine_upload.cpp
++++ b/src/video_core/engines/engine_upload.cpp
+@@ -4,10 +4,12 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include "common/algorithm.h"
+ #include "common/assert.h"
++#include "common/logging.h"
+ #include "video_core/engines/engine_upload.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/memory_manager.h"
+@@ -28,12 +30,35 @@ void State::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
+ void State::ProcessExec(const bool is_linear_) {
+     write_offset = 0;
+     flushed_offset = 0;
++    // EDEN_NX2_UPLOAD_CAP_MIB=<n>: an inline upload is a small thing, so a size above the cap means
++    // the registers hold garbage. Run149 asked for 3,316,524,576 bytes here at a loading screen and
++    // died of it. Refuse it, drop its data and say what the registers held.
++    static const u64 cap = [] {
++        const char* const value = std::getenv("EDEN_NX2_UPLOAD_CAP_MIB");
++        return value != nullptr ? static_cast<u64>(std::strtoull(value, nullptr, 10)) << 20 : u64{0};
++    }();
++    const u64 wanted = static_cast<u64>(regs.line_length_in) * regs.line_count;
++    refused = cap != 0 && wanted > cap;
++    if (refused) {
++        LOG_ERROR(HW_GPU,
++                  "Upload refused: {} bytes, line_length_in={} line_count={} dest=0x{:x} pitch={} "
++                  "size={}x{}x{} at {},{} linear={}",
++                  wanted, regs.line_length_in, regs.line_count, regs.dest.Address(),
++                  regs.dest.pitch, regs.dest.width, regs.dest.height, regs.dest.depth, regs.dest.x,
++                  regs.dest.y, is_linear_);
++        copy_size = 0;
++        is_linear = is_linear_;
++        return;
++    }
+     copy_size = regs.line_length_in * regs.line_count;
+     inner_buffer.resize_destructive(copy_size);
+     is_linear = is_linear_;
+ }
+ 
+ void State::ProcessData(const u32 data, const bool is_last_call) {
++    if (refused) {
++        return;
++    }
+     const u32 sub_copy_size = (std::min)(4U, copy_size - write_offset);
+     std::memcpy(&inner_buffer[write_offset], &data, sub_copy_size);
+     write_offset += sub_copy_size;
+@@ -53,6 +78,9 @@ void State::ProcessData(const u32 data, const bool is_last_call) {
+ }
+ 
+ void State::ProcessData(const u32* data, size_t num_data) {
++    if (refused) {
++        return;
++    }
+     if (native_partial && is_linear && regs.line_count == 1) {
+         const auto count = std::min<size_t>(num_data * sizeof(u32), copy_size - write_offset);
+         if (count) {
+diff --git a/src/video_core/engines/engine_upload.h b/src/video_core/engines/engine_upload.h
+index 55a82f938b..44fd5c3a05 100644
+--- a/src/video_core/engines/engine_upload.h
++++ b/src/video_core/engines/engine_upload.h
+@@ -85,6 +85,7 @@ private:
+     u32 flushed_offset{};
+     u32 write_offset = 0;
+     u32 copy_size = 0;
++    bool refused = false;
+     Common::ScratchBuffer<u8> inner_buffer;
+     Common::ScratchBuffer<u8> tmp_buffer;
+     bool is_linear = false;

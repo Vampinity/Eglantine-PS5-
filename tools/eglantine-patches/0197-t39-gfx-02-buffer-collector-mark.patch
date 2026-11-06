@@ -1,0 +1,54 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0431-gfx-02-buffer-collector-mark.patch
+
+Source: 0431-gfx-02-buffer-collector-mark.patch
+buffer collector from a lower mark
+
+Core patch on core-t33 (T35 stack), off unless EDEN_NX2_BC_COLLECT_MIB is set.
+
+For Switch 2 titles the buffer cache collects only when its buffers hold 512 MiB or more (in
+earnest at 1 GiB). Zelda's buffers on the console held 282 to 324 MiB while walking and 457 MiB
+8 s after an area change (run 149), so the collector never ran and nothing unused was ever given
+back. EDEN_NX2_BC_COLLECT_MIB=256 runs it from 256 MiB: the gentle collector, which deletes
+buffers no draw used for 120 frames, 32 a frame, and leaves every buffer holding GPU-written data
+alone, so there is no download and no wait for the GPU. From twice the mark the aggressive one
+runs as before (60 frames, 64 a frame, GPU-written buffers downloaded first).
+
+Logs once "EDEN_NX2_BC_COLLECT_MIB=256: the buffer collector runs from 256 MiB, in earnest from
+512 MiB". Proof is the "Buffer cache: N buffers M MiB" line every 600 frames and
+EDEN_REFUSED_BUFFERS in a refusal report, against run 149's 457 MiB.
+
+Trade: a buffer deleted and needed again is made and uploaded again. Unset, 512 MiB as before.
+Not built, not run.
+
+ src/video_core/buffer_cache/buffer_cache.h | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index c3d17b983b..99406bdd99 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -173,8 +173,21 @@ void BufferCache<P>::TickFrame() {
+         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
+         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
+         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
+-        if (buffer_bytes >= 512_MiB) {
+-            RunGarbageCollector(buffer_bytes >= 1_GiB);
++        // EDEN_NX2_BC_COLLECT_MIB=<MiB> (unset: 512, as before) lowers the mark: on the console
++        // Ocarina of Time's buffers held 280 to 460 MiB, so this never ran there. Below twice the
++        // mark it is the gentle collector: buffers unused for 120 frames, 32 a frame, none
++        // holding GPU-written data, so no download and no wait for the GPU.
++        static const u64 collect_mark = [] {
++            const char* const value = std::getenv("EDEN_NX2_BC_COLLECT_MIB");
++            const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
++            if (mib != 0) {
++                LOG_INFO(HW_GPU, "EDEN_NX2_BC_COLLECT_MIB={}: the buffer collector runs from {} MiB, in earnest from {} MiB",
++                         value, mib, 2 * mib);
++            }
++            return (mib != 0 ? mib : u64{512}) << 20;
++        }();
++        if (buffer_bytes >= collect_mark) {
++            RunGarbageCollector(buffer_bytes >= 2 * collect_mark);
+         }
+     } else if (total_used_memory >= minimum_memory) {
+         RunGarbageCollector(total_used_memory >= critical_memory);

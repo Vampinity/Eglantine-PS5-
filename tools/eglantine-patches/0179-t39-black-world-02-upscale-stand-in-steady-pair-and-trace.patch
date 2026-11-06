@@ -1,0 +1,306 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0401-black-world-02-upscale-stand-in-steady-pair-and-trace.patch
+
+Source: 0401-black-world-02-upscale-stand-in-steady-pair-and-trace.patch
+per-dispatch trace (EDEN_NX2_UPSCALE_STEADY, _TRACE)
+
+run75 (T20, Docked, Max Resolution): program 0x1148fc8e00 (first HMMA at 0xc00) was rejected at
+91.3 s with no pair, at 106.2 s the stand-in found one ("plain copy") and the world showed clean
+and without white for a short time, then it went black again while the program kept being
+dispatched. The rejection is remembered (ShaderCache::RethrowIfRejected), so the stand-in runs on
+every dispatch; what varies per dispatch is its pair search or its blit, and the log holds no
+per-dispatch data: "skipped" and "plain copy" log once per program, the blit line four times
+in all, and the TRACE line only when a pair's input changed.
+
+EDEN_NX2_UPSCALE_STEADY=1:
+- the program's own handle slots (read, store) that last gave a pair are remembered and tried
+  first on every dispatch, before the handle scan;
+- a handle of the program's own whose TIC index lies beyond the compute class's TIC limit is
+  still read when its TIC entry is mapped and describes a block-linear 2D image of a blit
+  format (or E5B9G9R9) with a mapped address, 64..16384 wide: the limit register need not
+  follow a TIC pool the game grows. The title-4, Fortune's Weave, Bananza and blind cbuf0
+  scans keep the limit.
+
+EDEN_NX2_UPSCALE_TRACE=1 now logs each change of a program's outcome, at most 256 lines:
+"<step>: <input> -> <output>, blitted|not accelerated" (step: title 4 slots, Fortune's Weave
+slots, remembered slots, program handles, cbuf0 image of the input's size, Bananza slots,
+cbuf0 scan), or "no pair (tic limit N, cbuf0 ...): r@0xc0 tic 123 >limit 0x... WxH format F
+..." listing the program's own read and store slots as they stand. The next run's log then
+says why a dispatch had no pair.
+
+Both unset: nothing changes. Clang syntax check (no warnings) against the T20 tree with
+black-world-01. Not built, not run. Which of the candidates (TIC limit, handle contents,
+blit refused under memory pressure: run75's VMA heap 1 stood at 6470 of 7069 MiB at 111 s) is
+the cause is not known; STEADY covers the first two, the trace names all three.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/kepler_compute.cpp | 162 ++++++++++++++++++----
+ 1 file changed, 133 insertions(+), 29 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 161cc7247a..8c4cbc3090 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -942,11 +942,6 @@ std::pair<std::vector<u32>, std::vector<u32>> KeplerCompute::NativeImageHandles(
+ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     const auto& cbuf = launch_description.const_buffer_config[0];
+     const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+-    const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
+-        const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
+-        if (tic_index > regs.tic.limit) return std::nullopt;
+-        return GetTICEntry(tic_index);
+-    };
+     // An upscale keeps the aspect ratio and scales by at most 4: anything else (a 4x4 lookup
+     // table, a 120x67 luminance image) is another image the program happens to use.
+     // EDEN_NX2_UPSCALE_SAME_SIZE=1: the program's own read and store handles may also pair images
+@@ -957,6 +952,48 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     // found its pair (run75). Only the program's own handles may pair same-size images: in the
+     // cbuf0 scans below any two same-size images of one format would do.
+     static const bool same_size_ok = std::getenv("EDEN_NX2_UPSCALE_SAME_SIZE") != nullptr;
++    // EDEN_NX2_UPSCALE_STEADY=1 (run75, Docked: that program's pair was found at 106 s and the
++    // world showed, then it was lost again while the program kept being dispatched; the log has no
++    // per-dispatch data): the program's own handle slots that last gave a pair are tried first on
++    // every dispatch, and a handle whose TIC index lies beyond the compute class's TIC limit is
++    // still read when its entry is mapped and describes a block-linear 2D image of a blit format
++    // (the limit register need not follow a pool the game grows). The cbuf0 scans stay strict.
++    // EDEN_NX2_UPSCALE_TRACE=1 logs every change of a program's outcome (which step paired which
++    // images, or why none did, and whether the blit ran), at most 256 lines.
++    static const bool steady = std::getenv("EDEN_NX2_UPSCALE_STEADY") != nullptr;
++    static const bool trace = std::getenv("EDEN_NX2_UPSCALE_TRACE") != nullptr;
++    const GPUVAddr program_address = regs.code_loc.Address();
++    const auto sane_image = [](const Texture::TICEntry& tic) {
++        switch (tic.format) {
++        case Texture::TextureFormat::A2B10G10R10:
++        case Texture::TextureFormat::A8B8G8R8:
++        case Texture::TextureFormat::B10G11R11:
++        case Texture::TextureFormat::R16G16B16A16:
++        case Texture::TextureFormat::E5B9G9R9:
++            break;
++        default:
++            return false;
++        }
++        return tic.Address() != 0 && tic.IsBlockLinear() && tic.Width() >= 64 &&
++               tic.Width() <= 16384 && tic.Height() >= 16 && tic.Height() <= 16384;
++    };
++    // lenient: a slot the program itself reads or stores through (EDEN_NX2_UPSCALE_STEADY).
++    const auto image_at = [&](u32 offset, bool lenient) -> std::optional<Texture::TICEntry> {
++        const u32 handle = memory_manager.Read<u32>(cbuf_address + offset);
++        const u32 tic_index = handle & 0xfffff;
++        if (tic_index <= regs.tic.limit) return GetTICEntry(tic_index);
++        if (!lenient || !steady || handle == 0) return std::nullopt;
++        const GPUVAddr tic_address = regs.tic.Address() + u64{tic_index} * sizeof(Texture::TICEntry);
++        if (!memory_manager.IsFullyMappedRange(tic_address, sizeof(Texture::TICEntry))) {
++            return std::nullopt;
++        }
++        const auto tic = GetTICEntry(tic_index);
++        if (!sane_image(tic) || !memory_manager.IsFullyMappedRange(tic.Address(), 4096)) {
++            return std::nullopt;
++        }
++        return tic;
++    };
++    const auto image = [&](u32 offset) { return image_at(offset, false); };
+     const auto upscale_pair = [](const std::optional<Texture::TICEntry>& from,
+                                  const std::optional<Texture::TICEntry>& to, bool same_format = true,
+                                  bool same_size = false) {
+@@ -972,56 +1009,85 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         return from_width >= 64 && scales && to_width <= from_width * 4 &&
+                (cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a) * 32 <= cross_a;
+     };
++    std::string_view step = "title 4 slots";
+     std::optional<Texture::TICEntry> input = image(0x90), output = image(0xa0);
+     bool fortunes_weave = false;
+     if (!upscale_pair(input, output)) {
+         input = image(0x328);
+         output = image(0x348);
+         fortunes_weave = upscale_pair(input, output);
++        step = "Fortune's Weave slots";
+     }
+     if (!upscale_pair(input, output)) {
+         // The images the program itself uses: textures it reads and the surface it stores to
+         // through cbuf0 handles (Ocarina of Time's gameplay network reads +0xc0, writes +0xd0).
+         // The input is the largest read image that the output upscales, the output's format first.
+-        const auto [reads, stores] = NativeImageHandles(regs.code_loc.Address());
++        const auto [reads, stores] = NativeImageHandles(program_address);
+         input.reset();
+         output.reset();
++        u32 input_slot = 0, output_slot = 0;
++        struct RememberedPair {
++            u32 read_slot;
++            u32 store_slot;
++        };
++        static std::unordered_map<GPUVAddr, RememberedPair> remembered;
++        if (steady) {
++            if (const auto it = remembered.find(program_address); it != remembered.end()) {
++                const auto from = image_at(it->second.read_slot, true);
++                const auto to = image_at(it->second.store_slot, true);
++                if (upscale_pair(from, to, false, same_size_ok)) {
++                    input = from;
++                    output = to;
++                    input_slot = it->second.read_slot;
++                    output_slot = it->second.store_slot;
++                    step = "remembered slots";
++                }
++            }
++        }
+         for (const u32 store : stores) {
+-            const auto to = image(store);
++            if (input) break;
++            const auto to = image_at(store, true);
+             // Same-size pairs: the drawn frame (E5B9G9R9, Ocarina of Time) first. Of the program's
+             // other reads of the output's size, one of its format may be its own last output (a
+             // temporal network's history): copying that would leave the output as it started.
+             if (same_size_ok) {
+                 for (const u32 read : reads) {
+-                    const auto from = image(read);
++                    const auto from = image_at(read, true);
+                     if (from && from->format == Texture::TextureFormat::E5B9G9R9 &&
+                         upscale_pair(from, to, false, true)) {
+                         input = from;
+                         output = to;
++                        input_slot = read;
++                        output_slot = store;
+                         break;
+                     }
+                 }
+             }
+             for (const bool same_format : {true, false}) {
+                 for (const u32 read : reads) {
+-                    const auto from = image(read);
++                    const auto from = image_at(read, true);
+                     if (upscale_pair(from, to, same_format, same_size_ok) &&
+                         (!input || u64{from->Width()} * from->Height() > u64{input->Width()} * input->Height())) {
+                         input = from;
+                         output = to;
++                        input_slot = read;
++                        output_slot = store;
+                     }
+                 }
+                 if (input) break;
+             }
+-            if (input) break;
++            if (input) step = "program handles";
++        }
++        if (input && steady) {
++            remembered[program_address] = RememberedPair{input_slot, output_slot};
+         }
+         const bool same_size_pair = input && output && input->Width() == output->Width() &&
+                                     input->Height() == output->Height();
+         if (same_size_pair) {
+             static std::unordered_set<GPUVAddr> reported;
+-            if (reported.insert(regs.code_loc.Address()).second) {
++            if (reported.insert(program_address).second) {
+                 LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: same-size copy {:#x} format {} {}x{} -> {:#x} format {}",
+-                         regs.code_loc.Address(), input->Address(),
++                         program_address, input->Address(),
+                          static_cast<u32>(input->format.Value()), input->Width(), input->Height(),
+                          output->Address(), static_cast<u32>(output->format.Value()));
+             }
+@@ -1046,13 +1112,14 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+                 continue;
+             }
+             static std::unordered_set<GPUVAddr> reported;
+-            if (reported.insert(regs.code_loc.Address()).second) {
++            if (reported.insert(program_address).second) {
+                 LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: cbuf0+{:#x} {:#x} format {} replaces {:#x} format {}",
+-                         regs.code_loc.Address(), slot, from->Address(),
++                         program_address, slot, from->Address(),
+                          static_cast<u32>(from->format.Value()), input->Address(),
+                          static_cast<u32>(input->format.Value()));
+             }
+             input = from;
++            step = "cbuf0 image of the input's size";
+             break;
+         }
+     }
+@@ -1061,10 +1128,12 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     if (!upscale_pair(input, output, false, same_size_ok)) {
+         input = image(0x60);
+         output = image(0x70);
++        step = "Bananza slots";
+     }
+     if (!upscale_pair(input, output, false, same_size_ok)) {
+         input.reset();
+         output.reset();
++        step = "cbuf0 scan";
+         for (u32 first = 0x80; first < 0x120 && !input; first += 4) {
+             const auto from = memory_manager.Read<u32>(cbuf_address + first) != 0 ? image(first)
+                                                                                     : std::nullopt;
+@@ -1079,21 +1148,52 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             }
+         }
+     }
+-    // EDEN_NX2_UPSCALE_TRACE=1 logs each change of a program's input (at most 64 lines): the log
+-    // below stops after four blits, so it never reaches Ocarina of Time's gameplay program.
+-    if (static const bool trace = std::getenv("EDEN_NX2_UPSCALE_TRACE") != nullptr;
+-        trace && input && output) {
+-        static std::unordered_map<GPUVAddr, GPUVAddr> inputs;
+-        static u32 changes{};
+-        GPUVAddr& previous = inputs[regs.code_loc.Address()];
+-        if (previous != input->Address() && changes < 64) {
+-            ++changes;
+-            LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: input {:#x} format {} {}x{}, output {:#x} format {} {}x{}",
+-                     regs.code_loc.Address(), input->Address(), static_cast<u32>(input->format.Value()),
+-                     input->Width(), input->Height(), output->Address(),
+-                     static_cast<u32>(output->format.Value()), output->Width(), output->Height());
+-        }
+-        previous = input->Address();
++    // The trace: one line per change of a program's outcome.
++    const auto trace_outcome = [&](std::string text) {
++        static std::unordered_map<GPUVAddr, std::string> last;
++        static u32 lines{};
++        std::string& previous = last[program_address];
++        if (previous == text || lines >= 256) return;
++        ++lines;
++        previous = std::move(text);
++        LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program_address, previous);
++    };
++    const auto describe = [](const std::optional<Texture::TICEntry>& tic) {
++        return tic ? fmt::format("{:#x} {}x{} format {}", tic->Address(), tic->Width(), tic->Height(),
++                                 static_cast<u32>(tic->format.Value()))
++                   : std::string{"none"};
++    };
++    if (trace && (!input || !output)) {
++        // Why not: the program's own handle slots, as they stand at this dispatch.
++        const auto [reads, stores] = NativeImageHandles(program_address);
++        std::string text = fmt::format("no pair (tic limit {}, cbuf0 {:#x} size {:#x}):",
++                                       static_cast<u32>(regs.tic.limit), cbuf_address, cbuf.size.Value());
++        u32 listed = 0;
++        const auto describe_slot = [&](char kind, u32 slot) {
++            if (listed++ >= 12) return;
++            const u32 handle = memory_manager.Read<u32>(cbuf_address + slot);
++            const u32 tic_index = handle & 0xfffff;
++            text += fmt::format(" {}@{:#x} tic {}", kind, slot, tic_index);
++            if (handle == 0) {
++                text += " (zero)";
++                return;
++            }
++            const GPUVAddr tic_address =
++                regs.tic.Address() + u64{tic_index} * sizeof(Texture::TICEntry);
++            if (tic_index > regs.tic.limit) text += " >limit";
++            if (!memory_manager.IsFullyMappedRange(tic_address, sizeof(Texture::TICEntry))) {
++                text += " unmapped";
++                return;
++            }
++            const auto tic = GetTICEntry(tic_index);
++            text += fmt::format(" {:#x} {}x{} format {}{}", tic.Address(), tic.Width(), tic.Height(),
++                                static_cast<u32>(tic.format.Value()),
++                                tic.IsBlockLinear() ? "" : " pitch");
++        };
++        for (const u32 read : reads) describe_slot('r', read);
++        for (const u32 store : stores) describe_slot('w', store);
++        if (reads.empty() && stores.empty()) text += " no handles in the program's code";
++        trace_outcome(std::move(text));
+     }
+     const auto skip = [&](std::string_view reason) {
+         static std::unordered_set<GPUVAddr> reported;
+@@ -1261,6 +1361,10 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+     const bool done = upscale_temporally() ||
+                       rasterizer->AccelerateSurfaceCopy(source, surface(*output), config);
+     VideoCommon::g_blit_source_format.reset();
++    if (trace) {
++        trace_outcome(fmt::format("{}: {} -> {}, {}", step, describe(input), describe(output),
++                                  done ? "blitted" : "not accelerated"));
++    }
+     if (static u32 checked{}; checked++ == sample_at) {
+         const u64 size = u64{output->Width()} * output->Height() * 4;
+         if (const auto device = memory_manager.GpuToCpuAddress(output->Address())) {

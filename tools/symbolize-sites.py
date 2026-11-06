@@ -4,15 +4,22 @@
 
   python3 -I tools/symbolize-sites.py STDERR_LOG build/headless-native/llvm-pie.elf
 
-stderr.log has two kinds of lines, each with the return addresses found on the stack of the code that
+stderr.log has three kinds of lines, each with the return addresses found on the stack of the code that
 asked for the memory (offsets from the image's start, as in a crash report):
 
   EDEN_HEAP_SITE <MiB> MiB in <n> blocks: <offsets>   a place that holds heap memory alive
   EDEN_CRAM_WRITER <n>: <offsets>                      a place that wrote guest memory (<n> slots)
+  EDEN_GUEST_GROWTH_WRITER <n>MiB: <offsets>           the same in the minute before a refused allocation
+  EDEN_CRAM_CLEAR_SITE <n> slots in <m> calls: <offset> the guest kernel's call that gave Own slots back
 
 The app's code is execute-only on the console, so the app cannot check that an address follows a call.
 That is done here, with the image: addresses whose previous instruction is not a call are stale words of
 the stack and are left out, and the rest are named, nearest call first.
+
+A write by the emulated CPU has no call above it: the first 128 words above a JIT frame's stack pointer
+are dynarmic's spill slots (backend/x64/stack_layout.h), which still hold what earlier calls left at that
+depth. A row of KernelCore::GetCurrentEmuThread, __emutls_get_address, Xbyak::... or the scheduler is that:
+the game's own store, not those functions.
 """
 import re
 import shutil
@@ -20,9 +27,6 @@ import struct
 import subprocess
 import sys
 from pathlib import Path
-
-BASE = 0x400000
-
 
 def tool(*names):
     for name in names:
@@ -45,6 +49,10 @@ class Image:
                 '<IIQQQQQQ', d, phoff + i * phentsize)
             if p_type == 1:
                 self.loads.append((vaddr, offset, filesz))
+        # The lines hold offsets from the image's start. The console runs it at 0x400000, but
+        # llvm-pie.elf is linked at 0: adding 0x400000 here named every address after an unrelated
+        # function, and almost none followed a call, so nearly all rows came out as "?" hints.
+        self.base = min(load[0] for load in self.loads)
 
     def bytes_before(self, address, count):
         for vaddr, offset, size in self.loads:
@@ -97,18 +105,30 @@ def main():
             writers = []
         elif line.startswith('EDEN_CRAM_WRITER '):
             writers.append(line)
+    clears = []
+    for line in log.read_text(errors='replace').splitlines():
+        if line.startswith('EDEN_CRAM_WRITERS'):
+            clears = []
+        elif line.startswith('EDEN_CRAM_CLEAR_SITE '):
+            clears.append(line)
+    growth = []
+    for line in log.read_text(errors='replace').splitlines():
+        if line.startswith('EDEN_GUEST_GROWTH held'):
+            growth = []
+        elif line.startswith('EDEN_GUEST_GROWTH_WRITER '):
+            growth.append(line)
 
     cache = {}
 
     def raw(offset):
-        out = subprocess.run([symbolizer, '-e', str(elf), '-f', '-C', '--no-inlines', hex(BASE + offset - 1)],
+        out = subprocess.run([symbolizer, '-e', str(elf), '-f', '-C', '--no-inlines', hex(image.base + offset - 1)],
                              capture_output=True, text=True).stdout.splitlines()
         return (out[0] if out else '?')[:110]
 
     def name(offset):
         """The function of an address that follows a call; None for any other (a stale word)."""
         if offset not in cache:
-            cache[offset] = raw(offset) if follows_call(image, BASE + offset) else None
+            cache[offset] = raw(offset) if follows_call(image, image.base + offset) else None
         return cache[offset]
 
     def show(title, rows, pattern):
@@ -119,7 +139,9 @@ def main():
                 continue
             amount, offsets = m.group(1), [int(x, 16) for x in m.group(2).split() if int(x, 16)]
             chain = [n for n in (name(o) for o in offsets) if n]
-            if chain:
+            if not offsets and row.startswith(('EDEN_CRAM_WRITER ', 'EDEN_GUEST_GROWTH_WRITER ')):
+                text = 'code the JIT made, the game\'s own stores (or no app address on the stack)'
+            elif chain:
                 text = ' <- '.join(chain[:3])
             else:
                 # No return address among them: the nearest functions of the words, as a hint only.
@@ -128,6 +150,10 @@ def main():
 
     show('Heap, largest places alive (MiB in blocks):', heap_block, r'EDEN_HEAP_SITE (\d+ MiB in \d+ blocks): (.*)')
     show('Guest memory, writers (slots promoted):', writers, r'EDEN_CRAM_WRITER (\d+): (.*)')
+    show('Guest memory, the minute before the last refusal:', growth,
+         r'EDEN_GUEST_GROWTH_WRITER (\d+MiB): ([0-9a-f ]+)$')
+    show('Guest memory, slots given back by a clear (the kernel call):', clears,
+         r'EDEN_CRAM_CLEAR_SITE (\d+ slots in \d+ calls): (.*)')
 
 
 if __name__ == '__main__':

@@ -1,0 +1,47 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0412-black-world-08-output-mean.patch
+
+Source: 0412-black-world-08-output-mean.patch
+mean channel
+
+Run86 (Max Resolution, EDEN_NX2_UPSCALE_SQUARE) logged "squares its E5B9G9R9 input" for the 1:1
+network and scored 74 against run83's plain copy at 77, while in normal mode the same square took
+run92's 60 to 90 outdoors to run89's 30 to 65. The stand-in's sampler logs the input's mean channel
+(589 and 592 in those runs) but only the output's non-zero count and changes, so the logs cannot
+say whether the squared output was darker than the plain one at 1:1.
+
+The "output after blit" line now carries the same 3x10-bit mean as the input line. A squared copy
+must read lower than its input; equal means the square never reached the output on that path.
+Same sampling cadence (EDEN_NX2_SAMPLE_AT), no switch of its own.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+ src/video_core/engines/kepler_compute.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index fefb9ac2d6..0c66573bb6 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -1532,15 +1532,20 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             rasterizer->FlushRegion(*device, size, VideoCommon::CacheType::All);
+         }
+         u32 nonzero{}, samples{}, changes{}, last{};
++        u64 sum{};
+         for (u64 offset = 0; offset < size; offset += 4096 + 4) {
+             const u32 word = memory_manager.Read<u32>(output->Address() + offset);
+             ++samples;
+             nonzero += word != 0;
+             changes += word != last;
+             last = word;
++            sum += (word & 0x3ff) + ((word >> 10) & 0x3ff) + ((word >> 20) & 0x3ff);
+         }
+-        LOG_INFO(HW_GPU, "Upscale fallback output after blit: {}/{} non-zero, {} changes", nonzero, samples,
+-                 changes);
++        // The mean channel uses the input sampler's 3x10-bit reading, so the two compare: a copy
++        // that squares its input (EDEN_NX2_UPSCALE_SQUARE) must read lower here than the input
++        // did, or the square never reached the output (run86: 74 against run83's 77 at 1:1).
++        LOG_INFO(HW_GPU, "Upscale fallback output after blit: {}/{} non-zero, {} changes, mean channel {}",
++                 nonzero, samples, changes, samples ? sum / (samples * 3) : 0);
+     }
+     // Debug: trace the draws that follow one upscale (EDEN_NX2_RT_TRACE_AFTER_UPSCALE).
+     static const u32 trace_at = [] {

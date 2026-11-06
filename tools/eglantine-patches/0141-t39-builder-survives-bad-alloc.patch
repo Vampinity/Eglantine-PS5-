@@ -1,0 +1,125 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0201-builder-survives-bad-alloc.patch
+
+Source: 0201-builder-survives-bad-alloc.patch
+Core patch, for tools/eglantine-patches as 0201, after 0200. Ours.
+
+Run 61 (next14, 326 s) ended on thread VkPipelineBuilder with std::bad_alloc. Symbolized with the
+next14 symbols the stack is aco::optimize_postRA, aco_compile_shader, radv_shader_nir_to_asm,
+radv_graphics_shaders_compile, radv_CreateGraphicsPipelines, GraphicsPipeline::MakePipeline, the
+lambda in the GraphicsPipeline constructor, StatefulThreadWorker. ACO is C++ and its operator new
+threw: 3420160 bytes is exactly 835 x 4 KiB, pr_opt_ctx's table of one entry per block, with the
+heap exhausted. 0181 does not cover this: its catch is in PipelineCache::CreateGraphicsPipeline,
+and that frame is not on this stack, because the lambda runs on the worker. The lambda only caught
+vk::Exception.
+
+With the switch vk::Device::CreateGraphicsPipeline and CreateComputePipeline turn it into a
+vk::Exception for VK_ERROR_OUT_OF_HOST_MEMORY, the error the driver should have returned, and the
+catch both lambdas already have ends the build as a failed one: is_built is set, so the GPU
+thread's wait ends, and the pipeline stays null. 0200 then drops its draws; a compute pipeline
+without a VkPipeline is not dispatched (IsBound). Done in the wrapper so the lambdas stay as they
+are: fable-mesh-compute-0181 edits those lines, and its extra compute builds are covered too. The
+two driver calls keep their text, because prepare-vulkan-port.py hangs its timers on it. Other
+callers (blit helpers, on the GPU thread) get the same vk::Exception, which ends the session there
+as the bad_alloc did.
+
+The unwinding goes through RADV's C frames and ACO's (-fno-exceptions, so nothing is cleaned up on
+the way). Checked in the next14 symbols: every frame from aco::optimize_postRA to
+radv_CreateGraphicsPipelines has an .eh_frame entry. Run 61 itself caught a bad_alloc from this same
+new handler at 195 s (144 MiB, decode worker), so throw and catch work on the console, but never
+yet across the driver's frames. In RADV's source (f5610fe, the pin in tools/deps.json) no lock is
+held across this compile, apart from shader_dump_mtx when dumping. What the driver allocated for
+that pipeline (NIR, the ACO program, the radv_pipeline) leaks: for an 835-block shader a few MiB,
+maybe tens, at a guess, and each new pipeline of such a shader that fails leaks again. A failed
+pipeline is not built again until the cache evicts it.
+
+Switch: EDEN_NX2_PIPELINE_FAIL_SOFT=1. Default off: no handler for bad_alloc is on the stack, so
+the exception ends the session as before, with the driver's frames in the crash report (a handler
+that rethrew would unwind first and lose them), and 0181's catch still sees an inline build. Not
+run. Syntax checked with clang only.
+
+In the log: "No memory for the driver to build a pipeline", then "Graphics pipeline build failed:
+VK_ERROR_OUT_OF_HOST_MEMORY ..." (compute: "Adreno rejected compute shader ...").
+
+Memory: nothing new, apart from the leak above. Not a fix for the memory wall: it only turns this
+one end into missing draws, and a plain malloc failure in RADV's C code is not covered.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.cpp b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+index d0bca88125..2520fff909 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.cpp
++++ b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+@@ -5,7 +5,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <memory>
++#include <new>
+ #include <optional>
+ #include <utility>
+ #include <vector>
+@@ -20,6 +22,29 @@ namespace Vulkan::vk {
+ 
+ namespace {
+ 
++/// EDEN_NX2_PIPELINE_FAIL_SOFT=1 (as PipelineFailSoft in vk_scheduler.h): the driver's shader
++/// compiler (ACO) is C++, and its operator new throws through vkCreate*Pipelines (run 61, on a
++/// builder thread with nobody to catch it). That becomes the error the call should have returned,
++/// so the build ends as a failed one. Unset, no handler is on the stack: the session ends as
++/// before, and the crash report keeps the driver's frames, which a handler that rethrew would lose.
++template <typename Func>
++void DriverPipelineBuild(Func&& build) {
++    static const bool soft = [] {
++        const char* const value = std::getenv("EDEN_NX2_PIPELINE_FAIL_SOFT");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (!soft) {
++        build();
++        return;
++    }
++    try {
++        build();
++    } catch (const std::bad_alloc&) {
++        LOG_CRITICAL(Render_Vulkan, "No memory for the driver to build a pipeline");
++        throw Exception(VK_ERROR_OUT_OF_HOST_MEMORY);
++    }
++}
++
+ template <typename Func>
+ void SortPhysicalDevices(std::vector<VkPhysicalDevice>& devices, const InstanceDispatch& dld,
+                          Func&& func) {
+@@ -773,20 +798,24 @@ PipelineLayout Device::CreatePipelineLayout(const VkPipelineLayoutCreateInfo& ci
+ 
+ Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, VkPipelineCache cache) const {
+     VkPipeline object = VK_NULL_HANDLE;
+-    auto const result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+-    // Adreno 5xx drivers do not properly return when a graphics pipeline fails to be created
+-    // Some (unkown) Mali drivers also do not properly return
+-    // This result code is out of spec, but should be handled as "kinda working"
+-    if (result == VK_INCOMPLETE)
+-        return Pipeline(object, handle, *dld);
+-    Check(result);
++    DriverPipelineBuild([&] {
++        auto const result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
++        // Adreno 5xx drivers do not properly return when a graphics pipeline fails to be created
++        // Some (unkown) Mali drivers also do not properly return
++        // This result code is out of spec, but should be handled as "kinda working"
++        if (result == VK_INCOMPLETE)
++            return;
++        Check(result);
++    });
+     return Pipeline(object, handle, *dld);
+ }
+ 
+ Pipeline Device::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
+                                        VkPipelineCache cache) const {
+     VkPipeline object;
+-    Check(dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object));
++    DriverPipelineBuild([&] {
++        Check(dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object));
++    });
+     return Pipeline(object, handle, *dld);
+ }
+ 

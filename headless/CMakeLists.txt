@@ -11,6 +11,8 @@ set(PORT_BUILD_DIR "${CMAKE_BINARY_DIR}/headless")
 include("${CMAKE_CURRENT_LIST_DIR}/dynarmic/shared-jit.cmake")
 # Register-allocator bookkeeping visits only the host locations in use (compile time).
 include("${CMAKE_CURRENT_LIST_DIR}/dynarmic/reg_alloc.cmake")
+# Shorter x64 code for FCMP, DMB and CBZ/TBZ-style branches (block compile time switches).
+include("${CMAKE_CURRENT_LIST_DIR}/dynarmic/fast_paths.cmake")
 if(PS5_NATIVE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(EDEN_SHARED_JIT ON)
 endif()
@@ -140,24 +142,49 @@ eden_sparse_replace("mprotect(reinterpret_cast<void*>(page), HostPageSize, PROT_
     "(CommitSparsePage(page), 0)" 1)
 eden_sparse_replace("void FreeMemoryPages(void* base, std::size_t size) noexcept;"
     "void FreeMemoryPages(void* base, std::size_t size) noexcept;\nvoid* AllocateSparsePages(std::size_t size) noexcept;\nvoid FreeSparsePages(void* base, std::size_t size) noexcept;\nvoid CommitSparsePage(std::uintptr_t page) noexcept;\nbool SparseTablesAvailable() noexcept;" 1)
+# A vector can carry a mirror mirror_index entries further on (the JIT's direct page table,
+# headless/jit-page-table.cmake): committing a page of the first part commits its mirror first,
+# so a write of an entry may always write its mirror.
+eden_sparse_replace("    constexpr bool CommitPage(std::size_t index) noexcept {\n"
+    "    constexpr bool CommitPage(std::size_t index) noexcept {\n        if (mirror_index != 0 && index < mirror_index && !IsCommittedPage(index + mirror_index))\n            CommitPage(index + mirror_index);\n" 1)
+eden_sparse_replace("    std::size_t alloc_size{};\n"
+    "public:\n    std::size_t mirror_index{};\n\nprivate:\n    std::size_t alloc_size{};\n" 1)
 write_derived("${PORT_BUILD_DIR}/sparse/common/sparse_large_vector.h" "${sparse_header}")
+include("${EDEN_PORT_DIR}/jit-page-table.cmake")
 
 # An abandoned fiber stack is not unwound. Empty the by-value weak reference
 # before switching; jump_fcontext returns the live destination supplied by the
 # resumer, under that fiber's guard, just as the initial entry trampoline does.
 file(READ "${PROJECT_SOURCE_DIR}/src/common/fiber.cpp" fiber_source)
-string(REPLACE "    to.impl->previous_fiber = weak_from.lock();"
-    "    to.impl->previous_fiber = weak_from.lock();\n    ASSERT(to.impl->previous_fiber);\n    weak_from.reset();" fiber_source "${fiber_source}")
-string(REPLACE "    // \"from\" might no longer be valid if the thread was killed\n    if (auto from = weak_from.lock()) {"
-    "    if (auto* from = static_cast<Fiber*>(transfer.data)) {" fiber_source "${fiber_source}")
+# A plain string(REPLACE) that finds nothing leaves the build working and the change gone: when the
+# core moved the stack to a unique_ptr, 278 MiB of fiber stacks went back into the heap unnoticed.
+function(eden_fiber_replace old new)
+    string(REPLACE "${old}" "" without "${fiber_source}")
+    string(LENGTH "${fiber_source}" before)
+    string(LENGTH "${without}" after)
+    string(LENGTH "${old}" each)
+    math(EXPR found "(${before} - ${after}) / ${each}")
+    if(NOT found EQUAL 1)
+        message(FATAL_ERROR "Pinned fiber.cpp changed: ${found} of '${old}', expected 1")
+    endif()
+    string(REPLACE "${old}" "${new}" changed "${fiber_source}")
+    set(fiber_source "${changed}" PARENT_SCOPE)
+endfunction()
+eden_fiber_replace("    to.impl->previous_fiber = weak_from.lock();"
+    "    to.impl->previous_fiber = weak_from.lock();\n    ASSERT(to.impl->previous_fiber);\n    weak_from.reset();")
+eden_fiber_replace("    // \"from\" might no longer be valid if the thread was killed\n    if (auto from = weak_from.lock()) {"
+    "    if (auto* from = static_cast<Fiber*>(transfer.data)) {")
 if(PS5_NATIVE)
-# Native fibers keep their 2MiB usable stack, but reserve it in the CPU flexible pool.
+# Native fibers reserve their stack in the CPU flexible pool, 512 KiB of it by default: the size
+# upstream gives its other PlayStation target (__OPENORBIS__). EDEN_FIBER_STACK_KIB in env.txt sets
+# another, 2048 being the size this port used to keep (fiber_stack.h says why it matters).
 # ThreadToFiber needs only context bookkeeping and allocates no unused private stack.
-string(REPLACE "    std::array<u8, DEFAULT_STACK_SIZE> stack{};"
-    "    ::Eden::FiberStack stack;" fiber_source "${fiber_source}")
-string(REPLACE "    impl->stack_limit = impl->stack.data();"
-    "    impl->stack.Allocate(DEFAULT_STACK_SIZE);\n    impl->stack_limit = impl->stack.data();"
-    fiber_source "${fiber_source}")
+eden_fiber_replace("constexpr size_t DEFAULT_STACK_SIZE = 512 * 4096;"
+    "#define DEFAULT_STACK_SIZE (::Eden::FiberStack::StackBytes())")
+eden_fiber_replace("    std::unique_ptr<u8[]> stack;"
+    "    ::Eden::FiberStack stack;")
+eden_fiber_replace("    impl->stack.reset(new u8[DEFAULT_STACK_SIZE]);\n    impl->stack_limit = impl->stack.get();"
+    "    impl->stack.Allocate(DEFAULT_STACK_SIZE);\n    impl->stack_limit = impl->stack.data();")
 string(PREPEND fiber_source "#include \"${EDEN_PORT_DIR}/fiber_stack.h\"\n")
 endif()
 write_derived("${PORT_BUILD_DIR}/fiber.cpp" "${fiber_source}")
@@ -278,6 +305,7 @@ foreach(bits 32 64)
     if(bits EQUAL 64)
         eden_shared_jit_emitter()
     endif()
+    eden_fast_paths_emitter(${bits})
     write_derived("${PORT_BUILD_DIR}/a${bits}_emit_x64.cpp" "${emitter}")
     get_target_property(jit_sources dynarmic SOURCES)
     list(FILTER jit_sources EXCLUDE REGEX "(^|/)a${bits}_emit_x64\\.cpp$")
@@ -306,9 +334,11 @@ if(PS5_NATIVE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     string(FIND "${port_regalloc_header}" "if (!iter.IsReleased())" port_released_check)
     if(NOT port_released_check LESS 0)
         file(REMOVE "${PORT_BUILD_DIR}/include/dynarmic/backend/x64/reg_alloc.h")
+        eden_reg_alloc_codegen_only()
     else()
         eden_reg_alloc_sources()
     endif()
+    eden_fast_paths_sources()
 endif()
 
 # Patch lookup must not create a large empty record for every compiled block.
@@ -357,6 +387,10 @@ string(REPLACE "${scalar_write}" [=[    if (bitsize == 32 || bitsize == 64) {
 write_derived("${PORT_BUILD_DIR}/scalar_impl.cpp" "${scalar_source}")
 file(READ "${PROJECT_SOURCE_DIR}/src/dynarmic/src/${translator_relative}/a64_translate.cpp" translator)
 string(REPLACE "${translator_relative}/impl/impl.cpp" "${PORT_BUILD_DIR}/scalar_impl.cpp" translator "${translator}")
+if(EDEN_FAST_PATHS_SYSTEM)
+    eden_fast_paths_require("${translator}" "${translator_relative}/impl/system.cpp" "a64_translate.cpp system.cpp include")
+    string(REPLACE "${translator_relative}/impl/system.cpp" "${EDEN_FAST_PATHS_SYSTEM}" translator "${translator}")
+endif()
 write_derived("${PORT_BUILD_DIR}/a64_translate.cpp" "${translator}")
 get_target_property(jit_sources dynarmic SOURCES)
 list(FILTER jit_sources EXCLUDE REGEX "(^|/)a64_translate\\.cpp$")
@@ -401,6 +435,10 @@ if(fold_offset LESS 0)
 endif()
 file(READ "${EDEN_PORT_DIR}/scalar-fold.inc" scalar_fold)
 string(REPLACE "${fold_anchor}" "${fold_anchor}\n${scalar_fold}" optimizer "${optimizer}")
+# One page lookup for nearby A64 accesses (dynarmic/page-reuse.cmake).
+include("${CMAKE_CURRENT_LIST_DIR}/dynarmic/page-reuse.cmake")
+eden_page_reuse_opcodes()
+eden_page_reuse_optimizer()
 write_derived("${PORT_BUILD_DIR}/opt_passes.cpp" "${optimizer}")
 get_target_property(jit_sources dynarmic SOURCES)
 list(FILTER jit_sources EXCLUDE REGEX "(^|/)opt_passes\\.cpp$")
@@ -533,6 +571,7 @@ string(REPLACE "${mark_test}" [=[        if (*ctx.conf.page_table_marked_bit == 
             string(REPLACE "${port_old_patch}" "                AddFastmemPatch(location, code.getCurr(), ${port_callback}, *fastmem_marker, conf.recompile_on_fastmem_failure);" memory_source "${memory_source}")
         endforeach()
     endif()
+    eden_page_reuse_memory_inc()
     write_derived("${PORT_BUILD_DIR}/include/${memory_inc}" "${memory_source}")
 set(exclusive_lookup [=[template<typename EmitContext>
 Xbyak::RegExp EmitExclusiveVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize,
@@ -553,6 +592,27 @@ string(REPLACE "${fastmem_declaration}" "${exclusive_lookup}${fastmem_declaratio
 if(EDEN_SHARED_JIT)
     eden_shared_jit_memory_header()
 endif()
+# Ordered reads (LDAR, LDAPR, and every exclusive read: LDXR/LDAXR) were a locked RMW of zero
+# (lock xadd), ~20 cycles and a full barrier each; a game's job and object-table code runs them in
+# its hottest blocks. Under x86-TSO a naturally aligned 8-64-bit load is atomic and already has
+# acquire semantics, and ordered writes stay xchg (a full barrier), so a plain load keeps ARM's
+# STLR->LDAR order: the usual sequentially consistent mapping (load = mov, store = xchg). Exclusive
+# reads stay correct because misaligned ones leave for the callback and the exclusive write's
+# lock cmpxchg compares against the value read. 128-bit reads keep cmpxchg16b (a 16-byte load is
+# not atomic). EDEN_JIT_PLAIN_ORDERED=1 (main.cpp) turns it on; off is the locked read.
+# Ported from Swordpdf/ProsperoEden PR 189, commit 64a1ee754a3b (Rockiu0), GPL-3.0-or-later.
+set(ordered_read_old [=[const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
+    if (ordered) {
+]=])
+string(FIND "${memory_emitter}" "${ordered_read_old}" ordered_read_at)
+if(ordered_read_at LESS 0)
+    message(FATAL_ERROR "Pinned EmitReadMemoryMov changed")
+endif()
+string(REPLACE "${ordered_read_old}" [=[const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
+    if (ordered && (bitsize == 128 || !__atomic_load_n(&eden_plain_ordered_reads, __ATOMIC_RELAXED))) {
+]=] memory_emitter "${memory_emitter}")
+string(REPLACE "#pragma once\n" "#pragma once\nextern \"C\" bool eden_plain_ordered_reads;  // ProsperoEden (CMakeLists.txt, ordered reads)\n"
+    memory_emitter "${memory_emitter}")
 write_derived("${PORT_BUILD_DIR}/include/${memory_relative}" "${memory_emitter}")
 # New include overlays do not invalidate objects whose depfile still names
 # upstream headers. Derive both translation units so the first build cannot
@@ -563,6 +623,9 @@ foreach(bits 32 64)
     file(READ "${PROJECT_SOURCE_DIR}/src/dynarmic/src/dynarmic/backend/x64/${memory_unit}" memory_source)
     if(EDEN_SHARED_JIT)
         eden_shared_jit_memory_unit(${bits})
+    endif()
+    if(bits EQUAL 64)
+        eden_page_reuse_memory_unit()
     endif()
     write_derived("${PORT_BUILD_DIR}/${memory_unit}" "${memory_source}")
     list(FILTER jit_sources EXCLUDE REGEX "(^|/)a${bits}_emit_x64_memory\\.cpp$")
@@ -671,6 +734,14 @@ foreach(bits 32 64)
     set(relative "arm/dynarmic/arm_dynarmic_${bits}.cpp")
     file(READ "${PROJECT_SOURCE_DIR}/src/core/${relative}" wrapper)
     string(REPLACE "Common::PageTable::SIGN_BIT" "std::countl_zero(Common::PageTable::ATTRIBUTE_MASK)" wrapper "${wrapper}")
+    # The JIT's direct page table when the process has one (headless/jit-page-table.cmake).
+    set(direct_anchor "            config.page_table_sign_extension = std::uint8_t(std::countl_zero(Common::PageTable::ATTRIBUTE_MASK));\n        }\n")
+    string(FIND "${wrapper}" "${direct_anchor}" direct_at)
+    if(direct_at LESS 0)
+        message(FATAL_ERROR "Pinned page-table JIT configuration changed (${bits})")
+    endif()
+    string(REPLACE "${direct_anchor}" "${direct_anchor}        if (void* const direct = page_table->DirectTable()) {\n            config.page_table = reinterpret_cast<decltype(config.page_table)>(direct);\n            config.page_table_pointer_mask = 0;\n            config.page_table_marked_bit = std::nullopt;\n            config.page_table_sign_extension = std::nullopt;\n        }\n"
+        wrapper "${wrapper}")
     # Without fastmem every LDREX/STREX left JIT code through a callback under the
     # global monitor lock (~7,000 pairs/frame in a measured racing game). The exclusive
     # emitter patch below supports page-table addresses; eden-memory-check covers
@@ -736,6 +807,17 @@ foreach(bits 32 64)
         string(PREPEND wrapper "#include \"${EDEN_PORT_DIR}/performance.h\"\n#include \"core/hle/kernel/k_thread.h\"\n")
         string(REPLACE "    return TranslateHaltReason(m_jit->Run());"
             "    const auto mkw_tid = thread ? thread->GetThreadId() : 0;\n    ::Eden::Performance::NoteRunning(mkw_tid, ::Eden::Performance::NowNs());\n    ::Eden::Performance::Timer mkw_run_timer(::Eden::Performance::mkw_guest_run[mkw_tid < 512 ? mkw_tid : 511]);\n    const auto mkw_start = ::Eden::Performance::NowNs();\n    const auto mkw_halt = m_jit->Run();\n    ::Eden::Performance::MkwRecordRunExit(mkw_tid, ${mkw_exit_pc}, ::Eden::Performance::NowNs() - mkw_start);\n${mkw_slow_run}    return TranslateHaltReason(mkw_halt);"
+            wrapper "${wrapper}")
+    elseif(NOT EDEN_DEV_PROFILE)
+        # EDEN_PERF_REPORT=1 (performance.h, GuestRunScope): one relaxed load per JIT run when off.
+        set(guest_run_old "    return TranslateHaltReason(m_jit->Run());")
+        string(FIND "${wrapper}" "${guest_run_old}" guest_run_at)
+        if(guest_run_at LESS 0)
+            message(FATAL_ERROR "Pinned RunThread changed (${bits})")
+        endif()
+        string(PREPEND wrapper "#include \"${EDEN_PORT_DIR}/performance.h\"\n#include \"core/hle/kernel/k_thread.h\"\n")
+        string(REPLACE "${guest_run_old}"
+            "    ::Eden::Performance::GuestRunScope guest_run_scope(thread ? thread->GetThreadId() : 0);\n${guest_run_old}"
             wrapper "${wrapper}")
     endif()
     if(EDEN_DEV_PROFILE)
@@ -997,9 +1079,26 @@ if(EDEN_DEV_PROFILE)
     list(REMOVE_ITEM core_sources "hle/kernel/svc/svc_ipc.cpp")
     list(APPEND core_sources "${PORT_BUILD_DIR}/svc_ipc.cpp")
 endif()
+file(READ "${PROJECT_SOURCE_DIR}/src/core/memory.cpp" arena_source)
+# An unmap zeroes the entries directly: zero the JIT's direct values first (jit-page-table.cmake).
+set(unmap_old "            page_table.entries.ZeroRegion(base, end);\n")
+string(FIND "${arena_source}" "${unmap_old}" unmap_at)
+if(unmap_at LESS 0)
+    message(FATAL_ERROR "Pinned page-table unmap changed")
+endif()
+string(REPLACE "${unmap_old}" "            if (const auto mirror = page_table.entries.mirror_index; mirror != 0)\n                page_table.entries.ZeroRegion(base + mirror, end + mirror);\n${unmap_old}"
+    arena_source "${arena_source}")
+# The direct values follow the entries in the same vector: entries.size() is then twice the address
+# space, and the check below would read a direct value as the page entry of a guest address.
+set(valid_old "    if (page >= page_table.entries.size()) {\n")
+string(FIND "${arena_source}" "${valid_old}" valid_at)
+if(valid_at LESS 0)
+    message(FATAL_ERROR "Pinned IsValidVirtualAddress changed")
+endif()
+string(REPLACE "${valid_old}" "    if (page >= page_table.entries.size() - page_table.entries.mirror_index) {\n"
+    arena_source "${arena_source}")
 if(EDEN_A32_FASTMEM)
     # The window spans 4 GiB: only 32-bit applications get it as their fastmem arena.
-    file(READ "${PROJECT_SOURCE_DIR}/src/core/memory.cpp" arena_source)
     set(arena_old "        if (process.IsApplication() && Settings::IsFastmemEnabled()) {")
     string(FIND "${arena_source}" "${arena_old}" arena_at)
     if(arena_at LESS 0)
@@ -1007,10 +1106,10 @@ if(EDEN_A32_FASTMEM)
     endif()
     string(REPLACE "${arena_old}" "        if (process.IsApplication() && !process.Is64Bit() && Settings::IsFastmemEnabled()) {"
         arena_source "${arena_source}")
-    write_derived("${PORT_BUILD_DIR}/memory.cpp" "${arena_source}")
-    list(REMOVE_ITEM core_sources "memory.cpp")
-    list(APPEND core_sources "${PORT_BUILD_DIR}/memory.cpp")
 endif()
+write_derived("${PORT_BUILD_DIR}/memory.cpp" "${arena_source}")
+list(REMOVE_ITEM core_sources "memory.cpp")
+list(APPEND core_sources "${PORT_BUILD_DIR}/memory.cpp")
 # Where a game's code is loaded: at a random offset, or at the one the game's seed gives
 # (load_address.h). Upstream takes the seed from its RNG seed setting, which also seeds the
 # random numbers a game is given; the port's seed fixes the offset alone.
@@ -1918,10 +2017,13 @@ string(REPLACE "${page_heap_free_site}"
     page_heap_source "${page_heap_source}")
 string(PREPEND page_heap_source "#include <cstddef>\n#include <cstdint>\n#include \"core/device_memory.h\"\nnamespace Common { void GuestMemoryFreed(std::uint64_t offset, std::size_t bytes) noexcept; }\n")
 write_derived("${PORT_BUILD_DIR}/k_page_heap.cpp" "${page_heap_source}")
-get_target_property(pool_core_sources core SOURCES)
-list(REMOVE_ITEM pool_core_sources hle/kernel/k_memory_manager.cpp hle/kernel/k_page_heap.cpp)
-list(APPEND pool_core_sources "${PORT_BUILD_DIR}/k_memory_manager.cpp" "${PORT_BUILD_DIR}/k_page_heap.cpp")
-set_property(TARGET core PROPERTY SOURCES "${pool_core_sources}")
+# Into core_sources, which already holds this section's kernel.cpp. These files used to go through a
+# list of their own that the next line replaced with core_sources: both copies were written and never
+# built, KPageHeap::Free never called GuestMemoryFreed, and every log says returns_free=0. The page
+# heap's copy goes in now (it does nothing unless EDEN_CRAM_FREE_RETURN=1). The memory manager's stays
+# out: with the service on its one live call returns at once, and with it off it would change a build.
+list(REMOVE_ITEM core_sources hle/kernel/k_page_heap.cpp)
+list(APPEND core_sources "${PORT_BUILD_DIR}/k_page_heap.cpp")
 set_property(TARGET core PROPERTY SOURCES "${core_sources}")
 
 # Replace SDL audio with the optional native sink; the renderer stays null.
@@ -2125,9 +2227,13 @@ if(EDEN_PS5_OPENGL)
         list(APPEND video_sources "${MACRO_OUTPUT}")
     endif()
     file(READ "${PROJECT_SOURCE_DIR}/src/video_core/gpu_thread.h" gpu_thread_header)
-    string(REPLACE "using CommandQueue = Common::SPSCQueue<CommandDataContainer>;"
-        "using CommandQueue = Common::SPSCQueue<CommandDataContainer, 8>;"
-        gpu_thread_header "${gpu_thread_header}")
+    # The GPU command queue stays unbounded (core patch 0027): with 8 entries, nx2:gpu requests
+    # that queue GPU maps under the registry and region locks, and a GPU-thread write into a lazily
+    # backed region that takes those locks, waited on each other (a loading screen that stops).
+    string(FIND "${gpu_thread_header}" "Common::HostCommandQueue<CommandDataContainer>" unbounded_queue_at)
+    if(unbounded_queue_at LESS 0)
+        message(FATAL_ERROR "The GPU command queue is bounded again (tools/eglantine-patches/0027)")
+    endif()
     string(REPLACE "    ~ThreadManager();" "    ~ThreadManager();\n    void Stop() { thread.request_stop(); if (thread.joinable()) thread.join(); }" gpu_thread_header "${gpu_thread_header}")
     if(PS5_NATIVE)
         string(PREPEND gpu_thread_header "#include <pthread.h>\n#include <condition_variable>\n")
@@ -2380,7 +2486,13 @@ set_property(SOURCE "${PORT_BUILD_DIR}/shader_environment.cpp" APPEND PROPERTY O
     "${EDEN_PORT_DIR}/shader_cache_reader.inc")
 list(REMOVE_ITEM video_sources shader_environment.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/shader_environment.cpp")
+include("${EDEN_PORT_DIR}/macro_native.cmake")
 set_property(TARGET video_core PROPERTY SOURCES "${video_sources}")
+# AV1 for Switch 2 movies: the static libavcodec's libdav1d decoder needs dav1d itself, which
+# tools/build-headless-dav1d.sh installs beside it (FindFFmpeg only lists FFmpeg's own archives).
+if(PS5_NATIVE AND EXISTS "${FFMPEG_DIR}/lib/libdav1d.a")
+    target_link_libraries(video_core PRIVATE "${FFMPEG_DIR}/lib/libdav1d.a")
+endif()
 
 if(PS5_NATIVE)
     target_compile_definitions(libzstd_static PRIVATE ZSTD_TRACE=0)

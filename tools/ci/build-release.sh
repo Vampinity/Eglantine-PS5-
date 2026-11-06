@@ -27,4 +27,6 @@ if [[ -n ${EDEN_DEV_CHECKOUT:-} ]]; then
         fi
     fi
 fi
+# Fork test build: the stale source checks stop a finished build (tools/build-headless-native.sh).
+export EDEN_SKIP_SOURCE_CHECKS=1
 make release

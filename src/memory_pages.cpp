@@ -25,6 +25,11 @@
 
 #include "fastmem.h"
 
+#if __has_include(<lz4.h>)
+#include <lz4.h>
+#define EDEN_SWAP_LZ4 1
+#endif
+
 #ifdef PS5_NATIVE
 // Keep CPU heaps/tables and JIT views out of RADV's high-word-2 GPU window.
 // This is a non-fixed hint: the kernel retains ownership of collision handling.
@@ -52,6 +57,7 @@ std::int32_t sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size
                                          std::size_t, int, std::int64_t*);
 std::int32_t sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
 std::int32_t sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
+std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*, std::size_t*);
 std::int32_t sceKernelReserveVirtualRange(void**, std::size_t, int, std::size_t);
 std::int32_t sceKernelEnableDmemAliasing();
 int sceKernelDebugOutText(int, const char*);
@@ -277,6 +283,7 @@ struct SparseRange {
     bool promote = false;               // writes to shared slots are promoted (the service runs)
     std::uint16_t* fine = nullptr;      // per slot: 16 KiB pages a Fine slot keeps (low 8 bits), times made whole (bits 8-11)
     std::uint32_t* fine_after = nullptr; // per slot: the scan pass from which it may be made Fine again
+    std::uint32_t* swap = nullptr;      // per slot: the tick it was last touched (Own) or armed (Probe), its place in the file (Out)
 };
 std::array<SparseRange, 64> sparse_ranges;
 std::mutex sparse_mutex;
@@ -305,11 +312,19 @@ extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type
 #ifdef PS5_NATIVE
 std::int64_t zero_block = -1;
 
+// Where a slot's short-lived view of a block goes. A view asks for the first gap at or after the
+// address, and at cpu_mapping_hint that can be the gap a heap piece leaves between DecommitMemoryRange's
+// munmap and its reservation, MAP_FIXED, which then takes the view's mapping away. These views are
+// made in the fault handler, so the clear that follows faults inside it (run 59's analysis found this
+// route; no run has shown it). EDEN_SLOT_VIEW_HIGH=1 (ServiceStart) puts them high above the heap.
+std::atomic<std::uintptr_t> slot_view_hint{cpu_mapping_hint};
+constexpr std::uintptr_t slot_view_high = 0x3800000000ull;
+
 // A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
 bool ZeroedBlock(std::int64_t* physical) {
     if (eden_direct_low(SparseSlot, SparseSlot, 12, physical) != 0)
         return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+    void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, *physical, SparseSlot) != 0) {
         (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
         return false;
@@ -350,11 +365,17 @@ void* ReserveSparse(std::size_t span, [[maybe_unused]] bool guest = false) {
 }
 
 // Gives the slot at `at` memory of its own, zeroed and writable. sparse_mutex is held.
+#ifdef PS5_NATIVE
+bool TableReserveBlock(std::int64_t* physical) noexcept; // guest_memory_service.inc
+#endif
 bool OwnSlot(std::uintptr_t at, std::int64_t* physical) {
 #ifdef PS5_NATIVE
     // The block is zeroed before it appears in the table: a JIT thread may read the slot at any
     // moment, and the mapping changes in one step.
-    if (!ZeroedBlock(physical)) return false;
+    // A table slot has nowhere to go if this fails (CommitSparsePage ends the app), so it may
+    // take a block of the guest reserve, as the guest writes do: run 62 ended here with 242 MiB
+    // of the reserve idle.
+    if (!ZeroedBlock(physical) && !TableReserveBlock(physical)) return false;
     if (MapSlot(at, PROT_READ | PROT_WRITE, *physical)) return true;
     (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
     return false;
@@ -369,6 +390,7 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept;
 bool ServiceCommit(SparseRange& range, std::size_t slot) noexcept;
 void ServiceStart(SparseRange& range) noexcept;
 void ServiceStop(SparseRange& range) noexcept;
+bool InCodeCache(std::uintptr_t address) noexcept; // code the JIT made (below, with the code ranges)
 
 void ReleaseSparse(SparseRange& range) {
     if (range.state != nullptr) ReleaseServiceBlocks(range); // its blocks, shared ones once
@@ -393,6 +415,8 @@ void ReleaseSparse(SparseRange& range) {
     range.fine = nullptr;
     delete[] range.fine_after;
     range.fine_after = nullptr;
+    delete[] range.swap;
+    range.swap = nullptr;
     range.begin.store(0, std::memory_order_release);
     delete[] range.owned;
     delete[] range.physical;
@@ -919,6 +943,14 @@ struct CodeRange {
 std::array<CodeRange, 16> code_ranges;
 std::mutex code_mutex;
 std::atomic<std::size_t> code_reserved{0}, code_committed{0};
+// Lock-free: asked in a fault handler.
+bool InCodeCache(std::uintptr_t address) noexcept {
+    for (const CodeRange& range : code_ranges) {
+        const std::uintptr_t executable = range.executable.load(std::memory_order_acquire);
+        if (executable != 0 && address >= executable && address - executable < range.span) return true;
+    }
+    return false;
+}
 
 // Memory behind the next step of both ranges, a 2 MiB block at a time: one block of 16 MiB
 // asked of a pool cut into small free ranges was refused with 2 MiB blocks still free and the

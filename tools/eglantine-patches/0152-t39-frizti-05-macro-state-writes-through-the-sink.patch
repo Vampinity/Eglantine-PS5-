@@ -1,0 +1,98 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0335-frizti-05-macro-state-writes-through-the-sink.patch
+
+Source: 0335-frizti-05-macro-state-writes-through-the-sink.patch
+maxwell_3d: macro state writes go through the back's method sink (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone, and before or after lichii-gpu 0214.
+
+Source: Frizti/Lichii 516ba08ce5 and 4ddc1a058d (Dr. Sergio, Lichii PR 166), 3D part,
+GPL-3.0-or-later. Frizti's v2 build keeps it opt-in.
+
+EDEN_NX2_MACRO_SINK=1. A macro's state write costs the back a full CallMethod. The command list's own
+state writes only go in the method sink, applied in one loop before the next executable write. With
+the switch macro writes do the same. Order against draws stays: the sink is applied before any
+executable or direct write and in FinishFrontMacro. On the back, CallMethod does for such a register
+what ConsumeSinkImpl does: shadow RAM, same-value skip, dirty flags.
+
+The split verify check counts sunk writes as done for the shadow RAM too, or it would move the front's
+shadow back. EDEN_NX2_3D_METHODS and EDEN_NX2_3D_HISTORY stop seeing these writes: they sit in
+CallMethod.
+
+Changed from the source: no ring pairs, no compute part (frizti-04), no counters.
+
+Runs on the PS5: yes. Worth trying only if lichii-gpu-0210 shows the back as the limit.
+Hang: no wait added. Pool memory: none beyond the sink vector, which already exists.
+Checked: PS5-target syntax compile, alone and on the stack. Not run.
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index e92235d451..c38689a1d5 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -892,6 +892,19 @@ bool FrontHandledOutsideDrawManager(u32 method) {
+     }
+ }
+ 
++// EDEN_NX2_MACRO_SINK=1: a macro's state write goes to the back's method sink, as the command list's
++// own state writes do, instead of a CallMethod each. The back applies the sink in order before the
++// next executable or direct write and in FinishFrontMacro, so the order against draws stays.
++// From Frizti/Lichii 516ba08ce5 and 4ddc1a058d (Dr. Sergio, Lichii PR 166), 3D part. Read at first
++// use: env.txt is applied in main, after the globals (Frizti 5c173ca274).
++bool FrontMacroSink() {
++    static const bool sink = [] {
++        const char* value = std::getenv("EDEN_NX2_MACRO_SINK");
++        return value != nullptr && value[0] == '1';
++    }();
++    return sink;
++}
++
+ // EDEN_NX2_SPLIT_SKIP=0: send state writes that keep the register's value too.
+ bool FrontSkipSame() {
+     static const bool skip = [] {
+@@ -990,7 +1003,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+             break;
+         }
+     }
+-    if (from_macro) {
++    if (from_macro && (execution_mask[method] || !FrontMacroSink())) {
+         split.MacroWrite(this, method, argument);
+     } else {
+         split.Method(this, method, argument, is_last_call, nullptr);
+@@ -1197,9 +1210,20 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+                                ? shadow_state.reg_array[method]
+                                : value;
+     }
++    // With EDEN_NX2_MACRO_SINK a tracked macro write reaches the shadow RAM only when the sink is
++    // applied: it counts as done here too, or the check would put the front's shadow back.
++    std::array<u32, Regs::NUM_REGS> expected_shadow;
++    std::memcpy(expected_shadow.data(), shadow_state.reg_array.data(), sizeof(expected_shadow));
++    if (FrontMacroSink() &&
++        (shadow_state.shadow_ram_control == Regs::ShadowRamControl::Track ||
++         shadow_state.shadow_ram_control == Regs::ShadowRamControl::TrackWithFilter)) {
++        for (const auto& [method, value] : method_sink) {
++            expected_shadow[method] = value;
++        }
++    }
+     static u64 control_differences{};
+     if ((fs.control != shadow_state.shadow_ram_control ||
+-         fs.shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] != shadow_state.reg_array[MAXWELL3D_REG_INDEX(shadow_ram_control)] ||
++         fs.shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] != expected_shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] ||
+          fs.regs[MAXWELL3D_REG_INDEX(shadow_ram_control)] != expected[MAXWELL3D_REG_INDEX(shadow_ram_control)]) &&
+         control_differences < 4) {
+         LOG_WARNING(HW_GPU, "Split shadow RAM control writes, front ({} total) / back ({} total):",
+@@ -1229,12 +1253,12 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+         fs.control = shadow_state.shadow_ram_control;
+     }
+     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
+-        if (fs.shadow[i] != shadow_state.reg_array[i]) {
++        if (fs.shadow[i] != expected_shadow[i]) {
+             if (control_differences++ < 16) {
+                 LOG_WARNING(HW_GPU, "Split front shadow register {:#x}: front {:#x}, back {:#x}", i,
+-                            fs.shadow[i], shadow_state.reg_array[i]);
++                            fs.shadow[i], expected_shadow[i]);
+             }
+-            fs.shadow[i] = shadow_state.reg_array[i];
++            fs.shadow[i] = expected_shadow[i];
+         }
+     }
+     if ((checks & 63) == 1) {

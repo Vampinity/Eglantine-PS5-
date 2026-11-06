@@ -1,9 +1,29 @@
     // Images the GPU wrote are copied back to guest memory before they go, behind a wait for the
     // GPU. Eden evicts them from its "expected" mark on; here they stay, as they do below that
     // mark, until memory is really short (performance.h, KeepDirtyTextures).
+    // A dirty pass that left the measured total where it was is not repeated every frame. Deleting
+    // images frees their allocations, not the allocator blocks the driver counts, so with fixed
+    // thresholds (EDEN_NX2_TC_EXPECTED_MIB) the total can stay above "expected" with nothing left
+    // to free: Ocarina of Time on the PS5 then downloaded and deleted images every frame without
+    // lowering it, at 16-22 fps. The next dirty pass waits until the total has dropped by 32 MiB
+    // since the last one, 60 frames have passed, or the total is past critical.
+    static u64 dirty_pass_usage = 0;
+    static u64 dirty_pass_frame = 0;
+    static bool dirty_pass_done = false;
+    const u64 pass_usage = total_used_memory;
+    const bool dirty_allowed = !dirty_pass_done || pass_usage >= critical_memory ||
+                               pass_usage + 32_MiB <= dirty_pass_usage ||
+                               frame_tick - dirty_pass_frame >= 60;
     const auto DirtyEvictions = [&] {
-        return high_priority_mode &&
-               (total_used_memory >= critical_memory || !::Eden::Performance::KeepDirtyTextures());
+        const bool evict =
+            dirty_allowed && high_priority_mode &&
+            (total_used_memory >= critical_memory || !::Eden::Performance::KeepDirtyTextures());
+        if (evict) {
+            dirty_pass_done = true;
+            dirty_pass_usage = pass_usage;
+            dirty_pass_frame = frame_tick;
+        }
+        return evict;
     };
     // One batch of copies behind a single wait for the GPU: this many images and bytes at most.
     // A pass frees up to 40 images at a time (num_iterations), and at a resolution above 1x most
@@ -52,7 +72,10 @@
                 if (!image.aliased_images.empty() || !image.overlapping_images.empty() ||
                     image.info.num_samples != 1 || gc_downloads.size() == kBatchImages)
                     return true;
-                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+                // No staging buffer: the images left stay for now, and Cleanup leaves them too.
+                const auto staged = runtime.TryDownloadStagingBuffer(image.unswizzled_size_bytes, true);
+                if (!staged) return true;
+                auto map = *staged;
                 // Pin until CPU publication, even if later recording submits work.
                 gc_downloads.emplace_back(id, map);
                 const auto copies = FullDownloadCopies(image.info);

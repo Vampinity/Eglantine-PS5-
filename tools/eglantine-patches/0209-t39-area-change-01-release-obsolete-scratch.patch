@@ -1,0 +1,44 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0428-area-change-01-release-obsolete-scratch.patch
+
+Source: 0428-area-change-01-release-obsolete-scratch.patch
+EDEN_AREA_CHANGE_SCRATCH_RELEASE=1 releases obsolete scratch before allocating
+its larger replacement. Unset or any other value preserves the existing path.
+A failed replacement leaves an empty buffer with zero size and capacity.
+This reduces overlapping allocations during loading; it is not a proven fix
+for run149's unidentified 3316524576-byte host request.
+
+Assisted-by: OpenAI Codex (analysis, patch draft and local validation)
+
+diff --git a/src/common/scratch_buffer.h b/src/common/scratch_buffer.h
+index fcbd1a22c9..4ba2516497 100644
+--- a/src/common/scratch_buffer.h
++++ b/src/common/scratch_buffer.h
+@@ -8,6 +8,7 @@
+ 
+ #include <iterator>
+ #include <cstring>
++#include <cstdlib>
+ #include <memory>
+ 
+ namespace Common {
+@@ -76,8 +77,17 @@ public:
+     /// The previously held data will be destroyed if a reallocation occurs.
+     void resize_destructive(size_type size) {
+         if (size > buffer_capacity) {
+-            // Allocate first: a caller that catches the failure must not be left with the new
+-            // capacity on the old, smaller buffer, or the next resize writes past its end.
++            static const bool release_before_growth = [] {
++                const char* value = std::getenv("EDEN_AREA_CHANGE_SCRATCH_RELEASE");
++                return value != nullptr && value[0] == '1' && value[1] == '\0';
++            }();
++            // Area transitions can grow scratch while the old area's memory is still held.
++            // Destructive growth needs none of these bytes; release() also resets the sizes
++            // if the replacement allocation fails.
++            if (release_before_growth) {
++                release();
++            }
++            // Publish the new capacity only after allocation succeeds.
+             buffer = std::make_unique_for_overwrite<T[]>(size);
+             buffer_capacity = size;
+         }

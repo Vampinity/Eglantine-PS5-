@@ -1,0 +1,54 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0344-driver-04-vma-block-size.patch
+
+Source: 0344-driver-04-vma-block-size.patch
+Core patch: for tools/eglantine-patches, any number after 0181 (the mesh-compute patches also use
+0180 and 0181). Paths are the submodule's. Applies on core16 (f9ab11e54f).
+
+Holes inside VMA's blocks came to 172-259 MiB across the refusals of runs 57 and 61 (247 of 3315 in
+606 holes, the largest 7 MiB, at run 61's first). The comment on this setting records holes shrinking
+with block size down to 16 MiB. Anything over half a block gets memory of its own, in 16 KiB pages.
+
+Switch: EDEN_VMA_BLOCK_MIB=<n>, 2 to 64; unset keeps 16. Try 8. Only the default blocks, which hold the
+images; the separate pools stay at 16 MiB, and the logs do not say how many of the holes are theirs.
+Cost: more blocks and more dedicated allocations, each two system calls, in a game that makes and
+frees images by the thousand. A hole may only move: a dedicated image of 2 MiB or more starts on a
+2 MiB boundary (radv_ps5_memory_alloc), so one of 5 MiB can leave up to 1 MiB of the pool that a
+2 MiB block cannot use. Watch EDEN_REFUSED_POOL's free blocks beside EDEN_VMA_USAGE.
+
+Guess: some of the holes come back, how many is not known. The added lines compile with VMA 3.3.0;
+vulkan_device.cpp as a whole not compiled (no Boost.Unordered or fmt here), not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 89a939bf2b..d9d0117f05 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -795,6 +795,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+             }
+         }
+     }
++    // EDEN_VMA_BLOCK_MIB=<n>, 2 to 64: blocks of that size. Smaller blocks drain sooner and leave
++    // fewer holes, as the note below found going from 256 to 16 MiB, and everything over half a
++    // block gets memory of its own. On the console the holes are the pool's: 172 to 259 MiB of it in
++    // about 600 pieces when Zelda's allocations were refused (runs 57, 61).
++    VkDeviceSize vma_block_bytes = 16u * 1024u * 1024u;
++    if (const char* value = std::getenv("EDEN_VMA_BLOCK_MIB")) {
++        const unsigned long mib = std::strtoul(value, nullptr, 10);
++        if (mib >= 2 && mib <= 64) {
++            vma_block_bytes = VkDeviceSize{mib} << 20;
++        }
++    }
+     const VmaAllocatorCreateInfo allocator_info{
+             .flags = flags,
+             .physicalDevice = physical,
+@@ -806,7 +817,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+             // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
+             // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
+             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
+-            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
++            .preferredLargeHeapBlockSize = vma_block_bytes,
+             .pAllocationCallbacks = nullptr,
+             .pDeviceMemoryCallbacks = nullptr,
+             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,

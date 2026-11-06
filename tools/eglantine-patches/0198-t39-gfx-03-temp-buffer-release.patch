@@ -1,0 +1,88 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0432-gfx-03-temp-buffer-release.patch
+
+Source: 0432-gfx-03-temp-buffer-release.patch
+buffers
+
+Core patch on core-t33 (T35 stack), off unless EDEN_NX2_TC_TEMP_BUFFER_FRAMES is set.
+
+Image copies between formats go through a device-local copy buffer from
+TextureCacheRuntime::GetTemporaryBuffer: one buffer per power of two, made at the size of the
+largest copy of that class and kept for the session. A 2560x1440 RGBA copy takes the 16 MiB one, a
+4096x4096 32-bit copy the 64 MiB one; the set stays after the targets that needed them are gone.
+EDEN_NX2_TC_TEMP_BUFFER_FRAMES=600 destroys a copy buffer no copy used for 600 frames once the GPU
+is past the last copy recorded with it (the scheduler's IsFree, as the decode images use); the next
+copy of that size makes it again.
+
+Logs once "EDEN_NX2_TC_TEMP_BUFFER_FRAMES=600: copy buffers unused for 600 frames are destroyed"
+and "Copy buffer of N MiB unused for F frames: destroyed" for each one; the sum of those sizes is
+the saving, which run 149's logs do not show (a guess: tens of MiB, at most about 128).
+
+Unset, kept for the session as before. Not built, not run.
+
+ .../renderer_vulkan/vk_texture_cache.cpp      | 29 +++++++++++++++++++
+ .../renderer_vulkan/vk_texture_cache.h        |  4 +++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 5f15974a6a..3f5ed42cc5 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1429,6 +1429,8 @@ bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) {
+ 
+ VkBuffer TextureCacheRuntime::GetTemporaryBuffer(size_t needed_size) {
+     const auto level = (8 * sizeof(size_t)) - std::countl_zero(needed_size - 1ULL);
++    buffer_ticks[level] = scheduler.CurrentTick();
++    buffer_unused_frames[level] = 0;
+     if (buffers[level]) {
+         return *buffers[level];
+     }
+@@ -2791,6 +2793,33 @@ void TextureCacheRuntime::TickFrame() {
+     std::erase_if(free_transcodes, [](PendingTranscode& t) {
+         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
+     });
++    // EDEN_NX2_TC_TEMP_BUFFER_FRAMES=<frames> (unset: kept for the session, as before): a copy
++    // buffer from GetTemporaryBuffer (one per power of two, the size of the largest copy of that
++    // class so far) that no copy has used for this many frames, and that the GPU is past, is
++    // destroyed; the next copy of that size makes it again.
++    static const u32 temp_buffer_frames = [] {
++        const char* const value = std::getenv("EDEN_NX2_TC_TEMP_BUFFER_FRAMES");
++        const u32 frames = value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
++        if (frames != 0) {
++            LOG_INFO(Render_Vulkan, "EDEN_NX2_TC_TEMP_BUFFER_FRAMES={}: copy buffers unused for {} frames are destroyed",
++                     value, frames);
++        }
++        return frames;
++    }();
++    if (temp_buffer_frames != 0) {
++        for (size_t level = 0; level < indexing_slots; ++level) {
++            if (!buffers[level]) {
++                continue;
++            }
++            if (++buffer_unused_frames[level] > temp_buffer_frames &&
++                scheduler.IsFree(buffer_ticks[level])) {
++                LOG_INFO(Render_Vulkan, "Copy buffer of {} MiB unused for {} frames: destroyed",
++                         (u64{1} << level) >> 20, buffer_unused_frames[level] - 1);
++                buffers[level].reset();
++                buffer_unused_frames[level] = 0;
++            }
++        }
++    }
+     std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
+         if (!scheduler.IsFree(scratch.tick)) {
+             scratch.unused_frames = 0;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index a3c54dc251..9a4e29f7a9 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -303,6 +303,10 @@ public:
+ 
+     static constexpr size_t indexing_slots = 8 * sizeof(size_t);
+     std::array<vk::Buffer, indexing_slots> buffers{};
++    /// GetTemporaryBuffer: the tick each copy buffer was last recorded for, and the frames since
++    /// (EDEN_NX2_TC_TEMP_BUFFER_FRAMES).
++    std::array<u64, indexing_slots> buffer_ticks{};
++    std::array<u32, indexing_slots> buffer_unused_frames{};
+     struct MsaaScratchKey {
+         VkFormat format;
+         VkImageType type;

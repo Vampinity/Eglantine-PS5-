@@ -1,0 +1,129 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0312-fog-03-table-pools-and-graphics-pointers.patch
+
+Source: 0312-fog-03-table-pools-and-graphics-pointers.patch
+Moved by hand: the compute binding carries the table flag beside upstream's IsDlssDispatch(); the pool-size rule sits before upstream's DLSS-only native size rule
+
+Core patch, for tools/eglantine-patches as 0192.
+
+Two ports, both with switches of ours:
+- Duck912, zortos293/Lichii bf3f395c96 (4dcbd1cb9 on port/ducky-oot-build16):
+  read-only pointers from a table are bound to the end of their mapping. Ocarina's
+  grass records lie 11.7 to 17.7 MiB past the base and the 8 MiB cap read them as 0.
+  EDEN_NX2_TABLE_POOL_MIB=64 turns it on; unset keeps the 8 MiB cap. 0170 said a
+  later patch would raise the cap; none in the series does.
+- Jonas, zortos293/Lichii 94c6015fad (37569c01d9): the word after a native graphics
+  pointer is not a size. EDEN_NX2_NATIVE_GRAPHICS_SIZE=1 turns it on. Lichii users
+  measured 9% fewer frames with it and saw no visual change in one spot.
+
+Only worth setting with EDEN_NX2_NATIVE_TABLES on and mesh draws running: the grass
+programs are task and mesh ones. Both make buffers larger, so memory rises.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+  src/video_core/buffer_cache/buffer_cache.h    | 39 +++++++++++++++++--
+  .../buffer_cache/buffer_cache_base.h          |  9 ++++-
+  2 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index fbb61d8914..2ddcf33e8d 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <cstdlib>
+ #include <memory>
+ #include <numeric>
+ #include <stdexcept>
+@@ -762,7 +763,11 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
+     }
+     // The next qword of a table entry is the next entry, not a size.
+     channel_state->storage_buffers[stage][ssbo_index] =
+-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, indirect_offset != ~0U);
++        StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
++                             indirect_offset != ~0U ||
++                                 (NativeGraphicsPointersAreBare() &&
++                                  maxwell3d->GetNativeMacroEngine().native_turing),
++                             indirect_offset != ~0U);
+     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
+ }
+ 
+@@ -851,7 +856,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+     }
+     channel_state->compute_storage_buffers[ssbo_index] =
+         StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
+-                             kepler_compute->IsDlssDispatch() || indirect_offset != ~0U);
++                             kepler_compute->IsDlssDispatch() || indirect_offset != ~0U,
++                             indirect_offset != ~0U);
+ }
+ 
+ template <class P>
+@@ -3148,9 +3154,29 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+     channel_state->has_deleted_buffers = true;
+ }
+ 
++template <class P>
++u32 BufferCache<P>::TablePoolSize() {
++    static const u32 size = [] {
++        const char* const value = std::getenv("EDEN_NX2_TABLE_POOL_MIB");
++        const unsigned long mib = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
++        return static_cast<u32>((std::min)(mib, 1024UL) * 1024 * 1024);
++    }();
++    return size;
++}
++
++template <class P>
++bool BufferCache<P>::NativeGraphicsPointersAreBare() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_NATIVE_GRAPHICS_SIZE");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
+ template <class P>
+ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+-                                             bool is_written, bool native_pointer) const {
++                                             bool is_written, bool native_pointer,
++                                             bool table_pointer) const {
+     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+ 
+     if (gpu_addr == 0) {
+@@ -3189,6 +3215,15 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+         u32 size = [&]() {
+             const u32 memory_layout_size =
+                 static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
++            // A pointer read from a table in memory is the base of an object pool, read anywhere
++            // in it (Ocarina of Time's grass instances lie 12-18 MiB past theirs). With
++            // EDEN_NX2_TABLE_POOL_MIB=64 a read-only one is bound to the end of its mapping, up
++            // to that size; written pools keep the cap, a write marks the whole binding
++            // GPU-modified.
++            if (const u32 pool_size = TablePoolSize();
++                pool_size != 0 && table_pointer && !is_written) {
++                return (std::min)(memory_layout_size, pool_size);
++            }
+             // A native (Switch 2) compute program's pointer is bare: the word after it is another
+             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
+             // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 123c075d37..fbed7e6f33 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -627,8 +627,15 @@ private:
+ 
+     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
+ 
++    /// EDEN_NX2_TABLE_POOL_MIB: the largest read-only binding of a pointer read from a table, or 0
++    [[nodiscard]] static u32 TablePoolSize();
++
++    /// EDEN_NX2_NATIVE_GRAPHICS_SIZE=1: the word after a native graphics pointer is not its size
++    [[nodiscard]] static bool NativeGraphicsPointersAreBare();
++
+     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+-                                               bool is_written, bool native_pointer = false) const;
++                                               bool is_written, bool native_pointer = false,
++                                               bool table_pointer = false) const;
+ 
+     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
+                                                                PixelFormat format);

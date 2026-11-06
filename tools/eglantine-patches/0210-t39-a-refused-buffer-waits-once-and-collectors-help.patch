@@ -1,0 +1,375 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0132-a-refused-buffer-waits-once-and-collectors-help.patch
+
+Source: 0132-a-refused-buffer-waits-once-and-collectors-help.patch
+Moved by hand: the release hook is set beside upstream's new SetPendingCpuWrites in the rasterizer's constructor
+
+caches: a refused buffer waits for the GPU once, and the collectors help at the end of the frame
+
+0131 keeps the session alive. This tries to give the buffer what it asked for first.
+
+The images the collector deleted and the buffers replaced by a join keep their memory for a while:
+images until TickFrame sees their tick, buffers for 8 frames. A growing buffer's old copy is one of
+those, about the size being refused. ReleaseFinished destroys them, right after a wait for the GPU.
+
+While a draw or dispatch looks up its buffers (may_wait_for_memory), a refused buffer waits once in
+the 250 ms pause: Scheduler::Finish, ReleaseFinished in both caches, and the retry. Staging goes in
+that retry too: MemoryAllocator::ReleaseRefused lets go of what is finished on its way. Both cache
+locks are held there (PrepareDraw, DispatchCompute) and on the same thread as the scheduler. Nothing
+recorded is lost: images were filled before, descriptors come after, and the check 0095 added binds
+the geometry again when the tick moved.
+
+Everywhere else, the refusal only leaves a note. ObtainCPUBuffer clears the flag around its lookup,
+so a query cannot wait even if it ran inside a draw's setup. A submission from inside
+Scheduler::EndRenderPass would end the pass twice, and a query sync can hold the buffer cache's lock
+with no claim on the texture cache's. The source does not reach SyncValues from EndRenderPass, only
+from NotifyWFI (WaitForIdle and fences); the entries of run 53 are a scan of the stack and can be
+stale. This does not depend on which.
+
+The note is read at the end of RasterizerVulkan::TickFrame, where no cache lock is held, and both are
+taken together, as a draw does. There the texture cache deletes up to 32 images unused for 3 frames
+with nothing to copy back, stopping when one left a hole of the size wanted. The normal collector is
+not used: it may ask for staging for dirty images, and its marks already keep it at 10 frames (run 53:
+28 images, 69 MiB past that). The buffer collector runs in aggressive mode, then the wait and
+ReleaseFinished. The bindings 0131 cut are set dirty, so the vertex and index buffers ask again.
+Storage and texture bindings do at every draw, uniforms when the guest binds them.
+
+The collectors never run during a draw: it holds image views and bindings.
+
+Host conditional rendering ends before the destruction. The predicate's VkBuffer can be among those
+destroyed, and resuming would use it. The draws go unconditionally until the guest sets a condition.
+
+Cost: a GPU wait at most every 250 ms while memory stays short, and textures of 3 frames ago to load
+again. EDEN_NX2_BUFFER_WAIT=0 turns all of this off and leaves 0131.
+
+Needs 0131. Proven with stubbed headers as 0131. Not built, not run on a console. Likely: the wait
+frees a hole for a buffer that grew. A guess: how often. With 1 MiB left in the pool and the largest
+hole at 6 MiB, the join may still be refused, and 0131 is what is left.
+
+Sources: the wait and rebind of 0095, the try-lock rule of the refusal hook in
+tools/prepare-vulkan-port.py, gpu_sentenced_images in TextureCache::TickFrame, the eviction steps of
+TextureCache::RunGarbageCollector; run 53 of 2026-11-05.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 2ddcf33e8d..1e28e49712 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -117,6 +117,30 @@ void BufferCache<P>::ReportMemory() {
+                  static_cast<unsigned long long>(largest >> 20));
+ }
+ 
++template <class P>
++void BufferCache<P>::CollectRefused() {
++    buffer_refused_bytes.store(0, std::memory_order_relaxed);
++    if (!channel_state) {
++        return;
++    }
++    RunGarbageCollector(true);
++    buffer_refused_size = ~u64{0};
++    if (std::exchange(bindings_cut, false)) {
++        // Uniform, storage and texture bindings are looked up again when the guest sets them.
++        auto& flags = maxwell3d->dirty.flags;
++        flags[Dirty::IndexBuffer] = true;
++        flags[Dirty::VertexBuffers] = true;
++        for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
++            flags[Dirty::VertexBuffer0 + index] = true;
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::ReleaseFinished() {
++    delayed_destruction_ring.Clear();
++}
++
+ template <class P>
+ void BufferCache<P>::TickFrame() {
+     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
+@@ -563,7 +587,9 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainBuffer(GPUVAddr gpu_ad
+ template <class P>
+ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
+     DAddr device_addr, u32 size, ObtainBufferSynchronize sync_info, ObtainBufferOperation post_op) {
++    const bool may_wait = std::exchange(may_wait_for_memory, false);
+     const BufferId buffer_id = FindBuffer(device_addr, size, false);
++    may_wait_for_memory = may_wait;
+     Buffer& buffer = slot_buffers[buffer_id];
+     if (buffer_cut) [[unlikely]] {
+         // The caller sees the null buffer, SizeBytes() 0, and goes without.
+@@ -1860,6 +1886,7 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
+ template <class P>
+ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
+     graphics_segments.clear();
++    may_wait_for_memory = true;
+     BufferOperations([&]() {
+         if (is_indexed) {
+             UpdateIndexBuffer();
+@@ -1875,16 +1902,19 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
+             UpdateDrawIndirect();
+         }
+     });
++    may_wait_for_memory = false;
+ }
+ 
+ template <class P>
+ void BufferCache<P>::DoUpdateComputeBuffers() {
+     compute_segments.clear();
++    may_wait_for_memory = true;
+     BufferOperations([&]() {
+         UpdateComputeUniformBuffers();
+         UpdateComputeStorageBuffers();
+         UpdateComputeTextureBuffers();
+     });
++    may_wait_for_memory = false;
+ }
+ 
+ template <class P>
+@@ -2565,6 +2595,25 @@ BufferId BufferCache<P>::CreateRefusedBuffer(DAddr device_addr, u32 wanted_size,
+         buffer_refused_size = ~u64{0};
+         return id;
+     }
++    static const bool wait_for_memory = [] {
++        const char* value = std::getenv("EDEN_NX2_BUFFER_WAIT");
++        return value == nullptr || value[0] != '0';
++    }();
++    if (first && wait_for_memory) {
++        buffer_refused_bytes.store(buffer_refused_size, std::memory_order_relaxed);
++        if (may_wait_for_memory) {
++            // Waits at most once in the pause. The images and buffers already deleted are only
++            // waiting for the GPU, the old copy of a buffer that grew among them. The collectors
++            // do not run here: this draw holds image views and bindings.
++            runtime.ReleaseForBuffer();
++            buffer_refused_size = ~u64{0};
++            if (const BufferId id =
++                    JoinBuffer(device_addr, wanted_size, sparse_compatible, false)) {
++                buffer_refused_size = ~u64{0};
++                return id;
++            }
++        }
++    }
+     if (first) {
+         std::fprintf(stderr,
+                      "EDEN_BUFFER_REFUSED %llu bytes at %llx (%u bytes wanted): since the last time "
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index fbed7e6f33..966d7a5833 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cstdlib>
+ #include <array>
+@@ -236,6 +237,19 @@ public:
+     /// holds mutex.
+     void ReportMemory();
+ 
++    /// The size of a buffer memory refused since CollectRefused, or 0. No need for mutex.
++    [[nodiscard]] u64 RefusedBytes() const noexcept {
++        return buffer_refused_bytes.load(std::memory_order_relaxed);
++    }
++
++    /// Lets go of buffers unused for a second, and has the bindings cut asked for again. At the end
++    /// of a frame, with mutex held.
++    void CollectRefused();
++
++    /// Destroys the buffers waiting for their frames. The caller holds mutex and has waited for the
++    /// GPU.
++    void ReleaseFinished();
++
+     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
+                                std::span<const MultiRangeSegment> pool);
+ 
+@@ -836,6 +850,12 @@ private:
+     bool buffer_cut = false;
+     bool bindings_cut = false; ///< Vertex and index bindings may hold less than the guest set
+ 
++    /// A refused buffer may wait for the GPU: set while a draw or dispatch looks up its buffers,
++    /// with both caches locked and nothing recorded a submission would lose. Elsewhere this can be
++    /// a query, a copy or a guest write: they get what is left, and TickFrame does the waiting.
++    bool may_wait_for_memory = false;
++    std::atomic<u64> buffer_refused_bytes{0}; ///< See RefusedBytes
++
+     /// After a refusal the allocator is not asked for this size or more until the time below: a
+     /// refusal walks the caches and writes to stderr, and the next draw is microseconds away.
+     u64 buffer_refused_size = ~u64{0};
+diff --git a/src/video_core/delayed_destruction_ring.h b/src/video_core/delayed_destruction_ring.h
+index 1f7af86d26..56350eb059 100644
+--- a/src/video_core/delayed_destruction_ring.h
++++ b/src/video_core/delayed_destruction_ring.h
+@@ -26,6 +26,13 @@ public:
+         elements[index].push_back(std::move(object));
+     }
+ 
++    /// Destroys everything now. The caller has waited for the GPU.
++    void Clear() {
++        for (auto& element : elements) {
++            element.clear();
++        }
++    }
++
+ private:
+     size_t index = 0;
+     std::array<std::vector<T>, TICKS_TO_DESTROY> elements;
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+index f457f53d7c..0c779c7865 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -124,6 +124,19 @@ public:
+     /// What MemoryAllocator::CreateBuffer throws, for a refusal that is to end the session.
+     [[noreturn]] void ThrowRefused() const;
+ 
++    /// Waits for the GPU and lets go of what the caches hold for it, through the rasterizer. Only
++    /// while a draw or dispatch is set up (BufferCache::may_wait_for_memory).
++    void ReleaseForBuffer() {
++        if (release_hook) {
++            release_hook(release_context);
++        }
++    }
++
++    void SetReleaseHook(void (*hook)(void* context), void* context) noexcept {
++        release_hook = hook;
++        release_context = context;
++    }
++
+     /// Returns the mask of bindings whose repacked state changed.
+     u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
+ 
+@@ -321,6 +334,9 @@ private:
+ 
+     vk::Buffer null_buffer;
+ 
++    void (*release_hook)(void* context) = nullptr;
++    void* release_context = nullptr;
++
+     std::unique_ptr<Uint8Pass> uint8_pass;
+     std::unique_ptr<VertexRepackPass> vertex_repack_pass;
+     u32 vertex_repack_mask{};
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 2b77339c71..cfa24a1cf5 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -240,6 +240,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
+       wfi_event(device.GetLogical().CreateEvent()) {
+     scheduler.SetQueryCache(query_cache);
++    buffer_cache_runtime.SetReleaseHook(
++        [](void* context) { static_cast<RasterizerVulkan*>(context)->ReleaseFinishedMemory(); },
++        this);
+     buffer_cache.SetPendingCpuWrites(
+         [this](const std::function<void(DAddr, size_t)>& callback) {
+             gpu.ForEachPendingCpuWrite(callback);
+@@ -1843,6 +1846,22 @@ void RasterizerVulkan::TickFrame() {
+         std::scoped_lock lock{buffer_cache.mutex};
+         buffer_cache.TickFrame();
+     }
++    // A refused buffer's relief: here, nothing is being set up and nothing is locked.
++    if (const u64 refused = buffer_cache.RefusedBytes(); refused != 0) [[unlikely]] {
++        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
++        texture_cache.CollectForBuffer(refused);
++        buffer_cache.CollectRefused();
++        ReleaseFinishedMemory();
++    }
++}
++
++void RasterizerVulkan::ReleaseFinishedMemory() {
++    // The predicate's buffer may be among those destroyed, and it is used again on resuming: the
++    // draws go unconditionally until the guest sets a condition again.
++    query_cache_runtime.EndHostConditionalRendering();
++    scheduler.Finish();
++    texture_cache.ReleaseFinished();
++    buffer_cache.ReleaseFinished();
+ }
+ 
+ bool RasterizerVulkan::AccelerateConditionalRendering() {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 041eeb18fc..8903922681 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -159,6 +159,10 @@ public:
+     void BindChannel(Tegra::Control::ChannelState& channel) override;
+ 
+     void ReleaseChannel(s32 channel_id) override;
++
++    /// Waits for the GPU and destroys the images and buffers that were waiting for it. Both caches
++    /// are locked by the caller.
++    void ReleaseFinishedMemory();
+     std::optional<FramebufferTextureInfo> AccelerateDisplay(const Tegra::FramebufferConfig& config,
+                                                             VAddr framebuffer_addr,
+                                                             u32 pixel_stride);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 1d07174211..1b289f3d45 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -313,6 +313,50 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+     }
+ }
+ 
++template <class P>
++void TextureCache<P>::CollectForBuffer(u64 wanted) {
++    static constexpr u64 MIN_AGE = 3;
++    static constexpr size_t MAX_IMAGES = 32;
++    if (frame_tick < MIN_AGE) {
++        return;
++    }
++    boost::container::small_vector<ImageId, MAX_IMAGES> clean;
++    u64 total = 0;
++    lru_cache.ForEachItemBelow(frame_tick - MIN_AGE, [&](ImageId image_id) {
++        const Image& image = slot_images[image_id];
++        if (True(image.flags & ImageFlagBits::IsDecoding) ||
++            (IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap))) {
++            return false;
++        }
++        const u64 bytes = ImageMemoryBytes(image);
++        total += bytes;
++        clean.push_back(image_id);
++        return bytes >= wanted || total >= wanted * 4 || clean.size() == MAX_IMAGES;
++    });
++    for (const ImageId image_id : clean) {
++        Image& image = slot_images[image_id];
++        if (True(image.flags & ImageFlagBits::Tracked)) {
++            UntrackImage(image, image_id);
++        }
++        UnregisterImage(image_id);
++        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
++    }
++    std::fprintf(stderr, "EDEN_BUFFER_REFUSED %zu images, %llu MiB, deleted for %llu MiB\n",
++                 clean.size(), static_cast<unsigned long long>(total >> 20),
++                 static_cast<unsigned long long>(wanted >> 20));
++}
++
++template <class P>
++void TextureCache<P>::ReleaseFinished() {
++    if constexpr (requires { runtime.CurrentTick(); }) {
++        while (!gpu_sentenced_images.empty() &&
++               runtime.IsFree(gpu_sentenced_images.front().tick)) {
++            gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
++            gpu_sentenced_images.pop_front();
++        }
++    }
++}
++
+ template <class P>
+ void TextureCache<P>::TickFrame() {
+     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 9d5c9c2749..5504ee1c9c 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -249,6 +249,15 @@ public:
+     /// mutex, and the slots are only read: this can run from inside an image being constructed.
+     void ReportMemory();
+ 
++    /// For a buffer of `wanted` bytes that memory refused: deletes images unused for a few frames
++    /// with nothing to copy back, until one left a hole that size or enough have gone. At the end
++    /// of a frame, with mutex held: nothing holds their views then. Needs no staging, which the
++    /// collector's dirty images do, and the collector has already taken what is older.
++    void CollectForBuffer(u64 wanted);
++
++    /// Destroys the deleted images the GPU is done with, as TickFrame does. Mutex held.
++    void ReleaseFinished();
++
+     /// Return a constant reference to the given image view id
+     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
+ 

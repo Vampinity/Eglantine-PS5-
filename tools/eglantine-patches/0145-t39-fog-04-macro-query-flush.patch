@@ -1,0 +1,49 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0313-fog-04-macro-query-flush.patch
+
+Source: 0313-fog-04-macro-query-flush.patch
+Core patch, for tools/eglantine-patches as 0193.
+
+Port of zortos293/Lichii 7859ef4150 (2995da891 on port/ducky-oot-build16), Jonas.
+Accurate GPU mode keeps report writes in the query cache until a fence, so
+Ocarina's predicate macro 0x142 read a stale "visible" record. Does nothing while
+the GPU split runs, as in the source. Ocarina on the PS5 runs the split with fast
+GPU (run61), so it changes nothing there. Fast GPU is a launcher setting: Mario Kart
+World had it off in runs 50 and 52, and on, with the split, in run45.
+
+Switch: EDEN_NX2_MACRO_QUERY_FLUSH=1, ours; the source has none. Default off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+  src/video_core/macro.cpp | 12 ++++++++++++
+  1 file changed, 12 insertions(+)
+
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index e18e6c5a7f..eab0f9ee50 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -30,6 +30,7 @@
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/dirty_flags.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/macro.h"
+@@ -1509,6 +1510,17 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+                             }
+                         }
+                     }
++                    // Accurate GPU mode holds report and semaphore writes in the query cache until a
++                    // fence: write them out, or occlusion predicates read stale values. The split only
++                    // runs with immediate payload writes, and the query cache belongs to its back.
++                    // EDEN_NX2_MACRO_QUERY_FLUSH=1 turns this on.
++                    static const bool flush_queries = [] {
++                        const char* const flush = std::getenv("EDEN_NX2_MACRO_QUERY_FLUSH");
++                        return flush != nullptr && flush[0] != '0';
++                    }();
++                    if (flush_queries && !VideoCommon::GpuSplit::Get().Active()) {
++                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
++                    }
+                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                         static u64 flushes{};

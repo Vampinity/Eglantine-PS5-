@@ -1,0 +1,156 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0340-heap-02-nup-cache-cap.patch
+
+Source: 0340-heap-02-nup-cache-cap.patch
+Core patch: tools/eglantine-patches, next free number after 0181 (0182 if it goes in first).
+
+NupDecompressCache keeps up to 512 MiB of decompressed zstd files in the heap, for the whole session,
+and nothing gives it back when the pool is short. Ocarina of Time is such a NUP. Proven: EDEN_HEAP_SITE
+"7 MiB in 1 blocks: ... 378872 2cfe12" is operator new(uncompressed_size) in NupVfsFile::Read (2cfe12
+follows that call in next14's image). That line is in the first report only: later reports list
+nothing under 10 MiB, so whether the block stayed is not known. How much the cache held in run 61 is
+not known either: the site table was full by then (see heap-01).
+
+EDEN_NUP_CACHE_MIB=<N> (at least 16; unset: 512 as now) sets the cap. A file over half of it goes to
+a temporary file in cache/nup, the path a file over 256 MiB takes now, which no console run is known
+to have used. Those files are removed once per process when the switch is set, because a crash leaves
+them behind and the app restarts by itself.
+
+The log gains "EDEN_NUP_CACHE holds N MiB in F files of C MiB, D files of E MiB dropped so far" at each
+32 MiB of a new high and each 256 files dropped, with or without the switch. With a small cap, N stops
+at the cap: E is what shows how much more was asked for (a file dropped twice counts twice).
+
+clang -fsyntax-only with Boost 1.90 passes (x86-64 host). Not compiled for the console, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/file_sys/nup_container.cpp b/src/core/file_sys/nup_container.cpp
+index c0e06de01b..de7ee815f2 100644
+--- a/src/core/file_sys/nup_container.cpp
++++ b/src/core/file_sys/nup_container.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cstring>
+ #include <list>
+ #include <map>
+@@ -361,13 +362,54 @@ bool NupContainer::IsNupFile(const VirtualFile& file) {
+     return magic == HeaderMagic;
+ }
+ 
++void NupDecompressCache::ReportHeld() const {
++    LOG_INFO(Loader, "EDEN_NUP_CACHE holds {} MiB in {} files of {} MiB, {} files of {} MiB dropped so far",
++             bytes >> 20, lru.size(), cap >> 20, evicted, evicted_bytes >> 20);
++}
++
++namespace {
++
++// EDEN_NUP_CACHE_MIB=<N>: the cache of decompressed files holds N MiB (at least 16) instead of 512.
++// It is heap memory the console's guest and GPU share: Ocarina of Time is a zstd NUP, and run 61
++// ended with 6 MiB free. A file over half of it goes to a temporary file, as one over 256 MiB
++// does now.
++std::size_t ChosenCacheCap(std::size_t cap) {
++    const char* const chosen = std::getenv("EDEN_NUP_CACHE_MIB");
++    if (chosen == nullptr) {
++        return cap;
++    }
++    const std::size_t mib = static_cast<std::size_t>(std::strtoull(chosen, nullptr, 10));
++    return mib == 0 ? cap : std::max<std::size_t>(mib, 16) << 20;
++}
++
++// A session that crashes leaves its temporary files, and the app starts again by itself: once per
++// process, at the first container, when no temporary file of this process exists yet.
++void RemoveOldSpills(const std::filesystem::path& spill_dir) {
++    static std::once_flag once;
++    std::call_once(once, [&spill_dir] {
++        std::error_code ec;
++        for (std::filesystem::directory_iterator it{spill_dir, ec}, end; !ec && it != end;
++             it.increment(ec)) {
++            if (it->path().extension() == ".tmp") {
++                std::error_code ignored;
++                std::filesystem::remove(it->path(), ignored);
++            }
++        }
++    });
++}
++
++} // Anonymous namespace
++
+ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
+                            std::filesystem::path spill_dir_)
+     : file(std::move(file_)), cache(std::make_shared<NupDecompressCache>()) {
+-    cache->cap = memory_cache_cap;
++    cache->cap = ChosenCacheCap(memory_cache_cap);
+     cache->spill_dir = spill_dir_.empty()
+                            ? Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup"
+                            : std::move(spill_dir_);
++    if (cache->cap != memory_cache_cap) {
++        RemoveOldSpills(cache->spill_dir);
++    }
+     if (file == nullptr) {
+         return;
+     }
+diff --git a/src/core/file_sys/nup_container.h b/src/core/file_sys/nup_container.h
+index 30733afb1d..8df5d023c4 100644
+--- a/src/core/file_sys/nup_container.h
++++ b/src/core/file_sys/nup_container.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <array>
+ #include <filesystem>
+ #include <functional>
+@@ -37,6 +38,8 @@ struct NupSpillFile {
+ /// LRU over decompressed zstd extents, shared by the files of one container.
+ struct NupDecompressCache {
+     static constexpr std::size_t DefaultCap = 512 * 1024 * 1024;
++    static constexpr std::size_t ReportStep = 32 * 1024 * 1024;
++    static constexpr std::size_t ReportEvicted = 256;
+ 
+     using Entry = std::pair<std::size_t, std::vector<u8>>;
+ 
+@@ -45,6 +48,11 @@ struct NupDecompressCache {
+     std::unordered_map<std::size_t, std::list<Entry>::iterator> index;
+     std::size_t bytes{};
+     std::size_t cap{DefaultCap};
++    /// Files dropped so far, their bytes, and the most held, for the log.
++    std::size_t evicted{};
++    std::size_t evicted_bytes{};
++    std::size_t reported{};
++    std::size_t reported_evicted{};
+     std::filesystem::path spill_dir;
+     std::unordered_map<std::size_t, std::shared_ptr<NupSpillFile>> spills;
+ 
+@@ -64,8 +72,10 @@ struct NupDecompressCache {
+         }
+         while (bytes + data.size() > cap && !lru.empty()) {
+             bytes -= lru.back().second.size();
++            evicted_bytes += lru.back().second.size();
+             index.erase(lru.back().first);
+             lru.pop_back();
++            ++evicted;
+         }
+         if (bytes + data.size() > cap) {
+             return;
+@@ -73,8 +83,17 @@ struct NupDecompressCache {
+         bytes += data.size();
+         lru.emplace_front(file_index, std::move(data));
+         index.emplace(file_index, lru.begin());
++        if (bytes >= reported + ReportStep || evicted >= reported_evicted + ReportEvicted) {
++            reported = (std::max)(reported, bytes);
++            reported_evicted = evicted;
++            ReportHeld();
++        }
+     }
+ 
++    /// What the cache holds is in the app's heap: a line in the log at each 32 MiB of a new high
++    /// and each 256 files dropped.
++    void ReportHeld() const;
++
+     std::shared_ptr<NupSpillFile> GetSpill(std::size_t file_index) {
+         auto& spill = spills[file_index];
+         if (!spill) {

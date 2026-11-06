@@ -5,6 +5,7 @@ extern "C" void eden_state_arg_remove(u64 value);
 extern "C" {
 // Development switch (dev-settings jit_shared=off): every core keeps its own blocks.
 bool eden_jit_shared = true;
+bool eden_jit_keep_history = true;
 }
 
 namespace {

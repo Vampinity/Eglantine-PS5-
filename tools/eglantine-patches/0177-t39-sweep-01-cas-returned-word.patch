@@ -1,0 +1,158 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Migrate 0397-sweep-01-cas-returned-word.patch
+
+Source: 0397-sweep-01-cas-returned-word.patch
+shader: EDEN_NX2_CAS_RETURNED=1 retries compare-exchange loops with the word the exchange returned
+
+Port of zortos293/Lichii PR 206 (jpkto, commits 22f0214c7a and 2b5cfdd0b9, head 2b5cfdd0b9, open,
+fixes Lichii #165). GPL-3.0-or-later, as the core.
+
+The source: Ocarina lost the device on an RX 7900 XTX in the first gameplay frame, in compute
+45384f519a8eacd3 (one 16x16 group, 256 invocations adding to the same four words). CasLoop reloaded
+the word with a plain OpLoad on each attempt, and on AMD it kept returning a stale value, so the
+invocations that lost the first exchange never matched again. Each attempt now expects the word the
+last exchange returned. The second commit puts f16x2 through the u32 word too: its old loop loaded
+an f16x2 through a u32 pointer, which spirv-val rejects.
+
+next19 does not have this. None of its 183 patch files changes CasLoop; 0036 only has
+DefineWriteStorageCasLoopFunction as a context line. With all of them applied both loops are the old
+ones.
+
+Changed from the source: behind the switch. The PR's loop is a new function, CasLoopReturnedWord,
+and CasLoop calls it when the switch is set, so the old loop and memory_type stay as they are. Unset,
+the SPIR-V does not change. Guest shader caches are not touched: SPIR-V is made at each build of a
+pipeline, so turning the switch on only changes what the driver compiles.
+
+Not changed, as in the PR: the 8 and 16 bit shared store loop in DefineSharedMemory has the same form,
+but exists only without explicit workgroup layout.
+
+Evidence: author-reported on one AMD Windows card, not run on the PS5. 45384f519a8eacd3 has no hits
+in PS5 logs. A link to our white fog is a guess. Memory: none. Pool memory: none.
+
+Co-authored-by: jpkto <255363096+jpkto@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 0e704f45c7..51938b0ef1 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <bit>
+ #include <climits>
++#include <cstdlib>
+ #include <optional>
+ 
+ #include <boost/container/static_vector.hpp>
+@@ -377,8 +378,81 @@ Id CasFunction(EmitContext& ctx, Operation operation, Id value_type) {
+     return func;
+ }
+ 
++// EDEN_NX2_CAS_RETURNED=1 (Lichii PR 206): each attempt of a compare-exchange loop expects the word
++// the previous exchange returned. A plain reload can keep returning a stale copy (AMD), and the
++// invocations that lost would never match again.
++bool CasExpectsReturnedWord() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_CAS_RETURNED");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++Id CasLoopReturnedWord(EmitContext& ctx, Operation operation, Id array_pointer, Id element_pointer,
++                       Id value_type, spv::Scope scope) {
++    const bool is_shared{scope == spv::Scope::Workgroup};
++    const bool is_struct{!is_shared || ctx.uses_explicit_workgroup_layout};
++    const Id cas_func{CasFunction(ctx, operation, value_type)};
++    const Id zero{ctx.u32_zero_value};
++    const Id scope_id{ctx.Const(static_cast<u32>(scope))};
++
++    const Id loop_header{ctx.OpLabel()};
++    const Id continue_block{ctx.OpLabel()};
++    const Id merge_block{ctx.OpLabel()};
++    const Id func_type{is_shared
++                           ? ctx.TypeFunction(value_type, ctx.U32[1], value_type)
++                           : ctx.TypeFunction(value_type, ctx.U32[1], value_type, array_pointer)};
++
++    const Id func{ctx.OpFunction(value_type, spv::FunctionControlMask::MaskNone, func_type)};
++    const Id index{ctx.OpFunctionParameter(ctx.U32[1])};
++    const Id op_b{ctx.OpFunctionParameter(value_type)};
++    const Id base{is_shared ? ctx.shared_memory_u32 : ctx.OpFunctionParameter(array_pointer)};
++    ctx.AddLabel();
++    const Id expected_var{ctx.AddLocalVariable(
++        ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1]), spv::StorageClass::Function)};
++    const Id word_pointer{is_struct ? ctx.OpAccessChain(element_pointer, base, zero, index)
++                                    : ctx.OpAccessChain(element_pointer, base, index)};
++    ctx.OpStore(expected_var, ctx.OpLoad(ctx.U32[1], word_pointer));
++    ctx.OpBranch(loop_header);
++    ctx.AddLabel(loop_header);
++
++    ctx.OpLoopMerge(merge_block, continue_block, spv::LoopControlMask::MaskNone);
++    ctx.OpBranch(continue_block);
++
++    ctx.AddLabel(continue_block);
++    // The word holds a u32, an f32, an f16x2, or an f32x2 packed as two halves.
++    const bool packed_half{value_type.value == ctx.F32[2].value};
++    const bool is_u32{value_type.value == ctx.U32[1].value};
++    const auto from_word{[&](Id word) {
++        if (packed_half) {
++            return ctx.OpUnpackHalf2x16(ctx.F32[2], word);
++        }
++        return is_u32 ? word : ctx.OpBitcast(value_type, word);
++    }};
++    const Id expected{ctx.OpLoad(ctx.U32[1], expected_var)};
++    const Id new_value{ctx.OpFunctionCall(value_type, cas_func, from_word(expected), op_b)};
++    const Id new_word{packed_half ? ctx.OpPackHalf2x16(ctx.U32[1], new_value)
++                      : is_u32    ? new_value
++                                  : ctx.OpBitcast(ctx.U32[1], new_value)};
++    const Id atomic_res{ctx.OpAtomicCompareExchange(ctx.U32[1], word_pointer, scope_id, zero, zero,
++                                                    new_word, expected)};
++    ctx.OpStore(expected_var, atomic_res);
++    const Id success{ctx.OpIEqual(ctx.U1, atomic_res, expected)};
++    ctx.OpBranchConditional(success, merge_block, loop_header);
++
++    ctx.AddLabel(merge_block);
++    ctx.OpReturnValue(from_word(atomic_res));
++    ctx.OpFunctionEnd();
++    return func;
++}
++
+ Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_pointer,
+            Id value_type, Id memory_type, spv::Scope scope) {
++    if (CasExpectsReturnedWord()) {
++        return CasLoopReturnedWord(ctx, operation, array_pointer, element_pointer, value_type,
++                                   scope);
++    }
+     const bool is_shared{scope == spv::Scope::Workgroup};
+     const bool is_struct{!is_shared || ctx.uses_explicit_workgroup_layout};
+     const Id cas_func{CasFunction(ctx, operation, value_type)};
+@@ -921,6 +995,14 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
+     const Id bit_count{OpFunctionParameter(U32[1])};
+ 
+     AddLabel();
++    // EDEN_NX2_CAS_RETURNED: each attempt expects the word the previous exchange returned.
++    const bool returned_word{CasExpectsReturnedWord()};
++    Id expected_var{};
++    if (returned_word) {
++        expected_var = AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
++                                        spv::StorageClass::Function);
++        OpStore(expected_var, OpLoad(U32[1], pointer));
++    }
+     const Id scope_device{Const(1u)};
+     const Id ordering_relaxed{u32_zero_value};
+     const Id body_label{OpLabel()};
+@@ -934,10 +1016,13 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
+     OpBranch(body_label);
+ 
+     AddLabel(body_label);
+-    const Id expected_value{OpLoad(U32[1], pointer)};
++    const Id expected_value{OpLoad(U32[1], returned_word ? expected_var : pointer)};
+     const Id desired_value{OpBitFieldInsert(U32[1], expected_value, value, bit_offset, bit_count)};
+     const Id actual_value{OpAtomicCompareExchange(U32[1], pointer, scope_device, ordering_relaxed,
+                                                   ordering_relaxed, desired_value, expected_value)};
++    if (returned_word) {
++        OpStore(expected_var, actual_value);
++    }
+     const Id store_successful{OpIEqual(U1, expected_value, actual_value)};
+     OpBranchConditional(store_successful, endloop_label, continue_label);
+ 
