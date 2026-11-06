@@ -1,0 +1,23 @@
+diff --git a/src/common/host_command_queue.h b/src/common/host_command_queue.h
+index 311666b4ff..87427cb246 100644
+--- a/src/common/host_command_queue.h
++++ b/src/common/host_command_queue.h
+@@ -80,6 +80,18 @@ public:
+         entries.pop_front();
+     }
+ 
++    /// Pops an entry, waiting at most `timeout` for one to be pushed.
++    template <typename Rep, typename Period>
++    bool PopWaitFor(T& out, const std::chrono::duration<Rep, Period>& timeout) {
++        std::unique_lock lock{mutex};
++        if (!available.wait_for(lock, timeout, [this] { return !entries.empty(); })) {
++            return false;
++        }
++        out = std::move(entries.front());
++        entries.pop_front();
++        return true;
++    }
++
+ private:
+     static long long SpinNanoseconds() {
+         static const long long value = [] {
