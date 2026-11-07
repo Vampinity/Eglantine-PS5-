@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 05:00:00 +0100
+Subject: [PATCH] vulkan: EDEN_NX2_MESH_CENSUS=1 says what each task or mesh pipeline draws
+
+Core patch, on the T45 series or mig020-core. Log only, off unless the switch is set.
+
+"Mesh pipeline ... first draw" keeps one count per pipeline, the first, and 24 of the 25 lone mesh
+pipelines logged 0 there. So the logs can't tell a pipeline that is always empty from one that only
+started empty. This names a pipeline at its first empty draw and at its first draw with workgroups,
+with task or lone mesh, pixel program, target and what becomes of the draw, and every 30 s prints each
+pipeline's draws, empty draws, workgroups and largest count. It reads draw_element_count, the draw's
+real count. The first-draw line reads vertex_buffer.count, which an indexed draw leaves stale.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 16729e4..a6f38e6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -13,6 +13,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <filesystem>
++#include <map>
+ #include <tuple>
+ #include <set>
+ #include <fstream>
+@@ -396,6 +397,84 @@ bool MeshPipelineSkipped(const GraphicsPipeline& pipeline,
+     }
+     return skipped;
+ }
++
++// EDEN_NX2_MESH_CENSUS=1: what task/mesh draws really ask for. "first draw" above has one count per
++// pipeline, the first, which can't tell always empty from started empty. This names a
++// pipeline once at its first empty draw and once at its first draw with workgroups, with the target
++// and what happens to it, and every 30 s prints what each pipeline drew. Log only.
++// An indirect draw counts as empty here: its count is in memory ("Indirect task/mesh draw skipped").
++void MeshDrawCensus(const GraphicsPipeline& pipeline, const Tegra::Engines::Maxwell3D::Regs& regs,
++                    const Tegra::Engines::Maxwell3D::DrawManager::State& draw_state) {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_MESH_CENSUS");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (!enabled) {
++        return;
++    }
++    static const bool driver_compute = [] {
++        const char* value = std::getenv("EDEN_NX2_RADV_MESH_COMPUTE");
++        return value != nullptr && value[0] == '1';
++    }();
++    struct Entry {
++        u64 draws{};
++        u64 empty{};
++        u64 groups{};
++        u64 told_draws{};
++        u32 largest{};
++        bool named_empty{};
++        bool named_groups{};
++    };
++    static std::mutex mutex;
++    static std::map<u64, Entry> entries;
++    static auto last_report = std::chrono::steady_clock::now();
++    const auto& key = pipeline.Key();
++    const u64 id = MeshPipelineId(key);
++    const bool lone = key.unique_hashes[3] == 0;
++    const std::string_view fate = pipeline.RunsMeshAsCompute() ? "the core runs it as compute"
++                                  : !driver_compute            ? "native mesh draw"
++                                  : lone ? "the driver drops it: no task program"
++                                         : "the driver runs it as compute";
++    const u32 count = draw_state.draw_element_count;
++
++    std::scoped_lock lock{mutex};
++    auto& entry = entries[id];
++    ++entry.draws;
++    entry.empty += count == 0 ? 1 : 0;
++    entry.groups += count;
++    entry.largest = (std::max)(entry.largest, count);
++    bool& named = count == 0 ? entry.named_empty : entry.named_groups;
++    if (!std::exchange(named, true)) {
++        const u64 first = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
++                          regs.pipelines[1].reserved[1];
++        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
++                       regs.pipelines[5].reserved[1];
++        LOG_INFO(Render_Vulkan,
++                 "Mesh census {:016x}: {} (draw {}, {} workgroups): {} {:016x}, mesh {:016x}, "
++                 "vs={:#x} ps={:#x} rt0 {}x{} targets={} zeta {}x{} enabled={}: {}",
++                 id, count == 0 ? "first empty draw" : "first draw with workgroups", entry.draws,
++                 count, lone ? "lone mesh" : "task", key.unique_hashes[1], key.unique_hashes[3],
++                 first, ps, regs.rt[0].width, regs.rt[0].height, regs.rt_control.count.Value(),
++                 regs.zeta_size.width, regs.zeta_size.height, static_cast<u32>(regs.zeta_enable),
++                 fate);
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last_report < std::chrono::seconds{30}) {
++        return;
++    }
++    last_report = now;
++    for (auto& [pipeline_id, line] : entries) {
++        if (line.draws == line.told_draws) {
++            continue;
++        }
++        LOG_INFO(Render_Vulkan,
++                 "Mesh census {:016x}: {} draws ({} since the last line), {} empty, {} workgroups, "
++                 "largest {}",
++                 pipeline_id, line.draws, line.draws - line.told_draws, line.empty, line.groups,
++                 line.largest);
++        line.told_draws = line.draws;
++    }
++}
+ // A timed A/B inside one run, for pictures the log can't judge.
+ // EDEN_NX2_AB_SKIP=<seconds>;<phase>;<phase>...: each phase is a comma list of program hashes, as
+ // the workaround and shader dumps name them (lower case, no 0x, lowest bit ignored: it is the
+@@ -641,6 +720,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         report_failure("EDEN_NX2_MESH_SKIP");
+         return;
+     }
++    if (mesh_draw) {
++        MeshDrawCensus(*pipeline, maxwell3d->regs, maxwell3d->draw_manager.draw_state);
++    }
+     if (TimedAb::Get().Active() &&
+         TimedAb::Get().SkipDraw(pipeline->Key().unique_hashes, maxwell3d->regs)) {
+         return;

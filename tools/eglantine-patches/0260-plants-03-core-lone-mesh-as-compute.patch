@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 05:00:00 +0100
+Subject: [PATCH] vulkan: EDEN_NX2_MESH_COMPUTE_LONE=1 runs only mesh programs without a task as compute in the core
+
+Core patch, on the T45 series or mig020-core. Off unless the switch is set, and it needs
+EDEN_NX2_MESH_AS_COMPUTE=1 as well.
+
+With EDEN_NX2_RADV_MESH_COMPUTE=1 the driver runs task pipelines as compute and drops every mesh
+draw without a task: 25 of the 46 pipelines in run190, 16 programs. This sends those down the core's
+own compute path, which has handled a mesh program alone since patch 0214, and leaves task pipelines to
+the driver. Neither path then touches the NGG mesh launch.
+
+Only worth building if a lone draw has workgroups. Every drop with a known count was empty, and the one
+lone program with a real count, 9dc7, draws into a 128x68 target.
+
+The core path has never drawn on a PS5: run156 fell back to native for want of device addresses. It
+breaks the render pass for every non-empty draw, so expect it to cost fps.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index f6cac16..abca279 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -712,6 +712,17 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
+ // boot that ran out of memory never saved one and the next boot did the same.
+ constexpr size_t MaxPipelinesWithoutUsedList = 3000;
+ 
++// EDEN_NX2_MESH_COMPUTE_LONE=1, with EDEN_NX2_MESH_AS_COMPUTE=1: only mesh programs without a task
++// program run as compute here. Pipelines with a task program stay native mesh pipelines, for the
++// driver to run as compute (EDEN_NX2_RADV_MESH_COMPUTE=1), which refuses and drops the lone ones.
++bool MeshComputeLoneOnly() {
++    static const bool lone = [] {
++        const char* value = std::getenv("EDEN_NX2_MESH_COMPUTE_LONE");
++        return value != nullptr && value[0] == '1';
++    }();
++    return lone;
++}
++
+ // EDEN_NX2_MESH_COMPUTE_ONLY=<hash>[,<hash>...]: with EDEN_NX2_MESH_AS_COMPUTE=1, only task/mesh
+ // pipelines whose task (or lone mesh) program or mesh program has one of these shader hashes (hex,
+ // the hashes of the "Mesh pipeline ... runs as compute"/"first draw" lines and of the
+@@ -1586,7 +1597,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     size_t env_index{0};
+     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
+     // Task and mesh programs run as compute (EDEN_NX2_MESH_AS_COMPUTE=1, vk_mesh_compute.h).
+-    const bool mesh_as_compute{mesh_scratch != nullptr && mesh_scratch->IsValid()};
++    const bool mesh_as_compute{mesh_scratch != nullptr && mesh_scratch->IsValid() &&
++                               (!MeshComputeLoneOnly() || key.unique_hashes[3] == 0)};
+     const bool uses_vertex_a{key.unique_hashes[0] != 0};
+     const bool uses_vertex_b{key.unique_hashes[1] != 0};
+ 

@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 05:00:00 +0100
+Subject: [PATCH] vulkan: EDEN_NX2_NULL_SLOTS logs or rebuilds compute programs translated with null list pointers
+
+Core patch, on the T45 series or mig020-core. Off unless the switch is set. Port of the runtime half of
+Lichii PR 395 (atk3001, open), for our compute cache, which has no cache entry struct.
+
+A native program's pointer slot that holds null at translation gets no binding, its accesses are lost,
+and vulkan.bin keeps that answer for good. Our 6 Nov vulkan.bin has four compute programs with
+c4[0x90], c4[0xd0], c4[0x130] and c4[0x170] null, the slots PR 395 names, and ten more c4 slots. They
+are not the PR's programs, whose hashes aren't in that file, and what they do isn't known.
+
+=1 logs a slot that holds a mapped pointer now, once per program and slot, and changes nothing.
+=2 also rebuilds the program from the live state, at most 4 times a run. The old pipeline stays alive
+for work in flight. Unlike the PR, a rebuild is not written to vulkan.bin: a key's first entry wins on
+load, so it would never be read. So =2 rebuilds again on each boot. The PR's load-time choice between
+translations is not ported.
+
+A PR 395 comment reports all grass gone in Hyrule Field on an RX 9070 XT, and its author saw the same.
+Start with =1.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/shader_recompiler/environment.h b/src/shader_recompiler/environment.h
+index b77cdfc..c0d3f52 100644
+--- a/src/shader_recompiler/environment.h
++++ b/src/shader_recompiler/environment.h
+@@ -7,6 +7,8 @@
+ #pragma once
+ 
+ #include <array>
++#include <utility>
++#include <vector>
+ #include "common/container/unordered_map.h"
+ 
+ #include "common/common_types.h"
+@@ -91,6 +93,11 @@ public:
+         return true;
+     }
+ 
++    /// Native programs: (index, offset) slots classified as non-pointers because they were null.
++    [[nodiscard]] virtual std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const {
++        return {};
++    }
++
+     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
+ 
+     [[nodiscard]] virtual TextureType ReadTextureType(u32 raw_handle) = 0;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 5b85567..f6cac16 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -759,6 +759,19 @@ bool MeshComputeAllowed(const GraphicsPipelineCacheKey& key) {
+     return false;
+ }
+ 
++// EDEN_NX2_NULL_SLOTS (Lichii PR 395, atk3001): a native program's pointer slot that held null at
++// translation gets no binding, its accesses through it are lost, and the disk cache keeps that
++// answer for good. =1 logs a compute program's slot that holds a pointer now, once per program and
++// slot. =2 also rebuilds the program from the live state, at most 4 times a run. A rebuild is not
++// written to the disk cache: the first entry of a key wins on load, so it would never be read.
++u32 NullSlotsMode() {
++    static const u32 mode = [] {
++        const char* value = std::getenv("EDEN_NX2_NULL_SLOTS");
++        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
++    }();
++    return mode;
++}
++
+ // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
+ bool PreloadAllPipelines() {
+     static const bool all = [] {
+@@ -1134,6 +1147,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
+     };
+     const auto [pair, is_new]{compute_cache.try_emplace(key)};
+     auto& pipeline{pair->second};
++    if (!is_new && NullSlotsMode() != 0 && pipeline) {
++        RecheckNullPointerSlots(key, shader, pipeline);
++    }
+     if (!is_new) {
+         return pipeline.get();
+     }
+@@ -1141,6 +1157,70 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
+     return pipeline.get();
+ }
+ 
++void PipelineCache::RecheckNullPointerSlots(const ComputePipelineCacheKey& key,
++                                            const ShaderInfo* shader,
++                                            std::unique_ptr<ComputePipeline>& pipeline) {
++    constexpr u32 MaxRebuilds = 4;
++    const auto& qmd{kepler_compute->launch_description};
++    {
++        std::scoped_lock lock{compute_null_slots_mutex};
++        const auto it = compute_null_slots.find(key);
++        if (it == compute_null_slots.end() || it->second.slots.empty()) {
++            return;
++        }
++        NullPointerSlots& entry = it->second;
++        bool stale{};
++        for (const auto& [index, offset] : entry.slots) {
++            if (index >= qmd.const_buffer_config.size() ||
++                ((qmd.const_buffer_enable_mask.Value() >> index) & 1) == 0) {
++                continue;
++            }
++            const auto& cbuf{qmd.const_buffer_config[index]};
++            if (offset + sizeof(u64) > cbuf.size) {
++                continue; // The translator reads past the bound size as zero, too
++            }
++            const GPUVAddr slot{cbuf.Address() + offset};
++            if (!gpu_memory->IsFullyMappedRange(slot, sizeof(u64))) {
++                continue;
++            }
++            const GPUVAddr address{gpu_memory->Read<u64>(slot)};
++            if (address == 0 || !gpu_memory->IsWithinGPUAddressRange(address) ||
++                !gpu_memory->IsFullyMappedRange(address, 1)) {
++                continue;
++            }
++            stale = true;
++            if (entry.told.emplace(index, offset).second) {
++                LOG_INFO(Render_Vulkan,
++                         "Compute program {:016x}: c{}[{:#x}] was null at translation and now "
++                         "points to {:#x}",
++                         key.unique_hash, index, offset, address);
++            }
++        }
++        if (!stale || NullSlotsMode() < 2 || entry.rebuilds >= MaxRebuilds) {
++            return;
++        }
++        ++entry.rebuilds;
++    }
++    const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
++    ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
++                           shader->lowered_native};
++    env.SetCachedSize(shader->size_bytes);
++    ShaderPools& pools{main_pools};
++    pools.ReleaseContents();
++    auto rebuilt{CreateComputePipeline(pools, key, env, nullptr, true)};
++    if (!rebuilt) {
++        LOG_WARNING(Render_Vulkan, "Compute program {:016x}: rebuild failed, keeping the old one",
++                    key.unique_hash);
++        std::scoped_lock lock{compute_null_slots_mutex};
++        compute_null_slots[key].rebuilds = MaxRebuilds;
++        return;
++    }
++    LOG_INFO(Render_Vulkan, "Compute program {:016x} rebuilt from the live constant buffers",
++             key.unique_hash);
++    retired_compute_pipelines.push_back(std::move(pipeline));
++    pipeline = std::move(rebuilt);
++}
++
+ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                       const VideoCore::DiskResourceLoadCallback& callback) {
+     visual_workaround_title = title_id;
+@@ -1949,6 +2029,10 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+         const auto name{fmt::format("Shader {:016x}", key.unique_hash)};
+         spv_module.SetObjectNameEXT(name.c_str());
+     }
++    if (NullSlotsMode() != 0 && env.IsNativeProgram()) {
++        std::scoped_lock lock{compute_null_slots_mutex};
++        compute_null_slots[key].slots = env.NullStoragePointerSlots();
++    }
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+     return std::make_unique<ComputePipeline>(device, scheduler, vulkan_pipeline_cache, descriptor_pool,
+                                              guest_descriptor_queue, descriptor_buffer_ring,
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 8cfa854..a2978b2 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -15,7 +15,10 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <memory>
++#include <mutex>
++#include <set>
+ #include <type_traits>
++#include <utility>
+ #include "common/container/unordered_map.h"
+ #include <vector>
+ 
+@@ -224,6 +227,19 @@ private:
+ 
+     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
+     u64 last_compute_hash{};
++
++    /// EDEN_NX2_NULL_SLOTS: what a compute program's translation left unbound because it was null.
++    struct NullPointerSlots {
++        std::vector<std::pair<u32, u32>> slots;
++        std::set<std::pair<u32, u32>> told;
++        u32 rebuilds{};
++    };
++    void RecheckNullPointerSlots(const ComputePipelineCacheKey& key, const ShaderInfo* shader,
++                                 std::unique_ptr<ComputePipeline>& pipeline);
++    std::mutex compute_null_slots_mutex;
++    ::Common::unordered_map<ComputePipelineCacheKey, NullPointerSlots> compute_null_slots;
++    /// Replaced by a rebuild: command buffers in flight may still use them.
++    std::vector<std::unique_ptr<ComputePipeline>> retired_compute_pipelines;
+     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
+ 
+     ShaderPools main_pools;
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index 8588b1a..a95800e 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -50,6 +50,26 @@ static u64 MakeCbufKey(u32 index, u32 offset) {
+     return (static_cast<u64>(index) << 32) | offset;
+ }
+ 
++// Constant buffer slots that held null when the program was translated and so got no binding
++// (EDEN_NX2_NULL_SLOTS). Slots holding a scalar stay out: only zero in both words counts.
++static std::vector<std::pair<u32, u32>> FindNullStoragePointerSlots(
++    const ::Common::unordered_map<u64, u32>& cbuf_values,
++    const ::Common::unordered_map<u64, u8>& storage_pointer_types) {
++    std::vector<std::pair<u32, u32>> slots;
++    for (const auto& [key, type] : storage_pointer_types) {
++        if (type != 0 || (key >> 63) != 0) {
++            continue;
++        }
++        const auto low = cbuf_values.find(key);
++        const auto high = cbuf_values.find(key + 4);
++        if (low != cbuf_values.end() && high != cbuf_values.end() && low->second == 0 &&
++            high->second == 0) {
++            slots.emplace_back(static_cast<u32>(key >> 32), static_cast<u32>(key));
++        }
++    }
++    return slots;
++}
++
+ // Pointer-table entries share the classification map with plain constant buffer pointers.
+ static u64 MakeIndirectCbufKey(u32 index, u32 offset, u32 indirect) {
+     return (u64{1} << 63) | (static_cast<u64>(indirect & 0x3fffff) << 40) |
+@@ -197,6 +217,10 @@ bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+     return mapped;
+ }
+ 
++std::vector<std::pair<u32, u32>> GenericEnvironment::NullStoragePointerSlots() const {
++    return FindNullStoragePointerSlots(cbuf_values, storage_pointer_types);
++}
++
+ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+     const u64 key = MakeIndirectCbufKey(index, offset, indirect);
+     if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
+@@ -947,6 +971,10 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+     return it->second != 0;
+ }
+ 
++std::vector<std::pair<u32, u32>> FileEnvironment::NullStoragePointerSlots() const {
++    return FindNullStoragePointerSlots(cbuf_values, storage_pointer_types);
++}
++
+ bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+     const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
+     if (it == storage_pointer_types.end()) {
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+index 48c588c..7ba69ad 100644
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -70,6 +70,8 @@ public:
+     [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                           u32 indirect) override;
+ 
++    [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
++
+     [[nodiscard]] std::optional<u64> Analyze();
+ 
+     void SetCachedSize(size_t size_bytes);
+@@ -227,6 +229,8 @@ public:
+     [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                           u32 indirect) override;
+ 
++    [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
++
+     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
+ 
+     [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) override;

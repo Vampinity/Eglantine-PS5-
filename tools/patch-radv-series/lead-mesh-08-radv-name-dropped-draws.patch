@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 05:00:00 +0100
+Subject: [PATCH] radv/ps5: EDEN_NX2_RADV_MESH_DROP_LOG=1 names every dropped pipeline with its reason
+
+Driver patch, after lead-mesh-07 in tools/patch-radv-series. Log only, off unless the switch is set.
+
+"mesh draw dropped" stops after 32 draws, a little over one frame, and has no reason. "mesh shader not run
+as compute" only prints when a pipeline compiles, and these came from the cache: lead-mesh-07 salts
+only the hash of pipelines with a task shader. This names each dropped pipeline once per kind of draw
+(empty, with workgroups, indirect), with the count and why.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 7dd772e..feab379 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -11,7 +11,9 @@
+ #include "radv_cmd_buffer.h"
+ #include "radv_gs_compute.h"
+ #ifdef RADV_GS_COMPUTE
++#include <stdlib.h>
+ #include "radv_mesh_compute.h"
++#include "util/simple_mtx.h"
+ #endif
+ #include "poly/geometry.h"
+ #include "meta/radv_meta.h"
+@@ -15888,11 +15890,54 @@ radv_mesh_compute_bound(const struct radv_cmd_buffer *cmd_buffer)
+ /* EglantinePS5: with the path on, a mesh draw of a pipeline it refused (mesh_compute_refused) is
+  * dropped, as EDEN_NX2_NO_MESH drops them all. exploitizm leaves those on the NGG mesh path, the
+  * one that stops this GPU. */
++static void
++radv_mesh_drop_log(const struct radv_cmd_buffer *cmd_buffer, uint32_t groups, bool indirect)
++{
++   /* EglantinePS5: EDEN_NX2_RADV_MESH_DROP_LOG=1 names every dropped pipeline once per kind of draw
++    * (empty, with workgroups, indirect) and why. The 32 lines below are draws, not pipelines, and a
++    * pipeline that came from the cache compiled nothing here, so mesh_compute_refused said nothing. */
++   static int enabled = -1;
++   if (enabled < 0) {
++      const char *const value = getenv("EDEN_NX2_RADV_MESH_DROP_LOG");
++      p_atomic_set(&enabled, value && value[0] == '1');
++   }
++   if (!enabled)
++      return;
++
++   static struct {
++      uint64_t hash;
++      uint32_t told;
++   } seen[512];
++   static uint32_t used;
++   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
++   const uint64_t hash = cmd_buffer->state.graphics_pipeline ? cmd_buffer->state.graphics_pipeline->base.pipeline_hash : 0;
++   const uint32_t kind = indirect ? 4 : groups ? 2 : 1;
++
++   simple_mtx_lock(&lock);
++   uint32_t i = 0;
++   while (i < used && seen[i].hash != hash)
++      i++;
++   if (i == used && used < ARRAY_SIZE(seen))
++      seen[used++].hash = hash;
++   const bool first = i < used && !(seen[i].told & kind);
++   if (i < used)
++      seen[i].told |= kind;
++   simple_mtx_unlock(&lock);
++
++   if (first)
++      fprintf(stderr, "radv/ps5: mesh draw dropped: pipeline %016" PRIx64 ", %s, %u workgroups: %s\n", hash,
++              indirect ? "indirect" : groups ? "first with workgroups" : "first empty", groups,
++              radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TASK)
++                 ? "a task shader but no compute pass: refused, or saved before the switch"
++                 : "no task shader");
++}
++
+ static bool
+-radv_mesh_draw_dropped(const struct radv_cmd_buffer *cmd_buffer)
++radv_mesh_draw_dropped(const struct radv_cmd_buffer *cmd_buffer, uint32_t groups, bool indirect)
+ {
+    if (!radv_mesh_compute_enabled())
+       return false;
++   radv_mesh_drop_log(cmd_buffer, groups, indirect);
+    static uint32_t told;
+    if (told < 32 && p_atomic_inc_return(&told) <= 32)
+       fprintf(stderr, "radv/ps5: mesh draw dropped: pipeline %016" PRIx64 " is not run as compute\n",
+@@ -15914,7 +15959,7 @@ radv_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y,
+       radv_mesh_compute_draw(cmd_buffer, NULL, x, y, z);
+       return;
+    }
+-   if (radv_mesh_draw_dropped(cmd_buffer))
++   if (radv_mesh_draw_dropped(cmd_buffer, x * y * z, false))
+       return;
+ #endif
+ 
+@@ -15984,7 +16029,7 @@ radv_CmdDrawMeshTasksIndirect2EXT(VkCommandBuffer commandBuffer, const VkDrawInd
+       radv_mesh_compute_draw(cmd_buffer, &info, 0, 0, 0);
+       return;
+    }
+-   if (radv_mesh_draw_dropped(cmd_buffer))
++   if (radv_mesh_draw_dropped(cmd_buffer, 0, true))
+       return;
+ #endif
+ 
+@@ -16056,7 +16101,7 @@ radv_CmdDrawMeshTasksIndirectCount2EXT(VkCommandBuffer commandBuffer, const VkDr
+       radv_mesh_compute_draw(cmd_buffer, &info, 0, 0, 0);
+       return;
+    }
+-   if (radv_mesh_draw_dropped(cmd_buffer))
++   if (radv_mesh_draw_dropped(cmd_buffer, 0, true))
+       return;
+ #endif
+ 
