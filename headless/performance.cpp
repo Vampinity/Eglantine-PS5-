@@ -522,37 +522,82 @@ static bool OffThreadReportsEnabled() {
     return enabled;
 }
 void RegisterWorker(const char* name);
-static void QueueOffThreadReport(bool report, bool trim) {
+static void WriteMemorySummary(std::size_t largest, bool memory_short);
+struct MemorySummaryNumbers {
+    bool due{};
+    std::size_t largest{};
+    bool memory_short{};
+};
+static void QueueOffThreadReport(bool report, bool trim, MemorySummaryNumbers summary = {}) {
     struct Pending {
         std::mutex mutex;
         std::condition_variable changed;
         bool report{}, trim{}, started{};
+        MemorySummaryNumbers summary;
     };
     static Pending* const pending = new Pending;  // outlives every static destructor
     {
         std::scoped_lock lock{pending->mutex};
         pending->report |= report;
         pending->trim |= trim;
+        if (summary.due) pending->summary = summary;
         if (!pending->started) {
             pending->started = true;
             std::thread([] {
                 RegisterWorker("MemoryReport");
                 for (;;) {
                     bool do_report, do_trim;
+                    MemorySummaryNumbers do_summary;
                     {
                         std::unique_lock lock{pending->mutex};
-                        pending->changed.wait(lock, [] { return pending->report || pending->trim; });
+                        pending->changed.wait(lock, [] {
+                            return pending->report || pending->trim || pending->summary.due;
+                        });
                         do_report = pending->report;
                         do_trim = pending->trim;
+                        do_summary = pending->summary;
                         pending->report = pending->trim = false;
+                        pending->summary = {};
                     }
                     if (do_report && eden_guest_memory_report) eden_guest_memory_report();
                     if (do_trim) TrimHeap("the pool is short");
+                    if (do_summary.due) WriteMemorySummary(do_summary.largest, do_summary.memory_short);
                 }
             }).detach();
         }
     }
     pending->changed.notify_one();
+}
+// The pool, the guest's memory and the heap in stderr.log, every 20 s (RefreshFreeMemory).
+static void WriteMemorySummary(std::size_t largest, bool memory_short) {
+    std::size_t guest_span = 0, guest_held = 0;
+    ::Common::GuestMemoryUsage(&guest_span, &guest_held);
+    const auto kernel_memory = guest_kernel_memory.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB"
+                 " (the kernel maps %llu MiB)\n",
+                 largest >> 20, int(memory_short), guest_held >> 20,
+                 kernel_memory ? kernel_memory() >> 20 : 0ULL);
+    ReportHeap("every 20 s");
+    ReportLedger();
+    // EDEN_NX2_POOL_WALK=1 (off unless set): the pool by block size every 20 s (EDEN_REFUSED_POOL,
+    // the walk a refusal makes). available_mib is the largest block, the ledger the sum: only
+    // this says how much of what is free comes in 2 MiB blocks. Up to 4096 kernel calls, on the
+    // GPU thread: not for timing runs. It prints the ledger again, and run-report.py counts
+    // each one as a refusal report. Then the writes that had to wait for a block: nothing calls
+    // eden_guest_memory_waits today, and the lines WaitForBlock writes go to the kernel log.
+    static const bool pool_walk = [] {
+        const char* const value = std::getenv("EDEN_NX2_POOL_WALK");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (pool_walk) {
+        ReportPool();
+        if (eden_guest_memory_waits) {
+            unsigned long long won = 0, lost = 0, refused = 0;
+            eden_guest_memory_waits(&won, &lost, &refused);
+            std::fprintf(stderr, "EDEN_GUEST_WAITS got a block %llu, waited 2 s for nothing %llu, writes refused %llu\n",
+                         won, lost, refused);
+        }
+    }
 }
 // The largest free block of direct memory is what the next graphics allocation needs. Looked at
 // again every 100 ms; called on the GPU thread by the texture collector (KeepDirtyTextures).
@@ -584,33 +629,12 @@ static void RefreshFreeMemory() {
     static std::atomic<long long> summary_ns{0};
     if (now - summary_ns.load(std::memory_order_relaxed) >= 20'000'000'000) {
         summary_ns.store(now, std::memory_order_relaxed);
-        std::size_t guest_span = 0, guest_held = 0;
-        ::Common::GuestMemoryUsage(&guest_span, &guest_held);
-        const auto kernel_memory = guest_kernel_memory.load(std::memory_order_relaxed);
-        std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB"
-                     " (the kernel maps %llu MiB)\n",
-                     largest >> 20, int(view.short_memory), guest_held >> 20,
-                     kernel_memory ? kernel_memory() >> 20 : 0ULL);
-        ReportHeap("every 20 s");
-        ReportLedger();
-        // EDEN_NX2_POOL_WALK=1 (off unless set): the pool by block size every 20 s (EDEN_REFUSED_POOL,
-        // the walk a refusal makes). available_mib is the largest block, the ledger the sum: only
-        // this says how much of what is free comes in 2 MiB blocks. Up to 4096 kernel calls, on the
-        // GPU thread: not for timing runs. It prints the ledger again, and run-report.py counts
-        // each one as a refusal report. Then the writes that had to wait for a block: nothing calls
-        // eden_guest_memory_waits today, and the lines WaitForBlock writes go to the kernel log.
-        static const bool pool_walk = [] {
-            const char* const value = std::getenv("EDEN_NX2_POOL_WALK");
-            return value != nullptr && value[0] == '1';
-        }();
-        if (pool_walk) {
-            ReportPool();
-            if (eden_guest_memory_waits) {
-                unsigned long long won = 0, lost = 0, refused = 0;
-                eden_guest_memory_waits(&won, &lost, &refused);
-                std::fprintf(stderr, "EDEN_GUEST_WAITS got a block %llu, waited 2 s for nothing %llu, writes refused %llu\n",
-                             won, lost, refused);
-            }
+        // Its heap, ledger and kernel queries can block, and the GPU thread must not wait for those
+        // (GrowingBlackBeans, issue 21). EDEN_MEMORY_REPORT_THREAD=1 writes it on the report thread.
+        if (OffThreadReportsEnabled()) {
+            QueueOffThreadReport(false, false, MemorySummaryNumbers{true, largest, view.short_memory});
+        } else {
+            WriteMemorySummary(largest, view.short_memory);
         }
     }
     // The last burst of a session falls between two reports of the guest's memory (every 30 s):

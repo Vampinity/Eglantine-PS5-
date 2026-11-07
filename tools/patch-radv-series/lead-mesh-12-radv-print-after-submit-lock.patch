@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 21:00:00 +0100
+Subject: [PATCH] radv/ps5: write the submission line after the submit lock
+
+Driver patch, after lead-mesh-11. No switch. Found by GrowingBlackBeans on issue 21: with Diagnostics
+"Write logs immediately" on, this fprintf could block with queue->submit_lock held, and every queue submit
+then waits behind it, which froze the intro. The window stays under the lock; only the print moves out.
+
+Same line, same numbers, same 10 s window.
+---
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+@@ -502,13 +502,19 @@
+ }
+ 
+ /* Where the submissions' time goes: a line on stderr every 10 s of a queue
+- * that submits (held with the submit lock). */
++ * that submits. The window is held with the submit lock, the line is written
++ * after it: stderr can block, and every queue submit waits on this lock. */
+ static struct {
+    uint64_t window_start, count, words, claim_ns, copy_ns;
+ } radv_ps5_submit_window;
+ 
+-static void
+-radv_ps5_note_submission(uint32_t words, uint64_t claim_ns, uint64_t copy_ns)
++struct radv_ps5_submit_line {
++   uint64_t count, words, claim_ns, copy_ns, times[3];
++};
++
++/* True when a window is full: the line is in *line, for after the unlock. */
++static bool
++radv_ps5_note_submission(uint32_t words, uint64_t claim_ns, uint64_t copy_ns, struct radv_ps5_submit_line *line)
+ {
+    const uint64_t now = os_time_get_nano();
+    if (!radv_ps5_submit_window.window_start)
+@@ -518,16 +524,25 @@
+    radv_ps5_submit_window.claim_ns += claim_ns;
+    radv_ps5_submit_window.copy_ns += copy_ns;
+    if (now - radv_ps5_submit_window.window_start < 10ull * 1000 * 1000 * 1000)
+-      return;
+-   uint64_t times[3];
+-   radv_ps5_submit_times(times);
++      return false;
++   radv_ps5_submit_times(line->times);
++   line->count = radv_ps5_submit_window.count;
++   line->words = radv_ps5_submit_window.words;
++   line->claim_ns = radv_ps5_submit_window.claim_ns;
++   line->copy_ns = radv_ps5_submit_window.copy_ns;
++   memset(&radv_ps5_submit_window, 0, sizeof(radv_ps5_submit_window));
++   radv_ps5_submit_window.window_start = now;
++   return true;
++}
++
++static void
++radv_ps5_print_submit_line(const struct radv_ps5_submit_line *line)
++{
+    fprintf(stderr,
+            "radv/ps5 submissions: window count=%" PRIu64 " kwords=%" PRIu64 " claim_ms=%.1f copy_ms=%.1f flush_ms=%.1f"
+            " agc_ms=%.1f suspend_ms=%.1f\n",
+-           radv_ps5_submit_window.count, radv_ps5_submit_window.words / 1024, radv_ps5_submit_window.claim_ns / 1e6,
+-           radv_ps5_submit_window.copy_ns / 1e6, times[0] / 1e6, times[1] / 1e6, times[2] / 1e6);
+-   memset(&radv_ps5_submit_window, 0, sizeof(radv_ps5_submit_window));
+-   radv_ps5_submit_window.window_start = now;
++           line->count, line->words / 1024, line->claim_ns / 1e6, line->copy_ns / 1e6, line->times[0] / 1e6,
++           line->times[1] / 1e6, line->times[2] / 1e6);
+ }
+ 
+ static VkResult
+@@ -671,8 +686,12 @@
+    }
+    util_dynarray_fini(&starts);
+    radv_ps5_record_submission(queue, count, parts, wait_count, signal_count, submit->queue_index, depends);
+-   radv_ps5_note_submission(count, copy_start - claim_start, copy_end - copy_start);
++   struct radv_ps5_submit_line submit_line;
++   const bool submit_line_due =
++      radv_ps5_note_submission(count, copy_start - claim_start, copy_end - copy_start, &submit_line);
+    simple_mtx_unlock(&queue->submit_lock);
++   if (submit_line_due)
++      radv_ps5_print_submit_line(&submit_line);
+    if (submitted != 0) {
+       fprintf(stderr, "radv/ps5: sceAgcDriverSubmitDcb failed: 0x%08x\n", (unsigned)submitted);
+       return VK_ERROR_DEVICE_LOST;
