@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 07:10:00 +0100
+Subject: [PATCH] radv/ps5: EDEN_NX2_RADV_MESH_COMPUTE_LONE=1 runs mesh shaders with no task shader as compute
+
+Driver patch, after lead-mesh-08 in tools/patch-radv-series. Off unless the switch is set.
+
+The T46 census (EDEN_NX2_MESH_CENSUS=1) shows the pipelines lead-mesh-07 drops are not empty. Over seven
+minutes in Kokiri Forest 25 of them had 6.0 million workgroups against 3.0 million for the 21 with a task
+shader, drawing to the screen and to a 1024x1000 depth target with no colour. The first-draw counts that
+read as empty were stale. Ocarina's leaves and their shadows are the likely loss, not yet proven.
+
+A direct draw of such a pipeline has no task workgroups, so nothing fills the draw ring. Its grid goes in
+as the one ring entry, and from there exploitizm's path runs as it does for a task draw: the records pass
+makes one record, the compute pass reads its workgroup ID and grid from it, the copy draws the slots. The
+draw also knows its workgroup count, so only the passes it fills run. Indirect draws stay dropped, and logged.
+
+The switch goes into the hash of these pipelines, or a cached copy with no compute pass would be used.
+EDEN_NX2_MESH_COMPUTE_LONE in the core can't do this: its path is off on this GPU for want of buffer
+device addresses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index cae4b2e..cfeb990 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15795,14 +15795,18 @@ radv_mesh_compute_dispatch(struct radv_cmd_buffer *cmd_buffer, const struct radv
+  * compute pass and the copy draw. */
+ static void
+ radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_task_emu *emu, uint64_t block_va,
+-                        uint32_t draw_id, uint32_t count, uint64_t count_va)
++                        uint32_t draw_id, uint32_t count, uint64_t count_va, uint32_t known_workgroups)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_pipeline *pipeline = &cmd_buffer->state.graphics_pipeline->base;
+    struct radv_cmd_stream *cs = cmd_buffer->cs;
+    const uint32_t capacity = pipeline->mesh_compute_capacity;
+-   const uint32_t passes = MIN3(DIV_ROUND_UP(RADV_MESH_COMPUTE_CHUNK_WORKGROUPS, capacity), RADV_MESH_COMPUTE_MAX_PASSES,
+-                                radv_mesh_compute_pass_limit());
++   uint32_t passes = MIN3(DIV_ROUND_UP(RADV_MESH_COMPUTE_CHUNK_WORKGROUPS, capacity), RADV_MESH_COMPUTE_MAX_PASSES,
++                          radv_mesh_compute_pass_limit());
++   /* With no task shader the draw says how many there are: only the passes they fill, each one
++    * costs its flushes even when empty. */
++   if (known_workgroups)
++      passes = MIN2(passes, DIV_ROUND_UP(known_workgroups, capacity));
+    const uint64_t header_va = radv_buffer_get_va(device->mesh_compute_bo);
+ 
+    radv_meta_mesh_compute_records(cmd_buffer, emu->draw_ring_va, AC_TASK_DRAW_ENTRY_BYTES, count_va, count,
+@@ -15868,9 +15872,32 @@ radv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct rad
+    if (state->dirty & RADV_CMD_DIRTY_GRAPHICS_SHADERS)
+       radv_bind_graphics_shaders(cmd_buffer);
+ 
++   /* No task shader: nothing fills the draw ring, so the draw's grid is its one entry. */
++   const bool lone = !pipeline->shaders[MESA_SHADER_TASK];
+    struct radv_task_emu emu;
+-   if (!radv_task_emu_begin(cmd_buffer, &emu))
++   if (lone) {
++      if (info) {
++         static uint32_t told;
++         if (told < 8 && p_atomic_inc_return(&told) <= 8)
++            fprintf(stderr, "radv/ps5: indirect mesh draw with no task shader dropped\n");
++         return;
++      }
++      if (!device->task_emu_bo)
++         return;
++      const uint32_t entry[4] = {x, y, z, 0};
++      unsigned entry_offset;
++      if (!radv_cmd_buffer_upload_data(cmd_buffer, sizeof(entry), entry, &entry_offset)) {
++         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++         return;
++      }
++      memset(&emu, 0, sizeof(emu));
++      emu.entries = 1;
++      emu.records_va = radv_buffer_get_va(device->task_emu_bo) + RADV_TASK_EMU_RECORDS_OFFSET;
++      emu.draw_ring_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + entry_offset;
++      radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->task_emu_bo);
++   } else if (!radv_task_emu_begin(cmd_buffer, &emu)) {
+       return;
++   }
+ 
+    radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->mesh_compute_bo);
+ 
+@@ -15903,7 +15930,9 @@ radv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct rad
+       radeon_check_space(device->ws, cmd_buffer->cs->b, 16);
+       radv_emit_userdata_address(device, cmd_buffer->cs, state->shaders[MESA_SHADER_VERTEX], AC_UD_VS_GS_COMPUTE_DRAW,
+                                  block_va);
+-      if (!info) {
++      if (lone) {
++         radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, 1, 0, workgroups);
++      } else if (!info) {
+          for (uint32_t first = 0; first < workgroups; first += emu.entries) {
+             const uint32_t count = MIN2(emu.entries, workgroups - first);
+             const struct radv_task_emu_block block = {.grid = {x, y, z}, .first_workgroup = first};
+@@ -15914,7 +15943,7 @@ radv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct rad
+             }
+             radv_task_emu_dispatch(cmd_buffer, &emu, radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset,
+                                    count, 0);
+-            radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, count, 0);
++            radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, count, 0, 0);
+          }
+       } else {
+          /* As radv_task_emu_draw_indirect: every chunk the task workgroup limit allows, those past
+@@ -15938,7 +15967,7 @@ radv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct rad
+                const uint64_t task_block_va = out_va + i * sizeof(struct radv_task_emu_block);
+                const uint64_t args_va = out_va + draws * chunks * sizeof(struct radv_task_emu_block) + i * 16;
+                radv_task_emu_dispatch(cmd_buffer, &emu, task_block_va, 0, args_va);
+-               radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, first_draw + i / chunks, emu.entries, args_va);
++               radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, first_draw + i / chunks, emu.entries, args_va, 0);
+             }
+          }
+       }
+diff --git a/src/amd/vulkan/radv_mesh_compute.c b/src/amd/vulkan/radv_mesh_compute.c
+index 511608c..495ed1a 100644
+--- a/src/amd/vulkan/radv_mesh_compute.c
++++ b/src/amd/vulkan/radv_mesh_compute.c
+@@ -72,6 +72,21 @@ radv_mesh_compute_pass_limit(void)
+    return limit;
+ }
+ 
++bool
++radv_mesh_compute_lone(void)
++{
++   static int lone = -1;
++   if (lone < 0) {
++      const char *const asked = getenv("EDEN_NX2_RADV_MESH_COMPUTE_LONE");
++      const int value = asked && asked[0] == '1' && radv_mesh_compute_enabled();
++      if (value)
++         fprintf(stderr, "radv/ps5: mesh shaders with no task shader run as compute too "
++                         "(EDEN_NX2_RADV_MESH_COMPUTE_LONE)\n");
++      p_atomic_set(&lone, value);
++   }
++   return lone;
++}
++
+ VkResult
+ radv_mesh_compute_init(struct radv_device *device)
+ {
+@@ -174,7 +189,7 @@ radv_mesh_compute_wanted(const struct radv_graphics_state_key *gfx_state, const
+ 
+    if (!mesh || !radv_mesh_compute_enabled())
+       return false;
+-   if (!task) {
++   if (!task && !radv_mesh_compute_lone()) {
+       mesh_compute_refused(mesh, "no task shader");
+       return false;
+    }
+@@ -500,7 +515,9 @@ radv_mesh_compute_split(const struct radv_compiler_info *compiler_info, struct r
+    l.stride = align(l.prim_offset + l.max_primitives * 4, 64);
+    l.capacity = MIN2((radv_mesh_compute_bytes() - RADV_MESH_COMPUTE_HEADER_BYTES) / l.stride,
+                      RADV_MESH_COMPUTE_CHUNK_WORKGROUPS);
+-   l.payload_stride = align(MAX2(stages[MESA_SHADER_TASK].nir->info.task_payload_size, 16), 16);
++   /* A mesh shader with no task shader reads no payload. */
++   const nir_shader *task = stages[MESA_SHADER_TASK].nir;
++   l.payload_stride = align(MAX2(task ? task->info.task_payload_size : 0, 16), 16);
+    l.address32_hi = compiler_info->hw.address32_hi;
+ 
+    nir_shader *vs = build_copy_vs(mesh->options, &l, compiler_info->key.ge_wave_size);
+diff --git a/src/amd/vulkan/radv_mesh_compute.h b/src/amd/vulkan/radv_mesh_compute.h
+index f5632e1..aa1ff1a 100644
+--- a/src/amd/vulkan/radv_mesh_compute.h
++++ b/src/amd/vulkan/radv_mesh_compute.h
+@@ -69,8 +69,12 @@ uint32_t radv_mesh_compute_bytes(void);
+  * pass costs its flushes even when it is empty; mesh workgroups past the last pass are left out. */
+ uint32_t radv_mesh_compute_pass_limit(void);
+ 
++/* Whether mesh pipelines with no task shader take this path too: EDEN_NX2_RADV_MESH_COMPUTE_LONE=1 in
++ * env.txt. A direct draw of one is a single record, its grid the draw's. Unset, those draws are dropped. */
++bool radv_mesh_compute_lone(void);
++
+ struct radv_device;
+-/* The device's buffer, made once (the first pipeline with a task shader). */
++/* The device's buffer, made once (the first pipeline that may use it). */
+ VkResult radv_mesh_compute_init(struct radv_device *device);
+ 
+ struct radv_mesh_compute_split {
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+index 663824c..526ae09 100644
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -3076,7 +3076,9 @@ radv_graphics_pipeline_hash(const struct radv_device *device, const struct radv_
+     * else, its slots sized to the buffer. Only those pipelines change: this takes the place of
+     * exploitizm's line in the cache's UUID, which made every saved pipeline useless, and a cold
+     * boot has ended out of memory on this console (runs 135, 146, 150). */
+-   if (gfx_state->stages && gfx_state->stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE &&
++   if (gfx_state->stages &&
++       (gfx_state->stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE ||
++        (gfx_state->stages[MESA_SHADER_MESH].stage != MESA_SHADER_NONE && radv_mesh_compute_lone())) &&
+        radv_mesh_compute_enabled()) {
+       const uint32_t mesh_compute_bytes = radv_mesh_compute_bytes();
+       _mesa_blake3_update(&ctx, &mesh_compute_bytes, sizeof(mesh_compute_bytes));
+@@ -3141,7 +3143,9 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
+    /* An emulated task shader's mesh shader may run as compute (radv_mesh_compute.h), whose draws
+     * need the device's buffer. Whether that path is on is in the pipeline's hash
+     * (radv_graphics_pipeline_hash). */
+-   if (stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE && device->task_emu_bo && radv_mesh_compute_enabled()) {
++   if ((stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE ||
++        (stages[MESA_SHADER_MESH].stage != MESA_SHADER_NONE && radv_mesh_compute_lone())) &&
++       device->task_emu_bo && radv_mesh_compute_enabled()) {
+       result = radv_mesh_compute_init(device);
+       if (result != VK_SUCCESS)
+          return result;
