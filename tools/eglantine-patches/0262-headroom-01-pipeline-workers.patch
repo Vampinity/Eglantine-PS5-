@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 08:30:00 +0100
+Subject: [PATCH] vulkan: EDEN_NX2_PIPELINE_WORKERS=<n> sets how many threads build pipelines
+
+Core patch, after 0260. Off unless the switch is set: unset, 0 or not a number leaves all 15 builders.
+
+A first boot after a shader change compiles on 15 threads, and nothing could limit them. T47's heap reached
+3,552 MiB with 763 in use, and the run ended out of memory at 468 s. T48 ended at 125 s with 3,104.
+
+Start with 4. T47's cold burst grew 2,432 MiB. If that scales with the builders, which is a guess, each one
+costs about 160 MiB: 4 would peak near 1,800, the plan's line for a warm boot, and 6 near 2,100.
+
+The price is a slower first boot, by an amount not measured. New pipelines in play use the same threads, so
+they come later too. One builder is already a supported case (HasBrokenParallelShaderCompiling), so no job
+waits on a second one.
+
+The log says "Pipeline builders: 4 of 15". The port copies this file to vk_pipeline_cache_cost.cpp, and the
+switch comes through.
+
+Of the plan's first item this is the builders only. exploitizm's 8b4cdfb897 is a driver change, so it is
+lead-mesh-11 in tools/patch-radv-series. The heap class line is in headless/heap_arenas.inc, which this series
+doesn't reach, and is left out.
+
+Compiled with the build's flags, syntax only. Not linked, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index a487d75..b16fc43 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -373,6 +373,17 @@ void SurviveBadAlloc(const char* where) {
+ size_t GetTotalPipelineWorkers() {
+     const size_t max_core_threads =
+         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
++    // EDEN_NX2_PIPELINE_WORKERS=<n>: that many builder threads, at most one per core but one. A
++    // first boot after a shader change builds on all of them at once, and each holds its compiler's
++    // memory and its own heap arenas. Unset, 0 or not a number: as many as before.
++    if (const char* const value = std::getenv("EDEN_NX2_PIPELINE_WORKERS"); value != nullptr) {
++        const size_t asked = static_cast<size_t>(std::strtoul(value, nullptr, 10));
++        if (asked != 0) {
++            const size_t builders = std::min(asked, max_core_threads);
++            LOG_INFO(Render_Vulkan, "Pipeline builders: {} of {}", builders, max_core_threads);
++            return builders;
++        }
++    }
+ #ifdef __ANDROID__
+     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
+     const int clamped = std::clamp(configured, 2, 8);

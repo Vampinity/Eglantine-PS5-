@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 08:40:00 +0100
+Subject: [PATCH] vulkan: EDEN_GPU_TIME=1 turns on the GPU time probe in any build
+
+Core patch, after 0263. Off unless the switch is set.
+
+No build measures how busy the GPU is. The probe exists (headless/gpu_time_probe.inc), but only dev-settings
+gpu_time=on sets its flag, and that is read in EDEN_DEV_PROFILE builds, as is the MKW diagnostic build's line.
+
+Its natural place is beside EDEN_PERF_REPORT in headless/main.cpp, but this series only reaches the Eglantine
+tree, and a patch for headless/ would stop the build. So it sits in the scheduler's constructor, before the
+first command buffer and the worker thread.
+
+vk_scheduler.cpp as it stands doesn't include dev_vulkan.h. The port adds it, and headless/vulkan.cmake always
+builds the port's vulkan_scheduler.cpp instead. If that changes, this stops compiling.
+
+Every 5 s the probe prints "EDEN_GPU_TIME wall_ms= busy_ms= submissions= max_ms=" to stdout, which is heap.log.
+Busy share is busy_ms / wall_ms. It costs two timestamps a submission, not measured on these builds.
+
+Compiled with the build's flags from the port's output, syntax only. Not linked, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 6c4d9a0..5ea2fa2 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -58,6 +58,11 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
+     : device{device_}, state_tracker{state_tracker_},
+       master_semaphore{std::make_unique<MasterSemaphore>(device)},
+       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
++    // EDEN_GPU_TIME=1: the probe of gpu_time_probe.inc, in any build. dev-settings gpu_time=on is
++    // read in development profile builds only. Before the first command buffer on purpose.
++    if (const char* const value = std::getenv("EDEN_GPU_TIME"); value != nullptr && value[0] == '1') {
++        ::Eden::DevVulkan::gpu_time = true;
++    }
+     if (const char* const value = std::getenv("EDEN_NX2_HANG_WATCH");
+         value != nullptr && value[0] != '0') {
+         hang_watching = true;

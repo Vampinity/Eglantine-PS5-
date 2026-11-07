@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 08:35:00 +0100
+Subject: [PATCH] kepler_compute: EDEN_NX2_NO_UPLOAD_STORE=1 stops native channels listing their uploads
+
+Core patch, after 0262. Off unless the switch is set.
+
+Every exec_upload adds a 24-byte entry to uploads, and only the older class's launch method reads and clears
+that list. A native channel never gets there: ProcessNativeMethod's default case returns true for everything
+but exec_upload and data_upload. So the list only grew, about 2,900 entries a second. Its heap block was 96 MiB
+at 13 min and 192 at 24 min, plus 24 on a second channel. The next doubling needs 192 and 384 at once, at about
+48 min by the same rate (a guess).
+
+With the switch a native channel stores nothing. The older class is unchanged. Nothing else reads the list, so
+picture and speed should not move.
+
+The change is right with or without a switch. The switch only keeps this series' rule, and can go after a run.
+
+Proof in a run: the site at T45's offset 161854d, which moves with each build, gone from EDEN_HEAP_SITE.
+
+Compiled with the build's flags, syntax only. Not linked, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 9017f9e..34b195e 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -38,6 +38,19 @@
+ 
+ namespace Tegra::Engines {
+ 
++namespace {
++// EDEN_NX2_NO_UPLOAD_STORE=1: a native channel doesn't list its inline uploads. Only the older
++// class's launch method reads that list and clears it, and ProcessNativeMethod never lets a native
++// channel get there, so the list only grew: 24 bytes an upload, about 2,900 a second.
++bool NoUploadStore() {
++    static const bool no_store = [] {
++        const char* const value = std::getenv("EDEN_NX2_NO_UPLOAD_STORE");
++        return value != nullptr && value[0] == '1';
++    }();
++    return no_store;
++}
++} // Anonymous namespace
++
+ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
+     : memory_manager{memory_manager_}
+     , upload_state{memory_manager, regs.upload}
+@@ -470,7 +483,9 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
+                         .exec_address = upload_state.ExecTargetAddress(),
+                         .copy_size = upload_state.GetUploadSize(),
+                         .was_dirty = upload_dirty};
+-        uploads.push_back(info);
++        if (!native_mode || !NoUploadStore()) {
++            uploads.push_back(info);
++        }
+         upload_state.ProcessExec(regs.exec_upload.linear != 0);
+         break;
+     }

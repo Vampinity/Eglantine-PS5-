@@ -1,0 +1,304 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 08:30:00 +0100
+Subject: [PATCH] shader: EDEN_NX2_COMPOSE_GUARD keeps NaN and infinity out of the scene compose's pack
+
+Core patch, on the T48 series. Off unless the switch is set. Aimed at the white flashes, but nothing yet
+shows they come from this program.
+
+Program a2fcaa95c5a162f2 is in the console's vulkan.bin of 6 Nov: the compose of Lichii issue 441, salt
+bit flipped, 128 threads, and its code hashes to that value. Run through the recompiler off the console,
+it is SMAA's neighbourhood blend, then a square root and a hand-written RGB9E5 pack. A thread does two
+pixels, x and x + 8, unrolled, with no loop.
+
+That changes the issue's story. A zero weight sum can't happen here: the reciprocal sits behind a 1e-05
+gate on the largest weight, and the pair it sums holds that weight. All-zero weights take the plain copy
+path. And the 125.0 was read as R11G11B10, which this word isn't.
+
+What does break is the pack. It compares float bits as unsigned, so a NaN or infinity takes the shared
+exponent. Replayed step by step: (0.4, 0.03, 0.04) comes back exact, a NaN channel reads 2.25 and the
+others 0. One bad channel is red, green or blue, two are yellow, cyan or pink, three are white. Those are
+the issue's colours and our white flashes. Where the NaN comes from isn't known: the colour image can
+hold one, and a blend tap holding infinity gives 0 * inf.
+
+In programs d9ee412f00ce399a and a2fcaa95c5a162f3, and any more in
+EDEN_NX2_COMPOSE_GUARD_HASHES=<hex>,<hex>, a pixel with a float that is NaN, infinite or signed on its
+way into the pack gets:
+  EDEN_NX2_COMPOSE_GUARD=black  written as 0. Needs nothing from the target or the hardware.
+  EDEN_NX2_COMPOSE_GUARD=1      not written. x moves out of the image: robustImageAccess, which RADV
+                                leaves to the hardware, and no run has shown it. What stays in the pixel
+                                was last drawn as R11G11B10, so it may read as the wrong colour.
+  EDEN_NX2_COMPOSE_GUARD=mark   written green, to show where it fires. A compute program has no free
+                                buffer to count skipped stores in, so this stands in for a count.
+
+Each tested float has its own word at the end of local memory and each store reads only its own, three
+each here, so the two pixels stay apart.
+
+Hashes: these are of the lowered code, so they move if we lower a program differently from Lichii. The
+low bit is the salt and is ignored. With the switch on, a compute program with floats on the way to a
+store logs "Compose guard candidate", so a run names ours. d9ee412f00ce399a wasn't in that vulkan.bin,
+its code is unread, and the guard may not fit it.
+
+Cache: nothing to clear. vulkan.bin holds guest code, translated at every boot, and the driver's cache
+keys on the SPIR-V, so guarded and plain programs can't mix.
+
+Log, once per program built, and it proves the guard was applied, not that it fired:
+  Compose guard black: shader a2fcaa95c5a162f2, workgroup 128x1x1, 2 image stores, 2 fed by floats,
+  6 floats watched, 0 stores left alone
+
+Not run on a PS5. The real program went through the real recompiler and guard off the console, and
+spirv-val passes in all three modes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/shader_recompiler/ir_opt/compose_guard.h b/src/shader_recompiler/ir_opt/compose_guard.h
+new file mode 100644
+--- /dev/null
++++ b/src/shader_recompiler/ir_opt/compose_guard.h
+@@ -0,0 +1,218 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <cstdlib>
++#include <iterator>
++#include <optional>
++#include <string_view>
++#include <unordered_map>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++#include "shader_recompiler/frontend/ir/ir_emitter.h"
++#include "shader_recompiler/frontend/ir/program.h"
++
++namespace Shader::Optimization {
++
++// EDEN_NX2_COMPOSE_GUARD: Ocarina's full-screen compose (Lichii issue 441) is SMAA's neighbourhood
++// blend, then a square root and a hand-written RGB9E5 pack that compares float bits as unsigned. A
++// NaN or infinity wins that compare and takes the shared exponent: its channel reads 1 to 2.25 and
++// the others fall to 0. One bad channel is pure red, green or blue, two are yellow, cyan or pink,
++// three are white. In the listed programs this stops such a pixel at the store:
++//   =1      it is not written
++//   =black  it is written as 0
++//   =mark   it is written green, to show where the guard fires
++// Any other value, or unset, changes nothing.
++//
++// A float that becomes integer bits on its way to a store is tested right there, into a word of its
++// own at the end of the program's local memory, and the store reads the words of its own data path.
++// The test's result can't be used directly: a value made in a branch doesn't dominate the store.
++// One flag for the whole thread won't do either: a thread covers two pixels, x and x + 8. A sign
++// counts as bad too: the pack handles unsigned colour only, and -0 is its brightest result.
++//
++// =1 drops a store by moving x out of the image, so no block is split and no phi moves. That is
++// defined with robustImageAccess, which RADV reports and leaves to the hardware. What stays in the
++// pixel may be in another encoding: the target was last drawn as R11G11B10.
++enum class ComposeGuardMode { Off, Skip, Black, Mark };
++
++inline ComposeGuardMode GetComposeGuardMode() {
++    static const ComposeGuardMode mode = [] {
++        const char* const text = std::getenv("EDEN_NX2_COMPOSE_GUARD");
++        const std::string_view value = text != nullptr ? text : "";
++        return value == "1"       ? ComposeGuardMode::Skip
++               : value == "black" ? ComposeGuardMode::Black
++               : value == "mark"  ? ComposeGuardMode::Mark
++                                  : ComposeGuardMode::Off;
++    }();
++    return mode;
++}
++
++// The two hashes of issue 441, and EDEN_NX2_COMPOSE_GUARD_HASHES=<hex>,<hex>,... on top of them.
++inline const std::vector<u64>& ComposeGuardHashes() {
++    static const std::vector<u64> hashes = [] {
++        std::vector<u64> list{0xd9ee412f00ce399aULL, 0xa2fcaa95c5a162f3ULL};
++        const char* text = std::getenv("EDEN_NX2_COMPOSE_GUARD_HASHES");
++        while (text != nullptr && *text != '\0') {
++            char* end = nullptr;
++            const u64 hash = std::strtoull(text, &end, 16);
++            if (end == text) {
++                ++text;
++                continue;
++            }
++            list.push_back(hash);
++            text = end;
++        }
++        return list;
++    }();
++    return hashes;
++}
++
++/// What ApplyComposeGuard found in one program.
++struct ComposeGuardEdits {
++    const char* what = "candidate"; ///< The mode, if the program was changed
++    size_t stores = 0;              ///< Image stores
++    size_t fed = 0;                 ///< Of those, with floats turned into bits in their data path
++    size_t watched = 0;             ///< Floats tested
++    size_t left = 0;                ///< Stores left alone
++};
++
++// The nearest floats a value is made from: walking back, a data path ends at its bitcast to bits.
++inline std::vector<IR::Inst*> ComposeGuardFloats(const IR::Value& root) {
++    std::vector<IR::Inst*> found;
++    std::unordered_set<const IR::Inst*> seen;
++    std::vector<IR::Value> pending{root};
++    while (!pending.empty()) {
++        const IR::Value value = pending.back();
++        pending.pop_back();
++        if (value.IsImmediate()) {
++            continue;
++        }
++        IR::Inst* const inst = value.InstRecursive();
++        if (!seen.insert(inst).second) {
++            continue;
++        }
++        if (inst->GetOpcode() == IR::Opcode::BitCastU32F32) {
++            found.push_back(inst);
++            continue;
++        }
++        for (size_t index = 0; index < inst->NumArgs(); ++index) {
++            pending.push_back(inst->Arg(index));
++        }
++    }
++    return found;
++}
++
++// With the switch on: nothing for a program that isn't listed and has no store fed by a float,
++// otherwise a line's worth of facts, so a run also names the programs that could be the compose.
++inline std::optional<ComposeGuardEdits> ApplyComposeGuard(IR::Program& program, u64 shader_hash) {
++    const ComposeGuardMode mode = GetComposeGuardMode();
++    if (mode == ComposeGuardMode::Off || program.stage != Stage::Compute) {
++        return std::nullopt;
++    }
++    // The lowest bit is the native hash salt, as in ApplyOotVisualWorkaround.
++    const auto& hashes = ComposeGuardHashes();
++    const bool listed = std::any_of(hashes.begin(), hashes.end(), [shader_hash](u64 hash) {
++        return (shader_hash | 1) == (hash | 1);
++    });
++    struct Store {
++        IR::Block* block;
++        IR::Inst* inst;
++        std::vector<IR::Inst*> floats;
++    };
++    std::vector<Store> stores;
++    std::vector<std::pair<IR::Block*, IR::Inst*>> bitcasts;
++    for (IR::Block* const block : program.blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            if (inst.GetOpcode() == IR::Opcode::BitCastU32F32) {
++                bitcasts.emplace_back(block, &inst);
++            } else if (inst.GetOpcode() == IR::Opcode::ImageWrite) {
++                stores.push_back(Store{block, &inst, ComposeGuardFloats(inst.Arg(2))});
++            }
++        }
++    }
++    ComposeGuardEdits edits;
++    edits.stores = stores.size();
++    edits.fed = static_cast<size_t>(std::count_if(
++        stores.begin(), stores.end(), [](const Store& store) { return !store.floats.empty(); }));
++    if (!listed) {
++        return edits.fed != 0 ? std::optional{edits} : std::nullopt;
++    }
++    edits.what = mode == ComposeGuardMode::Skip    ? "skip"
++                 : mode == ComposeGuardMode::Black ? "black"
++                                                   : "mark";
++    edits.left = stores.size() - edits.fed;
++
++    std::unordered_map<const IR::Inst*, u32> words;
++    const u32 first_word = (program.local_memory_size + 3) / 4;
++    u32 next_word = first_word;
++    for (const Store& store : stores) {
++        for (const IR::Inst* const value : store.floats) {
++            if (words.try_emplace(value, next_word).second) {
++                ++next_word;
++            }
++        }
++    }
++    edits.watched = words.size();
++    if (words.empty()) {
++        return edits;
++    }
++    program.local_memory_size = next_word * 4;
++
++    // Local memory starts undefined. A phi has to stay at the head of its block.
++    IR::Block* const entry = program.blocks.front();
++    auto start = entry->begin();
++    while (start != entry->end() && start->GetOpcode() == IR::Opcode::Phi) {
++        ++start;
++    }
++    IR::IREmitter entry_ir{*entry, start};
++    for (u32 word = first_word; word < next_word; ++word) {
++        entry_ir.WriteLocal(entry_ir.Imm32(word), entry_ir.Imm32(0U));
++    }
++    for (const auto& [block, inst] : bitcasts) {
++        const auto word = words.find(inst);
++        if (word == words.end()) {
++            continue;
++        }
++        IR::IREmitter ir{*block, std::next(block->Instructions().iterator_to(*inst))};
++        const IR::U1 bad =
++            ir.IGreaterThanEqual(IR::U32{IR::Value{inst}}, ir.Imm32(0x7f800000U), false);
++        ir.WriteLocal(ir.Imm32(word->second),
++                      IR::U32{ir.Select(bad, ir.Imm32(1U), ir.Imm32(0U))});
++    }
++    for (const Store& store : stores) {
++        const IR::Value coords = store.inst->Arg(1);
++        const IR::Type coords_type = coords.Type();
++        if (store.floats.empty() ||
++            (mode == ComposeGuardMode::Skip && coords_type != IR::Type::U32x2 &&
++             coords_type != IR::Type::U32x3 && coords_type != IR::Type::U32x4)) {
++            edits.left += store.floats.empty() ? 0 : 1;
++            continue;
++        }
++        IR::IREmitter ir{*store.block, store.block->Instructions().iterator_to(*store.inst)};
++        IR::U32 any = ir.Imm32(0U);
++        for (const IR::Inst* const value : store.floats) {
++            any = ir.BitwiseOr(any, ir.LoadLocal(ir.Imm32(words.at(value))));
++        }
++        const IR::U1 hit = ir.INotEqual(any, ir.Imm32(0U));
++        if (mode == ComposeGuardMode::Skip) {
++            store.inst->SetArg(1, ir.CompositeInsert(coords,
++                                                     ir.Select(hit, ir.Imm32(0xffffffffU),
++                                                               ir.CompositeExtract(coords, 0)),
++                                                     0));
++        } else {
++            // Green 1.0 as RGB9E5 of its square root. Only that format reads as green.
++            const u32 word = mode == ComposeGuardMode::Mark ? 0x80020000U : 0U;
++            const IR::Value color = store.inst->Arg(2);
++            store.inst->SetArg(2, ir.CompositeInsert(color,
++                                                     ir.Select(hit, ir.Imm32(word),
++                                                               ir.CompositeExtract(color, 0)),
++                                                     0));
++        }
++    }
++    return edits;
++}
++
++} // namespace Shader::Optimization
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -36,6 +36,7 @@
+ #include "shader_recompiler/frontend/maxwell/control_flow.h"
+ #include "shader_recompiler/frontend/maxwell/translate_program.h"
+ #include "shader_recompiler/ir_opt/passes.h"
++#include "shader_recompiler/ir_opt/compose_guard.h"
+ #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
+ #include "shader_recompiler/program_header.h"
+ #include "video_core/engines/kepler_compute.h"
+@@ -2006,6 +2007,16 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+                     *oot_fog_sun, key.unique_hash, edits->compares, edits->gathers, edits->plain,
+                     edits->sparse);
+     }
++    // EDEN_NX2_COMPOSE_GUARD, compose_guard.h. Programs are translated at every boot and the
++    // driver's cache keys on the SPIR-V: no new cache either way.
++    if (const auto guard = Shader::Optimization::ApplyComposeGuard(program, key.unique_hash)) {
++        LOG_WARNING(Render_Vulkan,
++                    "Compose guard {}: shader {:016x}, workgroup {}x{}x{}, {} image stores, {} "
++                    "fed by floats, {} floats watched, {} stores left alone",
++                    guard->what, key.unique_hash, program.workgroup_size[0],
++                    program.workgroup_size[1], program.workgroup_size[2], guard->stores, guard->fed,
++                    guard->watched, guard->left);
++    }
+     const VkDriverIdKHR driver_id = device.GetDriverID();
+     const bool needs_shared_mem_clamp =
+         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
