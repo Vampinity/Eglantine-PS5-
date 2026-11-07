@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 08:45:00 +0100
+Subject: [PATCH] radv/ps5: EDEN_NX2_RADV_MESH_COMPUTE_LATE_DEREFS=1 lowers indirect derefs after optimizing
+
+Driver patch, after lead-mesh-10. Off unless the switch is set. From exploitizm/PS5_Mesa 8b4cdfb897, which
+does this without a switch.
+
+The compute pass lowers indirect derefs before its first optimization loop, which RADV's graphics stages never
+do. exploitizm reports a builder out of memory in nir_opt_copy_prop_vars on Ocarina's mesh shaders without a
+task shader, in two runs, one with the heap at 0.9 GiB in use and the pool not short, and that this order
+stopped it. Ours has the same line, and the T47 env runs that path (EDEN_NX2_RADV_MESH_COMPUTE_LONE=1). Whether
+it played a part in T47's or T48's cold deaths is not known.
+
+RADV_MESH_COMPUTE_LONE_REVISION stays as it is on purpose, and the switch isn't in the hash. Both orders do the
+same work, so cached copies stay good, and raising it would cost another cold boot. The switch only acts on
+pipelines that actually compile. radv-build-id is pinned to the Mesa revision, so this patch doesn't change the
+driver's cache UUID either.
+
+Compiled with the driver's flags, syntax only. Not linked, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/amd/vulkan/radv_mesh_compute.c b/src/amd/vulkan/radv_mesh_compute.c
+index 119abaa..b52cea7 100644
+--- a/src/amd/vulkan/radv_mesh_compute.c
++++ b/src/amd/vulkan/radv_mesh_compute.c
+@@ -581,9 +581,23 @@ radv_mesh_compute_compile(const struct radv_compiler_info *compiler_info, struct
+    nir->info.max_subgroup_size = 32;
+    NIR_PASS(_, nir, nir_lower_compute_system_values, &compute_sysval_options);
+    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+-   NIR_PASS(_, nir, ac_nir_lower_indirect_derefs);
++   /* EDEN_NX2_RADV_MESH_COMPUTE_LATE_DEREFS=1: indirect derefs after the optimization loop, as the
++    * graphics stages have them (radv_graphics_shaders_compile). Lowered first, a mesh shader's arrays
++    * indexed by vertex or primitive become if-ladders before they can be optimized, and copy
++    * propagation of variables can run out of memory on the result. */
++   const char *const late_asked = getenv("EDEN_NX2_RADV_MESH_COMPUTE_LATE_DEREFS");
++   const bool late_derefs = late_asked && late_asked[0] == '1';
++   if (!late_derefs)
++      NIR_PASS(_, nir, ac_nir_lower_indirect_derefs);
+    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+    radv_optimize_nir(nir, stage.key.optimisations_disabled);
++   if (late_derefs) {
++      bool derefs_lowered = false;
++      NIR_PASS(derefs_lowered, nir, ac_nir_lower_indirect_derefs);
++      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
++      if (derefs_lowered && !stage.key.optimisations_disabled)
++         radv_optimize_nir(nir, false);
++   }
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
+    radv_nir_shader_info_init(MESA_SHADER_COMPUTE, MESA_SHADER_NONE, &stage.info);
