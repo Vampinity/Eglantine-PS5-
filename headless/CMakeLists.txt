@@ -786,7 +786,11 @@ foreach(bits 32 64)
               # Switch 2 games: six active guest cores share 688 MiB, cores 3-5 (workers) 96 MiB
               # each; Pokopia peaked at 80/32/32/32/48/32 MiB. Other A64 games keep 256/192/192
               # and 128 MiB on cores 3+.
-              set(jit_cache_sizes "m_cb->m_process->IsSwitch2() ? (m_core_index == 0 ? 160_MiB : m_core_index == 1 ? 144_MiB : m_core_index < 6 ? 96_MiB : 16_MiB) : (m_core_index == 0 ? 256_MiB : m_core_index < 3 ? 192_MiB : 128_MiB)")
+              # EDEN_JIT_CACHE_MIB=<core 0>,<core 1>,<cores 2 to 5> (performance.cpp,
+              # eden_jit_cache_bytes) replaces the Switch 2 sizes at run time; unset keeps them.
+              # Ocarina of Time filled the 96 MiB worker caches whole by 11 minutes (runs 160, 162).
+              set(jit_cache_sizes "m_cb->m_process->IsSwitch2() ? eden_jit_cache_bytes(unsigned(m_core_index), unsigned(m_core_index == 0 ? 160_MiB : m_core_index == 1 ? 144_MiB : m_core_index < 6 ? 96_MiB : 16_MiB)) : (m_core_index == 0 ? 256_MiB : m_core_index < 3 ? 192_MiB : 128_MiB)")
+              string(PREPEND wrapper "extern \"C\" unsigned eden_jit_cache_bytes(unsigned core, unsigned fallback);\n")
           else()
               set(jit_cache_sizes "m_core_index == 0 ? 512_MiB : m_core_index < 3 ? 64_MiB : 16_MiB")
           endif()

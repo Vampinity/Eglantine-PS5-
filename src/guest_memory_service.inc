@@ -110,6 +110,11 @@ std::uintptr_t SlotAddress(SparseRange& range, std::size_t slot) noexcept {
 // (ReserveKeeper) and given back with the guest's memory when the session ends.
 constexpr std::size_t ReserveBlocks = 256;      // 512 MiB (diagnostic62 shared-pool test)
 constexpr std::size_t ReserveAtStart = 16;      // taken as the service starts; the keeper takes the rest
+// What the reserve is to hold, in blocks: ReserveBlocks, or EDEN_NX2_CRAM_RESERVE_MIB (read as the
+// service starts; Aflakon, ocarina-cold-memory f0515ee16). Ocarina of Time in Kokiri Forest: the
+// graphics allocator found no memory while the reserve still held 840 MiB that nothing used
+// (crash-20261106-095505). The floor (EDEN_GUEST_RESERVE_FLOOR) should stay at or under it.
+std::atomic<std::size_t> reserve_target{ReserveBlocks};
 // The pool's largest block is under 1 GiB (headless/performance.cpp, every 100 ms). The reserve was
 // only for when the pool says no, and that moment never came: the graphics allocations ran out first,
 // with 512 MiB idle here (run 38, run 39: reserve=512, reserve_used=0) while the game's writes went
@@ -160,7 +165,7 @@ bool SparedBlock(std::int64_t* physical) noexcept {
 }
 // Zeroed blocks into the reserve until it holds `blocks` (at most ReserveBlocks) or the pool says no.
 void FillReserve(std::size_t blocks = ReserveBlocks) noexcept {
-    blocks = std::min(blocks, ReserveBlocks);
+    blocks = std::min({blocks, ReserveBlocks, reserve_target.load(std::memory_order_relaxed)});
     for (;;) {
         Spin(reserve_lock);
         const bool full = reserve_count.load(std::memory_order_relaxed) >= blocks;
@@ -261,6 +266,9 @@ constexpr std::size_t SwapEverOutSlots = 16384;
 std::atomic<std::uint64_t> swap_ever_out[SwapEverOutSlots / 64]{};
 std::atomic<std::uint32_t> swap_tick{SwapRearmTicks + 1};
 std::uint32_t swap_cold_ticks = 15;
+// SwapOut from two threads (the swapper's tick, and a refused graphics allocation asking through
+// eden_guest_memory_reclaim) one at a time: PackOut packs through one static buffer.
+std::mutex swap_out_mutex;
 bool swap_all_pools = false;
 std::size_t swap_ahead_bytes = 0;                // EDEN_GUEST_SWAP_AHEAD_MIB, 0 = only while short
 std::atomic<std::size_t> swap_pool_largest{0};   // the pool's largest free block at the last tick
@@ -1104,7 +1112,8 @@ extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target
     // Spent on purpose while the pool is short, so not counted as taken from what the caches see
     // (performance.h ViewOfPool): they would read a free pool as full for most of a session.
     const std::size_t blocks =
-        pool_is_short.load(std::memory_order_relaxed) ? reserve_floor.load(std::memory_order_relaxed) : ReserveBlocks;
+        pool_is_short.load(std::memory_order_relaxed) ? reserve_floor.load(std::memory_order_relaxed)
+                                                      : reserve_target.load(std::memory_order_relaxed);
     *target = running ? blocks * SparseSlot : 0;
 #else
     *held = 0;
@@ -1284,7 +1293,7 @@ void ReserveKeeper() {
         if (scanner_stop) break;
         lock.unlock();
         FillReserve(pool_is_short.load(std::memory_order_relaxed) ? reserve_floor.load(std::memory_order_relaxed)
-                                                                  : ReserveBlocks);
+                                                                  : reserve_target.load(std::memory_order_relaxed));
         lock.lock();
     }
 }
@@ -1406,6 +1415,7 @@ void SwapTick(SparseRange& range, std::size_t& hand, std::vector<std::pair<std::
     }
     if (!wanted) return;
     std::sort(cold.begin(), cold.end());
+    const std::lock_guard out_lock{swap_out_mutex};
     const std::uint64_t failed = swap_counters.failures.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < cold.size() && i < SwapOutPerTick; ++i)
         if (SwapOut(range, cold[i].second)) {
@@ -2193,6 +2203,12 @@ void ServiceStart(SparseRange& range) noexcept {
     if (const char* floor = std::getenv("EDEN_GUEST_RESERVE_FLOOR"))
         reserve_floor.store(std::min<std::size_t>(std::strtoul(floor, nullptr, 10), ReserveBlocks),
                             std::memory_order_relaxed);
+    if (const char* mib = std::getenv("EDEN_NX2_CRAM_RESERVE_MIB")) {
+        const long asked = std::atol(mib);
+        reserve_target.store(asked >= 0 ? std::min<std::size_t>(static_cast<std::size_t>(asked) / (SparseSlot >> 20), ReserveBlocks)
+                                        : ReserveBlocks,
+                             std::memory_order_relaxed);
+    }
     FillReserve(ReserveAtStart);
 #endif
     service_range.store(&range, std::memory_order_release);
@@ -2322,6 +2338,54 @@ extern "C" int eden_guest_swap_address_state(const void* host, int* ever_out) no
     if (ever_out != nullptr && slot < SwapEverOutSlots)
         *ever_out = static_cast<int>((swap_ever_out[slot / 64].load(std::memory_order_relaxed) >> (slot % 64)) & 1);
     return SlotState(*range, slot);
+}
+
+// A graphics allocation found no memory (the port's MemoryAllocator::ReleaseRefused): cold slots go
+// out now, on the thread that asked, up to `want` bytes given back or 256 slots, the lowest in the
+// pool first. After Aflakon's eden_guest_memory_reclaim (ocarina-cold-memory f0515ee16, patch 1905),
+// on this service's swapper: a slot untouched for a tick or more (2 s) is taken, by the mode's way
+// out (the file, or LZ4 in memory, in place when asked). EDEN_GUEST_SWAP_RECLAIM=1 turns it on; it
+// needs EDEN_GUEST_SWAP=2 or 3. Bytes given back.
+extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) noexcept {
+#ifdef PS5_NATIVE
+    static const bool enabled = std::getenv("EDEN_GUEST_SWAP_RECLAIM") != nullptr && std::getenv("EDEN_GUEST_SWAP_RECLAIM")[0] == '1';
+    const int mode = swap_mode.load(std::memory_order_relaxed);
+    SparseRange* const range = service_range.load(std::memory_order_acquire);
+    if (!enabled || (mode != 2 && mode != 3) || range == nullptr || range->state == nullptr) return 0;
+    const std::size_t slots = (range->end - range->begin.load(std::memory_order_relaxed)) / SparseSlot;
+    const std::uint32_t now = swap_tick.load(std::memory_order_relaxed);
+    std::vector<std::pair<std::int64_t, std::size_t>> cold;
+    for (std::size_t slot = 0; slot < slots; ++slot)
+        if (SlotState(*range, slot) == SlotProbe && now - range->swap[slot] >= 1) cold.emplace_back(range->physical[slot], slot);
+    std::sort(cold.begin(), cold.end());
+    const std::lock_guard out_lock{swap_out_mutex};
+    std::size_t freed = 0, made = 0;
+    const std::uint64_t failed = swap_counters.failures.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < cold.size() && made < 256 && freed < want; ++i) {
+        const std::size_t slot = cold[i].second;
+        if (SwapOut(*range, slot)) {
+            ++made;
+            // What the slot gave back: all of it to the file, or 2 MiB less its packed pages. Read
+            // after the fact, so a touch that brought it back already counts as nothing.
+            if (SlotState(*range, slot) == SlotOut) {
+                const std::int64_t physical = range->physical[slot];
+                freed += physical < 0 ? SparseSlot : SparseSlot - std::min(SparseSlot, PackedPages(range->swap[slot]) * FinePage);
+            }
+            if (slot < SwapEverOutSlots)
+                swap_ever_out[slot / 64].fetch_or(std::uint64_t{1} << (slot % 64), std::memory_order_relaxed);
+        } else if (swap_counters.failures.load(std::memory_order_relaxed) != failed) {
+            break; // no block for the packed bytes, or the file refused: nothing more now
+        }
+    }
+    char line[128];
+    const int length = std::snprintf(line, sizeof(line), "EDEN_SWAP reclaim for graphics: %zu slots, %zu MiB given back (asked %zu MiB)\n",
+                                     made, freed >> 20, want >> 20);
+    if (length > 0) Report(line);
+    return freed;
+#else
+    (void)want;
+    return 0;
+#endif
 }
 
 // The report now, for a burst of writes that falls between two of the scanner's (headless/performance.cpp).

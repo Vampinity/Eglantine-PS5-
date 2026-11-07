@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:00:00 +0100
+Subject: [PATCH] vulkan: EDEN_NX2_COMPUTE_TO_DRAW orders compute writes before later draws
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_COMPUTE_TO_DRAW=1 is set.
+The part of Lichii PR 295, 73bcdc059d (zortos293, based on mja00/Lichii c7b8715240) our tree lacks;
+its wait for idle barrier is here already as EDEN_NX2_WFI_BARRIER, which stays separate.
+
+What T42 has, by reading. A direct dispatch has a barrier before it. A dispatch that writes command
+list pages is ordered both ways by the barriers of its list copy. A guest wait for idle orders too:
+vkCmdWaitEvents on RADV runs radv_barrier with the event's stages whether the event is set or not,
+so compute and pixel work drain, but its access masks are 0, so no cache is invalidated.
+EDEN_NX2_WFI_BARRIER=1 adds the invalidate: it tests visibility, not order.
+
+What is left. A dispatch with no list copy and no guest wait for idle has nothing between it and the
+next render pass. Whether the game has such dispatches, and whether one feeds the flashing objects,
+was not checked. PR 295's indirect dispatch hunk is left out: that branch never runs on Ocarina,
+because native compute launches through QMD actions and indirect_compute is only set in the legacy
+launch case, and the hunk breaks the anchor at tools/prepare-vulkan-port.py:76, which would drop
+that port edit with an ANCHOR-SKIPPED line.
+
+Why this may matter: EDEN_NX2_FENCE_FLUSH_US=0 ended the white flashes in the Lost Woods (run178 to
+run180) and left few in Kokiri (run181, run182: 1 each). That switch cuts a command buffer at
+download and query fences, in FlushCommands and at list copies. A
+flush does far more than this barrier: it ends the render pass, resets the Z pass counter, drops
+command buffer state, closes the upload command buffer, and the submission's start and end
+invalidate and flush every cache. By the driver source a plain submission has no execution wait at
+all. So this barrier covers a slice of what a flush does: flashes gone would point to order or
+caches, flashes left say nothing about the rest. PR 295 claims no link to flashes.
+
+With the switch: a direct dispatch's barrier gets DRAW_INDIRECT added to its destination, and the
+next render pass begins after a COMPUTE_SHADER to ALL_GRAPHICS barrier. Render passes begun
+directly in blit_image.cpp do not get it, as upstream. Test with EDEN_NX2_WFI_BARRIER=1 and
+EDEN_NX2_FENCE_FLUSH_US unset. Cost: one barrier per render pass that follows a dispatch, which can
+stop compute and graphics overlapping on the GPU. Unset, nothing changes. Not built, not run.
+---
+ .../renderer_vulkan/vk_rasterizer.cpp         | 35 ++++++++++++++-----
+ .../renderer_vulkan/vk_scheduler.cpp          | 17 +++++++-
+ .../video_core/renderer_vulkan/vk_scheduler.h |  7 ++++
+ 3 files changed, 49 insertions(+), 10 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index eac1b6a..d070731 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1433,6 +1433,32 @@ void RasterizerVulkan::DispatchCompute() {
+ 
+     const auto& qmd{kepler_compute->launch_description};
+     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
++    // EDEN_NX2_COMPUTE_TO_DRAW=1 (Lichii PR 295, 73bcdc059d, after mja00/Lichii c7b8715240): what
++    // a dispatch writes reaches the next render pass. Unset, a dispatch without a command list
++    // copy is ordered before later draws only by a guest wait for idle, which drains the GPU but
++    // invalidates no cache unless EDEN_NX2_WFI_BARRIER=1.
++    static const bool compute_to_draw = [] {
++        const char* const value = std::getenv("EDEN_NX2_COMPUTE_TO_DRAW");
++        return value != nullptr && value[0] != '0';
++    }();
++    const auto record_read_barrier = [this] {
++        static constexpr VkMemoryBarrier READ_BARRIER{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++        };
++        scheduler.Record([](vk::CommandBuffer cmdbuf) {
++            const VkPipelineStageFlags stages =
++                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
++                (compute_to_draw ? VkPipelineStageFlags{VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT} : 0);
++            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, stages, 0,
++                                   READ_BARRIER);
++        });
++        if (compute_to_draw) {
++            scheduler.NoteComputeWrites();
++        }
++    };
+     if (indirect_address) {
+         // DispatchIndirect
+         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
+@@ -1461,14 +1487,7 @@ void RasterizerVulkan::DispatchCompute() {
+         return;
+     }
+     scheduler.RequestOutsideRenderPassOperationContext();
+-    static constexpr VkMemoryBarrier READ_BARRIER{
+-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+-        .pNext = nullptr,
+-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+-    };
+-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                               0, READ_BARRIER); });
++    record_read_barrier();
+     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
+         if (!pipeline->IsBound()) {
+             return;
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 6dff4d9..43f5191 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -278,8 +278,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+     for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
+         values[i] = clear_values[i];
+     }
+-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count](
+-               vk::CommandBuffer cmdbuf) {
++    const bool after_compute = std::exchange(compute_writes_pending, false);
++    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
++            after_compute](vk::CommandBuffer cmdbuf) {
+         const VkRenderPassBeginInfo renderpass_bi{
+             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+             .pNext = nullptr,
+@@ -293,6 +294,18 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+             .clearValueCount = clear_value_count,
+             .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
+         };
++        if (after_compute) {
++            // Draws read compute output as indirect arguments, vertices and resources. Only a
++            // guest wait for idle or a command list copy orders those reads otherwise.
++            static constexpr VkMemoryBarrier COMPUTE_TO_GRAPHICS{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++            };
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, COMPUTE_TO_GRAPHICS);
++        }
+         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+     });
+     num_renderpass_images = framebuffer->NumImages();
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 4ebcd69..b9c780b 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -95,6 +95,12 @@ public:
+     /// of a renderpass.
+     void RequestOutsideRenderPassOperationContext();
+ 
++    /// EDEN_NX2_COMPUTE_TO_DRAW=1: a dispatch was recorded, the next render pass must see what it
++    /// wrote.
++    void NoteComputeWrites() {
++        compute_writes_pending = true;
++    }
++
+     /// Returns true when a render pass is currently active in the scheduler state.
+     bool IsRenderPassActive() const {
+         return state.renderpass != VK_NULL_HANDLE;
+@@ -377,6 +383,7 @@ private:
+     StateTracker& state_tracker;
+ 
+     std::unique_ptr<MasterSemaphore> master_semaphore;
++    bool compute_writes_pending{};
+     bool graphics_pipeline_missing{};
+     std::unique_ptr<CommandPool> command_pool;
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,178 @@
+From 8c256f2a4e65f5544bdf4fef86e14b84f41720c0 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 01:58:56 +0100
+Subject: [PATCH] buffer_cache: EDEN_NX2_DOWNLOAD_GUARDS=1 guards the two
+ download sites the 020 move left raw, =0 turns every guard off
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_DOWNLOAD_GUARDS is set.
+
+Our T37 stack's 0391 (the port of Duck912's e27fbc6b03) also covered two download sites of our own:
+DownloadRangesMemory and FinishDownloadPieces. The move to v1.219.020 dropped 0391 as the series' own
+form, 0061, which is the original commit and has neither site, and the patches that add those sites
+(0115, 0133) still carry the raw write they had before 0391 rewrote them. Nothing upstream removed
+it: nx2-experimental carries fe2cd8be2b unreverted.
+
+Unset: as T42.
+
+=1: every buffer cache download write skips CPU writes still pending, as in Lichii PR 397 (Frizti's
+0c822822c1, from Duck912's e27fbc6b03). The pending list is read after the GPU wait, as in T37.
+Also logs "Download kept off newer CPU writes, N times so far, M on command list pages; last at
+device address A+S" at the 1st, 2nd, 4th ... of either count: nothing shows today whether the guards
+ever fire, or on what. A is a device address, not the GPU address JUNK_TRACE prints.
+
+=0: no download skips anything, at any site, as T34 and T37 ran. T40 to T42 have no way back from
+the skip, which works in whole 64-byte blocks. This is a test setting: it puts back the overwrite
+Duck912 measured. ClaimCpuWrites still runs, so it is not all of T37.
+
+What it reaches: Vulkan compiles five of the seven write sites (DownloadBufferMemory's mapped and
+immediate branches go) and T42 guards three of the five. FinishDownloadPieces only runs when a
+staging buffer is refused: 0 times in the 16 T42 eden logs (run164 to run179), 256 or more at 544 s
+in batch r's T40 run162-r2, 512 or more in hand run 149, 4,096 or more in run 118, none in hand runs
+161 and 162. DownloadRangesMemory only runs with EDEN_NX2_PREFLUSH=0, which no run sets now. So where
+nothing is refused, =1 writes what T42 writes and adds the log line.
+
+Cost at =1: one short list per small-buffer download. Not built, not run.
+
+Credit: Duck912 (e27fbc6b03), Frizti (0c822822c1), zortos293 (Lichii PR 397).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/buffer_cache/buffer_cache.h    | 53 ++++++++++++++++---
+ .../buffer_cache/buffer_cache_base.h          | 10 +++-
+ 2 files changed, 55 insertions(+), 8 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 74d02bd..a35bff2 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -447,11 +447,12 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
+     }
+     runtime.Finish();
+     const u8* const mapped_memory = download_staging.mapped_span.data();
++    const Common::RangeSet<DAddr> cpu_written = GuardedCpuWriteRanges();
+     for (const Download& download : downloads) {
+         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+-        device_memory.WriteBlockUnsafe(
+-            device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
+-            download.copy.size);
++        WriteDownloadedMemory(cpu_written, device_addr,
++                              mapped_memory + (download.copy.dst_offset - download_staging.offset),
++                              download.copy.size);
+     }
+ }
+ 
+@@ -1031,7 +1032,8 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+     if constexpr (requires { runtime.TryDownloadStagingBuffer(size_t{}, true); }) {
+         staged = runtime.TryDownloadStagingBuffer(total_size_bytes, true);
+         if (!staged) {
+-            // The bytes reach guest memory now instead of when the fence pops; nothing is skipped.
++            // The bytes reach guest memory now instead of when the fence pops; nothing is skipped
++            // unless EDEN_NX2_DOWNLOAD_GUARDS is 1 or 2 (FinishDownloadPieces).
+             for (const auto& [copy, buffer_id] : downloads) {
+                 DownloadInPieces(slot_buffers[buffer_id], copy);
+             }
+@@ -1116,8 +1118,9 @@ void BufferCache<P>::FinishDownloadPieces() {
+         }
+         runtime.Finish();
+         const u8* const mapped = runtime.ReservedDownloadBuffer().mapped_span.data();
++        const Common::RangeSet<DAddr> cpu_written = GuardedCpuWriteRanges();
+         for (const DownloadPiece& piece : download_pieces) {
+-            device_memory.WriteBlockUnsafe(piece.device_addr, mapped + piece.offset, piece.size);
++            WriteDownloadedMemory(cpu_written, piece.device_addr, mapped + piece.offset, piece.size);
+             // Older downloads of these bytes must not land over them when their fences pop.
+             ClearDownload(piece.device_addr, piece.size);
+             gpu_modified_ranges.Subtract(piece.device_addr, piece.size);
+@@ -1147,16 +1150,34 @@ void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> range
+     }
+ }
+ 
++template <class P>
++int BufferCache<P>::DownloadGuards() {
++    static const int level = [] {
++        const char* value = std::getenv("EDEN_NX2_DOWNLOAD_GUARDS");
++        return value == nullptr ? -1 : value[0] - '0';
++    }();
++    return level;
++}
++
+ template <class P>
+ Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
+     Common::RangeSet<DAddr> ranges;
+-    if (pending_cpu_writes) {
++    // EDEN_NX2_DOWNLOAD_GUARDS=0: no download skips anything, as T34 and T37 ran.
++    if (pending_cpu_writes && DownloadGuards() != 0) {
+         pending_cpu_writes(
+             [&ranges](DAddr device_addr, size_t size) { ranges.Add(device_addr, size); });
+     }
+     return ranges;
+ }
+ 
++template <class P>
++Common::RangeSet<DAddr> BufferCache<P>::GuardedCpuWriteRanges() {
++    if (DownloadGuards() >= 1) {
++        return PendingCpuWriteRanges();
++    }
++    return {};
++}
++
+ template <class P>
+ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
+                                            DAddr device_addr, const u8* data, u64 size) {
+@@ -1166,12 +1187,30 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
+     }
+     Common::RangeSet<DAddr> parts;
+     parts.Add(device_addr, size);
+-    cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
++    bool on_list_page = false;
++    cpu_written.ForEachInRange(device_addr, size, [&](DAddr start, DAddr end) {
+         parts.Subtract(start, end - start);
++        on_list_page = on_list_page || Tegra::Nx2IsCommandListPage(start) ||
++                       Tegra::Nx2IsCommandListPage(end - 1);
+     });
+     parts.ForEach([&](DAddr start, DAddr end) {
+         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+     });
++    if (DownloadGuards() >= 1) {
++        static std::atomic<u64> kept{};
++        static std::atomic<u64> kept_on_lists{};
++        const u64 list_step = on_list_page ? 1 : 0;
++        const u64 times = kept.fetch_add(1, std::memory_order_relaxed) + 1;
++        const u64 on_lists =
++            kept_on_lists.fetch_add(list_step, std::memory_order_relaxed) + list_step;
++        // The 1st, 2nd, 4th, 8th ... of either count.
++        if ((times & (times - 1)) == 0 || (on_list_page && (on_lists & (on_lists - 1)) == 0)) {
++            LOG_INFO(HW_GPU,
++                     "Download kept off newer CPU writes, {} times so far, {} on command list "
++                     "pages; last at device address {:#x}+{:#x}",
++                     times, on_lists, device_addr, size);
++        }
++    }
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 8796914..79484ec 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -677,9 +677,17 @@ private:
+     void RefreshRepackedVertexBuffers();
+ 
+ 
+-    /// CPU writes collected but not yet applied (SetPendingCpuWrites).
++    /// EDEN_NX2_DOWNLOAD_GUARDS: below 0 unset, as T42. 0: no download skips anything. 1 and up:
++    /// every download skips CPU writes still pending, and skips are logged.
++    [[nodiscard]] static int DownloadGuards();
++
++    /// CPU writes collected but not yet applied (SetPendingCpuWrites). Empty at DownloadGuards 0.
+     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
+ 
++    /// The same for DownloadRangesMemory and FinishDownloadPieces, the two download sites the move
++    /// to v1.219.020 left writing everything: empty unless DownloadGuards is 1 or more.
++    [[nodiscard]] Common::RangeSet<DAddr> GuardedCpuWriteRanges();
++
+     /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+     void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
+                                const u8* data, u64 size);
+-- 
+2.54.0
+

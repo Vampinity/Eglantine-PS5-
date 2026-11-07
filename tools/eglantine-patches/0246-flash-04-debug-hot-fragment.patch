@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:00:00 +0100
+Subject: [PATCH] spirv: EDEN_NX2_FRAG_HOT marks NaN and very large pixel shader colours
+
+Core patch on mig020-core (the v1.219.020 series), a debug aid, off unless EDEN_NX2_FRAG_HOT=<limit>
+is set. Not for a release.
+
+The flashes follow one object and glow through bloom. This shows whether a pixel shader wrote the
+bad value, and which pixels. A float colour component that is NaN, infinite or past <limit> is
+stored as red 8, green 0, blue 8, alpha 1, per component. The flashes are yellow-white or cyan-white,
+so look for any sign of the mark, not only magenta: a pixel hot in red or blue alone turns red or
+blue, and hot green stores 0, so it goes dark. A mark on the object in the flash frame means the
+pixel shader output is already bad, before any later pass. A flash that stays white means the value
+stays under <limit> at that stage, or comes from a later pass or a compute pass, so run it again
+with a lower limit. Try 4096, then 256. Normal HDR values may pass a low limit: compare with a frame
+without a flash.
+
+Each limit is new SPIR-V, so every value (4096, 256, unset) rebuilds every pixel shader, not only
+the first launch. Do a warm-up launch per value, since scripts press at fixed times. Integer targets
+are not looked at. Unset, nothing changes. Not built, not run.
+---
+ .../spirv/emit_spirv_context_get_set.cpp      | 21 ++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+index 28f9869..01c2274 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <bit>
++#include <cstdlib>
+ #include <tuple>
+ #include <utility>
+ 
+@@ -13,6 +14,24 @@
+ 
+ namespace Shader::Backend::SPIRV {
+ namespace {
++// EDEN_NX2_FRAG_HOT=<limit> (unset or 0: off, a debug aid): a pixel shader's float colour that is
++// NaN, infinite or past <limit> is stored as a marker instead: red and blue 8, green 0, alpha 1,
++// per component, so a pixel hot in one component turns red or blue, and hot green goes dark. It
++// shows which pixels of a flash a pixel shader wrote as such, before bloom spreads them.
++Id MarkHotFragColor(EmitContext& ctx, u32 component, Id value) {
++    static const float limit = [] {
++        const char* const text = std::getenv("EDEN_NX2_FRAG_HOT");
++        return text != nullptr ? static_cast<float>(std::atof(text)) : 0.0f;
++    }();
++    if (limit <= 0.0f) {
++        return value;
++    }
++    const Id is_nan{ctx.OpIsNan(ctx.U1, value)};
++    const Id is_hot{ctx.OpFOrdGreaterThan(ctx.U1, ctx.OpFAbs(ctx.F32[1], value), ctx.Const(limit))};
++    const float mark{component == 3 ? 1.0f : (component == 1 ? 0.0f : 8.0f)};
++    return ctx.OpSelect(ctx.F32[1], ctx.OpLogicalOr(ctx.U1, is_nan, is_hot), ctx.Const(mark), value);
++}
++
+ template <typename... Args>
+ Id AttrPointer(EmitContext& ctx, Id pointer_type, Id vertex, Id base, Args&&... args) {
+     switch (ctx.stage) {
+@@ -491,7 +510,7 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
+     const AttributeType type{ctx.runtime_info.color_output_types[index]};
+     if (type == AttributeType::Float) {
+         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
+-        ctx.OpStore(pointer, value);
++        ctx.OpStore(pointer, MarkHotFragColor(ctx, component, value));
+     } else if (type == AttributeType::UnsignedInt) {
+         const Id pointer{ctx.OpAccessChain(ctx.output_u32, ctx.frag_color.at(index), component_id)};
+         ctx.OpStore(pointer, ctx.OpBitcast(ctx.U32[1], value));
+-- 
+2.54.0
+

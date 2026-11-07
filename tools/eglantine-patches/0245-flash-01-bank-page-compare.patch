@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:00:00 +0100
+Subject: [PATCH] buffer_cache: EDEN_NX2_BANK_REUPLOAD=4 checks native banks per page on every bind,
+ EDEN_NX2_BANK_STATS=1 logs pages that changed while the tracker had them clean
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_BANK_REUPLOAD=4 or
+EDEN_NX2_BANK_STATS=1 is set. Port of the bank part of Lichii PR 345, a1b555012a (celmax85), which
+replaces Eglantine 031e07436c (kraibse), our EDEN_NX2_BANK_REUPLOAD=2.
+
+T42 uploads a 64 KiB native bank once per frame per address. kraibse measured one material pure
+white for one or two frames, 1 in 500 to 1 in 690 presents with a still camera, and none in 1000
+with an upload on every bind. Mode 2 here marks all 16 pages on every bind, which costs two mprotect
+calls per page and a 64 KiB upload. Mode 4 compares each page with a snapshot of its last contents
+on every bind and marks only the pages that changed, so an unchanged bank costs a memcmp.
+
+Changes from a1b555012a: a mode of the existing switch, not the new default. Snapshots are capped by
+EDEN_NX2_BANK_PAGES (4096 pages, 16 MiB; Lichii 16384, 64 MiB, too much for our pool). The compare
+in place is our EDEN_NX2_UBO_INPLACE already. Its memory.cpp counters, gpu.cpp and rasterizer
+batching are speed or debug work with no link to the flashes and are left out.
+
+EDEN_NX2_BANK_STATS=1 needs no mode and only looks in modes 0 to 3. It logs "Native bank pages
+checked" every 2^18 pages, with the total of changed pages the tracker had clean, and up to 50 lines
+per 10 s "Native bank page ... changed unseen" with the first changed word. Unseen means the page's
+bytes changed, the tracker has it clean and no tracked CPU write landed in its 4 MiB since the last
+check. So the tracker did not know yet, which is not proof of a lost write: a GPU write can wait in
+dirty memory until the next InvalidateGPUCache. Those log times can be set against the flash times.
+
+Use it with EDEN_NX2_UBO_BANK_DIRECT=1. T42's once per frame mark moves the write epoch of the whole
+4 MiB before a bank's next check, so without that switch unseen stays 0 whatever happens, and a
+warning says so. A bank sharing its 4 MiB with busy data can still hide changes, so 0 unseen proves
+nothing: read the "tracker clean" total too. With that switch uploads are direct, which is not quite
+T42, and the check adds a 64 KiB compare per bind on the GPU thread. This bug is sensitive to timing,
+so check that the run still flashes. If "Native bank snapshots forgotten" shows up, the cap was hit
+and every page counts as new, so mode 4 then acts like mode 2.
+
+On T42 mode 2 lowered the flashes but did not end them: run177 15 at the Lost Woods doorway against
+40 and 54 in two base runs, same fps, standing still, one run. EDEN_NX2_FENCE_FLUSH_US=0 did better
+(run178 and run179: 0). Mode 2 does several things at once: fresher bytes, more uploads, some of them
+with barriers and a render pass end, and a moved epoch. So mode 2 against mode 4 does not single one
+out. Unset, nothing changes. Not built, not run.
+---
+ .../video_core/buffer_cache/buffer_cache.h    | 143 +++++++++++++++++-
+ .../buffer_cache/buffer_cache_base.h          |  10 ++
+ 2 files changed, 150 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 74d02bd..e3300de 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1514,16 +1514,29 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
+     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+     // EDEN_NX2_BANK_REUPLOAD: 0 off, 1 once per frame (unset), 2 every bind of a 64 KiB bank, 3 every
+-    // bind of any native bank. Once per frame left Ocarina of Time's per-draw material data stale
+-    // for a frame now and then (white flashes); every bind costs front-thread time.
++    // bind of any native bank, 4 every bind of a 64 KiB bank, but only the pages whose bytes changed
++    // since the last check (Nx2CheckBankPages). Once per frame left Ocarina of Time's per-draw
++    // material data stale for a frame now and then (white flashes); every bind costs front-thread
++    // time.
+     static const char bank_mode = [] {
+         const char* const value = std::getenv("EDEN_NX2_BANK_REUPLOAD");
+         return value != nullptr ? value[0] : '1';
+     }();
++    // EDEN_NX2_BANK_STATS=1: count and log what the page check finds, whatever the mode. With modes
++    // 0 to 3 it only looks: nothing is marked, so the picture stays as it was. "Unseen" needs
++    // EDEN_NX2_UBO_BANK_DIRECT=1, see Nx2CheckBankPages.
++    static const bool bank_stats = [] {
++        const char* const value = std::getenv("EDEN_NX2_BANK_STATS");
++        return value != nullptr && value[0] != '0';
++    }();
+     const bool native_bank = has_host_buffer && size != 0 && gpu_memory != nullptr &&
+                              gpu_memory->UsesNativeTiling() &&
+                              !memory_tracker.IsRegionGpuModified(device_addr, size);
+-    if (bank_mode != '0' && native_bank &&
++    if ((bank_mode == '4' || bank_stats) && native_bank &&
++        (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000) {
++        Nx2CheckBankPages(device_addr, size, bank_mode == '4', bank_stats);
++    }
++    if (bank_mode != '0' && bank_mode != '4' && native_bank &&
+         (bank_mode == '3' || (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000) &&
+         (bank_mode == '2' || bank_mode == '3' ||
+          native_indirect_uniforms_this_frame.insert(device_addr).second)) {
+@@ -1622,6 +1635,130 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+     channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
+ }
+ 
++template <class P>
++void BufferCache<P>::Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, bool stats) {
++    // The bank size is only an upper limit: stop at the end of the mapped memory.
++    u64 mapped_size = 0;
++    while (mapped_size < size &&
++           device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
++        mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
++    }
++    const u64 check_size = (std::min<u64>)(mapped_size, size);
++    if (check_size == 0) {
++        return;
++    }
++    if (stats) {
++        // A mark moves the write epoch of its whole 4 MiB, and modes 1 to 3 mark before a bank's
++        // next check, so that check always sees a moved epoch and "unseen" stays 0.
++        [[maybe_unused]] static const bool warned = [] {
++            const char* const value = std::getenv("EDEN_NX2_UBO_BANK_DIRECT");
++            if (value == nullptr || value[0] != '1') {
++                LOG_WARNING(HW_GPU, "EDEN_NX2_BANK_STATS: without EDEN_NX2_UBO_BANK_DIRECT=1 bank "
++                                    "marks move the write epoch, so unseen stays 0");
++            }
++            return true;
++        }();
++    }
++    // EDEN_NX2_BANK_PAGES=<pages>: snapshots kept, 4 KiB each (unset: 4096, 16 MiB). Forgetting them
++    // makes every page new, so it marks and uploads them all once. Lichii keeps 16384 (64 MiB).
++    static const size_t max_pages = [] {
++        const char* const value = std::getenv("EDEN_NX2_BANK_PAGES");
++        const size_t pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
++        return pages != 0 ? pages : size_t{4096};
++    }();
++    if (native_indirect_page_snapshots.size() >= max_pages) {
++        static u64 clears{};
++        if (++clears % 64 == 1) {
++            LOG_INFO(HW_GPU, "Native bank snapshots forgotten at {} pages ({} times)", max_pages,
++                     clears);
++        }
++        native_indirect_page_snapshots.clear();
++    }
++    const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
++    const DAddr end = device_addr + check_size;
++    for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
++        const u8* const guest = device_memory.template GetPointer<u8>(page);
++        if (guest == nullptr) {
++            continue;
++        }
++        auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
++        Nx2BankPage& snapshot = it->second;
++        const bool same =
++            !inserted && std::memcmp(snapshot.bytes.data(), guest, Core::DEVICE_PAGESIZE) == 0;
++        if (stats) {
++            static std::array<u64, 3> counts{};
++            static std::array<u64, 4> changed_state{};
++            static u64 unseen{};
++            static u32 unseen_lines{};
++            static auto unseen_window = std::chrono::steady_clock::now();
++            ++counts[same ? 0 : (inserted ? 1 : 2)];
++            if (!same && !inserted) {
++                const bool known = memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE);
++                const bool gpu = memory_tracker.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE);
++                ++changed_state[(known ? 1 : 0) | (gpu ? 2 : 0)];
++                // Nothing marks the page and no tracked CPU write landed in its 4 MiB since the
++                // last check, so the tracker did not know of this change yet. That is not proof of
++                // a lost write: a GPU write can wait in dirty memory until the next
++                // InvalidateGPUCache, and a query report is copied straight into guest memory. A
++                // clean page with a moved epoch may have been uploaded by another binding: such
++                // pages only count in "tracker clean".
++                const bool unseen_change =
++                    !known && !gpu &&
++                    snapshot.epoch == memory_tracker.CpuWriteEpoch(page, Core::DEVICE_PAGESIZE);
++                if (unseen_change) {
++                    ++unseen;
++                    // At most 50 lines in 10 s, so that loading cannot use them all up before the
++                    // scene under test.
++                    const auto now = std::chrono::steady_clock::now();
++                    if (now - unseen_window >= std::chrono::seconds{10}) {
++                        unseen_window = now;
++                        unseen_lines = 0;
++                    }
++                }
++                if (unseen_change && unseen_lines < 50) {
++                    ++unseen_lines;
++                    u32 words = 0;
++                    u32 first = 0;
++                    u32 before = 0;
++                    u32 after = 0;
++                    for (u32 offset = 0; offset < Core::DEVICE_PAGESIZE; offset += sizeof(u32)) {
++                        u32 old_word;
++                        u32 new_word;
++                        std::memcpy(&old_word, snapshot.bytes.data() + offset, sizeof(u32));
++                        std::memcpy(&new_word, guest + offset, sizeof(u32));
++                        if (old_word != new_word && words++ == 0) {
++                            first = offset;
++                            before = old_word;
++                            after = new_word;
++                        }
++                    }
++                    LOG_INFO(HW_GPU,
++                             "Native bank page {:#x} of bank {:#x} changed unseen: {} words, first "
++                             "+{:#x} {:#010x} -> {:#010x}",
++                             page, device_addr, words, first, before, after);
++                }
++            }
++            if (((counts[0] + counts[1] + counts[2]) & 0x3ffff) == 0) {
++                LOG_INFO(HW_GPU,
++                         "Native bank pages checked: same {}, new {}, changed {} (tracker clean "
++                         "{}, CPU-modified {}, GPU {}, both {}), {} unseen, {} kept",
++                         counts[0], counts[1], counts[2], changed_state[0], changed_state[1],
++                         changed_state[2], changed_state[3], unseen,
++                         native_indirect_page_snapshots.size());
++            }
++        }
++        if (!same) {
++            std::memcpy(snapshot.bytes.data(), guest, Core::DEVICE_PAGESIZE);
++            if (mark) {
++                memory_tracker.MarkRegionAsCpuModified(page, Core::DEVICE_PAGESIZE);
++            }
++        }
++        if (stats) {
++            snapshot.epoch = memory_tracker.CpuWriteEpoch(page, Core::DEVICE_PAGESIZE);
++        }
++    }
++}
++
+ template <class P>
+ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
+                                               std::vector<MultiRangeSegment>& pool) {
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 8796914..2c68c19 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -419,6 +419,16 @@ public:
+     bool any_buffer_uploaded = false;
+     /// Indirectly read banks of native programs already uploaded this frame.
+     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
++    /// A page of a native program's indirectly read bank when last checked: unchanged pages keep
++    /// their tracking (marking one costs two mprotect calls).
++    struct Nx2BankPage {
++        std::array<u8, Core::DEVICE_PAGESIZE> bytes{};
++        u64 epoch{};
++    };
++    std::unordered_map<DAddr, Nx2BankPage> native_indirect_page_snapshots;
++    /// Compares each page of a bank with its snapshot (EDEN_NX2_BANK_REUPLOAD=4 marks the ones
++    /// that changed as CPU modified, EDEN_NX2_BANK_STATS=1 logs what it finds).
++    void Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, bool stats);
+ 
+     /// EDEN_NX2_DRAW_TUNING=0 turns off the two per-draw shortcuts below.
+     static bool Nx2DrawTuning() {
+-- 
+2.54.0
+

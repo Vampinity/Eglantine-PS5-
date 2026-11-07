@@ -629,11 +629,15 @@ u64 MemoryAllocator::ReleaseRefused(const char* why, u64 wanted) const {
     // twice the request, at most 256 MiB.
     const u64 lend = (std::min)((std::max)(wanted * 2, u64{32} << 20), u64{256} << 20);
     const u64 lent = wanted != 0 && staging + heap < wanted && eden_guest_reserve_lend ? eden_guest_reserve_lend(lend) : 0;
-    std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY %s: %llu MiB of finished staging, %llu MiB of the heap and %llu MiB of the "
-                 "guest's reserve went back\\n",
+    // Then cold guest memory, sent out now (EDEN_GUEST_SWAP_RECLAIM=1 with the swap on; after Aflakon's
+    // patch 1905): a scene load asks for hundreds of MiB within seconds, before the swapper's next tick.
+    // For images too: the pool's 2 MiB blocks side by side are what an image needs.
+    const u64 reclaimed = staging + heap + lent < lend && eden_guest_memory_reclaim ? eden_guest_memory_reclaim(lend) : 0;
+    std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY %s: %llu MiB of finished staging, %llu MiB of the heap, %llu MiB of the "
+                 "guest's reserve and %llu MiB of cold guest memory went back\\n",
                  why, static_cast<unsigned long long>(staging >> 20), static_cast<unsigned long long>(heap >> 20),
-                 static_cast<unsigned long long>(lent >> 20));
-    return staging + heap + lent;
+                 static_cast<unsigned long long>(lent >> 20), static_cast<unsigned long long>(reclaimed >> 20));
+    return staging + heap + lent + reclaimed;
 }
 
 // What held the pool when it refused: the pool, the guest's memory, the allocator's blocks by memory
@@ -684,7 +688,7 @@ bool MemoryAllocator::NoFallbackLeft(const VkImageCreateInfo& ci) const {
     return ends;
 }'''),
     ('#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n',
-     '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\nextern "C" std::size_t eden_guest_reserve_lend(std::size_t) __attribute__((weak));\n'),
+     '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\nextern "C" std::size_t eden_guest_reserve_lend(std::size_t) __attribute__((weak));\nextern "C" std::size_t eden_guest_memory_reclaim(std::size_t) __attribute__((weak));\n'),
     # An image the pool could not hold would be made with nothing bound: reads give zero, writes are
     # lost, and Eden's comment above says AMD's drivers do not survive sampling one. So it gets what a
     # buffer gets, and only then the fallback. The fallback stays: now and then an image too big for

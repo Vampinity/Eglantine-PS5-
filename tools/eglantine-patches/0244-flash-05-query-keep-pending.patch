@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:00:00 +0100
+Subject: [PATCH] query_cache: EDEN_NX2_QUERY_KEEP_PENDING keeps fence-flagged reports pending until
+ their fence runs
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_QUERY_KEEP_PENDING=1 is set.
+Port of Lichii PR 337, 0f0720d07d (Inc0rporate), open upstream.
+
+At Low accuracy, which Ocarina runs use (fast_gpu in the game's settings), CounterReport treats a
+fence-flagged report as synchronized: it frees the query at once, and SignalFence may skip the
+report's fence as empty and run its operation at once, before the host GPU has run the work the
+report follows. Inc0rporate
+reports that Ocarina then reads wrong reports and draws white flashes on leaves and walls, and that
+this change removes them on an RX 9070 XT, at about the frame time of Default fences.
+
+With the switch these reports go the way Balanced takes them: the query stays registered until its
+fence runs, and that one fence is made even when empty. Other fences are skipped as before. Only a
+report with unsynced queries gets a real wait: with no other work the fence is a stub and the
+operation still runs without waiting for the GPU, as at High and upstream. Report writes also move
+to the fence thread. The upstream patch removes is_synced; here the switch turns it off, so T42's
+code stays as it is.
+
+Risk: Inc0rporate saw a hang while loading with only the fence half, and felipecsl reports no change
+from the other half alone (Intel, on PR 215). This has both, on a tree that also has our split
+fixes, and it may stall where the upstream tree does not. Compute release semaphores wait for the
+fence too, which adds latency with the window at 500 us. Use EDEN_NX2_HANG_WATCH=1 on the first run.
+Unset, nothing changes. Not built, not run.
+---
+ src/video_core/fence_manager.h |  9 ++++++++-
+ src/video_core/query_cache/query_cache.h | 11 ++++++++++-
+ src/video_core/rasterizer_interface.h |  5 +++++
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 6bbfe0b..36384ad 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -83,7 +83,14 @@ public:
+ 
+     void SignalFence(std::function<void()>&& func) {
+         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
+-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
++        // EDEN_NX2_QUERY_KEEP_PENDING=1: a fence that writes a fence-flagged query report is never
++        // skipped as empty. A skipped fence runs its operation at once, before the host GPU has run
++        // the work the report follows.
++        const bool delay_fence = VideoCore::g_signaling_query_report_fence ||
++                                 (Settings::IsGPUFenceBehaviorDefault()
++                                      ? Settings::IsGPULevelHigh()
++                                      : Settings::IsGPUFenceBehaviorBalanced() ||
++                                            Settings::IsGPUFenceBehaviorAccurate());
+         if constexpr (!can_async_check) {
+             TryReleasePendingFences<false>();
+         }
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+index ac9a471..0121be1 100644
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -29,6 +29,7 @@
+ #include "video_core/query_cache/query_cache_base.h"
+ #include "video_core/query_cache/query_stream.h"
+ #include "video_core/query_cache/types.h"
++#include "video_core/rasterizer_interface.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -272,7 +273,13 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     };
+     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
+     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
+-    bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
++    // EDEN_NX2_QUERY_KEEP_PENDING=1 (Lichii PR 337, Inc0rporate): a fence-flagged report stays
++    // registered until its fence runs, as at High accuracy, without making other fences wait.
++    static const bool keep_pending = [] {
++        const char* const value = std::getenv("EDEN_NX2_QUERY_KEEP_PENDING");
++        return value != nullptr && value[0] != '0';
++    }();
++    bool is_synced = !keep_pending && (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+                                      pointer, pointer_timestamp, cpu_addr] {
+         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+@@ -305,7 +312,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+         }
+     });
+     if (is_fence) {
++        VideoCore::g_signaling_query_report_fence = keep_pending;
+         impl->rasterizer.SignalFence(std::move(operation));
++        VideoCore::g_signaling_query_report_fence = false;
+     } else {
+         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+             if (has_timestamp) {
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index bb45c5f..732517d 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -43,6 +43,11 @@ enum class LoadCallbackStage {
+ };
+ using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
+ 
++/// EDEN_NX2_QUERY_KEEP_PENDING=1: set while the query cache signals the fence that writes a
++/// fence-flagged report, so the fence manager makes that fence even when it is empty
++/// (FenceManager::SignalFence).
++inline thread_local bool g_signaling_query_report_fence = false;
++
+ class RasterizerInterface {
+ public:
+     virtual ~RasterizerInterface() = default;
+-- 
+2.54.0
+

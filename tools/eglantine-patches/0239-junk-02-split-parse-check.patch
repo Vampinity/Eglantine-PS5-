@@ -1,0 +1,136 @@
+From 6392a366e384d0314a9866070b255628379c6542 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 00:56:09 +0100
+Subject: [PATCH] dma_pusher: EDEN_NX2_SPLIT_PARSE_CHECK parks only an entry that
+ reads as a fresh stream (junk-02)
+
+EDEN_NX2_PARK_SPLIT_METHODS parked every non-adjacent entry that began while a method still
+wanted words, and hung Ocarina of Time at its first load (run 165: real command lists do
+continue a split method into an entry elsewhere). The default continued every one, and
+misparsed run 162 (entry 3579 ended three words into a four-word method; entry 3580, a fresh
+stream 100 bytes before it, lost its first word and read `3f800000` as a header with a count
+of 8,064). With EDEN_NX2_SPLIT_PARSE_CHECK=1 the entry is read first: taken as the continuation, what
+follows the carried words must read as commands (known modes, counts that fit the entry, a last
+one a little past it); only when that fails and the entry taken fresh does read as commands is
+the method parked (ResolveSplitMethod, resumed at the address the split one ended). Title 4's
+5-word subroutine continuation reads as data to its end and passes. EDEN_NX2_SPLIT_PARSE_CHECK=2
+logs the first 64 decisions ("Split check: ... continued/parked"). Unset: as before.
+
+The switch was EDEN_NX2_SPLIT_CHECK in cloud-patches/junk-02-020-split-check.patch. That name is
+already read at gpu_split.cpp:149 (a thread owner check), so it is renamed here. Nothing else changed.
+---
+ src/video_core/dma_pusher.cpp | 74 +++++++++++++++++++++++++++++++++++
+ src/video_core/dma_pusher.h   |  5 +++
+ 2 files changed, 79 insertions(+)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index fcdd939643..e5cdce776b 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -244,6 +244,19 @@ bool DmaPusher::Step() {
+                 }
+                 if (park_split_methods) {
+                     ResolveSplitMethod(header.addr);
++                } else if (SplitCheckMode() != 0) {
++                    // EDEN_NX2_SPLIT_PARSE_CHECK: park only an entry that does not read as the
++                    // continuation but does read as a fresh stream (run 162), otherwise continue
++                    // as before (run 165: parking every non-adjacent entry hung the first load).
++                    const bool parked_here = std::ranges::any_of(parked_methods, [&](const ParkedMethod& p) {
++                        return p.resume_address == header.addr;
++                    });
++                    if (dma_state.method_count != 0 && header.addr != split_method_end &&
++                        !SplitContinuesHere(header)) {
++                        ResolveSplitMethod(header.addr);
++                    } else if (dma_state.method_count == 0 && parked_here) {
++                        ResolveSplitMethod(header.addr);
++                    }
+                 }
+             }
+             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
+@@ -470,6 +483,67 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
+ // buffer (e.g. a compute dispatch) before the entry that carries the rest, which starts right
+ // where the first one ended. An entry starting anywhere else is such a call: run it with a clean
+ // method state and resume the unfinished method when the stream continues at that address.
++// EDEN_NX2_SPLIT_PARSE_CHECK=1 (off unless set; 2 also logs the first 64 decisions): whether an entry that
++// begins while a method of the entry before still wants words is its continuation. Taken as the
++// continuation, the carried words are data and what follows must read as commands: headers in the
++// modes the parser knows, each with a count that fits the entry (a last one may run a little past
++// it: a split of its own). Run 162's slip read `00000000` then `3f800000` as headers (a mode the
++// parser has no case for, then a count of 8,064 in a 25-word entry) because entry 3579 ended three
++// words into a four-word method and entry 3580, a fresh stream 100 bytes before it, was taken as
++// the fourth. Title 4's real continuation (a 5-word subroutine entry after a macro's first word)
++// reads as data to the end, which passes.
++int DmaPusher::SplitCheckMode() {
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_SPLIT_PARSE_CHECK");
++        return value != nullptr ? std::atoi(value) : 0;
++    }();
++    return mode;
++}
++
++static bool ReadsAsCommands(std::span<const u32> words, size_t entry_words, size_t skip) {
++    size_t i = skip;
++    while (i < words.size()) {
++        const u32 header = words[i];
++        const size_t count = (header >> 16) & 0x1fff;
++        switch (header >> 29) {
++        case 1: // Increasing
++        case 3: // NonIncreasing
++        case 5: // IncreaseOnce
++            if (i + 1 + count > entry_words + 64) {
++                return false; // a count no split explains: data read as a header
++            }
++            i += 1 + count;
++            break;
++        case 4: // Inline: the data is in the header
++            ++i;
++            break;
++        default:
++            return false; // IncreasingOld, NonIncreasingOld and the unused modes: ProcessCommands drops them
++        }
++    }
++    return true; // data to the end of the window is a continuation too
++}
++
++bool DmaPusher::SplitContinuesHere(const CommandListHeader& header) {
++    std::array<u32, 64> words{};
++    const size_t read = std::min<size_t>(header.size, words.size());
++    memory_manager.ReadBlockUnsafe(header.addr, words.data(), read * sizeof(u32));
++    const std::span<const u32> window{words.data(), read};
++    const bool as_continuation = ReadsAsCommands(window, header.size, dma_state.method_count);
++    const bool as_fresh = ReadsAsCommands(window, header.size, 0);
++    const bool continues = as_continuation || !as_fresh;
++    if (static u32 logged{}; SplitCheckMode() >= 2 && logged < 64) {
++        ++logged;
++        LOG_WARNING(HW_GPU,
++                    "Split check: method {:#x} wants {} more words at entry {:#x}+{} (split one ended {:#x}): "
++                    "as continuation {}, fresh {}: {}; starts {:08x} {:08x} {:08x} {:08x}",
++                    dma_state.method, dma_state.method_count, u64{header.addr}, u64{header.size}, split_method_end,
++                    as_continuation ? "reads" : "does not read", as_fresh ? "reads" : "does not read",
++                    continues ? "continued" : "parked", words[0], words[1], words[2], words[3]);
++    }
++    return continues;
++}
++
+ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+     const auto continued = std::ranges::find(parked_methods, entry_address,
+                                              &ParkedMethod::resume_address);
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index 6167f2150f..d9eda56f93 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -276,6 +276,11 @@ public:
+     };
+     void ResolveSplitMethod(GPUVAddr entry_address);
+     static constexpr size_t MaxParkedMethods = 16;
++    /// EDEN_NX2_SPLIT_PARSE_CHECK: 0 off, 1 on, 2 on and logging the first decisions.
++    static int SplitCheckMode();
++    /// Whether the entry reads as the continuation of the method the entry before left unfinished
++    /// (true), or as a fresh stream the carried words would misparse (false: park it).
++    bool SplitContinuesHere(const CommandListHeader& header);
+ 
+     // Debug aid: hashes of the words of the last entries as they were parsed.
+     struct ParsedEntry {
+-- 
+2.54.0
+

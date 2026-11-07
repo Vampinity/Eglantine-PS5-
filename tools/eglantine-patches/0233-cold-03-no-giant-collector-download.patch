@@ -1,0 +1,46 @@
+From 35901dc565c9b1e9f54fc548bb101ee14b55d25f Mon Sep 17 00:00:00 2001
+From: Aflakon <125590634+Aflakon@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 00:46:56 +0100
+Subject: [PATCH] texture_cache: the collector drops a huge GPU-written image
+ without a download when memory is critical (Aflakon, cold-020-03)
+
+Aflakon's patch 1904 (ocarina-cold-memory f0515ee16), ported onto v1.219.020's collector: a
+download needs a staging buffer and a heap block as large as the image at the moment memory is
+short; evicting a 288 MiB image (Ocarina of Time's 12288x12288 shadow map) ended a session.
+With EDEN_NX2_TC_DOWNLOAD_MAX_MIB=<MiB> an image larger than that which the GPU wrote stays
+while memory is not critical, and then goes without its contents (EDEN_TC_DROP line). Unset:
+every image downloads, as before (Aflakon's default was 64).
+---
+ src/video_core/texture_cache/texture_cache.h | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 1b289f3d45..0ca810b714 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -196,3 +196,21 @@ void TextureCache<P>::RunGarbageCollector() {
+         }
+-        const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
++        // A download needs a staging buffer and a heap block as large as the image, at the moment
++        // memory is short: evicting a 288 MiB image ended Ocarina of Time (crash-20261106-102813).
++        // An image larger than EDEN_NX2_TC_DOWNLOAD_MAX_MIB (unset: never) the GPU wrote stays while
++        // memory is not critical, and then goes without its contents. (Aflakon, patch 1904.)
++        static const u64 download_max = [] {
++            const char* value = std::getenv("EDEN_NX2_TC_DOWNLOAD_MAX_MIB");
++            return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL) << 20;
++        }();
++        const bool dirty_image = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
++        const bool drop_contents = dirty_image && download_max != 0 && image.unswizzled_size_bytes > download_max;
++        if (drop_contents) {
++            if (!aggressive_mode && total_used_memory < critical_memory) {
++                return false;
++            }
++            LOG_INFO(HW_GPU, "EDEN_TC_DROP {} MiB image {}x{}x{} layers {} format {} deleted without download",
++                     image.unswizzled_size_bytes >> 20, image.info.size.width, image.info.size.height,
++                     image.info.size.depth, image.info.resources.layers, static_cast<int>(image.info.format));
++        }
++        const bool must_download = dirty_image && !drop_contents;
+         if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
+-- 
+2.54.0
+

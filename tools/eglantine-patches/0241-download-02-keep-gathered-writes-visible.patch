@@ -1,0 +1,198 @@
+From b14ea156b7d3b24630bb04ae2bf381b5413987df Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 01:58:56 +0100
+Subject: [PATCH] gpu dirty memory: EDEN_NX2_DOWNLOAD_GUARDS=2 keeps gathered
+ CPU writes visible to downloads until applied
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_DOWNLOAD_GUARDS=2. Does what
+the front_buffer lines of Lichii PR 397 set out to do, which those lines cannot do on this code.
+
+PR 397's ForEachPending copies front_buffer under gather_guard. Gather holds gather_guard from before
+its swap until after front_buffer.clear(), in Lichii and here, so anyone holding gather_guard finds
+front_buffer empty. The copy adds nothing and the fencing thread waits on the lock for it. Writes
+are also not safe once Gather returns: they stay out of view until OnCacheInvalidations gets the
+buffer cache's lock and claims them, and a fence-thread download that takes that lock first writes
+the GPU's older copy over them. PR 397 lists that gap as its known limitation; its review asked to
+keep them protected through the claim.
+
+With =2:
+- Gather also copies what it hands out to handed_out, under `guard`, in the same step that takes
+  it out of back_buffer and current, so a write is never out of view. Empty entries stay out:
+  nothing would clear them. ForEachPending reads handed_out under `guard` alone; gather_guard is not
+  taken and no lock order changes. The two gather sites in gpu.cpp clear handed_out once
+  OnCacheInvalidations has returned. A second gatherer's writes can be cleared with the first's:
+  those are then as exposed as today. I found no second gatherer on this tree.
+- DownloadBufferMemory, the one site that reads the pending list before its GPU wait, adds what was
+  collected during the wait. Same order in T37 and upstream, so this is new, not a restoration.
+
+Only the fence thread's PopAsyncBuffers can land between Gather and the claim: with the split on,
+the back runs every gather and, as far as I read, every other download. The list read inside one
+pop stays a gap: a write collected after it is still overwritten. So a clean run at =2 says little.
+
+Not =2: handed_out stays empty and the pending list is read once. As T42.
+
+Applies with or without lead-download-01; =2 is meant with it. Not built, not run.
+
+Credit: Duck912 (e27fbc6b03), Frizti (0c822822c1), zortos293 (Lichii PR 397).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/gpu_dirty_memory_manager.h        | 36 +++++++++++++++++++++-
+ src/video_core/buffer_cache/buffer_cache.h | 12 +++++++-
+ src/video_core/gpu.cpp                     | 12 ++++++++
+ 3 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
+index e6bf2d4..12692cc 100644
+--- a/src/core/gpu_dirty_memory_manager.h
++++ b/src/core/gpu_dirty_memory_manager.h
+@@ -5,6 +5,7 @@
+ 
+ #include <atomic>
+ #include <bit>
++#include <cstdlib>
+ #include <functional>
+ #include <mutex>
+ #include <utility>
+@@ -19,10 +20,23 @@ public:
+     GPUDirtyMemoryManager() : current{default_transform} {
+         back_buffer.reserve(256);
+         front_buffer.reserve(256);
++        handed_out.reserve(256);
+     }
+ 
+     ~GPUDirtyMemoryManager() = default;
+ 
++    /// EDEN_NX2_DOWNLOAD_GUARDS=2: a write stays in ForEachPending's view from Collect until the
++    /// caller of Gather has applied it (ForgetHandedOut). Otherwise it leaves the view at Gather,
++    /// and a download that takes the buffer cache's lock before the claim lands on top of it. A
++    /// function-local static: env.txt is read in main.
++    [[nodiscard]] static bool KeepHandedOut() {
++        static const bool keep = [] {
++            const char* const value = std::getenv("EDEN_NX2_DOWNLOAD_GUARDS");
++            return value != nullptr && value[0] == '2';
++        }();
++        return keep;
++    }
++
+     void Collect(PAddr address, size_t size) {
+         TransformAddress t = BuildTransform(address, size);
+         TransformAddress tmp, original;
+@@ -47,12 +61,14 @@ public:
+                                                 std::memory_order_relaxed));
+     }
+ 
+-    /// Calls `callback` for each write collected and not yet gathered, without consuming them.
++    /// Calls `callback` for each write collected and not yet gathered, without consuming them. With
++    /// KeepHandedOut: not yet applied.
+     void ForEachPending(const std::function<void(PAddr, size_t)>& callback) {
+         std::vector<TransformAddress> pending;
+         {
+             std::scoped_lock lk(guard);
+             pending = back_buffer;
++            pending.insert(pending.end(), handed_out.begin(), handed_out.end());
+             const TransformAddress t = current.load(std::memory_order_acquire);
+             if (IsValid(t.address)) {
+                 pending.push_back(t);
+@@ -74,6 +90,15 @@ public:
+             if (IsValid(t.address)) {
+                 front_buffer.emplace_back(t);
+             }
++            if (KeepHandedOut()) {
++                // Not entries with no bits (IsValid passes default_transform): they call no
++                // callback, so a gather of only those never reaches ForgetHandedOut.
++                for (const TransformAddress& transform : front_buffer) {
++                    if (transform.mask != 0) {
++                        handed_out.push_back(transform);
++                    }
++                }
++            }
+         }
+         for (auto& transform : front_buffer) {
+             ForEachRun(transform, callback);
+@@ -81,6 +106,13 @@ public:
+         front_buffer.clear();
+     }
+ 
++    /// The writes Gather handed out are applied: downloads need not skip them any more. A second
++    /// gatherer's writes go with them, which only leaves those as exposed as without the switch.
++    void ForgetHandedOut() {
++        std::scoped_lock lk(guard);
++        handed_out.clear();
++    }
++
+ private:
+     struct alignas(8) TransformAddress {
+         u32 address;
+@@ -141,6 +173,8 @@ private:
+     std::mutex gather_guard;
+     std::vector<TransformAddress> back_buffer;
+     std::vector<TransformAddress> front_buffer;
++    /// Writes handed out by Gather and not applied yet (KeepHandedOut); held under `guard`.
++    std::vector<TransformAddress> handed_out;
+ };
+ 
+ } // namespace Core
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 74d02bd..6aab266 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -3089,7 +3089,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+     if (total_size_bytes == 0) {
+         return;
+     }
+-    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
++    Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+ 
+     if constexpr (requires { buffer.Mapped(); }) {
+         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
+@@ -3125,6 +3125,16 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+         }
+         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+         runtime.Finish();
++        // EDEN_NX2_DOWNLOAD_GUARDS=2: writes collected during that wait are newer than this copy.
++        // Same test as GPUDirtyMemoryManager::KeepHandedOut, which this file doesn't include.
++        static const bool after_wait = [] {
++            const char* value = std::getenv("EDEN_NX2_DOWNLOAD_GUARDS");
++            return value != nullptr && value[0] == '2';
++        }();
++        if (after_wait) {
++            PendingCpuWriteRanges().ForEach(
++                [&](DAddr start, DAddr end) { cpu_written.Add(start, end - start); });
++        }
+         for (const BufferCopy& copy : copies) {
+             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
+             // Undo the modified offset
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index f6863aa..f04d56e 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -148,6 +148,17 @@ struct GPU::Impl {
+         system.GatherGPUDirtyMemory(callback_writes);
+         if (!writes.empty()) {
+             renderer->ReadRasterizer()->OnCacheInvalidations(writes);
++            ForgetHandedOutWrites();
++        }
++    }
++
++    /// EDEN_NX2_DOWNLOAD_GUARDS=2: the gathered writes are applied, downloads may land there again.
++    void ForgetHandedOutWrites() {
++        if (!Core::GPUDirtyMemoryManager::KeepHandedOut()) {
++            return;
++        }
++        for (auto& manager : system.GetGPUDirtyMemoryManager()) {
++            manager.ForgetHandedOut();
+         }
+     }
+ 
+@@ -169,6 +180,7 @@ struct GPU::Impl {
+         system.GatherGPUDirtyMemory(callback_writes);
+         if (!writes.empty()) {
+             renderer->ReadRasterizer()->OnCacheInvalidations(writes);
++            ForgetHandedOutWrites();
+         }
+         if (count >= next_log) {
+             next_log = count * 2;
+-- 
+2.54.0
+

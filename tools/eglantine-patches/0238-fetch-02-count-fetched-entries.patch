@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:30:00 +0100
+Subject: [PATCH] dma_pusher: EDEN_NX2_FETCH_COUNT counts where each entry's words
+ came from and reports next to JUNK_TRACE
+
+Core patch on mig020-core (the v1.219.020 series, on top of 0232), off unless
+EDEN_NX2_FETCH_COUNT is set.
+
+After kraibse's 2c9263140d on Djihads80/Eglantine (cherry-picked there from e17076e388): entries
+parsed from anything but their submit copy, by the reason, and how many differ from that copy.
+
+EDEN_NX2_FETCH_COUNT=1 counts every entry. Lines: the first 4 differing entries per reason, "Entry
+at ... differs from its words at submit in N words", and every 1,048,576 entries "FETCH_COUNT
+differ/compared/seen: ...; lists read again N, dropped words N, new-mark calls so far N". Compared
+counts only entries really compared: at =1 an entry on its untouched submit copy is seen, not
+compared, and its row says "not compared". =2 also compares those with memory at the parse, which
+reads every entry.
+
+DumpCurrentEntry adds those totals and, for the last 64 entries, "FETCH_COUNT -N: entry i at
+addr+size words from <reason>, words differing from submit: d, list read again r times, resumed at
+word w, k words wanted at its start, GPU-written at fetch a, at this report b". The first nonzero
+word the parser drops where a header belongs does the same, at most 4 times and once per entry,
+after "FETCH_COUNT dropped word ..." (the first 16): the unknown-method dump comes once a session
+and only after the slip, and run 149's kind never reached it.
+
+Reasons the original doesn't have:
+- "copy read again after submit": RefreshSnapshot or RefreshDeferredEntries replaced the copy, so
+  "submit copy" would be a false label after a suspension. RefreshSnapshot keeps the words as
+  submitted in CommandList::first_words, only with the switch on, and every compare uses those: a
+  nonzero count on this reason is the refresh itself changing the words.
+- "GPU-written page" comes in three: "after a flush", "host copy" and "memory read live". The last
+  is a page ReadGpuWrittenCommands calls Synced, read live with no copy behind it.
+- "deferred entry" (its slot is unfilled) and "no copy kept" and "empty at submit" (its offset is ~0
+  here, the original's read would run off the array on our tree).
+
+Changed from the original: off by default; no cap at 50,000 entries (it counts only entries that
+skipped the copy, and no log gives their rate, so whether it would run out before a slip at 10
+minutes is a guess; a cap would also end the counting just when it matters); the words compared
+are the ones the parser got, so no second read and a host copy of GPU-written words counts; a
+resumed entry is compared from its resume word; the last-entries report is new, since the bad
+entry is not always the wrong one (run 162: the entries before it left the method open).
+
+EDEN_NX2_PB_CHECK is now read at first use. It was a file-scope static, read before main applies
+env.txt, so RecordParsedEntry never kept an entry on the console and "CHANGED since parsed" could
+not print. Unset, nothing changes.
+
+The original only looks at entries that skipped the copy, so it can't see an entry left on a stale
+copy, and neither can this patch by itself: for that see EDEN_NX2_FETCH_RECHECK's hit lines. With
+the switch off the behaviour is T42's; the cost is 32 bytes per queued list and about 3 KiB per
+channel. Not built, not run.
+---
+ src/video_core/dma_pusher.cpp | 242 +++++++++++++++++++++++++++++++++++++++-
+ src/video_core/dma_pusher.h   |  33 ++++++
+ 2 files changed, 272 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 0901032f55..89e74452d8 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -60,6 +60,77 @@ bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u
+     }
+     return false;
+ }
++
++// EDEN_NX2_FETCH_COUNT=1, after kraibse's 2c9263140d (Djihads80/Eglantine): where each entry's
++// words came from, and how often the words the parser got differ from the words at submit. An
++// entry read live, or a copy read again after submit, is how a ring the game already refilled gets
++// parsed as this frame's commands. =2 also compares the entries that took their copy with memory
++// as it is at the parse: that reads every entry. DumpCurrentEntry adds the totals and the last
++// entries to its report, and so does the first nonzero word the parser drops (NoteDroppedWord).
++int FetchCountMode() {
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_FETCH_COUNT");
++        return value == nullptr ? 0 : value[0] - '0';
++    }();
++    return mode;
++}
++
++enum FetchReason : u32 {
++    FetchSubmitCopy,
++    FetchRefreshedCopy,
++    FetchResumed,
++    FetchNoCopy,
++    FetchEmptyAtSubmit,
++    FetchSuspendedCopy,
++    FetchSuspensionsChanged,
++    FetchDeferred,
++    FetchGpuWritten, // CountFetchedEntry splits off the next two by what ReadGpuWrittenCommands did
++    FetchGpuCopied,
++    FetchGpuLive,
++    FetchSafeDirty,
++    FetchReasonCount,
++};
++constexpr std::array<const char*, FetchReasonCount> fetch_reason_names{
++    "submit copy",
++    "copy read again after submit",
++    "resumed entry",
++    "no copy kept",
++    "empty at submit",
++    "copied during a suspension",
++    "suspension count changed",
++    "deferred entry",
++    "GPU-written page, after a flush",
++    "GPU-written page, host copy",
++    "GPU-written page, memory read live",
++    "safe read of dirty memory",
++};
++// DmaPusher::fetch_gpu_read
++constexpr u32 FetchReadCopy = 1;
++constexpr u32 FetchReadLive = 2;
++
++std::array<std::atomic<u64>, FetchReasonCount> fetch_seen{};
++std::array<std::atomic<u64>, FetchReasonCount> fetch_compared{};
++std::array<std::atomic<u64>, FetchReasonCount> fetch_differing{};
++std::atomic<u64> fetch_total{};
++std::atomic<u64> fetch_refreshed_lists{};
++std::atomic<u64> fetch_dropped_words{};
++
++void ReportFetchTotals() {
++    std::string totals;
++    for (size_t i = 0; i < fetch_reason_names.size(); ++i) {
++        totals += fmt::format("{}{} {}/{}/{}", i == 0 ? "" : ", ", fetch_reason_names[i],
++                              fetch_differing[i].load(std::memory_order_relaxed),
++                              fetch_compared[i].load(std::memory_order_relaxed),
++                              fetch_seen[i].load(std::memory_order_relaxed));
++    }
++    // New-mark calls: one per 64-page word with a new bit, so a lower bound on pages, any pages.
++    LOG_WARNING(HW_GPU,
++                "FETCH_COUNT differ/compared/seen: {}; lists read again {}, dropped words {}, "
++                "new-mark calls so far {}",
++                totals, fetch_refreshed_lists.load(std::memory_order_relaxed),
++                fetch_dropped_words.load(std::memory_order_relaxed),
++                Tegra::g_nx2_new_written_pages.load(std::memory_order_relaxed));
++}
+ } // Anonymous namespace
+ 
+ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
+@@ -303,6 +374,11 @@ bool DmaPusher::Step() {
+             entry_trace.gpu_written = gpu_written;
+             entry_trace.source = submitted ? 0 : use_safe ? 1 : 3;
+         }
++        if (FetchCountMode() != 0) {
++            fetch_reason = FetchReasonOf(command_list, submitted, gpu_written);
++            fetch_gpu_written = gpu_written;
++            fetch_gpu_read = 0;
++        }
+         if (submitted) {
+             const std::span<const CommandHeader> commands{
+                 command_list.submitted_words.data() +
+@@ -389,8 +465,12 @@ static const u32 g_semaphore_watch = [] {
+     return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
+ }();
+ 
+-// EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
+-static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
++// EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry. Read at first use:
++// env.txt is applied in main, after the globals.
++static bool RecordParsedEntries() {
++    static const bool enabled = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
++    return enabled;
++}
+ 
+ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+     for (size_t index = 0; index < commands.size();) {
+@@ -470,6 +550,9 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
+                 dma_increment_once = true;
+                 break;
+             default:
++                if (FetchCountMode() != 0 && command_header.argument != 0) {
++                    NoteDroppedWord(command_header.argument, word_offset + index);
++                }
+                 break;
+             }
+             index++;
+@@ -666,6 +749,14 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+ 
+ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
+     list.snapshot_suspensions = now;
++    if (FetchCountMode() != 0) {
++        // The words as submitted, for CountFetchedEntry. A deferred entry's slot holds none.
++        if (list.refreshes == 0 && list.deferred_entries.empty()) {
++            list.first_words = list.submitted_words;
++        }
++        ++list.refreshes;
++        fetch_refreshed_lists.fetch_add(1, std::memory_order_relaxed);
++    }
+     for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
+         const CommandListHeader& entry = list.command_lists[i];
+         const u32 offset = list.submitted_offsets[i];
+@@ -679,6 +770,9 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
+ }
+ 
+ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
++    if (FetchCountMode() != 0) {
++        ++list.refreshes;
++    }
+     for (const u32 i : list.deferred_entries) {
+         if (i >= list.command_lists.size() || i >= list.submitted_offsets.size()) {
+             continue;
+@@ -737,6 +831,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
+     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
+     command_headers.resize_destructive(count);
+     u8* const out = reinterpret_cast<u8*>(command_headers.data());
++    u32 read_from = 0;
+     for (GPUVAddr chunk = address; chunk < end;) {
+         const GPUVAddr chunk_end = (std::min)(end, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
+         const std::span<u8> part{out + (chunk - address), static_cast<size_t>(chunk_end - chunk)};
+@@ -754,8 +849,10 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
+         if (where == GpuWrittenList::Synced) {
+             memory_manager.ReadBlockUnsafe(chunk, part.data(), part.size());
+         }
++        read_from |= where == GpuWrittenList::Synced ? FetchReadLive : FetchReadCopy;
+         chunk = chunk_end;
+     }
++    fetch_gpu_read = read_from;
+     return true;
+ }
+ 
+@@ -829,9 +926,145 @@ void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash
+     }
+ }
+ 
++u32 DmaPusher::FetchReasonOf(const CommandList& list, bool submitted, bool gpu_written) const {
++    // In the order of Step's `submitted`.
++    const size_t index = dma_pushbuffer_subindex;
++    if (submitted) {
++        return list.refreshes != 0 ? FetchRefreshedCopy : FetchSubmitCopy;
++    }
++    if (command_resume_offset != 0) {
++        return FetchResumed;
++    }
++    if (index >= list.submitted_offsets.size()) {
++        return FetchNoCopy;
++    }
++    if (list.submitted_offsets[index] >= list.submitted_words.size()) {
++        return FetchEmptyAtSubmit;
++    }
++    if ((list.snapshot_suspensions & 1) != 0) {
++        return FetchSuspendedCopy;
++    }
++    if (list.snapshot_suspensions != suspensions.load(std::memory_order_acquire)) {
++        return FetchSuspensionsChanged;
++    }
++    if (std::ranges::binary_search(list.deferred_entries, static_cast<u32>(index))) {
++        return FetchDeferred;
++    }
++    return gpu_written ? FetchGpuWritten : FetchSafeDirty;
++}
++
++void DmaPusher::CountFetchedEntry(const CommandListHeader& header,
++                                  std::span<const CommandHeader> commands) {
++    const CommandList& list = dma_pushbuffer.front();
++    const size_t index = dma_pushbuffer_subindex;
++    u32 reason = fetch_reason;
++    if (reason == FetchGpuWritten && fetch_gpu_read != 0) {
++        reason = (fetch_gpu_read & FetchReadLive) != 0 ? FetchGpuLive : FetchGpuCopied;
++    }
++    // An all-zero entry's offset is out of range on purpose, a deferred entry's slot is unfilled,
++    // and a list read again without first_words no longer holds its words as submitted.
++    const bool has_copy =
++        index < list.submitted_offsets.size() &&
++        size_t{list.submitted_offsets[index]} + commands.size() <= list.submitted_words.size() &&
++        !std::ranges::binary_search(list.deferred_entries, static_cast<u32>(index)) &&
++        (list.refreshes == 0 || !list.first_words.empty());
++    u32 first = ~0U;
++    u32 words = 0;
++    bool compared = false;
++    const auto compare = [&](const CommandHeader* copy, size_t i, u32 value) {
++        if (copy[i].argument != value) {
++            first = (std::min)(first, static_cast<u32>(i));
++            ++words;
++        }
++    };
++    if (has_copy) {
++        const CommandHeader* const copy =
++            (list.first_words.empty() ? list.submitted_words : list.first_words).data() +
++            list.submitted_offsets[index];
++        if (reason != FetchSubmitCopy) {
++            // The words the parser got, not memory again: a GPU-written entry can come from a
++            // host copy that memory doesn't hold. A resumed entry parses from its resume word.
++            for (size_t i = command_resume_offset; i < commands.size(); ++i) {
++                compare(copy, i, commands[i].argument);
++            }
++            compared = true;
++        } else if (FetchCountMode() == 2) {
++            fetch_scratch.resize(commands.size());
++            memory_manager.ReadBlockUnsafe(header.addr, fetch_scratch.data(),
++                                           fetch_scratch.size() * sizeof(u32));
++            for (size_t i = 0; i < fetch_scratch.size(); ++i) {
++                compare(copy, i, fetch_scratch[i]);
++            }
++            compared = true;
++        }
++    }
++    fetch_seen[reason].fetch_add(1, std::memory_order_relaxed);
++    if (compared) {
++        fetch_compared[reason].fetch_add(1, std::memory_order_relaxed);
++    }
++    if (words != 0 && fetch_differing[reason].fetch_add(1, std::memory_order_relaxed) < 4) {
++        LOG_WARNING(HW_GPU,
++                    "Entry at {:#x}+{:#x} ({}) differs from its words at submit in {} words, first "
++                    "at word {}",
++                    header.addr.Value(), header.size.Value(), fetch_reason_names[reason], words,
++                    first);
++    }
++    fetched_entries[fetched_entry_count++ % fetched_entries.size()] = FetchedEntry{
++        .address = header.addr.Value(),
++        .index = static_cast<u32>(index),
++        .size = static_cast<u32>(commands.size()),
++        .reason = reason,
++        .carried = dma_state.method_count,
++        .resumed = static_cast<u32>(command_resume_offset),
++        .differing = words,
++        .refreshes = list.refreshes,
++        .compared = compared,
++        .gpu_written = fetch_gpu_written,
++    };
++    // Also in the log when the stream never reaches an unknown puller method (run 149).
++    if (((fetch_total.fetch_add(1, std::memory_order_relaxed) + 1) & 0xfffff) == 0) {
++        ReportFetchTotals();
++    }
++}
++
++void DmaPusher::ReportFetchCount() {
++    ReportFetchTotals();
++    const size_t kept = (std::min)(fetched_entry_count, fetched_entries.size());
++    for (size_t i = 0; i < kept; ++i) {
++        const FetchedEntry& entry =
++            fetched_entries[(fetched_entry_count - 1 - i) % fetched_entries.size()];
++        LOG_WARNING(HW_GPU,
++                    "FETCH_COUNT -{}: entry {} at {:#x}+{:#x} words from {}, words differing from "
++                    "submit: {}, list read again {} times, resumed at word {}, {} words wanted at "
++                    "its start, GPU-written at fetch {}, at this report {}",
++                    i, entry.index, entry.address, entry.size, fetch_reason_names[entry.reason],
++                    entry.compared ? fmt::format("{}", entry.differing) : "not compared",
++                    entry.refreshes, entry.resumed, entry.carried, entry.gpu_written,
++                    IsGpuWrittenCommands(entry.address, size_t{entry.size} * sizeof(u32)));
++    }
++}
++
++void DmaPusher::NoteDroppedWord(u32 word, size_t position) {
++    // A nonzero word where a header belongs goes without a trace, and in run 86 two of them went
++    // an entry before the unknown method. A healthy stream may have some too: 4 reports at most,
++    // one per entry, and the unknown method's report still comes after them.
++    if (fetch_dropped_words.fetch_add(1, std::memory_order_relaxed) < 16) {
++        LOG_WARNING(HW_GPU, "FETCH_COUNT dropped word {:08x}, word {} of the entry at {:#x}", word,
++                    position, dma_state.dma_get);
++    }
++    if (fetch_reports < 4 && fetch_report_entry != fetched_entry_count) {
++        ++fetch_reports;
++        fetch_report_entry = fetched_entry_count;
++        ReportFetchCount();
++    }
++}
++
+ void DmaPusher::RecordParsedEntry(const CommandListHeader& header,
+                                   std::span<const CommandHeader> commands) {
+-    if (!g_record_parsed_entries) {
++    if (FetchCountMode() != 0) {
++        CountFetchedEntry(header, commands);
++    }
++    if (!RecordParsedEntries()) {
+         return;
+     }
+     u64 hash = 0xcbf29ce484222325ULL;
+@@ -924,6 +1157,9 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
+                     entry_trace.carried_method, entry_trace.carried_count, entry_trace.gpu_written,
+                     has_snapshot ? "kept" : "none", differ, first_differing, slot_state, ever_out);
+     }
++    if (FetchCountMode() != 0) {
++        ReportFetchCount();
++    }
+     const auto& lists = dma_pushbuffer.front().command_lists;
+     const size_t first = dma_pushbuffer_subindex >= 2 ? dma_pushbuffer_subindex - 2 : 0;
+     for (size_t i = first; i <= dma_pushbuffer_subindex && i < lists.size(); ++i) {
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index e3a58cb7ff..a10cc22197 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -132,6 +132,11 @@ struct CommandList final {
+     /// that waited behind one, reads memory instead: games write the commands it runs before they
+     /// release the acquire.
+     u64 snapshot_suspensions = 0;
++    /// EDEN_NX2_FETCH_COUNT: submitted_words as they were before RefreshSnapshot first replaced
++    /// them (empty if it never did, or the list had deferred entries then), and how many times
++    /// the list's words were read again after submit.
++    std::vector<CommandHeader> first_words;
++    u32 refreshes = 0;
+ };
+ 
+ /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
+@@ -305,6 +310,34 @@ public:
+         return enabled;
+     }
+ 
++    // EDEN_NX2_FETCH_COUNT: the last entries fetched, newest logged first by DumpCurrentEntry. The
++    // bad entry is often not the wrong one: in run 162 the entry before it left the method open.
++    struct FetchedEntry {
++        GPUVAddr address;
++        u32 index;     ///< Its place in its command list, as in DumpCurrentEntry's lines
++        u32 size;      ///< Words
++        u32 reason;    ///< FetchReason in dma_pusher.cpp
++        u32 carried;   ///< dma_state.method_count at its start: a carry, or what a resume left
++        u32 resumed;   ///< Its resume word, 0 if it was not resumed
++        u32 differing; ///< Words that differ from the words at submit, if compared
++        u32 refreshes; ///< CommandList::refreshes
++        bool compared; ///< False: nothing was compared, `differing` says nothing
++        bool gpu_written; ///< Step's answer at the fetch
++    };
++    std::array<FetchedEntry, 64> fetched_entries{};
++    size_t fetched_entry_count{};
++    size_t fetch_report_entry{};
++    u32 fetch_reports{};
++    u32 fetch_reason{};
++    u32 fetch_gpu_read{}; ///< What ReadGpuWrittenCommands read: FetchReadCopy, FetchReadLive
++    bool fetch_gpu_written{};
++    std::vector<u32> fetch_scratch;
++    u32 FetchReasonOf(const CommandList& list, bool submitted, bool gpu_written) const;
++    void CountFetchedEntry(const CommandListHeader& header,
++                           std::span<const CommandHeader> commands);
++    void ReportFetchCount();
++    void NoteDroppedWord(u32 word, size_t position);
++
+     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
+     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
+ 
+-- 
+2.54.0
+

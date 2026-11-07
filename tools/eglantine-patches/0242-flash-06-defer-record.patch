@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:00:00 +0100
+Subject: [PATCH] vulkan: EDEN_NX2_DEFER_RECORD and EDEN_NX2_NO_UPLOAD_REORDER take apart what a
+ flush does
+
+Core patch on mig020-core (the v1.219.020 series), a debug aid, off unless EDEN_NX2_DEFER_RECORD or
+EDEN_NX2_NO_UPLOAD_REORDER is set. Not from upstream. Not for a release.
+
+EDEN_NX2_FENCE_FLUSH_US=0 ended the white flashes in the Lost Woods (run178 to run180: 0 hot against
+40 and 54 standing and 10 to 30 walking), at twice the submissions, and left few in Kokiri (run181,
+run182: 1 each). Nobody knows which part of a flush does that. A
+flush ends the render pass, resets the Z pass counter, drops command buffer state and with it raises
+every dirty flag, closes the upload command buffer, and submits, which invalidates and flushes the
+GPU caches and lets the fence land sooner. Both switches keep the 500 us window and its submission
+count and add one part back.
+
+EDEN_NX2_DEFER_RECORD=<mode>: whenever Scheduler::DeferFlush defers a flush, at any of its three
+callers, it still does this much at that point:
+1 InvalidateState only: dirty flags, bound pipeline.
+2 Ends the render pass only.
+3 Both.
+4 As 3, and the Z pass counter reset: everything SubmitExecution records in the command buffer.
+5 As 4, and a full barrier, ALL_COMMANDS to ALL_COMMANDS, memory write to memory read and write. It
+  stands in for what a submission's start and end do to the caches, and it also orders execution.
+
+Start with 5. Clean means the extra submissions are not needed, and the fix is in the recording or
+in the caches at that point: then 4, then 3, 2 and 1 narrow it down. Still flashing means what is left
+is the upload command buffer or the fence landing sooner.
+
+EDEN_NX2_NO_UPLOAD_REORDER=1: CanReorderUpload says no, as the disable_buffer_reorder setting does,
+which no env line reaches. An upload to a free region then stays in order among the draws instead of
+moving to the start of the command buffer. It also ends the render pass at each upload, so read it
+together with mode 2: clean here and flashing at 2 points to the reorder.
+
+Cost: modes 2 to 5 add render pass ends, mode 5 also stops the GPU at each one. Mode 4 does what
+window 0 does to the Z pass count, so it can drop samples like window 0. Unset, nothing changes. Not
+built, not run.
+---
+ .../renderer_vulkan/vk_buffer_cache.cpp       |  9 +++++-
+ .../renderer_vulkan/vk_scheduler.cpp          | 29 +++++++++++++++++++
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index ffc1b47..d4d57c7 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -539,7 +539,14 @@ void BufferCacheRuntime::Finish() {
+ 
+ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
+                                           std::span<const VideoCommon::BufferCopy> copies) {
+-    if (Settings::values.disable_buffer_reorder) {
++    // EDEN_NX2_NO_UPLOAD_REORDER=1 (a debug aid): as the disable_buffer_reorder setting, which no
++    // env line reaches. An upload then stays in order among the draws, at the price of ending the
++    // render pass, instead of moving to the start of the command buffer.
++    static const bool no_reorder = [] {
++        const char* const value = std::getenv("EDEN_NX2_NO_UPLOAD_REORDER");
++        return value != nullptr && value[0] != '0';
++    }();
++    if (no_reorder || Settings::values.disable_buffer_reorder) {
+         return false;
+     }
+     const bool can_use_upload_cmdbuf =
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 6dff4d9..3c40fa9 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -175,6 +175,35 @@ bool Scheduler::DeferFlush() {
+         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
+         return false;
+     }
++    // EDEN_NX2_DEFER_RECORD=<mode> (a debug aid, unset or 0: off): a deferred flush still does to
++    // the recording what Flush does, so a test can tell that from the submission itself. 1 drops
++    // the command buffer state, 2 ends the render pass, 3 both, 4 also resets the Z pass counter,
++    // which is everything SubmitExecution records, and 5 adds a full barrier, which stands in for
++    // what a submission's start and end do to the GPU caches.
++    static const char record_mode = [] {
++        const char* const value = std::getenv("EDEN_NX2_DEFER_RECORD");
++        return value != nullptr ? value[0] : '0';
++    }();
++    if (record_mode == '4' || record_mode == '5') {
++        EndPendingOperations();
++    } else if (record_mode == '2' || record_mode == '3') {
++        EndRenderPass();
++    }
++    if (record_mode == '1' || record_mode == '3' || record_mode == '4' || record_mode == '5') {
++        InvalidateState();
++    }
++    if (record_mode == '5') {
++        Record([](vk::CommandBuffer cmdbuf) {
++            static constexpr VkMemoryBarrier FULL_BARRIER{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++            };
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, FULL_BARRIER);
++        });
++    }
+     flush_pending = true;
+     return true;
+ }
+-- 
+2.54.0
+

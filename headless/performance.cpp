@@ -1449,6 +1449,32 @@ void PlatformChecks() {
 }
 } // namespace Eden::Performance
 
+// EDEN_JIT_CACHE_MIB=<core 0>,<core 1>,<cores 2 to 5>: the Switch 2 code caches' sizes in MiB, read
+// once as the first JIT starts (headless/CMakeLists.txt, jit_cache_sizes); 0 or a missing field keeps
+// the built-in size. A cache is address space committed 16 MiB at a time as it fills, so a larger
+// one costs only what is used; the most is 1 GiB (memory_pages.cpp CodeSteps). Ocarina of Time's
+// worker caches reached 96 of 96 MiB by 11 minutes (runs 160 and 162, EDEN_JIT_MEMORY); one more
+// block then clears the whole group (EDEN_JIT_PRESSURE in heap.log). Aflakon's 36-minute session
+// ran with 128 MiB on cores 3 to 5 (ocarina-cold-memory f0515ee16).
+extern "C" unsigned eden_jit_cache_bytes(unsigned core, unsigned fallback) {
+    static const std::array<unsigned, 3> mib = [] {
+        std::array<unsigned, 3> sizes{};
+        const char* value = std::getenv("EDEN_JIT_CACHE_MIB");
+        for (std::size_t i = 0; value != nullptr && i < sizes.size(); ++i) {
+            char* end = nullptr;
+            const unsigned long asked = std::strtoul(value, &end, 10);
+            sizes[i] = static_cast<unsigned>(std::min<unsigned long>(asked, 1024));
+            if (end == nullptr || *end != ',') break;
+            value = end + 1;
+        }
+        if (sizes[0] != 0 || sizes[1] != 0 || sizes[2] != 0)
+            std::fprintf(stderr, "EDEN_JIT_CACHE_MIB core0=%u core1=%u cores2to5=%u (0: as built)\n", sizes[0], sizes[1], sizes[2]);
+        return sizes;
+    }();
+    const unsigned asked = core == 0 ? mib[0] : core == 1 ? mib[1] : core < 6 ? mib[2] : 0;
+    return asked != 0 ? asked << 20 : fallback;
+}
+
 // dynarmic A64 hooks (weak there): whole-cache evacuations and block compilation time.
 extern "C" void eden_jit_evacuation(unsigned core) {
     if (core < Eden::Performance::evacuations.size())

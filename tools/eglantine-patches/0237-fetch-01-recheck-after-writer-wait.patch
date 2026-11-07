@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:30:00 +0100
+Subject: [PATCH] dma_pusher: EDEN_NX2_FETCH_RECHECK looks at the written pages
+ again when the writer wait returns at once
+
+Core patch on mig020-core (the v1.219.020 series, on top of 0232), off unless
+EDEN_NX2_FETCH_RECHECK is set.
+
+From Lichii PR 345, commit 8a8d134efb by celmax85 (zortos293/Lichii, PR still open), found by
+CodeRabbit in the review of that PR.
+
+Step looks at an entry's pages, then waits for the compute and copy work queued so far.
+WaitFor returns false when that work has already run, and Step only looks again after a real
+wait. A page that got its first mark between the first look and the wait leaves the entry on its
+submit copy.
+
+EDEN_NX2_FETCH_RECHECK=1: look again and take the entry as GPU-written. =2: look again and log,
+but leave the entry on the submit copy. Both log "Fetch recheck hit N: a page of the entry at ...
+got its first GPU-written mark during this fetch" (the first 256). A hit says only that. A mark
+covers a 4 KiB page and a whole written binding, so the write may be elsewhere on the page, and
+the back also marks for draws, which the wait doesn't cover, so the writer may still be running.
+A page's written bit never clears, so a page can hit only once a session.
+
+=1 also logs "Fetch recheck hit N words: read after a flush, k of n differ from the submit copy,
+first at word f; the entry would have taken that copy: true". That line is the evidence. k = 0:
+the hole did this entry no harm. k > 0 with true: the copy and the read disagree, so either the
+copy was stale or the read got a ring the game had refilled; the line can't tell which. =2 has no
+such line: it stays on the copy and has nothing better to compare with.
+
+EDEN_NX2_LIST_FAST stays as it was: =1 skips the wait and there is no second look there; =2 counts
+a hit as a miss. Lichii's 2 to 3 ms a frame belongs to f4434caca1, which removed a skip we don't
+have; this costs one more walk of the page bits per entry, only with the switch on. Unset, nothing
+changes. Not built, not run.
+---
+ src/video_core/dma_pusher.cpp | 97 ++++++++++++++++++++++++++++++++++++++---
+ src/video_core/dma_pusher.h   |  2 +
+ 2 files changed, 94 insertions(+), 5 deletions(-)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 0901032f55..8f0768e528 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -120,6 +120,38 @@ static int ListFastMode() {
+     return mode;
+ }
+ 
++// EDEN_NX2_FETCH_RECHECK, from Lichii PR 345 (zortos293/Lichii, celmax85's 8a8d134efb, found by
++// CodeRabbit in its review). WaitForWriters returns false when the compute and copy work sent so
++// far has already run, and Step then kept its first look at the written pages: a page that got its
++// first mark between that look and the wait left the entry on its submit copy. =1 looks again and
++// takes the entry as GPU-written. =2 looks again and logs, but leaves the entry on the submit copy:
++// the hole stays open, to see whether a slip follows a hit. Unset: no second look.
++static int FetchRecheckMode() {
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_FETCH_RECHECK");
++        return value == nullptr ? 0 : value[0] - '0';
++    }();
++    return mode;
++}
++
++// A hit says one of the entry's 4 KiB pages got its first mark during this fetch, nothing more. A
++// mark covers a whole page and a whole written binding, so the write can be elsewhere on the page,
++// and the back also marks for draws, which the wait doesn't cover, so the writer may still be
++// running. A page's written bit never clears, so a page can hit only once a session: these lines
++// are rare. Returns the hit's number for NoteFetchRecheckWords.
++static u64 NoteFetchRecheck(GPUVAddr address, u64 words, int mode) {
++    static std::atomic<u64> hits{};
++    const u64 hit = hits.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (hit <= 256) {
++        LOG_WARNING(HW_GPU,
++                    "Fetch recheck hit {}: a page of the entry at {:#x}+{:#x} words got its first "
++                    "GPU-written mark during this fetch, the entry may be stale: {}",
++                    hit, address, words,
++                    mode == 1 ? "read as GPU-written" : "left on the submit copy");
++    }
++    return hit;
++}
++
+ bool DmaPusher::WrittenPagesSettled() {
+     const u64 marks = Tegra::g_nx2_new_written_pages.load(std::memory_order_relaxed);
+     const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+@@ -265,14 +297,28 @@ bool DmaPusher::Step() {
+         // billions of instances and lost the device loading a race).
+         bool gpu_written =
+             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
++        u64 recheck_hit = 0; // EDEN_NX2_FETCH_RECHECK=1 moved this entry off its submit copy
+         if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
+             const int list_fast = ListFastMode();
+             const bool settled = list_fast != 0 && WrittenPagesSettled();
+-            if (!(settled && list_fast == 1) && VideoCommon::GpuSplit::Get().WaitForWriters()) {
+-                gpu_written =
+-                    IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+-                if (settled) {
+-                    NoteListFastCheck(dma_state.dma_get, gpu_written);
++            if (!(settled && list_fast == 1)) {
++                if (VideoCommon::GpuSplit::Get().WaitForWriters()) {
++                    gpu_written =
++                        IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
++                    if (settled) {
++                        NoteListFastCheck(dma_state.dma_get, gpu_written);
++                    }
++                } else if (const int recheck = FetchRecheckMode();
++                           recheck != 0 &&
++                           IsGpuWrittenCommands(dma_state.dma_get,
++                                                size_t{header.size} * sizeof(u32))) {
++                    // No wait, yet a page is marked now: its first mark came after the first look.
++                    const u64 hit = NoteFetchRecheck(dma_state.dma_get, u64{header.size}, recheck);
++                    gpu_written = recheck == 1;
++                    recheck_hit = recheck == 1 ? hit : 0;
++                    if (settled) {
++                        NoteListFastCheck(dma_state.dma_get, true);
++                    }
+                 }
+             }
+         }
+@@ -321,6 +367,9 @@ bool DmaPusher::Step() {
+             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+             entry_trace.source = 2;
+             RecordParsedEntry(header, commands);
++            if (recheck_hit != 0) {
++                NoteFetchRecheckWords(recheck_hit, commands, "through the list copies");
++            }
+             command_resume_offset +=
+                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+         } else {
+@@ -328,6 +377,9 @@ bool DmaPusher::Step() {
+             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+             RecordParsedEntry(header, commands);
++            if (recheck_hit != 0) {
++                NoteFetchRecheckWords(recheck_hit, commands, "after a flush");
++            }
+             command_resume_offset +=
+                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+         }
+@@ -802,6 +854,41 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+     }
+ }
+ 
++void DmaPusher::NoteFetchRecheckWords(u64 hit, std::span<const CommandHeader> commands,
++                                      const char* how) {
++    if (hit > 256) {
++        return;
++    }
++    const CommandList& list = dma_pushbuffer.front();
++    const size_t index = dma_pushbuffer_subindex;
++    // An all-zero entry's offset is out of range on purpose, a deferred entry's slot is unfilled.
++    if (index >= list.submitted_offsets.size() ||
++        size_t{list.submitted_offsets[index]} + commands.size() > list.submitted_words.size() ||
++        std::ranges::binary_search(list.deferred_entries, static_cast<u32>(index))) {
++        LOG_WARNING(HW_GPU, "Fetch recheck hit {} words: read {}, no submit copy to compare", hit,
++                    how);
++        return;
++    }
++    // Whether Step would have parsed that copy with no second look (its `submitted`).
++    const bool would_take_copy = command_resume_offset == 0 &&
++                                 (list.snapshot_suspensions & 1) == 0 &&
++                                 list.snapshot_suspensions ==
++                                     suspensions.load(std::memory_order_acquire);
++    const CommandHeader* const copy = list.submitted_words.data() + list.submitted_offsets[index];
++    size_t differing = 0;
++    size_t first = 0;
++    for (size_t i = command_resume_offset; i < commands.size(); ++i) {
++        if (copy[i].argument != commands[i].argument) {
++            first = differing == 0 ? i : first;
++            ++differing;
++        }
++    }
++    LOG_WARNING(HW_GPU,
++                "Fetch recheck hit {} words: read {}, {} of {} differ from the submit copy, first "
++                "at word {}; the entry would have taken that copy: {}",
++                hit, how, differing, commands.size(), first, would_take_copy);
++}
++
+ void DmaPusher::ReportUnboundSubchannel() {
+     // Methods sent to a subchannel with no engine (no SetObject yet) are dropped.
+     static std::atomic<u32> reported{};
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index e3a58cb7ff..2b0d34f51e 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -218,6 +218,8 @@ public:
+     void NoteListFastCheck(GPUVAddr address, bool written);
+     u64 list_fast_marks{};
+     u64 list_fast_since{};
++    /// EDEN_NX2_FETCH_RECHECK=1: logs how the words the parser got for a hit differ from the copy.
++    void NoteFetchRecheckWords(u64 hit, std::span<const CommandHeader> commands, const char* how);
+     /// Copies the list's words from memory again, as of suspension count `now`.
+     void RefreshSnapshot(CommandList& list, u64 now);
+     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
+-- 
+2.54.0
+
