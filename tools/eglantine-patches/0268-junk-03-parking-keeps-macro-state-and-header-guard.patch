@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 23:30:00 +0100
+Subject: [PATCH] Command parser: parking keeps the macro state; EDEN_NX2_JUNK_GUARD header guard
+
+Two changes to the split-method parser (runs 149, 162, 165, 195, 196: an entry's first words fed a
+method the entry before left open, and the stream was read one word off from there, GPUBack SIGSEGV).
+
+1. Parking (EDEN_NX2_PARK_SPLIT_METHODS and EDEN_NX2_SPLIT_PARSE_CHECK paths) parked only the DMA state
+   and left the Maxwell3D macro the method was feeding (executing_macro and its words) in the engine, so
+   the next macro's words joined it under the old id. ParkedMethod now carries the macro id and words,
+   taken out of the engine when parked (Maxwell3D::SwapMacroState: the front's with front macros, the
+   back's with no split, none while the back thread owns them) and put back when the stream resumes
+   at the split entry's end; a parked method dropped at the end of the submission, or as the oldest of
+   16, drops its macro with it (the "Submission ended" line now names it). SplitContinuesHere reads the
+   entry's submit copy, the words the parser will run, instead of memory the game may be refilling.
+   Nothing changes without one of those two switches.
+
+2. EDEN_NX2_JUNK_GUARD=1 (off unless set): an Increasing header whose method + count passes 0x1000 is
+   a data word read as a header (run 162: 3f800000, count 8064; run 195: 38400000, count 6208). The
+   guard takes any half-fed macro out of the engine the carried words went to, dumps the entry
+   (DumpCurrentEntry, with the JUNK_TRACE line when that is on; the first 4 hits), logs the hit with
+   the first 8 words (first 64 hits), clears the method and drops the rest of the entry. When the
+   entry had given words to a method of the entry before without starting where that one ended, the
+   entry that starts there (the real continuation) begins with that many words of data: ProcessCommands
+   skips them once, logged. The skip is forgotten at the end of the submission, as parked methods are.
+
+Not built, not run on the console. Syntax-checked with Apple clang 21 (-std=c++20, Boost stubs).
+---
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 2f5501d..926e9fb 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -366,6 +366,8 @@ bool DmaPusher::Step() {
+                     }
+                 }
+             }
++            // For JunkGuardHit: words this entry gives a method of the entry before, not starting where it ended.
++            guard_carried_words = header.addr != split_method_end ? dma_state.method_count : 0;
+             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
+                 CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
+             }
+@@ -489,12 +491,13 @@ bool DmaPusher::Step() {
+             if (reported.fetch_add(1) < 16) {
+                 LOG_WARNING(HW_GPU,
+                             "Submission ended with parked method {:#x} (sub {}, {} words left, "
+-                            "resume {:#x})",
++                            "resume {:#x}, macro {:#x} with {} words dropped)",
+                             parked.method, parked.subchannel, parked.method_count,
+-                            parked.resume_address);
++                            parked.resume_address, parked.macro, parked.macro_parameters.size());
+             }
+         }
+         parked_methods.clear();
++        junk_skip_words = 0;
+         dma_pushbuffer.pop_front();
+         dma_pushbuffer_subindex = 0;
+     } else {
+@@ -538,7 +541,14 @@ static bool RecordParsedEntries() {
+ }
+ 
+ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+-    for (size_t index = 0; index < commands.size();) {
++    size_t index = 0;
++    if (junk_skip_words != 0 && word_offset == 0 && dma_state.method_count == 0 &&
++        dma_state.dma_get == junk_skip_address) [[unlikely]] {
++        index = std::min<size_t>(junk_skip_words, commands.size()); // data of the method JunkGuardHit dropped
++        LOG_WARNING(HW_GPU, "Junk guard: skipping {} words at {:#x}, the dropped method's data", index, dma_state.dma_get);
++        junk_skip_words = 0;
++    }
++    for (; index < commands.size();) {
+         // Data word of methods command
+         if (dma_state.method_count && dma_state.non_incrementing) {
+             auto const& command_header = commands[index]; //must ref (MUltiMethod re)
+@@ -592,6 +602,11 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
+             // No command active - this is the first word of a new one
+             switch (command_header.mode) {
+             case SubmissionMode::Increasing:
++                static const bool junk_guard = [] { const char* v = std::getenv("EDEN_NX2_JUNK_GUARD"); return v != nullptr && v[0] == '1'; }();
++                if (junk_guard && u32{command_header.method} + u32{command_header.arg_count} > 0x1000) [[unlikely]] {
++                    JunkGuardHit(commands, index, word_offset);
++                    return commands.size(); // the rest of the entry is junk too
++                }
+                 SetState(command_header);
+                 dma_state.non_incrementing = false;
+                 dma_increment_once = false;
+@@ -677,7 +692,16 @@ static bool ReadsAsCommands(std::span<const u32> words, size_t entry_words, size
+ bool DmaPusher::SplitContinuesHere(const CommandListHeader& header) {
+     std::array<u32, 64> words{};
+     const size_t read = std::min<size_t>(header.size, words.size());
+-    memory_manager.ReadBlockUnsafe(header.addr, words.data(), read * sizeof(u32));
++    // The words the parser runs: the submit copy where there is one (the game may be refilling the ring).
++    const CommandList& list = dma_pushbuffer.front();
++    if (dma_pushbuffer_subindex < list.submitted_offsets.size() &&
++        size_t{list.submitted_offsets[dma_pushbuffer_subindex]} + header.size <= list.submitted_words.size() &&
++        !std::ranges::binary_search(list.deferred_entries, static_cast<u32>(dma_pushbuffer_subindex))) {
++        const CommandHeader* const copy = list.submitted_words.data() + list.submitted_offsets[dma_pushbuffer_subindex];
++        std::transform(copy, copy + read, words.begin(), [](const CommandHeader& h) { return h.argument; });
++    } else {
++        memory_manager.ReadBlockUnsafe(header.addr, words.data(), read * sizeof(u32));
++    }
+     const std::span<const u32> window{words.data(), read};
+     const bool as_continuation = ReadsAsCommands(window, header.size, dma_state.method_count);
+     const bool as_fresh = ReadsAsCommands(window, header.size, 0);
+@@ -699,7 +723,7 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+                                              &ParkedMethod::resume_address);
+     std::optional<ParkedMethod> resume;
+     if (continued != parked_methods.end()) {
+-        resume = *continued;
++        resume = std::move(*continued);
+         parked_methods.erase(continued);
+     }
+     if (dma_state.method_count != 0 && entry_address != split_method_end) {
+@@ -714,14 +738,19 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+             }
+             parked_methods.erase(parked_methods.begin());
+         }
+-        parked_methods.push_back(ParkedMethod{
++        ParkedMethod parked{
+             .method = dma_state.method,
+             .subchannel = dma_state.subchannel,
+             .method_count = dma_state.method_count,
+             .non_incrementing = dma_state.non_incrementing,
+             .increment_once = dma_increment_once,
+             .resume_address = split_method_end,
+-        });
++        };
++        // A macro the method was feeding goes with it: left behind, the next macro's words would join it.
++        if (auto* const maxwell3d = Maxwell3DOn(dma_state.subchannel)) {
++            maxwell3d->SwapMacroState(parked.macro, parked.macro_parameters);
++        }
++        parked_methods.push_back(std::move(parked));
+         dma_state.method_count = 0;
+         dma_increment_once = false;
+     }
+@@ -731,6 +760,42 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+         dma_state.method_count = resume->method_count;
+         dma_state.non_incrementing = resume->non_incrementing;
+         dma_increment_once = resume->increment_once;
++        if (auto* const maxwell3d = Maxwell3DOn(resume->subchannel); maxwell3d && resume->macro != 0) {
++            maxwell3d->SwapMacroState(resume->macro, resume->macro_parameters);
++        }
++    }
++}
++
++Engines::Maxwell3D* DmaPusher::Maxwell3DOn(u32 subchannel) const {
++    return subchannel_type[subchannel] == Engines::EngineTypes::Maxwell3D ? static_cast<Engines::Maxwell3D*>(subchannels[subchannel]) : nullptr;
++}
++
++void DmaPusher::JunkGuardHit(std::span<const CommandHeader> commands, size_t index, size_t word_offset) {
++    static std::atomic<u32> hits{};
++    const u32 hit = hits.fetch_add(1);
++    const u32 carried_method = dma_state.method;
++    u32 macro{}; // any half-fed macro of the engine the carried words went to
++    std::vector<u32> parameters;
++    if (auto* const maxwell3d = Maxwell3DOn(dma_state.subchannel)) {
++        maxwell3d->SwapMacroState(macro, parameters);
++    }
++    SetState(commands[index]); // what the dump reports
++    dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
++    if (hit < 64) {
++        std::array<u32, 8> words{};
++        std::ranges::transform(commands.subspan(index, std::min<size_t>(words.size(), commands.size() - index)), words.begin(), &CommandHeader::argument);
++        LOG_WARNING(HW_GPU,
++                    "Junk guard hit {}: method {:#x} count {} at word {} of entry {:#x}, dropping the rest; it gave {} "
++                    "words to method {:#x} of the entry before (ended {:#x}); macro {:#x} dropped with {} words; words {:08x}",
++                    hit, dma_state.method, dma_state.method_count, word_offset + index, dma_state.dma_get,
++                    guard_carried_words, carried_method, split_method_end, macro, parameters.size(), fmt::join(words, " "));
++    }
++    if (hit < 4) DumpCurrentEntry("junk guard");
++    dma_state.method_count = 0;
++    dma_increment_once = false;
++    if (guard_carried_words != 0) { // the real continuation starts with the words this entry gave
++        junk_skip_address = split_method_end;
++        junk_skip_words = guard_carried_words;
+     }
+ }
+ 
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index 1c80bb6..ed4cd7d 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -34,6 +34,7 @@ struct ChannelState;
+ 
+ class GPU;
+ class MemoryManager;
++namespace Engines { class Maxwell3D; }
+ 
+ enum class SubmissionMode : u32 {
+     IncreasingOld = 0,
+@@ -281,8 +282,11 @@ public:
+         bool non_incrementing;
+         bool increment_once;
+         GPUVAddr resume_address; ///< Where the entry that continues the method starts
++        u32 macro{}; ///< Maxwell3D macro the method was feeding (0 none), with its words so far
++        std::vector<u32> macro_parameters;
+     };
+     void ResolveSplitMethod(GPUVAddr entry_address);
++    Engines::Maxwell3D* Maxwell3DOn(u32 subchannel) const;
+     static constexpr size_t MaxParkedMethods = 16;
+     /// EDEN_NX2_SPLIT_PARSE_CHECK: 0 off, 1 on, 2 on and logging the first decisions.
+     static int SplitCheckMode();
+@@ -301,6 +305,13 @@ public:
+     std::vector<ParkedMethod> parked_methods;
+     GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
+ 
++    // EDEN_NX2_JUNK_GUARD=1 (off unless set): an Increasing header whose method + count passes 0x1000 is
++    // a data word read as a header (runs 162 and 195: the stream read one word off after a split method).
++    void JunkGuardHit(std::span<const CommandHeader> commands, size_t index, size_t word_offset);
++    u32 guard_carried_words{}; ///< Words the entry being parsed gave a method of the entry before
++    GPUVAddr junk_skip_address{}; ///< Entry that starts with junk_skip_words of a dropped method's data
++    u32 junk_skip_words{};
++
+     // EDEN_NX2_JUNK_TRACE=1: what fed the entry being parsed, logged by DumpCurrentEntry at the
+     // first unknown method (where the stream had turned to junk in runs 149 and 162).
+     struct EntryTrace {
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index ae9c92d..2416cd2 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1082,6 +1082,16 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
+     return *front;
+ }
+ 
++void Maxwell3D::SwapMacroState(u32& macro, std::vector<u32>& parameters) {
++    if (front_macros && front) {
++        std::swap(macro, front->executing_macro);
++        parameters.swap(front->parameters);
++    } else if (!VideoCommon::GpuSplit::Get().Active()) {
++        std::swap(macro, executing_macro);
++        parameters.swap(macro_params);
++    }
++}
++
+ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                            u32 argument, bool is_last_call, bool from_macro) {
+     namespace Profile = VideoCommon::Nx2Profile;
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index aba49b5..fd06025 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3215,6 +3215,10 @@ public:
+     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                               const u32* base_start, u32 amount, u32 methods_pending);
+ 
++    /// DmaPusher parking a macro call split across GPFIFO entries (NX2): swaps the call's id and words so
++    /// far (the front's with front macros, the back's with no split, none when the back thread owns them).
++    void SwapMacroState(u32& macro, std::vector<u32>& parameters);
++
+     bool ShouldExecute() const {
+         return execute_on;
+     }

@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 21:40:00 +0100
+Subject: [PATCH] Ocarina Dynamic FPS: EDEN_NX2_OOT_DYNAMIC_FPS_DIV sets the delta cap
+
+Off unless set. Lichii 760183a, CTGL's #299, rewritten as a switch here: the routine caps the measured frame
+time at CNTFRQ / 20 (50 ms), so under 20 fps the game runs below real speed. =10 keeps real speed down to 10 fps.
+Same routine, one instruction. Does not change the intro movie's picture drifting from its audio.
+---
+diff --git a/src/core/loader/nso.cpp b/src/core/loader/nso.cpp
+index 922be51..566683a 100644
+--- a/src/core/loader/nso.cpp
++++ b/src/core/loader/nso.cpp
+@@ -102,6 +102,16 @@ void ApplyOcarinaDynamicFps(std::span<u8> image, const NSOHeader& header, u64 co
+                 OcarinaDynamicFpsCall.size());
+     std::memcpy(image.data() + OcarinaDynamicFpsSite, OcarinaDynamicFpsCode.data(),
+                 OcarinaDynamicFpsCode.size());
++    // EDEN_NX2_OOT_DYNAMIC_FPS_DIV=<n> (off unless set): the routine caps a frame's measured time at
++    // CNTFRQ / n, 20 in the original (50 ms), so under 20 fps the game runs slow. 10 keeps real speed
++    // down to 10 fps (Lichii 760183a, CTGL's #299). `mov x14, #n` is the routine's 10th instruction.
++    if (const char* const divisor = std::getenv("EDEN_NX2_OOT_DYNAMIC_FPS_DIV")) {
++        const unsigned value = static_cast<unsigned>(std::strtoul(divisor, nullptr, 10));
++        if (value >= 2 && value <= 60) {
++            const u32 instruction = 0xD2800000u | (value << 5) | 14u;
++            std::memcpy(image.data() + OcarinaDynamicFpsSite + 36, &instruction, sizeof(instruction));
++        }
++    }
+     const auto& data = header.segments[2];
+     LOG_INFO(Loader, "Ocarina of Time: Dynamic FPS on (main+{:#x} held {:#010x}, BSS ends at {:#x})",
+              OcarinaFrameStepSite, replaced, u64{data.location} + data.size + data.bss_size);
