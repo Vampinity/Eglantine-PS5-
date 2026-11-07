@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 04:00:00 +0100
+Subject: [PATCH] vk_rasterizer: EDEN_NX2_DEPTH_EQUAL_RELAX tests whether the opaque pass's EQUAL
+ depth test is what loses an object's colour
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_DEPTH_EQUAL_RELAX is set.
+Debug only, not a fix. =1 is the depth part of sharkiix 28f594acc7 (Shakoquo/Lichii-sharkiix-version).
+
+The white shapes look like the full-screen sky seen inside an object's outline. ChiefSZ13's nxnative
+PR 1299 describes the same thing for the whole picture: the game's main opaque pass tests depth
+EQUAL against the prepass, and when that test failed everywhere "only the full-screen sky remained".
+That case is a depth target cleared across the whole picture, so it supports "EQUAL fails and sky
+shows", not "one object was judged occluded". An object can lose its colour for a frame in two ways:
+its opaque draws don't run, or they run and EQUAL rejects them, because the prepass and the opaque
+pass disagree about its depth (a stale per-draw transform in one of them, say).
+
+=2 runs an EQUAL depth test as ALWAYS, in the dynamic state and in the pipeline. If the white goes,
+the draws ran and EQUAL rejected them, which points at the bank and at per-draw data. If it stays,
+EQUAL isn't what loses the colour: the draws did not run, or they don't use EQUAL. It needs the line
+"first EQUAL depth test changed" in the log, or the run had no EQUAL test to change. Later draws
+paint over earlier ones whatever their depth, so the picture will look wrong: judge only the white
+shape.
+
+=1 runs it as LESS_OR_EQUAL. That passes a mismatch on one side only, and the game's depth direction
+isn't known, so a flash that stays under =1 proves nothing. Use it only after =2 made the white go.
+
+Unset, nothing changes. Not built, not run.
+---
+ src/video_core/renderer_vulkan/maxwell_to_vk.cpp        | 23 +++++++++++++++++++++++
+ src/video_core/renderer_vulkan/maxwell_to_vk.h          |  2 ++
+ src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp |  2 +-
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp        |  2 +-
+ 4 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/maxwell_to_vk.cpp b/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
+index e03e578..35bec45 100644
+--- a/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
++++ b/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
++#include <cstdlib>
+ #include <iterator>
+ 
+ #include "common/assert.h"
+@@ -612,6 +614,27 @@ VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
+                                      FormatType::Buffer);
+ }
+ 
++VkCompareOp DepthTestOp(Maxwell::ComparisonOp comparison) {
++    // EDEN_NX2_DEPTH_EQUAL_RELAX (diagnostic): an EQUAL depth test after a depth prepass passes only
++    // if both passes computed the same depth. =1 (sharkiix 28f594acc7) runs it as LESS_OR_EQUAL,
++    // which lets through a mismatch on one side only, and which side depends on the game's depth
++    // direction. =2 runs it as ALWAYS, which lets through any mismatch.
++    static const char mode = [] {
++        const char* value = std::getenv("EDEN_NX2_DEPTH_EQUAL_RELAX");
++        return value != nullptr ? value[0] : '0';
++    }();
++    const VkCompareOp op = ComparisonOp(comparison);
++    if (mode == '0' || op != VK_COMPARE_OP_EQUAL) {
++        return op;
++    }
++    // A run with no such line had no EQUAL test to change, and says nothing.
++    static std::atomic<bool> logged{};
++    if (!logged.exchange(true)) {
++        LOG_INFO(Render_Vulkan, "EDEN_NX2_DEPTH_EQUAL_RELAX: first EQUAL depth test changed");
++    }
++    return mode == '2' ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL;
++}
++
+ VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison) {
+     switch (comparison) {
+     case Maxwell::ComparisonOp::Never_D3D:
+diff --git a/src/video_core/renderer_vulkan/maxwell_to_vk.h b/src/video_core/renderer_vulkan/maxwell_to_vk.h
+index 8e97e48..ce2dc22 100644
+--- a/src/video_core/renderer_vulkan/maxwell_to_vk.h
++++ b/src/video_core/renderer_vulkan/maxwell_to_vk.h
+@@ -56,6 +56,8 @@ VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
+ 
+ VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison);
+ 
++VkCompareOp DepthTestOp(Maxwell::ComparisonOp comparison);
++
+ VkIndexType IndexFormat(Maxwell::IndexFormat index_format);
+ 
+ VkStencilOp StencilOp(Maxwell::StencilOp::Op stencil_op);
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 8405131..19bf728 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -1057,7 +1057,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         .depthTestEnable = dynamic.depth_test_enable,
+         .depthWriteEnable = dynamic.depth_write_enable,
+         .depthCompareOp = dynamic.depth_test_enable
+-                              ? MaxwellToVK::ComparisonOp(dynamic.DepthTestFunc())
++                              ? MaxwellToVK::DepthTestOp(dynamic.DepthTestFunc())
+                               : VK_COMPARE_OP_ALWAYS,
+         .depthBoundsTestEnable = dynamic.depth_bounds_enable && device.IsDepthBoundsSupported(),
+         .stencilTestEnable = dynamic.stencil_enable,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index eac1b6a..b9ce9af 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2840,7 +2840,7 @@ void RasterizerVulkan::UpdateDepthCompareOp(Tegra::Engines::Maxwell3D::Regs& reg
+         return;
+     }
+     scheduler.Record([func = regs.depth_test_func](vk::CommandBuffer cmdbuf) {
+-        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::ComparisonOp(func));
++        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::DepthTestOp(func));
+     });
+ }
+ 

@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 03:30:00 +0100
+Subject: [PATCH] maxwell_3d: EDEN_NX2_COND_MODE decides guest render conditions
+ on pending reports, EDEN_NX2_COND_TRACE counts them
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_COND_MODE or
+EDEN_NX2_COND_TRACE is set.
+
+Ocarina's water surface switches on and off whole, from one game frame to the next (Robin's hand
+recording, 334.5 and 342.2 s; the white sheets are the correct picture). This is one suspect, not a
+proven cause: nothing yet shows that Ocarina gates the water with a render condition.
+
+Upstream draws unconditionally below High accuracy when a condition's values are pending host
+queries. Our port's default, hcr_mode 1 (tools/prepare-vulkan-port.py, headless/dev_vulkan.h), sends
+those cases to the CPU evaluation in ProcessQueryCondition instead, on the grounds that the read
+waits for the query. Below High accuracy it does not: ReadBlock calls FlushRegion, then
+RequestGuestHostSync, then WaitPendingFences, and SignalFence runs that wait's callback at once. The
+comment in RasterizerVulkan::FlushQueryResults says the same, and Lichii PR 215 (7ae3e74014) found
+it for macro reads. So the condition can read a word older than the report, and SemiFlushRegion can
+write a report before its carried count is added. A false result drops the draws.
+
+EDEN_NX2_COND_MODE:
+  always   every Conditional, IfEqual and IfNotEqual condition passes. The blunt test.
+  pending  a condition whose report is still pending passes, as upstream does below High accuracy.
+  wait     wait for the pending report, then read it. Exact, at the price of a GPU wait.
+EDEN_NX2_COND_TRACE=1 logs a line a second (host path, read true, read false, read with the report
+pending) and the words of the first 32 conditions that read false. It works with any mode.
+
+A report freed at once by is_synced is not pending, so pending and wait do not see it: use
+EDEN_NX2_QUERY_KEEP_PENDING=1 (patch 0244) with them to cover fence-flagged reports.
+
+Both strings pinned by headless/CMakeLists.txt for development builds (condition_accelerated,
+condition_end) are kept as they are. hcr= in dev-settings.txt can't be used on a release build: that
+block is inside EDEN_DEV_PROFILE. Unset, nothing changes. Not built, not run.
+---
+ src/video_core/engines/maxwell_3d.cpp | 103 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 103 insertions(+)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -7,9 +7,12 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <optional>
++#include <string_view>
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+ #include "common/scope_exit.h"
+@@ -684,5 +687,72 @@
+         break;
+     }
+ }
++
++namespace {
++enum class RenderConditionMode { Normal, Always, Pending, Wait };
+ 
++/// EDEN_NX2_COND_MODE: how a guest render condition is decided on the CPU. Below High accuracy a
++/// fence runs its callback at once, so the flush in ReadBlock returns before a pending report has
++/// reached guest memory, and the read gets an older word.
++/// always: every guest condition passes, as a test. pending: one whose report is still pending
++/// passes, which is what upstream does below High accuracy. wait: wait for the pending report,
++/// then read it. Unset: as before.
++RenderConditionMode GetRenderConditionMode() {
++    static const RenderConditionMode mode = [] {
++        const char* const value = std::getenv("EDEN_NX2_COND_MODE");
++        const std::string_view name{value != nullptr ? value : ""};
++        return name == "always"    ? RenderConditionMode::Always
++               : name == "pending" ? RenderConditionMode::Pending
++               : name == "wait"    ? RenderConditionMode::Wait
++                                   : RenderConditionMode::Normal;
++    }();
++    return mode;
++}
++
++/// EDEN_NX2_COND_TRACE=1: a line a second counting guest render conditions, and the first 32 that
++/// read false with their words.
++bool RenderConditionTraceEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_COND_TRACE");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++/// Runs on the thread that owns the rasterizer's caches, so the counters need no lock.
++void NoteRenderCondition(const MemoryManager& memory, GPUVAddr address, bool on_host, bool pending,
++                         bool executed) {
++    static u64 host{};
++    static u64 read_true{};
++    static u64 read_false{};
++    static u64 read_pending{};
++    static u64 logged{};
++    static auto last = std::chrono::steady_clock::now();
++    if (on_host) {
++        ++host;
++    } else {
++        ++(executed ? read_true : read_false);
++        read_pending += pending ? 1 : 0;
++        if (!executed && logged < 32) {
++            std::array<u32, 6> words{};
++            memory.ReadBlockUnsafe(address, words.data(), sizeof(words));
++            LOG_INFO(HW_GPU,
++                     "Render condition false #{}: gpu={:#x} pending={} "
++                     "words={:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
++                     ++logged, address, pending, words[0], words[1], words[2], words[3], words[4],
++                     words[5]);
++        }
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last >= std::chrono::seconds{1}) {
++        LOG_INFO(HW_GPU,
++                 "Render conditions in the last second: {} on the host path, {} read true, {} read "
++                 "false, {} of those read with the report pending",
++                 host, read_true, read_false, read_pending);
++        host = read_true = read_false = read_pending = 0;
++        last = now;
++    }
++}
++} // Anonymous namespace
++
+ void Maxwell3D::ProcessQueryCondition() {
+@@ -697,8 +800,41 @@
++    const bool guest_condition =
++        regs.render_enable_override == Regs::RenderEnable::Override::UseRenderEnable &&
++        (regs.render_enable.mode == Regs::RenderEnable::Mode::Conditional ||
++         regs.render_enable.mode == Regs::RenderEnable::Mode::IfEqual ||
++         regs.render_enable.mode == Regs::RenderEnable::Mode::IfNotEqual);
++    const RenderConditionMode condition_mode = GetRenderConditionMode();
++    const bool condition_trace = RenderConditionTraceEnabled();
++    bool on_host = true;
++    bool pending = false;
++    SCOPE_EXIT {
++        if (guest_condition && condition_trace) {
++            NoteRenderCondition(memory_manager, regs.render_enable.Address(), on_host, pending,
++                                execute_on);
++        }
++    };
++    if (guest_condition && condition_mode == RenderConditionMode::Always) {
++        execute_on = true;
++        return;
++    }
+     if (rasterizer->AccelerateConditionalRendering()) {
+         execute_on = true;
+         return;
+     }
+     const GPUVAddr condition_address{regs.render_enable.Address()};
++    on_host = false;
++    if (guest_condition && (condition_trace || condition_mode != RenderConditionMode::Normal)) {
++        pending = VideoCommon::QueryDma::HasPendingQueries(
++            memory_manager, *rasterizer, condition_address, sizeof(Regs::ReportSemaphore::Compare));
++        if (pending && condition_mode == RenderConditionMode::Pending) {
++            execute_on = true;
++            return;
++        }
++        if (pending && condition_mode == RenderConditionMode::Wait) {
++            // Wait first: the flush in ReadBlock can write a report before its carried count is
++            // added (see RasterizerVulkan::FlushQueryResults).
++            rasterizer->WaitForQueries();
++        }
++    }
+     switch (regs.render_enable_override) {
+     case Regs::RenderEnable::Override::AlwaysRender:
+         execute_on = true;

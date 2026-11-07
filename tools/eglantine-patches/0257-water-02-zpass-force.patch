@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 03:30:00 +0100
+Subject: [PATCH] query_cache: EDEN_NX2_ZPASS_FORCE makes every occlusion report
+ read as visible, as a test
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_ZPASS_FORCE=1 is set. A test,
+never a fix.
+
+Ocarina's water surface switches on and off whole from one game frame to the next. This asks one
+question whatever path the game reads its reports through (a render condition, a macro, the CPU):
+is an occlusion report the switch? Each ZPass report gets a rising value, 0x10000 a report, so a
+report and the difference of two reports are never 0. The real count is kept for the running
+accumulation. SemiFlushQueryDirty skips these reports, or it would write the real count first.
+
+If the water stays on, occlusion reports are the gate. If it still flips, they probably aren't. One
+limit: a word the game clears before the report lands still reads 0, so run it with
+EDEN_NX2_COND_MODE=always to close the render condition path too.
+
+Cost: nothing is occlusion culled, so expect a lower frame rate, and effects that scale with a
+count (lens flare, glows) may show at full strength. Judge the water only. Unset, nothing changes.
+Not built, not run.
+---
+ src/video_core/query_cache/query_cache.h | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <cstdlib>
+ #include <deque>
+ #include <memory>
+@@ -33,6 +34,16 @@
+ namespace VideoCommon {
+ 
+ using Maxwell = Tegra::Engines::Maxwell3D;
++
++/// EDEN_NX2_ZPASS_FORCE=1: every occlusion report reads as visible, a test and never a fix. Each
++/// report gets a rising value, so a report, or the difference of two, is never 0.
++inline bool ForceZpassReports() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_ZPASS_FORCE");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
+ 
+ struct SyncValuesStruct {
+     VAddr address;
+@@ -294,3 +305,8 @@
++        if (ForceZpassReports() &&
++            streamer->GetId() == static_cast<size_t>(QueryType::ZPassPixelCount64)) {
++            static std::atomic<u64> forced{};
++            query_base->value = forced.fetch_add(0x10000, std::memory_order_relaxed) + 0x10000;
++        }
+         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+             u64 timestamp = impl->gpu.GetTicks();
+             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+@@ -591,6 +607,10 @@
+     }
+     if (True(query_base->flags & QueryFlagBits::IsFinalValueSynced) &&
+         False(query_base->flags & QueryFlagBits::IsGuestSynced)) {
++        if (ForceZpassReports() &&
++            location.stream_id.Value() == static_cast<u32>(QueryType::ZPassPixelCount64)) {
++            return false;
++        }
+         auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
+         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+             std::memcpy(ptr, &query_base->value, sizeof(query_base->value));

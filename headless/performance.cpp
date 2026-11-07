@@ -454,6 +454,8 @@ extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 extern "C" void eden_guest_memory_report(void) __attribute__((weak));
 extern "C" void eden_guest_memory_pool_short(int is_short) __attribute__((weak));
+extern "C" void eden_guest_memory_waits(unsigned long long* won, unsigned long long* lost,
+                                        unsigned long long* refused) __attribute__((weak));
 #ifdef PS5_NATIVE
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
 extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
@@ -591,6 +593,25 @@ static void RefreshFreeMemory() {
                      kernel_memory ? kernel_memory() >> 20 : 0ULL);
         ReportHeap("every 20 s");
         ReportLedger();
+        // EDEN_NX2_POOL_WALK=1 (off unless set): the pool by block size every 20 s (EDEN_REFUSED_POOL,
+        // the walk a refusal makes). available_mib is the largest block, the ledger the sum: only
+        // this says how much of what is free comes in 2 MiB blocks. Up to 4096 kernel calls, on the
+        // GPU thread: not for timing runs. It prints the ledger again, and run-report.py counts
+        // each one as a refusal report. Then the writes that had to wait for a block: nothing calls
+        // eden_guest_memory_waits today, and the lines WaitForBlock writes go to the kernel log.
+        static const bool pool_walk = [] {
+            const char* const value = std::getenv("EDEN_NX2_POOL_WALK");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (pool_walk) {
+            ReportPool();
+            if (eden_guest_memory_waits) {
+                unsigned long long won = 0, lost = 0, refused = 0;
+                eden_guest_memory_waits(&won, &lost, &refused);
+                std::fprintf(stderr, "EDEN_GUEST_WAITS got a block %llu, waited 2 s for nothing %llu, writes refused %llu\n",
+                             won, lost, refused);
+            }
+        }
     }
     // The last burst of a session falls between two reports of the guest's memory (every 30 s):
     // who wrote it, while the pool's largest block is nearly gone (every 5 s at most).

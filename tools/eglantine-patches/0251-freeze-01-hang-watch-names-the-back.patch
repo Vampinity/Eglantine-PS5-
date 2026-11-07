@@ -1,0 +1,776 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 04:00:00 +0100
+Subject: [PATCH] gpu_split: the hang watch names the back's entry, engine and
+ wait site
+
+Core patch, next after 0250 (T44). Also applies on mig020-core (T42) and needs nothing from 0233 to
+0250. Off unless EDEN_NX2_HANG_WATCH=1.
+
+Runs 182 and 190 froze with "back running (inside a command)" and nothing else: the log gave a word
+count that is 4096 words coarse, no method, and no idea whether the back slept or spun. The present
+runs on the back (async_presentation off), so its waits for the Vulkan worker and for the display are
+the back's waits too, and none of them logs. The hang watch only saw GPU tick waits.
+
+With the switch on, each 5 s report of the front waiting for the back (GpuSplit::Drain and WaitFor)
+is followed by:
+
+  Hang watch: the back runs word N of M: <kind> entry, <engine> engine, method, value, last thunk,
+              at: <wait site>
+  Hang watch: ring at N: ...           the entry and up to 128 words queued behind it, once per place
+  Hang watch: texture cache lock S ... state, and who holds it by name
+  Hang watch: the GPU is at tick ...   ticks, chunks queued, worker idle or not, submit lock
+  Hang watch: worker at: ...; present thread at: ...; fencing at: ...
+
+and, when the GPU has unfinished work, by ReportStall's lines: the unfinished ticks and, on T44, the
+ask for the driver's dump (EDEN_NX2_RADV_STALL_DUMP=1). Until now only a tick wait reached those, and
+runs 182 and 190 had none, so run 190's stall dump was never asked for. ReportStall's "waited 3 s"
+wording stays, because 0250 anchors on those lines; a line before it says it isn't a tick wait.
+
+Wait sites are string literals in one atomic per thread (common/hang_site.h), set by a small RAII
+object at each place that can block without a time limit: GetRenderFrame's two waits, the steps of
+CopyToSwapchainImpl, RecreateSwapchain and DiscardFrame, the back's WaitWorker in Present, a GPU tick
+wait, a pipeline build (ReportRuntimePipeline only logs when it ends), the fencing thread, and a
+sleeper on a cache lock (in LockContended, so no lock site changes). "waiting for a cache lock" with
+that lock at state 0 is a lost wake-up, the Android freeze of gpu_split.cpp:225 on another atomic.
+
+The report runs on the front, which is stuck anyway: it reads atomics, try-locks and the ring, which
+only the front writes, and it lets go of every lock before ReportStall, where the driver's dump can
+sleep a second. At most 64 reports. Cost with the switch on: three relaxed stores per ring
+entry on the back, and a thread-local read at each marked place. Off, a marked place reads one
+thread-local and nothing else changes.
+
+No string of prepare-vulkan-port.py changes its count in these files; of headless/CMakeLists.txt only
+two generic ones do ("        }" and "    });\n}"), neither applied to these files. WaitWorker,
+DispatchWork and WorkerThread stay untouched: check-vulkan-handoff.py compiles them against its own
+mock. Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/hang_site.h                             |   97 ++++++++++++++++++++
+ src/common/spin_recursive_mutex.h                  |   12 ++
+ src/video_core/dma_pusher.h                        |    1 
+ src/video_core/engines/engine_interface.h          |    2 
+ src/video_core/fence_manager.h                     |    6 +
+ src/video_core/gpu_split.cpp                       |   58 ++++++++++++
+ src/video_core/gpu_split.h                         |   19 ++++
+ src/video_core/renderer_vulkan/renderer_vulkan.cpp |    2 
+ .../renderer_vulkan/vk_compute_pipeline.cpp        |    1 
+ .../renderer_vulkan/vk_graphics_pipeline.cpp       |    1 
+ .../renderer_vulkan/vk_master_semaphore.cpp        |    2 
+ .../renderer_vulkan/vk_pipeline_cache.cpp          |    2 
+ .../renderer_vulkan/vk_present_manager.cpp         |   11 ++
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp   |   14 +++
+ src/video_core/renderer_vulkan/vk_rasterizer.h     |    4 +
+ src/video_core/renderer_vulkan/vk_scheduler.cpp    |   60 ++++++++++++
+ src/video_core/renderer_vulkan/vk_scheduler.h      |    5 +
+ 17 files changed, 296 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/hang_site.h b/src/common/hang_site.h
+new file mode 100644
+index 0000000..ba1150b
+--- /dev/null
++++ b/src/common/hang_site.h
+@@ -0,0 +1,97 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdlib>
++#include <thread>
++
++namespace Common {
++
++/// The threads whose place the hang watch reports.
++enum class HangThread : std::size_t { Back, Worker, Present, Fence, Count };
++
++/// EDEN_NX2_HANG_WATCH=1. A function-local static: env.txt is read in main, after the globals.
++[[nodiscard]] inline bool HangWatchOn() {
++    static const bool on = [] {
++        const char* const value = std::getenv("EDEN_NX2_HANG_WATCH");
++        return value != nullptr && value[0] != '0';
++    }();
++    return on;
++}
++
++/// Where each watched thread is now: a string literal, or null when it is at no marked place.
++inline std::array<std::atomic<const char*>, static_cast<std::size_t>(HangThread::Count)>
++    hang_sites{};
++/// Who each watched thread is, to name a lock's holder.
++inline std::array<std::atomic<std::thread::id>, static_cast<std::size_t>(HangThread::Count)>
++    hang_ids{};
++/// The calling thread's entry in hang_sites; null on every other thread and with the switch off.
++inline thread_local std::atomic<const char*>* hang_slot{};
++
++/// Called by a watched thread as it starts.
++inline void HangThreadStarts(HangThread thread) {
++    if (HangWatchOn()) {
++        const auto index = static_cast<std::size_t>(thread);
++        hang_ids[index].store(std::this_thread::get_id(), std::memory_order_relaxed);
++        hang_slot = &hang_sites[index];
++    }
++}
++
++[[nodiscard]] inline const char* HangSiteOf(HangThread thread) {
++    const char* const site =
++        hang_sites[static_cast<std::size_t>(thread)].load(std::memory_order_relaxed);
++    return site != nullptr ? site : "none";
++}
++
++/// A lock's holder by name, for a report written on the split's front. "another thread" is one the
++/// watch doesn't follow, such as a CPU write trap.
++[[nodiscard]] inline const char* HangHolderName(std::thread::id holder) {
++    static constexpr std::array<const char*, static_cast<std::size_t>(HangThread::Count)> names{
++        "the back", "the worker", "the present thread", "the fencing thread"};
++    if (holder == std::thread::id{}) {
++        return "nobody";
++    }
++    if (holder == std::this_thread::get_id()) {
++        return "the front";
++    }
++    for (std::size_t index = 0; index < names.size(); ++index) {
++        if (hang_ids[index].load(std::memory_order_relaxed) == holder) {
++            return names[index];
++        }
++    }
++    return "another thread";
++}
++
++/// Marks a place a watched thread can wait at for as long as it lives, and restores the mark it
++/// found. Takes string literals only: the front reads them while the thread is stuck.
++class HangSite {
++public:
++    explicit HangSite(const char* name) noexcept : slot{hang_slot} {
++        if (slot != nullptr) {
++            previous = slot->exchange(name, std::memory_order_relaxed);
++        }
++    }
++    ~HangSite() {
++        if (slot != nullptr) {
++            slot->store(previous, std::memory_order_relaxed);
++        }
++    }
++    HangSite(const HangSite&) = delete;
++    HangSite& operator=(const HangSite&) = delete;
++
++    void Set(const char* name) noexcept {
++        if (slot != nullptr) {
++            slot->store(name, std::memory_order_relaxed);
++        }
++    }
++
++private:
++    std::atomic<const char*>* const slot;
++    const char* previous{};
++};
++
++} // namespace Common
+diff --git a/src/common/spin_recursive_mutex.h b/src/common/spin_recursive_mutex.h
+index 291dd4e..65b13f9 100644
+--- a/src/common/spin_recursive_mutex.h
++++ b/src/common/spin_recursive_mutex.h
+@@ -11,6 +11,8 @@
+ #include <immintrin.h>
+ #endif
+ 
++#include "common/hang_site.h"
++
+ namespace Common {
+ 
+ /// A recursive mutex that spins briefly before sleeping. The GPU caches' locks are taken tens of
+@@ -60,6 +62,15 @@ public:
+         }
+     }
+ 
++    /// Hang reports, from any thread: 0 free, 1 held, 2 held with (possible) sleepers.
++    [[nodiscard]] std::uint32_t HangState() const {
++        return state.load(std::memory_order_relaxed);
++    }
++    /// Hang reports, from any thread: who holds it (a default id: nobody).
++    [[nodiscard]] std::thread::id HangHolder() const {
++        return owner.load(std::memory_order_relaxed);
++    }
++
+ private:
+     // About 10 microseconds of spinning before sleeping.
+     static constexpr int SpinCount = 1024;
+@@ -85,6 +96,7 @@ private:
+         }
+         // 2: held with (possible) sleepers; taken this way it stays marked, so its unlock wakes
+         // the next sleeper.
++        HangSite site{"waiting for a cache lock"};
+         while (state.exchange(2, std::memory_order_acquire) != 0) {
+             state.wait(2, std::memory_order_relaxed);
+         }
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index e3a58cb..f163d90 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -184,6 +184,7 @@ public:
+     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
+         subchannels[subchannel_id] = engine;
+         subchannel_type[subchannel_id] = engine_type;
++        engine->hang_engine_type = engine_type;
+     }
+ 
+     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+diff --git a/src/video_core/engines/engine_interface.h b/src/video_core/engines/engine_interface.h
+index 82121f5..9e4de73 100644
+--- a/src/video_core/engines/engine_interface.h
++++ b/src/video_core/engines/engine_interface.h
+@@ -50,6 +50,8 @@ public:
+     std::vector<std::pair<u32, u32>> method_sink{};
+     GPUVAddr current_dma_segment;
+     bool current_dirty{};
++    /// The engine's class for hang reports (DmaPusher::BindSubchannel, the split's front).
++    EngineTypes hang_engine_type{EngineTypes::Nv01Timer};
+ protected:
+     virtual void ConsumeSinkImpl(Core::System& system) {
+         for (auto [method, value] : method_sink) {
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 6bbfe0b..5cf1dd6 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -20,6 +20,7 @@
+ #include <queue>
+ 
+ #include "common/common_types.h"
++#include "common/hang_site.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+@@ -157,6 +158,7 @@ public:
+         if constexpr (!can_async_check) {
+             TryReleasePendingFences<true>();
+         }
++        Common::HangSite site{"waiting for the fencing thread"};
+         std::unique_lock lk(wait_mutex);
+         wait_cv.wait(lk, [&finished] { return finished; });
+     }
+@@ -214,6 +216,7 @@ public:
+             // With delayed fence operations the callback waits for this fence's tick, whose
+             // submission may be deferred to the waiting thread itself (the GPU split's back).
+             SubmitDeferred();
++            Common::HangSite site{"waiting for the fencing thread"};
+             std::unique_lock lk(wait_mutex);
+             wait_cv.wait(
+                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
+@@ -290,6 +293,7 @@ private:
+         Common::SetCurrentThreadName("GPUFencingThread");
+         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+         Common::SetCurrentThreadToPerformanceCores();
++        Common::HangThreadStarts(Common::HangThread::Fence);
+ 
+         // Every fence the host GPU has already passed is released together: Switch 2 titles
+         // signal thousands a second and the host GPU completes them in bursts, so each cache's
+@@ -324,8 +328,10 @@ private:
+                 take_front();
+             }
+             if (!batch.front().fence->IsStubbed()) {
++                Common::HangSite site{"fence: waiting for the GPU"};
+                 WaitFence(batch.front().fence);
+             }
++            Common::HangSite site{"fence: downloads and operations"};
+             {
+                 std::unique_lock lock(guard);
+                 while (batch.size() < MaxBatch && !fences.empty() &&
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 7b87cca..586e4ad 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -180,6 +180,9 @@ void GpuSplit::Stop() {
+     publish_every = PublishEvery;
+     front_engine = nullptr;
+     back_engine = nullptr;
++    back_engine_now.store(nullptr, std::memory_order_relaxed);
++    hang_reports = 0;
++    hang_dumped_position = ~u64{0};
+     front_macros = false;
+     published.store(0, std::memory_order_relaxed);
+     consumed.store(0, std::memory_order_relaxed);
+@@ -269,6 +272,7 @@ void GpuSplit::Drain() {
+                             consumed_cache, write_position,
+                             back_waiting.load() ? "parked" : "running",
+                             g_back_busy.load() ? "inside a command" : "between batches");
++                ReportBack();
+             }
+         }
+     }
+@@ -337,6 +341,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+                         drain_site_names[static_cast<size_t>(site)],
+                         back_waiting.load() ? "parked" : "running",
+                         g_back_busy.load() ? "inside a command" : "between batches");
++            ReportBack();
+         }
+     }
+     wait_target.store(~u64{0}, std::memory_order_relaxed);
+@@ -354,6 +359,48 @@ void GpuSplit::NoteWait(DrainSite site, u64 start) {
+     wait_max_ns[index] = std::max(wait_max_ns[index], elapsed);
+ }
+ 
++void GpuSplit::ReportBack() {
++    if (!Common::HangWatchOn() || hang_reports >= 64) {
++        return;
++    }
++    ++hang_reports;
++    static constexpr std::array<const char*, 5> kinds{"wrap", "engine", "method", "multi", "call"};
++    // As Tegra::Engines::EngineTypes.
++    static constexpr std::array<const char*, 6> engines{"timer", "compute", "3D",
++                                                        "2D",    "DMA",     "memory"};
++    const u64 position = back_entry_position.load(std::memory_order_relaxed);
++    const u64 head = back_entry_head.load(std::memory_order_relaxed);
++    const u64 kind = head & 0xf;
++    const auto* const engine = back_engine_now.load(std::memory_order_relaxed);
++    const size_t type =
++        engine != nullptr ? static_cast<size_t>(engine->hang_engine_type) : engines.size();
++    // A call entry has no method: its thunk says what the front deferred (address - 0x400000 is
++    // eboot+offset).
++    LOG_WARNING(HW_GPU,
++                "Hang watch: the back runs word {} of {}: {} entry, {} engine, method {:#x}, "
++                "value {:#x}, last thunk {:#x}, at: {}",
++                position, write_position, kind < kinds.size() ? kinds[kind] : "unknown",
++                type < engines.size() ? engines[type] : "no", (head >> 8) & 0xffff, head >> 32,
++                back_entry_call.load(std::memory_order_relaxed),
++                Common::HangSiteOf(Common::HangThread::Back));
++    // Once per place: the entry and what is queued behind it. The front is the ring's only writer,
++    // and it is here.
++    if (position != hang_dumped_position) {
++        hang_dumped_position = position;
++        const u64 end = (std::min)(write_position, position + 128);
++        for (u64 at = position; at < end; at += 8) {
++            std::string line;
++            for (u64 word = at; word < (std::min)(end, at + 8); ++word) {
++                line += fmt::format(" {:016x}", ring[word & RingMask]);
++            }
++            LOG_WARNING(HW_GPU, "Hang watch: ring at {}:{}", at, line);
++        }
++    }
++    if (hang_report != nullptr) {
++        hang_report(hang_argument);
++    }
++}
++
+ void GpuSplit::ReportWaits() {
+     const u64 now = WaitClockNs();
+     if (waits_window_start == 0) {
+@@ -438,6 +485,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
+         return 0;
+     case Kind::Engine:
+         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
++        back_engine_now.store(back_engine, std::memory_order_relaxed);
+         return 2;
+     case Kind::Method: {
+         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+@@ -522,6 +570,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+ #ifdef _WIN32
+     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
+ #endif
++    Common::HangThreadStarts(Common::HangThread::Back);
++    const bool hang_watch = Common::HangWatchOn();
+     u64 read_position = 0;
+     while (!stop_token.stop_requested()) {
+         Nx2Profile::Report("GPU back thread");
+@@ -569,6 +619,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         g_back_busy.store(true, std::memory_order_relaxed);
+         while (read_position != available) {
+             const size_t index = read_position & RingMask;
++            if (hang_watch) {
++                const u64 head = ring[index];
++                back_entry_position.store(read_position, std::memory_order_relaxed);
++                back_entry_head.store(head, std::memory_order_relaxed);
++                if (static_cast<Kind>(head & 0xf) == Kind::Call) {
++                    back_entry_call.store(ring[index + 1], std::memory_order_relaxed);
++                }
++            }
+             const size_t size =
+                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
+             read_position += size != 0 ? size : RingWords - index;
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 63cecd8..b67f742 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -12,6 +12,7 @@
+ #include <type_traits>
+ 
+ #include "common/common_types.h"
++#include "common/hang_site.h"
+ 
+ namespace Core {
+ class System;
+@@ -86,6 +87,11 @@ public:
+         idle_hook = hook;
+         idle_argument = argument;
+     }
++    /// EDEN_NX2_HANG_WATCH=1: called on the front with its reports of a long wait for the back.
++    void SetHangReport(void (*hook)(void*), void* argument) {
++        hang_report = hook;
++        hang_argument = argument;
++    }
+     /// Any thread: whether the back thread runs (false before it starts and once it stopped).
+     [[nodiscard]] bool BackRunning() const {
+         return back_running.load(std::memory_order_acquire);
+@@ -220,6 +226,8 @@ private:
+     void NoteWait(DrainSite site, u64 start);
+     /// Front thread, EDEN_NX2_SPLIT_WAITS=1: logs the totals every 10 s.
+     void ReportWaits();
++    /// Front thread, EDEN_NX2_HANG_WATCH=1: logs what the back is doing, with a long wait's report.
++    void ReportBack();
+     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+         if (engine != front_engine) [[unlikely]] {
+             SwitchEngine(engine);
+@@ -250,6 +258,11 @@ private:
+     std::array<u64, static_cast<size_t>(DrainSite::Count)> wait_max_ns{};
+     u64 waits_window_start{};
+     u64 waits_window_words{};
++    /// EDEN_NX2_HANG_WATCH=1: reports so far, and the back's position at the last dump of the ring.
++    u32 hang_reports{};
++    u64 hang_dumped_position{~u64{0}};
++    void (*hang_report)(void*){};
++    void* hang_argument{};
+ 
+     // Back side.
+     Tegra::Engines::EngineInterface* back_engine{};
+@@ -281,6 +294,12 @@ private:
+     std::jthread back_thread;
+     /// EDEN_NX2_SPLIT_WAITS=1: time the back spun or slept for work or ran its idle hook.
+     alignas(128) std::atomic<u64> back_idle_ns{};
++    /// EDEN_NX2_HANG_WATCH=1: the entry the back runs now, for the front's reports. `consumed` only
++    /// moves every 4096 words and at the end of a batch, so it can't say which entry that is.
++    alignas(128) std::atomic<u64> back_entry_position{};
++    std::atomic<u64> back_entry_head{};
++    std::atomic<u64> back_entry_call{}; ///< The thunk of the last Call entry
++    std::atomic<Tegra::Engines::EngineInterface*> back_engine_now{};
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index fc0eea8..a8d609e 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -208,6 +208,7 @@ RendererVulkan::~RendererVulkan() {
+ }
+ 
+ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
++    Common::HangSite site{"composite"};
+     SCOPE_EXIT {
+         render_window.OnFrameDisplayed();
+     };
+@@ -250,6 +251,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
+     scheduler.DispatchWork();
+ #endif
+ 
++    site.Set("composite: tick frame");
+     gpu.RendererFrameEndNotify();
+     rasterizer.TickFrame();
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index a0d2be0..a82fc8c 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -285,6 +285,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            Common::HangSite site{"worker: waiting for a pipeline build"};
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 8405131..e4d9e94 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -736,6 +736,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            Common::HangSite site{"worker: waiting for a pipeline build"};
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+index 4e368d8..5217f58 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -7,6 +7,7 @@
+ #include <thread>
+ 
+ #include <ranges>
++#include "common/hang_site.h"
+ #include "common/settings.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+@@ -104,6 +105,7 @@ void MasterSemaphore::Wait(u64 tick) {
+     }
+ 
+     // If none of the above is hit, fallback to a regular wait
++    Common::HangSite site{"waiting for a GPU tick"};
+     try {
+         // EDEN_NX2_HANG_WATCH: only the first 3 s of this wait, not a loop of them. Each timed wait
+         // restarts RADV's 10 s no-progress check on the PS5 (radv_ps5_queue_wait_seq), so a loop
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 5b85567..775332a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1785,6 +1785,7 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
+ } // Anonymous namespace
+ 
+ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
++    Common::HangSite site{"building a graphics pipeline"};
+     const auto begin = std::chrono::steady_clock::now();
+     const u64 key_hash = graphics_key.Hash();
+     RuntimeBuild reason = used_and_evicted.contains(key_hash)  ? RuntimeBuild::Evicted
+@@ -1837,6 +1838,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+ 
+ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
++    Common::HangSite site{"building a compute pipeline"};
+     const auto begin = std::chrono::steady_clock::now();
+     SCOPE_EXIT {
+         ReportRuntimePipeline("Compute", begin, RuntimeBuild::New, key.Hash());
+diff --git a/src/video_core/renderer_vulkan/vk_present_manager.cpp b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+index c1724e1..35de188 100644
+--- a/src/video_core/renderer_vulkan/vk_present_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+@@ -171,6 +171,7 @@ PresentManager::~PresentManager() = default;
+ 
+ Frame* PresentManager::GetRenderFrame() {
+ 
++    Common::HangSite site{"waiting for a free present frame"};
+     // Wait for free presentation frames
+     std::unique_lock lock{free_mutex};
+     free_cv.wait(lock, [this] { return !free_queue.empty(); });
+@@ -180,6 +181,7 @@ Frame* PresentManager::GetRenderFrame() {
+     free_queue.pop_front();
+ 
+     // Wait for the presentation to be finished so all frame resources are free
++    site.Set("waiting for a frame's last present (present_done)");
+     frame->present_done.Wait();
+     frame->present_done.Reset();
+ 
+@@ -194,7 +196,9 @@ void PresentManager::Present(Frame* frame) {
+             frame_cv.notify_one();
+         });
+     } else {
++        Common::HangSite site{"waiting for the Vulkan worker"};
+         scheduler.WaitWorker();
++        site.Set("present: copying to the swapchain");
+         CopyToSwapchain(frame);
+         free_queue.push_back(frame);
+     }
+@@ -331,6 +335,7 @@ void PresentManager::PresentThread(std::stop_token token) {
+     Common::SetCurrentThreadName("VulkanPresent");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+     Common::SetCurrentThreadToPerformanceCores();
++    Common::HangThreadStarts(Common::HangThread::Present);
+     while (!token.stop_requested()) {
+         std::unique_lock lock{queue_mutex};
+         // Wait for presentation frames
+@@ -356,6 +361,7 @@ void PresentManager::PresentThread(std::stop_token token) {
+ }
+ 
+ void PresentManager::RecreateSwapchain(Frame* frame) {
++    Common::HangSite site{"present: recreating the swapchain"};
+     swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
+     SetImageCount();
+ }
+@@ -378,6 +384,7 @@ void PresentManager::SetImageCount() {
+ }
+ 
+ void PresentManager::DiscardFrame(Frame* frame) {
++    Common::HangSite site{"present: dropping a frame"};
+     static constexpr VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+     const VkSemaphore render_ready = *frame->render_ready;
+     const VkSubmitInfo submit_info{
+@@ -434,10 +441,12 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
+         RecreateSwapchain(frame);
+     }
+ 
++    Common::HangSite site{"present: acquiring a swapchain image"};
+     while (swapchain.AcquireNextImage(!use_present_thread)) {
+         RecreateSwapchain(frame);
+     }
+ 
++    site.Set("present: recording the copy");
+     const vk::CommandBuffer cmdbuf{frame->cmdbuf};
+     cmdbuf.Begin({
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+@@ -566,6 +575,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
+     };
+ 
+     // Submit the image copy/blit to the swapchain
++    site.Set("present: submitting the copy to the swapchain");
+     {
+         std::scoped_lock submit_lock{scheduler.submit_mutex};
+         switch (const VkResult result =
+@@ -582,6 +592,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
+     }
+ 
+     // Present
++    site.Set("present: queue present");
+     swapchain.Present(render_semaphore);
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index eac1b6a..91962d8 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -251,10 +251,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+     VideoCommon::GpuSplit::Get().SetIdleHook(
+         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
+         &scheduler);
++    VideoCommon::GpuSplit::Get().SetHangReport(
++        [](void* context) { static_cast<RasterizerVulkan*>(context)->ReportHang(); }, this);
+ }
+ 
+ RasterizerVulkan::~RasterizerVulkan() {
+     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
++    VideoCommon::GpuSplit::Get().SetHangReport(nullptr, nullptr);
+     scheduler.WaitWorker();
+     scheduler.Finish();
+ }
+@@ -1931,6 +1934,17 @@ void RasterizerVulkan::TickFrame() {
+     }
+ }
+ 
++void RasterizerVulkan::ReportHang() {
++    LOG_WARNING(Render_Vulkan,
++                "Hang watch: texture cache lock {} (held by {}), buffer cache lock {} (held by "
++                "{}); 0 free, 1 held, 2 held with sleepers",
++                texture_cache.mutex.HangState(),
++                Common::HangHolderName(texture_cache.mutex.HangHolder()),
++                buffer_cache.mutex.HangState(),
++                Common::HangHolderName(buffer_cache.mutex.HangHolder()));
++    scheduler.ReportFreeze();
++}
++
+ void RasterizerVulkan::ReleaseFinishedMemory() {
+     // The predicate's buffer may be among those destroyed, and it is used again on resuming: the
+     // draws go unconditionally until the guest sets a condition again.
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index d165b26..f999ec2 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -164,6 +164,10 @@ public:
+     /// Waits for the GPU and destroys the images and buffers that were waiting for it. Both caches
+     /// are locked by the caller.
+     void ReleaseFinishedMemory();
++
++    /// EDEN_NX2_HANG_WATCH=1, the split's front in a long wait for the back: logs the caches' locks
++    /// and the scheduler's state. Never waits for the back or the worker.
++    void ReportHang();
+     std::optional<FramebufferTextureInfo> AccelerateDisplay(const Tegra::FramebufferConfig& config,
+                                                             VAddr framebuffer_addr,
+                                                             u32 pixel_stride);
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 6dff4d9..b3f28f5 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -35,6 +35,7 @@ namespace Vulkan {
+ 
+ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
+                                          vk::CommandBuffer upload_cmdbuf) {
++    Common::HangSite site{"worker: recording commands"};
+     auto command = first;
+     while (command != nullptr) {
+         auto next = command->GetNext();
+@@ -63,7 +64,10 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
+ 
+     AcquireNewChunk();
+     AllocateWorkerCommandBuffer();
+-    worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
++    worker_thread = std::jthread([this](std::stop_token token) {
++        Common::HangThreadStarts(Common::HangThread::Worker);
++        WorkerThread(token);
++    });
+ }
+ 
+ Scheduler::~Scheduler() = default;
+@@ -149,6 +153,58 @@ void Scheduler::ReportStall(u64 tick, u64 gpu_tick, u64 next_tick) {
+     }
+ }
+ 
++void Scheduler::ReportFreeze() {
++    using Common::HangSiteOf;
++    using Common::HangThread;
++    try {
++        master_semaphore->Refresh();
++    } catch (const vk::Exception&) {
++        // A lost device: the known tick is still worth the line.
++    }
++    const u64 gpu_tick = master_semaphore->KnownGpuTick();
++    const u64 next_tick = master_semaphore->CurrentTick();
++    u64 last_submitted{};
++    if (std::unique_lock lock{hang_mutex, std::try_to_lock};
++        lock.owns_lock() && !hang_submissions.empty()) {
++        last_submitted = hang_submissions.back().tick;
++    }
++    size_t queued{};
++    bool queue_free{};
++    bool worker_idle{};
++    if (std::unique_lock lock{queue_mutex, std::try_to_lock}; lock.owns_lock()) {
++        queue_free = true;
++        queued = work_queue.size();
++        worker_idle = worker_waiting;
++    }
++    bool submit_free{};
++    bool execution_free{};
++    {
++        // Only a look: held across ReportStall below, they would stop the worker.
++        const std::unique_lock submit_lock{submit_mutex, std::try_to_lock};
++        const std::unique_lock execution_lock{execution_mutex, std::try_to_lock};
++        submit_free = submit_lock.owns_lock();
++        execution_free = execution_lock.owns_lock();
++    }
++    LOG_WARNING(Render_Vulkan,
++                "Hang watch: the GPU is at tick {}, the last submitted is {}, the next to record "
++                "is {}; {} chunks queued (queue lock {}), worker {}, submit lock {}, execution "
++                "lock {}",
++                gpu_tick, last_submitted, next_tick, queued, queue_free ? "free" : "held",
++                worker_idle ? "idle" : "not idle", submit_free ? "free" : "held",
++                execution_free ? "free" : "held");
++    LOG_WARNING(Render_Vulkan, "Hang watch: worker at: {}; present thread at: {}; fencing at: {}",
++                HangSiteOf(HangThread::Worker), HangSiteOf(HangThread::Present),
++                HangSiteOf(HangThread::Fence));
++    // The tick wait's report is the only way to the unfinished ticks and to the driver's dump (0250,
++    // EDEN_NX2_RADV_STALL_DUMP=1), and in this freeze no thread need be in a tick wait.
++    if (last_submitted > gpu_tick) {
++        LOG_WARNING(Render_Vulkan,
++                    "Hang watch: the GPU is behind. The next line is from this report, not from a "
++                    "thread that waited 3 s");
++        ReportStall(last_submitted, gpu_tick, next_tick);
++    }
++}
++
+ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
+@@ -536,7 +592,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+             HangSubmit(signal_value, wait_semaphore != VK_NULL_HANDLE);
+         }
+ 
++        Common::HangSite site{"worker: waiting for the submit lock"};
+         std::scoped_lock lock{submit_mutex};
++        site.Set("worker: in the queue submit");
+         switch (const VkResult result = master_semaphore->SubmitQueue(
+                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+         case VK_SUCCESS:
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 4ebcd69..138e236 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -162,6 +162,11 @@ public:
+         return hang_watching;
+     }
+ 
++    /// EDEN_NX2_HANG_WATCH=1, the split's front in a long wait for the back: logs how far the GPU
++    /// got and where the Vulkan threads are. Never waits for the back or the worker; with a GPU
++    /// that is behind it makes ReportStall's ask for the driver's dump, which can sleep a second.
++    void ReportFreeze();
++
+     /// Per-stage shader hashes of a bound pipeline; index 6 is a compute program.
+     using HangPipeline = std::array<u64, 7>;
+ 

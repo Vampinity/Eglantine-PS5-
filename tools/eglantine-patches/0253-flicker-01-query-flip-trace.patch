@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 04:00:00 +0100
+Subject: [PATCH] query_dma: EDEN_NX2_QUERY_FLIP_TRACE and EDEN_NX2_RENDER_ALWAYS, to name what
+ switches the white shapes on and off
+
+Core patch on mig020-core (the v1.219.020 series), off unless one of the two switches is set.
+Debug only. Not a fix.
+
+In run183 a rock by the camera turns white in blocks of mostly 2 game frames on, 2 off, for 8 s with
+the camera still. Nothing in the logs moves with it. Occlusion reports are the first suspect: macro
+0x142 reads reports (word 0 is the sample count, often 0, seen in the Linux run's log), and Lichii
+PR 215 (WeslieDE) ties white flashes to stale reads of them (976 in 2.5 minutes in its trace, all
+macro 0xe2c, method 0x158). But nobody has seen one of our reports flip in time with a flash:
+EDEN_NX2_QUERY_DMA_TRACE gives words for its first 4000 reads only, and logs nothing at all unless
+the read covers a report it counts as pending. run185 had it on and logged nothing.
+
+EDEN_NX2_QUERY_FLIP_TRACE=1: Maxwell3D::FrontDmaRead notes the first 4 words of every FIFOed macro
+read (method 0x158), each word on its own, in a table of 16384 slots. Once a second it logs up to 16
+words that went between zero and non-zero at least 3 times, with their last 32 reads as bits, so a
+report in step with the flash reads ...1100110011... dev= is the address EDEN_NX2_ZPASS_CUT_LOG logs
+for the same report. A flip here with none there means the game read something other than what was
+written last: a late report. The 3D engine also logs once a second how many draws ran and were
+skipped by render enable, how often render_enable.mode was written and with which mode, and what
+render_enable_override held at the draws. That register is only looked at inside
+ProcessQueryCondition, so a macro that writes it alone changes nothing here: "override at draws"
+shows whether that happens. Draws are counted in ProcessDraw, so indirect draws aren't in these
+numbers. A count of 0 mode writes says render enable isn't used at all.
+
+The host compare is not traced. On this port hcr_mode is 1 by default (headless/dev_vulkan.h), and
+prepare-vulkan-port.py sends a condition with a report pending out of
+HostConditionalRenderingCompareValues with false, into the CPU evaluation. Upstream's "return true"
+at Low, where draws run whatever the report will say, does not ship here, so it isn't a suspect.
+That block of vk_query_cache.cpp is also an anchor of prepare-vulkan-port.py: this patch must not
+touch it, or adapt() skips the change, the build still passes, and the shipped code returns true.
+
+EDEN_NX2_RENDER_ALWAYS=1: ProcessQueryCondition leaves execute_on true and never starts host
+conditional rendering. If the flashes stop, a condition decides them. If the water's reflection
+stays on too, the same condition hides it. If the macro skips draws by itself, it changes nothing,
+and that proves nothing. It may draw things the game meant to hide, and cost fps.
+
+Only the split's front path is traced (EDEN_NX2_SPLIT=2, the default for these titles). The macro.cpp
+read path for lower split modes isn't. Unset, nothing changes. Not built, not run.
+---
+diff --git a/src/video_core/query_dma.h b/src/video_core/query_dma.h
+--- a/src/video_core/query_dma.h
++++ b/src/video_core/query_dma.h
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdlib>
+ 
+ #include <fmt/ranges.h>
+@@ -45,6 +46,138 @@
+     return mode;
+ }
+ 
++/// EDEN_NX2_QUERY_FLIP_TRACE=1: logs which occlusion reports change between zero and non-zero
++/// read after read, and what the 3D engine's render enable does. QUERY_DMA_TRACE stops giving
++/// words after 4000 reads, a second or two at Ocarina's rate, so it can't see a late flash.
++inline bool FlipTraceEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_QUERY_FLIP_TRACE");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++/// EDEN_NX2_RENDER_ALWAYS=1: render enable conditions are ignored and every draw runs, on the host
++/// too. Asks whether a condition decides the flashes. It can show objects meant to be hidden.
++inline bool RenderAlways() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_RENDER_ALWAYS");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++struct FlipSlot {
++    GPUVAddr source;
++    DAddr device;  ///< The same word as ZPASS_CUT_LOG names it, 0 if unmapped
++    u64 bits;      ///< One bit a read, newest lowest: 1 when the word wasn't zero
++    u32 last_word;
++    u32 macro;
++    u32 reads;     ///< This second
++    u32 flips;     ///< This second
++};
++
++/// Notes one word of a report read. The split's front only. Once a second, logs the words that
++/// flipped at least 3 times, 16 at most, with their last 32 reads as bits.
++inline void FlipTrace(u32 macro, GPUVAddr source, DAddr device, u32 word) {
++    static constexpr size_t table_size = size_t{1} << 14;
++    static constexpr size_t max_probes = 8;
++    static constexpr u32 min_flips = 3;
++    static constexpr size_t max_lines = 16;
++    static std::array<FlipSlot, table_size> table{};
++    static u64 total_reads{};
++    static u64 untracked{};
++    static auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds{1};
++
++    ++total_reads;
++    FlipSlot* slot = nullptr;
++    const size_t index = static_cast<size_t>(((source >> 2) * 0x9E3779B97F4A7C15ULL) >> 50);
++    for (size_t probe = 0; probe < max_probes; ++probe) {
++        FlipSlot& candidate = table[(index + probe) & (table_size - 1)];
++        if (candidate.source == source || candidate.source == 0) {
++            slot = &candidate;
++            break;
++        }
++    }
++    if (slot == nullptr) {
++        ++untracked;
++    } else {
++        const bool non_zero = word != 0;
++        if (slot->source != 0 && non_zero != ((slot->bits & 1) != 0)) {
++            ++slot->flips;
++        }
++        slot->source = source;
++        slot->device = device;
++        slot->macro = macro;
++        slot->bits = (slot->bits << 1) | (non_zero ? 1 : 0);
++        slot->last_word = word;
++        ++slot->reads;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now < next_report) {
++        return;
++    }
++    next_report = now + std::chrono::seconds{1};
++    size_t lines = 0;
++    u64 flipping = 0;
++    for (FlipSlot& entry : table) {
++        if (entry.flips >= min_flips) {
++            ++flipping;
++            if (lines < max_lines) {
++                ++lines;
++                LOG_INFO(HW_GPU,
++                         "Query flip: gpu={:#x} dev={:#x} macro={:#x} reads={} flips={} "
++                         "bits={:032b} last={:#x}",
++                         entry.source, entry.device, entry.macro, entry.reads, entry.flips,
++                         entry.bits & 0xffffffffULL, entry.last_word);
++            }
++        }
++        entry.reads = 0;
++        entry.flips = 0;
++    }
++    if (flipping != 0) {
++        LOG_INFO(HW_GPU, "Query flip: {} reports flipped this second, {} reads, {} untracked",
++                 flipping, total_reads, untracked);
++    }
++}
++
++struct RenderEnableCounts {
++    std::array<u64, 8> mode_writes{}; ///< By regs.render_enable.mode
++    std::array<u64, 4> overrides{};   ///< By regs.render_enable_override at each draw
++    u64 draws{};
++    u64 skipped{};
++};
++
++inline RenderEnableCounts& RenderEnableStats() {
++    static RenderEnableCounts counts;
++    return counts;
++}
++
++/// A write to render_enable.mode. The thread that runs the engine's methods only.
++inline void NoteCondition(u32 mode) {
++    ++RenderEnableStats().mode_writes[mode & 7];
++}
++
++/// A draw from ProcessDraw, run or skipped: indirect draws don't come here. The thread that runs
++/// the engine's methods only. Logs once a second.
++inline void NoteDraw(bool executed, u32 override_value) {
++    RenderEnableCounts& counts = RenderEnableStats();
++    ++counts.draws;
++    ++counts.overrides[override_value & 3];
++    counts.skipped += executed ? 0 : 1;
++    static auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds{1};
++    const auto now = std::chrono::steady_clock::now();
++    if (now < next_report) {
++        return;
++    }
++    next_report = now + std::chrono::seconds{1};
++    LOG_INFO(HW_GPU,
++             "Render enable: {} draws, {} skipped, mode writes {}, override at draws {}",
++             counts.draws, counts.skipped, fmt::join(counts.mode_writes, ","),
++             fmt::join(counts.overrides, ","));
++    counts = RenderEnableCounts{};
++}
++
+ /// Whether [source, source + size) holds reports still waiting for host query results. Runs
+ /// where the rasterizer's caches are owned (the back of a split GPU thread). A report that has
+ /// landed counts too until it is unregistered: nothing sets IsGuestSynced here.
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -686,6 +686,13 @@
+ }
+ 
+ void Maxwell3D::ProcessQueryCondition() {
++    if (VideoCommon::QueryDma::FlipTraceEnabled()) [[unlikely]] {
++        VideoCommon::QueryDma::NoteCondition(static_cast<u32>(regs.render_enable.mode));
++    }
++    if (VideoCommon::QueryDma::RenderAlways()) [[unlikely]] {
++        execute_on = true;
++        return;
++    }
+     if (rasterizer->AccelerateConditionalRendering()) {
+         execute_on = true;
+         return;
+@@ -1233,6 +1240,15 @@
+             fs.parameters.push_back(word);
+         } else if (ram + i < native_data_ram.size()) {
+             native_data_ram[ram + i] = word;
++        }
++    }
++    if (VideoCommon::QueryDma::FlipTraceEnabled() && method == 0x158) [[unlikely]] {
++        // Each word on its own: NX2_NOTES says this macro reads two counters.
++        for (u32 i = 0; i < std::min<u32>(words, 4); ++i) {
++            const GPUVAddr word_address = source + u64{i} * sizeof(u32);
++            VideoCommon::QueryDma::FlipTrace(macro, word_address,
++                                             memory_manager.GpuToCpuAddress(word_address).value_or(0),
++                                             memory_manager.Read<u32>(word_address));
+         }
+     }
+ }
+diff --git a/src/video_core/engines/draw_manager.cpp b/src/video_core/engines/draw_manager.cpp
+--- a/src/video_core/engines/draw_manager.cpp
++++ b/src/video_core/engines/draw_manager.cpp
+@@ -9,6 +9,7 @@
+ #include "common/settings.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/query_dma.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/macro.h"
+ 
+@@ -318,6 +319,10 @@
+         draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
+     UpdateTopology(maxwell3d);
++    if (VideoCommon::QueryDma::FlipTraceEnabled()) [[unlikely]] {
++        VideoCommon::QueryDma::NoteDraw(maxwell3d.ShouldExecute(),
++                                        static_cast<u32>(maxwell3d.regs.render_enable_override));
++    }
+     if (maxwell3d.ShouldExecute()) {
+         if (draw_indexed && maxwell3d.regs.IsShaderConfigEnabled(4)) {
+             maxwell3d.GetNativeMacroEngine().RecordBananzaTerrainDepthDraw(maxwell3d, instance_count);

@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 03:40:00 +0100
+Subject: [PATCH] texture_cache: EDEN_NX2_TC_LOG names each asynchronous decode
+ and says when it landed
+
+Core patch on mig020-core (the v1.219.020 series). Log lines only, under EDEN_NX2_TC_LOG, which the
+base env already sets. Nothing else changes.
+
+The ground of Ocarina of Time settles late: in five scripted runs it jumps about 4.1 s and 9.2 s after
+the world load. Three CPU decodes run in that window and may be what it waits for, but the logs only
+count them, per 600 frames. Nobody knows when one lands, which image is which stage, how long one
+takes on the console, or whether a decode is a new image or one the game wrote again.
+
+Two lines per decode. "Async decode queued" gives the size, format, address, whether the image is new
+(black until it lands) or written again (keeps its picture), and how many are ahead of it. "Async
+decode landed" gives the time in the queue, decoding and uploading. Log time matches video time to
+about 0.2 s (run181: last line 116.26 s, picture gone 116.4 s), so each line can be set against a
+recording. A few lines a minute. Not built, not run.
+---
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 05f90cc..af95f75 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -61,6 +61,12 @@ namespace VideoCommon {
+     return frames;
+ }
+ 
++/// EDEN_NX2_TC_LOG, read once: also a line when an asynchronous decode is queued and when it lands.
++[[nodiscard]] inline bool AsyncDecodeLog() {
++    static const bool enabled = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
++    return enabled;
++}
++
+ using Tegra::Texture::TICEntry;
+ using Tegra::Texture::TSCEntry;
+ using VideoCore::Surface::GetFormatType;
+@@ -2828,6 +2834,15 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     auto decode = std::make_unique<AsyncDecodeContext>();
+     auto* decode_ptr = decode.get();
+     decode->image_id = image_id;
++    decode->queued = std::chrono::steady_clock::now();
++    if (AsyncDecodeLog()) {
++        // "new": a new image, black until it lands. "again": the guest wrote it, it keeps its picture.
++        LOG_INFO(HW_GPU, "Async decode queued: {}x{}, {} layers, {} levels, format {}, at {:#x}, {}, {} ahead of it",
++                 image.info.size.width, image.info.size.height, image.info.resources.layers,
++                 image.info.resources.levels, static_cast<u32>(image.info.format), image.gpu_addr,
++                 True(image.flags & ImageFlagBits::ZeroFilled) ? "again" : "new",
++                 async_decodes.size());
++    }
+     async_decodes.push_back(std::move(decode));
+ 
+     std::vector<u8> local_unswizzle_data_buffer(image.unswizzled_size_bytes, 0);
+@@ -2882,6 +2897,7 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     auto func = [out_size, copies, info = image.info,
+                  input = std::move(local_unswizzle_data_buffer),
+                  async_decode = decode_ptr]() mutable {
++        async_decode->started = std::chrono::steady_clock::now();
+         try {
+             async_decode->decoded_data.resize_destructive(out_size);
+             std::span copies_span{copies.data(), copies.size()};
+@@ -2893,6 +2909,7 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+ 
+         // TODO: Do we need this lock?
+         std::unique_lock lock{async_decode->mutex};
++        async_decode->decoded = std::chrono::steady_clock::now();
+         async_decode->copies = std::move(copies);
+         async_decode->complete = true;
+     };
+@@ -2968,6 +2985,7 @@ void TextureCache<P>::TickAsyncDecode() {
+             continue;
+         }
+         const size_t slice_limit = UploadSliceLimit(runtime);
++        ++async_decode->upload_frames;
+         if (MapSizeBytes(image) > slice_limit) {
+             if (async_decode->next_copy == 0 && async_decode->next_layer == 0) {
+                 ConvertedLayout(image.info, async_decode->copies);
+@@ -3016,6 +3034,18 @@ void TextureCache<P>::TickAsyncDecode() {
+             image.UploadMemory(*staging, async_decode->copies);
+             has_uploads = true;
+         }
++        if (AsyncDecodeLog()) {
++            const auto ms = [](auto from, auto to) {
++                return static_cast<long long>(
++                    std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count());
++            };
++            LOG_INFO(HW_GPU, "Async decode landed: {}x{}, {} layers, at {:#x}: {} ms in the queue, {} ms decoding, {} ms to upload over {} frames",
++                     image.info.size.width, image.info.size.height, image.info.resources.layers,
++                     image.gpu_addr, ms(async_decode->queued, async_decode->started),
++                     ms(async_decode->started, async_decode->decoded),
++                     ms(async_decode->decoded, std::chrono::steady_clock::now()),
++                     async_decode->upload_frames);
++        }
+         image.flags &= ~ImageFlagBits::IsDecoding;
+         i = async_decodes.erase(i);
+     }
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 0696447..58a4923 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -83,6 +83,11 @@ struct AsyncDecodeContext {
+     bool cancelled{}; ///< The image was deleted meanwhile: drop the result (GPU thread only).
+     size_t next_copy{}; ///< A large image uploads over several frames: the next copy...
+     s32 next_layer{};   ///< ...and the next layer of it (GPU thread only).
++    /// EDEN_NX2_TC_LOG: when it was queued, taken up by the worker and decoded (read once complete).
++    std::chrono::steady_clock::time_point queued{};
++    std::chrono::steady_clock::time_point started{};
++    std::chrono::steady_clock::time_point decoded{};
++    u32 upload_frames{}; ///< Frames its upload has taken so far (GPU thread only).
+ };
+ 
+ using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;
+-- 
+2.47.0

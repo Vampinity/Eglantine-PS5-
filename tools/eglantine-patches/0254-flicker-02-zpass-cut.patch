@@ -1,0 +1,671 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 04:00:00 +0100
+Subject: [PATCH] query_cache: EDEN_NX2_ZPASS_CUT_LOG counts submissions inside a guest's ZPass
+ window, EDEN_NX2_ZPASS_PAUSE_AB compares reset and pause in one run, EDEN_NX2_ZPASS_KEEP_WINDOW
+ holds back the two that can wait
+
+Core patch on mig020-core (the v1.219.020 series), off unless one of the three switches is set.
+Not built, not run.
+
+Each submission runs Scheduler::EndPendingOperations, which resets the ZPass counter unless
+EDEN_NX2_ZPASS_PAUSE=1. A guest that resets the counter, draws and reports then gets only the draws
+after the submission, often 0, and the game reads that as "occluded" (Kajcsi, Lichii PR 121: same
+binary, reset 15 flashes in 492 frames and 9 in 296, pause 0 in 510 and 0 in 507, FENCE_FLUSH_US=0
+also 0; the same PR saw 1 in 339 frames and 1 in 1,356 left with the pause, and PR 215 still saw
+flashes after it until its report wait went in). That PR's reason for the fence result is that
+deferred submissions land anywhere, through the split's idle hook. With the window at 0 no
+submission comes from the idle hook, but these still submit in the draw stream without passing
+DeferFlush: every 128 draws, RasterizerVulkan::FlushWork, unless a fence or a frame reset the count
+first; every ASTC GPU decode, ASTCDecoderPass::AssembleInto; AccelerateDMA::BufferCopy's list copies;
+and each Finish. A fence itself now submits right there, and nobody has counted how many fall inside
+a window. Whether any of these explain Kokiri's flashes is not known. Against the decodes: run184
+had 9,427 by log 561 s and no hot flash before that, and they are about 0.6% of submissions.
+Against FlushWork and the decodes both: they come before the draw's own counter starts, so that
+draw's samples survive. This patch measures it.
+
+EDEN_NX2_ZPASS_PAUSE=1 carries the count across, but run185 (with it and QUERY_DMA_SYNC=2) stopped
+at log 468 s on a GPU tick with no pipelines in it.
+
+EDEN_NX2_ZPASS_CUT_LOG=1, log only: counts submissions by who asked for them, and those that land
+in an open guest window with samples at stake. Each report after such a cut carries a note, until
+the guest's next reset. Reports are kept by address. Once a second, up to 32 lines
+"ZPASS flip: addr= reports= to zero= after a cut= last site= value bits= cut bits=" name the
+addresses that went to 0 at least twice, then "ZPASS cut totals" and "ZPASS cut sites" give counts
+since the start. Only the first 0 of a row counts as "to zero": after a game hides an object its
+next reports can read 0 for reasons of their own. A 0 can be genuine too, so read "to zero ... after
+a cut" against "stayed ... after a cut", which need no clock. "Cut zero" alone proves nothing. With
+the pause on, "cut no draw" still counts the reports a reset would have left at 0. A report that
+drops without reaching 0 isn't seen, and the game's limit is not known.
+
+EDEN_NX2_ZPASS_PAUSE_AB=<seconds>: submissions reset for <seconds>, then pause for <seconds>, round
+and round, and each change is logged. One run at one spot compares the two. The pause phases carry
+the pause's risks.
+
+EDEN_NX2_ZPASS_KEEP_WINDOW=1: from the guest's ZPass counter reset to its next report, FlushWork
+keeps dispatching without submitting, up to 8 times its draw count, and an ASTC decode leaves its
+submission to the next one. Nothing on the CPU waits for that decode, as the note in
+prepare-vulkan-port.py says, and Target::wait false already takes this path. Fences, list copies
+and Finish are left alone. Use with EDEN_NX2_FENCE_FLUSH_US=0: at 500 the idle hook still cuts.
+
+Off, the only changes are a u32 in QueryBase, four members in SamplesStreamer, one bool in the
+scheduler, a thread_local store around seven flushes, one bool store per ZPass reset and report, and
+one static check per submission. Replaying prepare-vulkan-port.py's adapt() before and after: no
+anchor changes, on T42 or on T42 plus 0233 to 0250.
+---
+ src/video_core/query_cache/query_base.h             |   1 +
+ src/video_core/query_cache/query_cache.h            |  11 ++
+ src/video_core/query_cache/query_cache_base.h       |   2 +
+ src/video_core/query_cache/query_stream.h           |   6 +
+ src/video_core/renderer_vulkan/vk_compute_pass.cpp  |   8 +
+ src/video_core/renderer_vulkan/vk_fence_manager.cpp |   2 +
+ src/video_core/renderer_vulkan/vk_query_cache.cpp   |  30 ++++
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp    |  18 +++
+ src/video_core/renderer_vulkan/vk_scheduler.cpp     |  16 +-
+ src/video_core/renderer_vulkan/vk_scheduler.h       |   8 +
+ src/video_core/zpass_cut.h                    | 254 +++++++++++++++++++++++++++++++
+ 11 files changed, 355 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/query_cache/query_base.h b/src/video_core/query_cache/query_base.h
+index d5d21be..cf66b78 100644
+--- a/src/video_core/query_cache/query_base.h
++++ b/src/video_core/query_cache/query_base.h
+@@ -26,6 +26,7 @@ public:
+     DAddr guest_address{};
+     QueryFlagBits flags{};
+     u64 value{};
++    u32 cut_note{}; ///< EDEN_NX2_ZPASS_CUT_LOG: see video_core/zpass_cut.h
+ 
+ protected:
+     // Default constructor
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+index ac9a471..71d08e8 100644
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -213,6 +213,13 @@ void QueryCacheBase<Traits>::CounterClose(QueryType counter_type) {
+     streamer->CloseCounter();
+ }
+ 
++template <typename Traits>
++void QueryCacheBase<Traits>::CounterNoteSubmission(QueryType counter_type, bool will_reset) {
++    if (StreamerInterface* streamer = impl->streamers[static_cast<size_t>(counter_type)]) {
++        streamer->NoteSubmission(will_reset);
++    }
++}
++
+ template <typename Traits>
+ void QueryCacheBase<Traits>::CounterReset(QueryType counter_type) {
+     size_t index = static_cast<size_t>(counter_type);
+@@ -291,6 +298,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+         }
+         query_base->value += streamer->GetAmendValue();
+         streamer->SetAccumulationValue(query_base->value);
++        if (ZpassCut::Enabled() &&
++            streamer->GetId() == static_cast<size_t>(QueryType::ZPassPixelCount64)) [[unlikely]] {
++            ZpassCut::NoteReport(cpu_addr, query_base->value, query_base->cut_note);
++        }
+         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+             u64 timestamp = impl->gpu.GetTicks();
+             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+index 0ec1105..5dd52e9 100644
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -106,6 +106,8 @@ public:
+ 
+     void CounterClose(QueryType counter_type);
+ 
++    void CounterNoteSubmission(QueryType counter_type, bool will_reset);
++
+     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
+                        u32 payload, u32 subreport);
+ 
+diff --git a/src/video_core/query_cache/query_stream.h b/src/video_core/query_cache/query_stream.h
+index b4dc9d1..98778d8 100644
+--- a/src/video_core/query_cache/query_stream.h
++++ b/src/video_core/query_cache/query_stream.h
+@@ -14,6 +14,7 @@
+ #include "common/common_types.h"
+ #include "video_core/query_cache/bank_base.h"
+ #include "video_core/query_cache/query_base.h"
++#include "video_core/zpass_cut.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -40,6 +41,11 @@ public:
+         /* Do Nothing */
+     }
+ 
++    /// EDEN_NX2_ZPASS_CUT_LOG: a submission comes next, and resets the counter if will_reset.
++    virtual void NoteSubmission([[maybe_unused]] bool will_reset) {
++        /* Do Nothing */
++    }
++
+     virtual bool HasPendingSync() const {
+         return false;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pass.cpp b/src/video_core/renderer_vulkan/vk_compute_pass.cpp
+index 5902b7d..a3334bf 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pass.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pass.cpp
+@@ -38,6 +38,7 @@
+ #include "video_core/texture_cache/accelerated_swizzle.h"
+ #include "video_core/texture_cache/types.h"
+ #include "video_core/texture_cache/util.h"
++#include "video_core/zpass_cut.h"
+ #include "video_core/textures/decoders.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -811,7 +812,14 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
+     if (!target.wait) {
+         return;
+     }
++    // EDEN_NX2_ZPASS_KEEP_WINDOW=1: nothing on the CPU waits for this decode (the image barrier
++    // above orders later shaders), so its submission can go with the next one.
++    if (scheduler.HoldSubmissionForZpass()) {
++        VideoCommon::ZpassCut::NoteHeld();
++        return;
++    }
+     const auto start = std::chrono::steady_clock::now();
++    VideoCommon::ZpassCut::SiteScope site{VideoCommon::ZpassCut::Site::Astc};
+     if (flush_only) {
+         scheduler.Flush();
+     } else {
+diff --git a/src/video_core/renderer_vulkan/vk_fence_manager.cpp b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+index 10083ae..a8a6d30 100644
+--- a/src/video_core/renderer_vulkan/vk_fence_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+@@ -11,6 +11,7 @@
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
++#include "video_core/zpass_cut.h"
+ 
+ namespace Vulkan {
+ 
+@@ -25,6 +26,7 @@ void InnerFence::Queue() {
+     }
+     // Get the current tick so we can wait for it
+     wait_tick = scheduler.CurrentTick();
++    VideoCommon::ZpassCut::SiteScope site{VideoCommon::ZpassCut::Site::Fence};
+     if (!scheduler.DeferFlush()) {
+         scheduler.Flush();
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index 7bd1a77..f190c4a 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -31,6 +31,7 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "video_core/zpass_cut.h"
+ 
+ namespace Vulkan {
+ 
+@@ -167,6 +168,7 @@ public:
+     ~SamplesStreamer() = default;
+ 
+     void StartCounter() override {
++        samples_at_stake = true;
+         if (has_started) {
+             return;
+         }
+@@ -196,6 +198,13 @@ public:
+     }
+ 
+     void ResetCounter() override {
++        if (reset_by_submission) {
++            reset_by_submission = false;
++        } else {
++            cut_note = 0;
++            window_open = true;
++        }
++        samples_at_stake = false;
+         if (has_started) {
+             PauseCounter();
+         }
+@@ -210,6 +219,17 @@ public:
+         last_accumulation_checkpoint = (std::max)(last_accumulation_checkpoint, num_slots_used);
+     }
+ 
++    // EDEN_NX2_ZPASS_CUT_LOG: runs before the reset or the close of each submission.
++    void NoteSubmission(bool will_reset) override {
++        namespace Cut = VideoCommon::ZpassCut;
++        Cut::NoteSubmission(samples_at_stake && window_open);
++        if (samples_at_stake) {
++            cut_note = 1 + static_cast<u32>(Cut::current_site);
++        }
++        reset_by_submission = will_reset;
++        samples_at_stake = false;
++    }
++
+     // Called at each submission with EDEN_NX2_ZPASS_PAUSE=1. The running query carries the count
+     // across it: a guest's reset-to-report window can span one.
+     void CloseCounter() override {
+@@ -393,6 +413,9 @@ public:
+         auto* new_query = GetQuery(index);
+         new_query->guest_address = address;
+         new_query->value = 0;
++        new_query->cut_note =
++            cut_note | (cut_note != 0 && !samples_at_stake ? VideoCommon::ZpassCut::NoDrawAfter : 0U);
++        window_open = false;
+         new_query->flags &= ~VideoCommon::QueryFlagBits::IsOrphan;
+         if (has_timestamp) {
+             new_query->flags |= VideoCommon::QueryFlagBits::HasTimestamp;
+@@ -654,6 +677,13 @@ private:
+     bool has_started{};
+     std::mutex flush_guard;
+     std::optional<QueriesPrefixScanPass> queries_prefix_scan_pass;
++    // EDEN_NX2_ZPASS_CUT_LOG: whether a draw counted since the last reset or submission, whether
++    // the guest's window is open (its reset to its next report), the note a submission left for
++    // the guest's next reports, and whether the next reset is that submission's.
++    bool samples_at_stake{};
++    bool window_open{};
++    u32 cut_note{};
++    bool reset_by_submission{};
+ };
+ 
+ // Transform feedback queries
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index eac1b6a..592865f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -58,6 +58,7 @@
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/query_dma.h"
++#include "video_core/zpass_cut.h"
+ 
+ namespace Vulkan {
+ 
+@@ -1518,6 +1519,9 @@ void RasterizerVulkan::DispatchCompute() {
+ }
+ 
+ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
++    if (type == VideoCommon::QueryType::ZPassPixelCount64) {
++        scheduler.SetZpassWindowOpen(true);
++    }
+     switch (type) {
+     case VideoCommon::QueryType::ZPassPixelCount64:
+     case VideoCommon::QueryType::StreamingByteCount:
+@@ -1533,6 +1537,9 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
+ 
+ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
++    if (type == VideoCommon::QueryType::ZPassPixelCount64) {
++        scheduler.SetZpassWindowOpen(false);
++    }
+     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+ }
+ 
+@@ -1557,6 +1564,7 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
+     }();
+     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) &&
+         (at_once || !scheduler.DeferFlush())) {
++        VideoCommon::ZpassCut::SiteScope site{VideoCommon::ZpassCut::Site::ListCopy};
+         scheduler.Flush();
+     }
+ }
+@@ -1901,6 +1909,7 @@ void RasterizerVulkan::FlushCommands() {
+     draw_counter = 0;
+     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
+     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
++    VideoCommon::ZpassCut::SiteScope site{VideoCommon::ZpassCut::Site::FenceFlush};
+     if (!scheduler.DeferFlush()) {
+         scheduler.Flush();
+     }
+@@ -2114,6 +2123,14 @@ void RasterizerVulkan::FlushWork() {
+         scheduler.DispatchWork();
+         return;
+     }
++    // EDEN_NX2_ZPASS_KEEP_WINDOW=1: this flush only keeps the GPU fed, so it can wait for the
++    // guest's report. A window the guest never reports ends the wait at 8 times the count.
++    if (scheduler.HoldSubmissionForZpass() && draw_counter < draws_to_dispatch * 8) {
++        VideoCommon::ZpassCut::NoteHeld();
++        scheduler.DispatchWork();
++        return;
++    }
++    VideoCommon::ZpassCut::SiteScope site{VideoCommon::ZpassCut::Site::Draws};
+     scheduler.Flush();
+     draw_counter = 0;
+ }
+@@ -2132,6 +2149,7 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64
+     buffer_cache.Nx2CollectListCopies(true);
+     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
++        VideoCommon::ZpassCut::SiteScope site{VideoCommon::ZpassCut::Site::ListCopy};
+         scheduler.Flush();
+     }
+     buffer_cache.Nx2CollectListCopies(false);
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 6dff4d9..5578932 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -22,6 +22,7 @@
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
++#include "video_core/zpass_cut.h"
+ #include "video_core/renderer_vulkan/vk_command_pool.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+@@ -181,10 +182,19 @@ bool Scheduler::DeferFlush() {
+ 
+ void Scheduler::FlushDeferred() {
+     if (flush_pending) {
++        VideoCommon::ZpassCut::SiteScope site{VideoCommon::ZpassCut::Site::Idle};
+         Flush();
+     }
+ }
+ 
++bool Scheduler::HoldSubmissionForZpass() const {
++    static const bool keep_window = [] {
++        const char* value = std::getenv("EDEN_NX2_ZPASS_KEEP_WINDOW");
++        return value != nullptr && value[0] == '1';
++    }();
++    return keep_window && zpass_window_open;
++}
++
+ bool Scheduler::WaitSubmitted(u64 tick) {
+     if (IsSubmitted(tick)) {
+         return true;
+@@ -582,7 +592,11 @@ void Scheduler::EndPendingOperations() {
+         const char* value = std::getenv("EDEN_NX2_ZPASS_PAUSE");
+         return value != nullptr && value[0] == '1';
+     }();
+-    if (pause_zpass) {
++    const bool pause_now = VideoCommon::ZpassCut::PauseNow(pause_zpass);
++    if (VideoCommon::ZpassCut::Enabled()) [[unlikely]] {
++        query_cache->CounterNoteSubmission(VideoCommon::QueryType::ZPassPixelCount64, !pause_now);
++    }
++    if (pause_now) {
+         query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
+     } else {
+         query_cache->CounterReset(VideoCommon::QueryType::ZPassPixelCount64);
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 4ebcd69..f29c8ce 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -63,6 +63,13 @@ public:
+     bool DeferFlush();
+     /// Submits deferred work (the split's back, from its idle hook).
+     void FlushDeferred();
++    /// The guest reset its ZPass counter (true) or reported it (false). The submitting thread only.
++    void SetZpassWindowOpen(bool open) {
++        zpass_window_open = open;
++    }
++    /// EDEN_NX2_ZPASS_KEEP_WINDOW=1: true while a submission that can wait should wait for the
++    /// guest's report. Without EDEN_NX2_ZPASS_PAUSE, one made now drops the samples of the window.
++    [[nodiscard]] bool HoldSubmissionForZpass() const;
+     /// Threads other than the split's back: waits until tick is submitted, asking the back to
+     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
+     /// is not running, so nothing will submit it: the caller then submits it itself.
+@@ -245,6 +252,7 @@ public:
+ private:
+     std::chrono::steady_clock::time_point last_flush{};
+     bool flush_pending{};
++    bool zpass_window_open{}; ///< From the guest's ZPass counter reset to its next report
+ 
+     class Command {
+     public:
+diff --git b/src/video_core/zpass_cut.h b/src/video_core/zpass_cut.h
+new file mode 100644
+index 0000000..326deb4
+--- /dev/null
++++ b/src/video_core/zpass_cut.h
+@@ -0,0 +1,254 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdlib>
++#include <mutex>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++
++namespace VideoCommon::ZpassCut {
++
++/// EDEN_NX2_ZPASS_CUT_LOG=1: log only. Counts the submissions that land inside a guest's ZPass
++/// window (from its reset to its report), who asked for each, and what the reports after them
++/// read. With EDEN_NX2_ZPASS_PAUSE unset such a submission drops the samples counted so far
++/// (Scheduler::EndPendingOperations), and a report that reads 0 tells the game "occluded".
++inline bool Enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_ZPASS_CUT_LOG");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++/// EDEN_NX2_ZPASS_PAUSE_AB=<seconds>: a submission resets the counter for <seconds>, then pauses
++/// it for <seconds>, round and round from the first submission, so one run at one spot compares
++/// the two (Kajcsi's A/B on one binary, Lichii PR 121). Each change is logged with the console's
++/// wall clock. Unset, this returns pause. The pause phases carry EDEN_NX2_ZPASS_PAUSE's risks.
++inline bool PauseNow(bool pause) {
++    static const std::chrono::seconds period = [] {
++        const char* value = std::getenv("EDEN_NX2_ZPASS_PAUSE_AB");
++        return std::chrono::seconds{value != nullptr ? std::strtoul(value, nullptr, 10) : 0UL};
++    }();
++    if (period.count() == 0) {
++        return pause;
++    }
++    static const auto start = std::chrono::steady_clock::now();
++    static bool last{};
++    const bool now_paused = ((std::chrono::steady_clock::now() - start) / period) % 2 != 0;
++    if (now_paused != last) {
++        last = now_paused;
++        const auto clock = std::chrono::duration_cast<std::chrono::seconds>(
++            std::chrono::system_clock::now().time_since_epoch());
++        LOG_INFO(HW_GPU, "ZPASS pause A/B: {} from unix time {}", now_paused ? "pause" : "reset",
++                 clock.count());
++    }
++    return now_paused;
++}
++
++/// Who asked for a submission. Other is every caller without a SiteScope: the present, Finish.
++enum class Site : u32 { Other, Draws, Astc, Fence, FenceFlush, ListCopy, Idle, Count };
++
++inline constexpr std::size_t SiteCount = static_cast<std::size_t>(Site::Count);
++inline constexpr std::array<const char*, SiteCount> SiteNames{
++    "other", "draws", "astc", "fence", "fence flush", "list copy", "idle"};
++
++/// QueryBase::cut_note: 0 for a clean window, else 1 + the site of the last submission inside it.
++/// NoDrawAfter: no draw counted after that submission, so a reset leaves this report at 0.
++inline constexpr u32 SiteMask = 0xff;
++inline constexpr u32 NoDrawAfter = 0x100;
++
++/// The site of the submission this thread is making. Submissions run on the split's back.
++inline thread_local Site current_site = Site::Other;
++
++class SiteScope {
++public:
++    explicit SiteScope(Site site) : previous{current_site} {
++        current_site = site;
++    }
++    ~SiteScope() {
++        current_site = previous;
++    }
++    SiteScope(const SiteScope&) = delete;
++    SiteScope& operator=(const SiteScope&) = delete;
++
++private:
++    Site previous;
++};
++
++/// One report address. Bits are one a report, newest lowest.
++struct ReportSlot {
++    DAddr address;
++    u64 value_bits; ///< 1: the report wasn't 0
++    u64 cut_bits;   ///< 1: a submission fell in its window
++    u32 reports;    ///< This second
++    u32 to_zero;    ///< This second: reports of 0 after one that wasn't
++    u32 to_zero_cut;
++    u32 last_cut_note;
++};
++
++inline constexpr std::size_t TableSize = std::size_t{1} << 14;
++
++struct Stats {
++    std::array<std::atomic<u64>, SiteCount> submissions{};
++    std::array<std::atomic<u64>, SiteCount> cuts{};
++    std::atomic<u64> held{};
++
++    std::mutex mutex; ///< All below. Reports are written by more than one thread
++    std::array<ReportSlot, TableSize> table{};
++    std::array<u64, SiteCount> to_zero_by_site{};
++    u64 reports{};
++    u64 zero_reports{};
++    u64 cut_reports{};
++    u64 cut_zero_reports{};
++    u64 cut_no_draw_reports{};
++    u64 to_zero{};     ///< Reports of 0 after one that wasn't
++    u64 to_zero_cut{}; ///< Those with a cut in their window
++    u64 stayed{};      ///< Reports that weren't 0 after one that wasn't
++    u64 stayed_cut{};  ///< Those with a cut in their window
++    u64 untracked{};
++    s64 next_log_ms{};
++};
++
++inline Stats& Get() {
++    static Stats stats;
++    return stats;
++}
++
++/// A submission on this thread: open is whether a guest's window has samples at stake.
++inline void NoteSubmission(bool open) {
++    auto& stats = Get();
++    const auto site = static_cast<std::size_t>(current_site);
++    stats.submissions[site].fetch_add(1, std::memory_order_relaxed);
++    if (open) {
++        stats.cuts[site].fetch_add(1, std::memory_order_relaxed);
++    }
++}
++
++/// EDEN_NX2_ZPASS_KEEP_WINDOW held back a submission that could wait.
++inline void NoteHeld() {
++    if (Enabled()) {
++        Get().held.fetch_add(1, std::memory_order_relaxed);
++    }
++}
++
++/// The name of the site in a cut note.
++inline const char* CutSiteName(u32 cut_note) {
++    const std::size_t site = (cut_note & SiteMask) - 1;
++    return cut_note != 0 && site < SiteCount ? SiteNames[site] : "none";
++}
++
++/// Keeps one report under its address. Only the first 0 of a row counts: once a game hides an
++/// object, its next reports can read 0 for reasons of their own.
++inline void NoteHistory(Stats& stats, DAddr address, bool non_zero, u32 cut_note) {
++    static constexpr std::size_t max_probes = 8;
++    const std::size_t index =
++        static_cast<std::size_t>(((address >> 2) * 0x9E3779B97F4A7C15ULL) >> 50);
++    for (std::size_t probe = 0; probe < max_probes; ++probe) {
++        ReportSlot& slot = stats.table[(index + probe) & (TableSize - 1)];
++        if (slot.address != address && slot.address != 0) {
++            continue;
++        }
++        const bool cut = cut_note != 0;
++        if (slot.address != 0 && (slot.value_bits & 1) != 0) {
++            if (non_zero) {
++                ++stats.stayed;
++                stats.stayed_cut += cut ? 1 : 0;
++            } else {
++                ++stats.to_zero;
++                ++slot.to_zero;
++                if (cut) {
++                    ++stats.to_zero_cut;
++                    ++slot.to_zero_cut;
++                    const std::size_t site = (cut_note & SiteMask) - 1;
++                    if (site < SiteCount) {
++                        ++stats.to_zero_by_site[site];
++                    }
++                }
++            }
++        }
++        slot.address = address;
++        slot.value_bits = (slot.value_bits << 1) | (non_zero ? 1 : 0);
++        slot.cut_bits = (slot.cut_bits << 1) | (cut ? 1 : 0);
++        slot.last_cut_note = cut ? cut_note : slot.last_cut_note;
++        ++slot.reports;
++        return;
++    }
++    ++stats.untracked;
++}
++
++/// Once a second: the addresses that went to 0 at least twice, 32 at most, then totals since the
++/// start. "stayed" against "to zero", each with its share after a cut, tells whether a cut makes a
++/// report read 0 with no clock to line up: an object that keeps flipping with the camera still
++/// isn't really going in and out of view.
++inline void LogSecond(Stats& stats) {
++    static constexpr u32 min_to_zero = 2;
++    static constexpr std::size_t max_lines = 32;
++    std::size_t lines = 0;
++    for (ReportSlot& slot : stats.table) {
++        if (slot.to_zero >= min_to_zero && lines < max_lines) {
++            ++lines;
++            LOG_INFO(HW_GPU,
++                     "ZPASS flip: addr={:#x} reports={} to zero={} after a cut={} last site={} "
++                     "value bits={:032b} cut bits={:032b}",
++                     slot.address, slot.reports, slot.to_zero, slot.to_zero_cut,
++                     CutSiteName(slot.last_cut_note), slot.value_bits & 0xffffffffULL,
++                     slot.cut_bits & 0xffffffffULL);
++        }
++        slot.reports = 0;
++        slot.to_zero = 0;
++        slot.to_zero_cut = 0;
++    }
++    const auto at = [](const std::array<std::atomic<u64>, SiteCount>& list, Site site) {
++        return list[static_cast<std::size_t>(site)].load(std::memory_order_relaxed);
++    };
++    const auto zero_at = [&stats](Site site) {
++        return stats.to_zero_by_site[static_cast<std::size_t>(site)];
++    };
++    LOG_INFO(HW_GPU,
++             "ZPASS cut totals: reports {} zero {} cut {} cut zero {} cut no draw {} held {}; "
++             "to zero {} after a cut {}; stayed {} after a cut {}; untracked {}",
++             stats.reports, stats.zero_reports, stats.cut_reports, stats.cut_zero_reports,
++             stats.cut_no_draw_reports, stats.held.load(std::memory_order_relaxed), stats.to_zero,
++             stats.to_zero_cut, stats.stayed, stats.stayed_cut, stats.untracked);
++    LOG_INFO(HW_GPU,
++             "ZPASS cut sites, to zero, cuts/submissions: draws {}, {}/{} astc {}, {}/{} fence {}, "
++             "{}/{} fence flush {}, {}/{} list copy {}, {}/{} idle {}, {}/{} other {}, {}/{}",
++             zero_at(Site::Draws), at(stats.cuts, Site::Draws), at(stats.submissions, Site::Draws),
++             zero_at(Site::Astc), at(stats.cuts, Site::Astc), at(stats.submissions, Site::Astc),
++             zero_at(Site::Fence), at(stats.cuts, Site::Fence), at(stats.submissions, Site::Fence),
++             zero_at(Site::FenceFlush), at(stats.cuts, Site::FenceFlush),
++             at(stats.submissions, Site::FenceFlush), zero_at(Site::ListCopy),
++             at(stats.cuts, Site::ListCopy), at(stats.submissions, Site::ListCopy),
++             zero_at(Site::Idle), at(stats.cuts, Site::Idle), at(stats.submissions, Site::Idle),
++             zero_at(Site::Other), at(stats.cuts, Site::Other), at(stats.submissions, Site::Other));
++}
++
++/// Runs where the report is written to guest memory, with its final value.
++inline void NoteReport(DAddr address, u64 value, u32 cut_note) {
++    auto& stats = Get();
++    std::scoped_lock lock{stats.mutex};
++    ++stats.reports;
++    stats.zero_reports += value == 0 ? 1 : 0;
++    if (cut_note != 0) {
++        ++stats.cut_reports;
++        stats.cut_zero_reports += value == 0 ? 1 : 0;
++        stats.cut_no_draw_reports += (cut_note & NoDrawAfter) != 0 ? 1 : 0;
++    }
++    NoteHistory(stats, address, value != 0, cut_note);
++    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                        std::chrono::steady_clock::now().time_since_epoch())
++                        .count();
++    if (now >= stats.next_log_ms) {
++        stats.next_log_ms = now + 1000;
++        LogSecond(stats);
++    }
++}
++
++} // namespace VideoCommon::ZpassCut

@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 03:20:00 +0100
+Subject: [PATCH] texture_cache: EDEN_NX2_CLEAR_UPLOAD_GUARDS puts back two checks the
+ v1.219.020 move lost
+
+Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_CLEAR_UPLOAD_GUARDS=1.
+
+A new render target made by joining images, which a clear overwrites whole, gets no upload from guest
+memory. Our tree had that rule with two more checks up to T39 (core-t33, texture_cache.h:3327 and 3338,
+from the T32 stack): not for an image with sparse or unbacked flags, and not when the clear sits under
+a condition. The move to v1.219.020 dropped our patch as "upstream has it" (migrate-020.json, source
+0146, upstream patch 0078, Kaj, Lichii #141). Upstream's copy has neither check, so T40 to T43 upload
+nothing in both cases.
+
+The sparse check is for Mario Kart World's terrain images. The condition check is for any game: if the
+host predicate skips the clear, such a target has no defined contents. IsFullClear has no such check
+in either tree, so a target that is not joined loses its upload anyway; this puts back T39, no more.
+
+Whether any game reaches this is not known. With the switch on, "Clear upload guard:" says how often
+and why, without counting flashes. A run with no such line says that route does not reach it, and
+nothing about other areas or games: run it on the Kokiri walk and on a Mario Kart race before dropping
+the patch. Not in any plan yet.
+
+Unset, nothing changes. Not built, not run.
+---
+ src/video_core/texture_cache/texture_cache.h | 33 +++++++++++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3519,7 +3519,38 @@
+             break;
+         }
+     }
+-    if (overwritten_by_clear()) {
++    // EDEN_NX2_CLEAR_UPLOAD_GUARDS=1 (off unless set): the two checks our tree had in that rule up to
++    // T39, which upstream's copy (0078) does not have. An image with sparse or unbacked flags keeps
++    // its upload, and so does one under a condition: the host predicate can skip the clear, and the
++    // image must then hold what guest memory holds. Counted, so a run says whether it ever fires.
++    const auto clear_guard_keeps_upload = [&] {
++        static const bool guards = [] {
++            const char* const value = std::getenv("EDEN_NX2_CLEAR_UPLOAD_GUARDS");
++            return value != nullptr && value[0] == '1';
++        }();
++        if (!guards) {
++            return false;
++        }
++        const auto& regs = maxwell3d->regs;
++        using RenderEnable = Tegra::Engines::Maxwell3D::Regs::RenderEnable;
++        const bool sparse =
++            True(new_image.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
++                                    ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
++                                    ImageFlagBits::Unbacked));
++        const bool conditional = regs.render_enable_override == RenderEnable::Override::UseRenderEnable &&
++                                 regs.render_enable.mode != RenderEnable::Mode::True &&
++                                 regs.render_enable.mode != RenderEnable::Mode::False;
++        if (!sparse && !conditional) {
++            return false;
++        }
++        static u64 kept_uploads{};
++        if (++kept_uploads <= 16 || kept_uploads % 1024 == 0) {
++            LOG_INFO(HW_GPU, "Clear upload guard: {}x{} at {:#x} keeps its upload (sparse {}, condition {}; {} so far)",
++                     new_info.size.width, new_info.size.height, gpu_addr, sparse, conditional, kept_uploads);
++        }
++        return true;
++    };
++    if (overwritten_by_clear() && !clear_guard_keeps_upload()) {
+         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
+         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
+         runtime.TransitionImageLayout(new_image);
