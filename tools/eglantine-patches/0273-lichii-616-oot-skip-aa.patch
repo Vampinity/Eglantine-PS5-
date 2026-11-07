@@ -1,0 +1,407 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 01:15:00 +0100
+Subject: [PATCH] EDEN_NX2_OOT_SKIP_AA=1: bypass Ocarina of Time's sharpening AA network
+
+Off unless set. Port of zortos293/Lichii PR 616 (imports #319 by ProphetWild): the prepass
+(8475d671..) and the network (42593194..) are skipped and the output pass (da6df3e5..) is replaced
+by a same-size point copy of the tonemap draw's B10G11R11 render target into the output pass's
+target (cb0+0xd0). Lichii's per-game setting becomes the env switch; its docs, Qt strings and the
+Streamline DLSS branch are left out (UsesNvidiaDlss still wins). Lichii hooks ShaderCache::
+ComputeShader with DispatchReplaced, which ours lacks: here RasterizerVulkan::DispatchCompute asks
+before the pipeline lookup, using a native program key LoweredNativeCode now keeps when the switch
+is set. Tonemap fragment hashes compare with the salt bit ignored. Any check failing (formats,
+sizes, unseen tonemap, copy refused) runs the whole network natively next frame. Unproven on PS5.
+---
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -113,6 +113,7 @@
+     native_query_trace.h
+     nx2.h
+     nx2_profile.h
++    oot_network.h
+     present.h
+     pte_kind.h
+     query_cache/bank_base.h
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -30,6 +30,7 @@
+ #include "video_core/game_dlss_status.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/native_query_trace.h"
++#include "video_core/oot_network.h"
+ #ifdef ARCHITECTURE_x86_64
+ #include "video_core/macro_turing_jit.h"
+ #endif
+@@ -868,6 +869,116 @@
+     }
+ }
+ 
++std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) const {
++    const auto& cbuf = launch_description.const_buffer_config[0];
++    const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
++    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < offset + 4 ||
++        !memory_manager.IsFullyMappedRange(cbuf_address + offset, 4)) {
++        return std::nullopt;
++    }
++    const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
++    if (tic_index > regs.tic.limit ||
++        !memory_manager.IsFullyMappedRange(regs.tic.Address() +
++                                               u64{tic_index} * sizeof(Texture::TICEntry),
++                                           sizeof(Texture::TICEntry))) {
++        return std::nullopt;
++    }
++    return GetTICEntry(tic_index);
++}
++
++// EDEN_NX2_OOT_SKIP_AA=1, from Lichii PR 616 (there in ShaderCache::ComputeShader; ours asks from
++// RasterizerVulkan::DispatchCompute before the pipeline is looked up, so a skipped pass builds none).
++bool KeplerCompute::BypassOotNetwork(VideoCommon::OotNetwork::BypassState& state, u64 native_key) {
++    using namespace VideoCommon::OotNetwork;
++    if (native_key != PrepassProgramKey && native_key != NetworkProgramKey &&
++        native_key != OutputProgramKey) {
++        return false;
++    }
++    // NVIDIA DLSS replaces the same output pass and takes precedence.
++    if (rasterizer->UsesNvidiaDlss()) {
++        return false;
++    }
++    // The tonemap pass draws before the network every frame; until it has been seen (menus, the
++    // first frame) the network runs as usual. Its first passes are skipped only while the output
++    // pass is being replaced, so a failed replacement brings the whole network back next frame.
++    Maxwell3D::Regs::RenderTargetConfig tonemapped;
++    {
++        std::scoped_lock lock{state.mutex};
++        tonemapped = state.tonemapped;
++    }
++    if (tonemapped.Address() == 0) {
++        return false;
++    }
++    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
++        return state.output_replaced.load(std::memory_order_relaxed);
++    }
++    // The copy needs the tonemapped image to be a B10G11R11 block-linear image of the output's size.
++    const auto output = ConstBuffer0Image(OutputImageHandleOffset);
++    if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
++        output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
++        tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
++        tonemapped.tile_mode.is_pitch_linear || tonemapped.width != output->Width() ||
++        tonemapped.height != output->Height()) {
++        state.output_replaced.store(false, std::memory_order_relaxed);
++        static u32 warned = 0;
++        if (warned < 4) {
++            ++warned;
++            LOG_WARNING(HW_GPU,
++                        "EDEN_NX2_OOT_SKIP_AA: unexpected network images, not replaced (tonemapped "
++                        "{:#x} {}x{} format {:#x}, output {})",
++                        tonemapped.Address(), tonemapped.width, tonemapped.height,
++                        static_cast<u32>(tonemapped.format),
++                        output ? fmt::format("{:#x} {}x{} format {:#x}", output->Address(),
++                                             output->Width(), output->Height(),
++                                             static_cast<u32>(output->format.Value()))
++                               : std::string{"unreadable"});
++        }
++        return false;
++    }
++    Fermi2D::Surface destination{};
++    destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
++    destination.linear = Fermi2D::MemoryLayout::BlockLinear;
++    destination.block_width.Assign(output->block_width);
++    destination.block_height.Assign(output->block_height);
++    destination.block_depth.Assign(output->block_depth);
++    destination.depth = 1;
++    destination.width = output->Width();
++    destination.height = output->Height();
++    destination.addr_upper = static_cast<u32>(output->Address() >> 32);
++    destination.addr_lower = static_cast<u32>(output->Address());
++    Fermi2D::Surface source = destination;
++    source.block_width.Assign(tonemapped.tile_mode.block_width);
++    source.block_height.Assign(tonemapped.tile_mode.block_height);
++    source.block_depth.Assign(tonemapped.tile_mode.block_depth);
++    source.addr_upper = tonemapped.address_high;
++    source.addr_lower = tonemapped.address_low;
++    const s32 width = static_cast<s32>(output->Width());
++    const s32 height = static_cast<s32>(output->Height());
++    const Fermi2D::Config config{
++        .operation = Fermi2D::Operation::SrcCopy,
++        .filter = Fermi2D::Filter::Point,
++        .must_accelerate = true,
++        .dst_x0 = 0,
++        .dst_y0 = 0,
++        .dst_x1 = width,
++        .dst_y1 = height,
++        .src_x0 = 0,
++        .src_y0 = 0,
++        .src_x1 = width,
++        .src_y1 = height,
++    };
++    const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
++    state.output_replaced.store(copied, std::memory_order_relaxed);
++    static u32 logged = 0;
++    if (logged < 4 && (logged == 0 || !copied)) {
++        ++logged;
++        LOG_INFO(HW_GPU, "EDEN_NX2_OOT_SKIP_AA: network bypassed ({}): {:#x} -> {:#x} {}x{}",
++                 copied ? "copy of the tonemapped image" : "copy failed", tonemapped.Address(),
++                 output->Address(), width, height);
++    }
++    return copied;
++}
++
+ std::atomic<u32> g_nx2_trace_draws_after_upscale{};
+ 
+ // Fire Emblem: Fortune's Weave's first DLSS pass (rejected, before the network) has the input colour
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -32,6 +32,10 @@
+ class GpuSplit;
+ }
+ 
++namespace VideoCommon::OotNetwork {
++struct BypassState;
++}
++
+ namespace Tegra {
+ class MemoryManager;
+ }
+@@ -253,6 +257,10 @@
+     }
+ 
+     bool IsNativeMode() const { return native_mode; }
++    /// EDEN_NX2_OOT_SKIP_AA=1 (oot_network.h): true when this dispatch of Ocarina of Time's
++    /// anti-aliasing network is skipped, or its output pass replaced by a copy of the tonemapped
++    /// image. Called by the rasterizer before the pipeline is looked up.
++    bool BypassOotNetwork(VideoCommon::OotNetwork::BypassState& state, u64 native_key);
+     /// Whether the dispatch being run is a pass of a game DLSS evaluation (Fortune's Weave).
+     bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
+     /// Whether the matrix multiplies (tensor-core instructions) of the program being dispatched
+@@ -290,6 +298,8 @@
+     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
+     void ProcessNativeReportSemaphore(u32 argument);
+     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
++    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
++    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
+     bool RememberDlssMotionVectors();
+     bool IsDlssOutputPass();
+     bool FinishDlssEvaluation();
+diff --git a/src/video_core/oot_network.h b/src/video_core/oot_network.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/oot_network.h
+@@ -0,0 +1,66 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <cstdlib>
++#include <mutex>
++
++#include "common/common_types.h"
++#include "video_core/engines/maxwell_3d.h"
++
++// EDEN_NX2_OOT_SKIP_AA=1 (port of zortos293/Lichii PR 616, imports #319 by ProphetWild): The Legend
++// of Zelda: Ocarina of Time's anti-aliasing. After tonemapping, the game runs a single-frame tensor
++// network on the tonemapped image and an output pass that sharpens the result hard (the halos).
++// With the switch, the prepass and the network are skipped and the output pass is replaced by a
++// same-size point copy of the tonemapped image. Unset: nothing here runs.
++//
++// Shader hashes, native program keys and the constant buffer offset are those of the game's main
++// with build id E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348; with other keys nothing is replaced.
++namespace VideoCommon::OotNetwork {
++
++constexpr u64 ProgramId = 0x0400486024DEC000ULL;
++
++// Native program keys (Shader::Ampere::NativeProgramKey, the EDEN_NX2_SHADER_DUMP file names) of
++// the network's compute passes.
++constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
++constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
++constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
++
++/// Constant buffer 0 offset of the output pass's texture handle for the B10G11R11 image it writes
++/// (the scene image the rest of the frame uses).
++constexpr u32 OutputImageHandleOffset = 0xd0;
++
++/// Fragment shaders of the game's tonemap passes; render target 0 of their draws is the network's
++/// input. The lowest bit of a pipeline hash is a salt (ours log bded5ce917183215), so it is ignored.
++constexpr bool IsTonemapShader(u64 hash) {
++    hash |= 1;
++    return hash == (0xbded5ce917183214ULL | 1) || // outdoors
++           hash == (0x6cb06edf14be1d79ULL | 1) || // indoors
++           hash == (0x3ac011bd2d772994ULL | 1);   // outdoors at another time of day
++}
++
++/// Owned by the rasterizer: the tonemap pass draws on the 3D engine, the network's passes compute.
++struct BypassState {
++    std::mutex mutex;
++    /// Render target 0 of the latest tonemap draw (address 0 until one is seen), under mutex.
++    Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig tonemapped{};
++    std::atomic<bool> output_replaced{}; ///< the latest output pass was replaced
++};
++
++inline bool SkipAaSwitch() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_OOT_SKIP_AA");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++/// Takes the program id getter so that, with the switch unset, a draw or dispatch costs one
++/// static bool and no call.
++inline bool BypassEnabled(u64 (*current_program_id)()) {
++    return SkipAaSwitch() && current_program_id() == ProgramId;
++}
++
++} // namespace VideoCommon::OotNetwork
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1155,6 +1155,11 @@
+     return CurrentGraphicsPipelineSlowPath();
+ }
+ 
++u64 PipelineCache::CurrentComputeNativeKey() {
++    const ShaderInfo* const shader{ComputeShader()};
++    return shader && shader->lowered_native ? shader->lowered_native->native_key : 0;
++}
++
+ ComputePipeline* PipelineCache::CurrentComputePipeline() {
+ 
+     const ShaderInfo* const shader{ComputeShader()};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -133,6 +133,11 @@
+ 
+     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+ 
++    /// EDEN_NX2_OOT_SKIP_AA: the native program key of the compute program about to be
++    /// dispatched (0 when it is not a native program), without building its pipeline. Throws
++    /// like CurrentComputePipeline for a rejected program.
++    [[nodiscard]] u64 CurrentComputeNativeKey();
++
+     /// The program hash of the pipeline CurrentComputePipeline returned last
+     [[nodiscard]] u64 LastComputeHash() const noexcept {
+         return last_compute_hash;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -690,6 +690,9 @@
+     if (!is_indexed && TryNx2IndirectReset()) {
+         submitted = true;
+         return;
++    }
++    if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID)) {
++        TrackOotTonemappedImage(*pipeline);
+     }
+     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
+     mesh_draw = pipeline->IsMeshPipeline();
+@@ -1150,6 +1153,30 @@
+     });
+ }
+ 
++void RasterizerVulkan::TrackOotTonemappedImage(const GraphicsPipeline& pipeline) {
++    const auto& hashes = pipeline.Key().unique_hashes;
++    if (!VideoCommon::OotNetwork::IsTonemapShader(hashes[5])) {
++        return;
++    }
++    const auto& target = maxwell3d->regs.rt[0];
++    if (target.Address() == 0) {
++        return;
++    }
++    std::scoped_lock lock{oot_network_bypass.mutex};
++    if (oot_network_bypass.tonemapped.Address() != target.Address()) {
++        // The game may alternate targets: a few lines are enough to see which.
++        static u32 logged = 0;
++        if (logged < 8) {
++            ++logged;
++            LOG_INFO(Render_Vulkan,
++                     "EDEN_NX2_OOT_SKIP_AA: tonemapped image at {:#x} {}x{} format {:#x}",
++                     target.Address(), target.width, target.height,
++                     static_cast<u32>(target.format));
++        }
++    }
++    oot_network_bypass.tonemapped = target;
++}
++
+ void RasterizerVulkan::DrawIndirect() {
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+     const auto& params = maxwell3d->draw_manager.indirect_state;
+@@ -1485,6 +1512,16 @@
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+     FlushWork();
+     gpu_memory->FlushCaching();
++
++    // EDEN_NX2_OOT_SKIP_AA=1: Ocarina of Time's anti-aliasing network is skipped and its output
++    // pass replaced by a copy (oot_network.h). A skipped pass counts as dispatched.
++    if (kepler_compute->IsNativeMode() &&
++        VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID)) {
++        const u64 native_key = pipeline_cache.CurrentComputeNativeKey();
++        if (native_key != 0 && kepler_compute->BypassOotNetwork(oot_network_bypass, native_key)) {
++            return;
++        }
++    }
+ 
+     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
+     if (!pipeline) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -14,6 +14,7 @@
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/engines/maxwell_dma.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/oot_network.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/renderer_vulkan/blit_image.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+@@ -265,6 +266,11 @@
+ 
+     u32 draw_counter = 0;
+     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
++    /// EDEN_NX2_OOT_SKIP_AA (oot_network.h): the tonemapped image and whether the output pass of
++    /// Ocarina of Time's network was replaced.
++    VideoCommon::OotNetwork::BypassState oot_network_bypass;
++    /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
++    void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
+     bool mesh_runs_as_compute{}; ///< ... whose programs run as compute passes (vk_mesh_compute.h)
+     GraphicsPipeline::MeshComputeDraw mesh_compute_draw{}; ///< the readback draw they left
+ };
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -34,6 +34,7 @@
+ #include "shader_recompiler/frontend/ampere/program_address_map.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/oot_network.h"
+ #include "video_core/shader_environment.h"
+ #include "video_core/texture_cache/format_lookup_table.h"
+ #include "video_core/textures/texture.h"
+@@ -608,6 +609,9 @@
+     }();
+     if (hash_for_indirect_reset) {
+         result->diagnostic_key = Shader::Ampere::NativeProgramKey(native);
++    }
++    if (VideoCommon::OotNetwork::SkipAaSwitch()) {
++        result->native_key = Shader::Ampere::NativeProgramKey(native);
+     }
+     result->texture_bound = lowered.required_texture_buffer;
+     result->source_size = native_header_size + lowered.source_size;
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -33,6 +33,9 @@
+ /// it so the environments built for the program's pipelines don't capture and lower it again.
+ struct LoweredNativeCode {
+     u64 diagnostic_key{};
++    /// Shader::Ampere::NativeProgramKey of the program, only with EDEN_NX2_OOT_SKIP_AA=1
++    /// (oot_network.h), otherwise 0.
++    u64 native_key{};
+     /// Shader header, lowered instructions with Maxwell scheduling words, then the native
+     /// address map (what the environment's `code` used to be filled with).
+     std::vector<u64> code;

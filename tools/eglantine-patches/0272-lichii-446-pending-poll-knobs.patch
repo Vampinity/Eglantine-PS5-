@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 00:45:00 +0100
+Subject: [PATCH] EDEN_NX2_PENDING_POLL_US / _SPIN_US: env knobs for the pending-channel poll
+
+Off unless set: unset keeps the 500 us yield and the 250 us poll exactly. Port of the idea in
+zortos293/Lichii PR 446 (50 us poll while a channel waits on a CPU-released semaphore, 1 ms after
+2 s). Ours already wakes on new commands and polls every 250 us (0041), so Lichii's 1 ms -> 50 us
+gain mostly does not apply; this makes 50 testable. A poll below 250 us returns to 250 us once a
+channel has waited 2 s. The Linux prctl timer slack hunk is left out (not our kernel).
+---
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
+ #include <thread>
+@@ -26,6 +27,27 @@
+ namespace VideoCommon::GPUThread {
+ 
+ namespace {
++
++// EDEN_NX2_PENDING_SPIN_US / EDEN_NX2_PENDING_POLL_US (Lichii #446): how long the GPU thread yields
++// after the last command arrived, then how often it polls the channel's semaphores while it
++// sleeps for new commands. Unset: 500 and 250, the values below have always been. Lichii polls every
++// 50 us. A poll shorter than 250 us goes back to 250 us once 2 s pass with no new command
++// (last_progress only moves when a command arrives, so a title that still submits every frame
++// stays on the short poll), as Lichii goes back to 1 ms; at 250 or more nothing changes then.
++// Values outside min..100000 or not a plain number keep the default (a 0 poll would spin on
++// ResumePending). Read once.
++std::chrono::microseconds PendingKnob(const char* name, long long fallback, long long min) {
++    const char* const value = std::getenv(name);
++    if (value == nullptr || value[0] == '\0') {
++        return std::chrono::microseconds{fallback};
++    }
++    char* end = nullptr;
++    const long long parsed = std::strtoll(value, &end, 10);
++    if (end == value || *end != '\0') {
++        return std::chrono::microseconds{fallback};
++    }
++    return std::chrono::microseconds{parsed >= min && parsed <= 100000 ? parsed : fallback};
++}
+ 
+ // Tells a CPU thread waiting in PushCommand that its command ran.
+ void SignalCommand(SynchState& state, u64 fence, bool block) {
+@@ -63,6 +85,10 @@
+         auto last_progress = std::chrono::steady_clock::now();
+         namespace Profile = VideoCommon::Nx2Profile;
+         auto& split = VideoCommon::GpuSplit::Get();
++        static const auto pending_spin = PendingKnob("EDEN_NX2_PENDING_SPIN_US", 500, 0);
++        static const auto pending_poll = PendingKnob("EDEN_NX2_PENDING_POLL_US", 250, 1);
++        static const auto pending_poll_long =
++            (std::max)(pending_poll, std::chrono::microseconds{250});
+         while (!stop_token.stop_requested()) {
+             Profile::Report();
+             split.MaybeStart(system);
+@@ -77,15 +103,17 @@
+                     // millisecond before sleeping, or every wait also waits out a host sleep
+                     // (title 1 waits ~25 times a second).
+                     Profile::Scope scope{Profile::Zone::PendingSleep};
+-                    if (std::chrono::steady_clock::now() - last_progress <
+-                        std::chrono::microseconds{500}) {
++                    const auto waited = std::chrono::steady_clock::now() - last_progress;
++                    if (waited < pending_spin) {
+                         std::this_thread::yield();
+                         continue;
+                     }
+                     // Then sleep until the CPU submits more work, polling the semaphores every
+                     // quarter millisecond (a release is a plain guest memory write that wakes
+                     // nothing). A fixed 1 ms sleep let new submissions wait out the rest of it.
+-                    if (!state.queue.PopWaitFor(next, std::chrono::microseconds{250})) {
++                    const auto poll =
++                        waited < std::chrono::seconds{2} ? pending_poll : pending_poll_long;
++                    if (!state.queue.PopWaitFor(next, poll)) {
+                         continue;
+                     }
+                 }

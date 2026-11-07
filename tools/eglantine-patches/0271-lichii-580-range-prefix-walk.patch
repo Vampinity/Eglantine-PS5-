@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 00:30:00 +0100
+Subject: [PATCH] EDEN_NX2_RANGE_PREFIX=1: reuse a contiguous range's page walk for shorter sizes
+
+Off unless set. Port of zortos293/Lichii PR 580 (imports #478 by mstampfli), core hunk only; the
+catch2 test and the templated Query are left out. VirtualRangeCache kept one size per address, so
+Ocarina's alternating storage binding sizes replaced the entry and walked the page tables on every
+size change. With the switch, a cached single segment answers any shorter size. The only caller,
+BufferCache::ResolveMultiRangeStorage, returns early when the list has fewer than two segments, so
+the oversized single segment is never used as a range. Unset: the exact-size match is unchanged.
+---
+diff --git a/src/video_core/buffer_cache/virtual_range_cache.h b/src/video_core/buffer_cache/virtual_range_cache.h
+index f4284d6..ed7ce9e 100644
+--- a/src/video_core/buffer_cache/virtual_range_cache.h
++++ b/src/video_core/buffer_cache/virtual_range_cache.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <cstdlib>
+ #include <limits>
+ #include <mutex>
+ #include <optional>
+@@ -44,6 +45,22 @@ public:
+             it->second.gpu_addr == gpu_addr && it->second.size == size) {
+             return &it->second.segments;
+         }
++        // EDEN_NX2_RANGE_PREFIX=1 (Lichii #580 / #478): titles bind one address with several sizes
++        // (Ocarina of Time ~2,000 times a second, half of them over 1 MiB), and every size change
++        // replaced the entry and walked the page tables again. A prefix of a contiguous range is
++        // contiguous too, so a cached single segment answers any shorter size and the longest walk
++        // is kept. The returned segment may then cover more than was asked: the only caller
++        // (BufferCache::ResolveMultiRangeStorage) ignores lists with fewer than two segments.
++        // Lists of split ranges still match exactly.
++        static const bool range_prefix = [] {
++            const char* const value = std::getenv("EDEN_NX2_RANGE_PREFIX");
++            return value != nullptr && value[0] == '1';
++        }();
++        if (range_prefix && it != entries.end() && it->second.as_id == as_id &&
++            it->second.gpu_addr == gpu_addr && it->second.segments.size() == 1 &&
++            size < it->second.size) {
++            return &it->second.segments;
++        }
+         Entry entry{};
+         entry.as_id = as_id;
+         entry.gpu_addr = gpu_addr;

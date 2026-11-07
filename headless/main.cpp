@@ -26,6 +26,8 @@
 #include <cstring>
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
+// headless/heap_pages.cpp (the native build only): the pool switches, read once env.txt is in.
+extern "C" void eden_heap_pool_init(void) __attribute__((weak));
 #endif
 #ifdef EDEN_DEV_VULKAN
 #include "sdk_audit.h"
@@ -542,6 +544,9 @@ int main(int argc, char** argv) {
                 std::printf("EDEN_ENV %s\n", entry.c_str());
             }
         }
+        // The heap's pool switches (EDEN_BIG_IMAGE_RESERVE_MIB, EDEN_BIG_IMAGE_NO_SPLIT) are read
+        // now, with the environment complete and the pool still whole (headless/heap_pages.cpp).
+        if (eden_heap_pool_init) eden_heap_pool_init();
         // Test runs (test_harness.h): nothing happens here without an EDEN_TEST_ setting.
         Eden::TestHarness::Start();
         if (const std::string& title = Eden::TestHarness::BootTitle(); !title.empty()) {

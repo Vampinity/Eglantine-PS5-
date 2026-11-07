@@ -17,7 +17,7 @@
 // one block the graphics driver keeps for good (its zero block, taken in the middle of a game
 // and then left where it was). The driver's command ring and marker page are known by who
 // asks. The app's own 2 MiB blocks, the slots of the guest page tables, go back when a game
-// ends: they bypass the wrap; EDEN_GUEST_BAND optionally prefers a fixed top band.
+// ends: they bypass the wrap; EDEN_GUEST_BAND2 optionally prefers a fixed bottom band.
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -67,23 +67,42 @@ static void eden_direct_acquire(void) {
 }
 static void eden_direct_release(void) { atomic_flag_clear_explicit(&eden_direct_lock, memory_order_release); }
 
+/* Called under eden_direct_lock. Configuration is fixed before any placement preference.
+ * Round down to whole guest slots; reject a band that leaves no outside slot. */
+static int64_t eden_direct_band2(int64_t total) {
+  static int64_t band = -1;
+  if (band < 0) {
+    const char *value = getenv("EDEN_GUEST_BAND2");
+    char *end = NULL;
+    const unsigned long long mib = value && value[0] >= '0' && value[0] <= '9'
+                                    ? strtoull(value, &end, 10) : 0;
+    band = end && *end == '\0' && total > EDEN_DIRECT_STEP &&
+                   mib <= (unsigned long long)((total - EDEN_DIRECT_STEP) >> 20)
+             ? (int64_t)(mib / 2 * 2 << 20) : 0;
+  }
+  return band;
+}
+
+int eden_direct_low(size_t size, size_t alignment, int type, int64_t *start);
+
 /* Memory from as high in the pool as there is room; from anywhere when the top has none. */
 int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
   const int64_t total = sceKernelGetDirectMemorySize();
   const int64_t bytes = (int64_t)size;
   if (bytes <= 0 || total <= 0) return eden_direct_take(0, total, size, alignment, type, start);
   eden_direct_acquire();
+  const int64_t band = eden_direct_band2(total);
   /* A block given back earlier left a hole of its size. */
   while (size == EDEN_DIRECT_SMALL && eden_direct_hole_count != 0) {
     const int64_t hole = eden_direct_holes[--eden_direct_hole_count];
-    if (eden_direct_take(hole, hole + bytes, size, alignment, type, start) == 0) {
+    if (hole >= band && eden_direct_take(hole, hole + bytes, size, alignment, type, start) == 0) {
       eden_direct_release();
       return 0;
     }
   }
   /* Below what is at the top already; past what something else has put there, for a while. */
   int64_t next = eden_direct_floor != 0 ? eden_direct_floor : total;
-  for (unsigned tries = 0; tries < 512 && next >= bytes; ++tries) {
+  for (unsigned tries = 0; tries < 512 && next >= bytes && next - bytes >= band; ++tries) {
     const int64_t at = (next - bytes) / EDEN_DIRECT_STEP * EDEN_DIRECT_STEP;
     next = at;
     if (eden_direct_take(at, at + bytes, size, alignment, type, start) == 0) {
@@ -93,30 +112,27 @@ int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
     }
   }
   eden_direct_release();
+  return eden_direct_low(size, alignment, type, start);
+}
+
+/* Session/graphics allocations prefer outside the guest band; full-pool recovery stays. */
+int eden_direct_low(size_t size, size_t alignment, int type, int64_t *start) {
+  const int64_t total = sceKernelGetDirectMemorySize();
+  eden_direct_acquire();
+  const int64_t band = eden_direct_band2(total);
+  eden_direct_release();
+  if (band > 0 && eden_direct_take(band, total, size, alignment, type, start) == 0) return 0;
   return eden_direct_take(0, total, size, alignment, type, start);
 }
 
-/* As the system places it: for what a session takes and gives back. */
-int eden_direct_low(size_t size, size_t alignment, int type, int64_t *start) {
-  return eden_direct_take(0, sceKernelGetDirectMemorySize(), size, alignment, type, start);
-}
-
-/* Guest slots/packed blocks: lowest fit in a fixed top band, then the original full pool.
- * This is a placement preference, not a kernel reservation excluding other owners. */
+/* Guest slots and packed blocks prefer [0, band). No placeholder or shared high floor.
+ * Both owners may cross the boundary on failure: this is deliberately a soft partition. */
 int eden_direct_guest(size_t size, size_t alignment, int type, int64_t *start) {
   const int64_t total = sceKernelGetDirectMemorySize();
-  static int64_t band = -1;
   eden_direct_acquire();
-  if (band < 0) {
-    const char *value = getenv("EDEN_GUEST_BAND");
-    char *end = NULL;
-    const unsigned long long mib = value && value[0] >= '0' && value[0] <= '9'
-                                    ? strtoull(value, &end, 10) : 0;
-    band = end && *end == '\0' && total > 0 && mib <= (unsigned long long)(total >> 20)
-             ? (int64_t)(mib << 20) : 0;
-  }
+  const int64_t band = eden_direct_band2(total);
   if (band > 0) {
-    if (eden_direct_take(total - band, total, size, alignment, type, start) == 0) {
+    if (eden_direct_take(0, band, size, alignment, type, start) == 0) {
       atomic_fetch_add_explicit(&eden_band_hits, 1, memory_order_relaxed);
       eden_direct_release();
       return 0;
@@ -124,7 +140,7 @@ int eden_direct_guest(size_t size, size_t alignment, int type, int64_t *start) {
     atomic_fetch_add_explicit(&eden_band_fallbacks, 1, memory_order_relaxed);
   }
   eden_direct_release();
-  return eden_direct_low(size, alignment, type, start);
+  return eden_direct_take(0, total, size, alignment, type, start);
 }
 
 /* The Vulkan driver makes its command ring (16 MiB) and, right after it, the ring's marker page
@@ -156,6 +172,8 @@ int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, 
   if (from == 0 && start && to >= sceKernelGetDirectMemorySize() &&
       (size == EDEN_DIRECT_SMALL || eden_direct_driver_keeps(size, __builtin_return_address(0))))
     return eden_direct_high(size, alignment, type, start);
+  if (from == 0 && start && to >= sceKernelGetDirectMemorySize())
+    return eden_direct_low(size, alignment, type, start);
   return eden_direct_take(from, to, size, alignment, type, start);
 }
 

@@ -230,6 +230,10 @@ void *eden_heap_split_pages(size_t size) {
     return address;
 }
 void eden_heap_split_pages_free(void *address, size_t size) { munmap(address, size); atomic_fetch_sub(&split_blocks, 1); }
+// The block kept for a big image (EDEN_BIG_IMAGE_RESERVE_MIB, headless/heap_pages.cpp): not set here.
+void *eden_heap_reserve_pages(size_t size) { (void)size; return NULL; }
+void eden_heap_reserve_pages_free(void *address, size_t size) { (void)address; (void)size; }
+int eden_heap_big_image_refuses(size_t size) { (void)size; return 0; }
 '''
 
 TEST = r'''
