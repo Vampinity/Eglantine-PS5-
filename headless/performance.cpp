@@ -464,7 +464,8 @@ extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::in
 struct DirectMemoryRegion { std::int64_t start; std::int64_t end; std::int32_t type; };
 extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemoryRegion*, std::size_t);
 extern "C" std::int32_t sceKernelAvailableFlexibleMemorySize(std::size_t*);
-extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long* blocks) __attribute__((weak));
+extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long* blocks,
+                                    unsigned long long* hits, unsigned long long* fallbacks) __attribute__((weak));
 // The allocator's blocks and what is in use of them (vulkan_memory_allocator.cpp).
 extern "C" void eden_vma_usage(unsigned long long* blocks, unsigned long long* used) __attribute__((weak));
 #ifdef EDEN_PS5_RADV
@@ -477,8 +478,8 @@ extern "C" void eden_radv_private_radv_ps5_memory_report_now(void);
 // (the same call as ProsperoEden's launch line). A release build imports one more kernel function.
 static void ReportLedger() {
     if (!eden_direct_ledger) return;
-    unsigned long long bytes[4]{}, blocks[4]{};
-    eden_direct_ledger(bytes, blocks);
+    unsigned long long bytes[4]{}, blocks[4]{}, hits = 0, fallbacks = 0;
+    eden_direct_ledger(bytes, blocks, &hits, &fallbacks);
     std::size_t span = 0, guest = 0, tables = 0, code = 0, reserve = 0, target = 0, flexible = 0;
     ::Common::GuestMemoryUsage(&span, &guest);
     ::Common::SparseUsage(&span, &tables);
@@ -487,10 +488,10 @@ static void ReportLedger() {
     const bool known = sceKernelAvailableFlexibleMemorySize(&flexible) == 0;
     std::fprintf(stderr, "EDEN_POOL_LEDGER out of the pool: %llu MiB in %llu blocks under 2 MiB, %llu in %llu of 2 MiB, "
                  "%llu in %llu up to 32 MiB, %llu in %llu larger; guest %zu reserve %zu heap %zu jit %zu tables %zu MiB; "
-                 "flexible free %lld MiB\n",
+                 "flexible free %lld MiB; guest band hits=%llu fallbacks=%llu\n",
                  bytes[0] >> 20, blocks[0], bytes[1] >> 20, blocks[1], bytes[2] >> 20, blocks[2], bytes[3] >> 20, blocks[3],
                  guest >> 20, reserve >> 20, (eden_heap_committed ? eden_heap_committed() : std::size_t{0}) >> 20,
-                 code >> 20, tables >> 20, known ? static_cast<long long>(flexible >> 20) : -1LL);
+                 code >> 20, tables >> 20, known ? static_cast<long long>(flexible >> 20) : -1LL, hits, fallbacks);
     // RADV_PS5_MEMORY_REPORT=1: out of the pool, less the owners above, less this, is the driver's
     // own buffers and the rest, every 20 s and not only at a refusal. Without it nothing here runs:
     // this is on the GPU thread, and the question below can refresh the allocator's budget.

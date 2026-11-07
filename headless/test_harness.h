@@ -20,6 +20,15 @@
 //                                   logs/recorded-input.txt in the same format, so a route is
 //                                   recorded by playing it; the session before moves to
 //                                   logs/recorded-input.prev.txt. A script in env.txt wins.
+//   EDEN_TEST_SHOTS=<s>[,<s>...]    One lossless picture of the game at each of these times, in
+//                                   the script's seconds (below), to logs/game-frame-<s>.ppm
+//                                   (game-frame-95.ppm, game-frame-95.5.ppm): the same frame of
+//                                   every build, to compare texture detail. At most kMaxShots,
+//                                   the earliest; one time that cannot be read turns them all off.
+//                                   logs/game-shots.txt lists this session's files, so a picture
+//                                   an earlier run left is not taken for this one. Only in the
+//                                   booted game, as a script; the renderer reads the frame back
+//                                   and a thread of its own writes the file (TakeShots).
 //
 // With any of them set, the app looks for /data/eglantineps5/test-quit four times a second. It
 // removes the file and closes: a game stops as Touchpad + L1 stops it, a launcher closes, main
@@ -52,6 +61,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <optional>
 #include <sstream>
@@ -79,6 +89,10 @@ inline constexpr std::string_view kQuitFile = "test-quit";
 inline constexpr std::string_view kBootOnceFile = "test-boot-once";
 inline constexpr std::string_view kRecordFile = "recorded-input.txt";
 inline constexpr std::string_view kRecordPreviousFile = "recorded-input.prev.txt";
+inline constexpr std::size_t kMaxShots = 12;
+inline constexpr std::string_view kShotListFile = "game-shots.txt";
+// How long a shot waits for its file before the next one is due anyway.
+inline constexpr std::chrono::seconds kShotWait{10};
 
 struct NamedButton {
     std::string_view name;
@@ -157,6 +171,45 @@ inline std::optional<Ms> Seconds(std::string_view text) {
 inline std::string SecondsText(Ms ms) {
     std::string fraction = std::to_string(ms % 1000);
     return std::to_string(ms / 1000) + '.' + std::string(3 - fraction.size(), '0') + fraction;
+}
+
+// EDEN_TEST_SHOTS's times: sorted, each once, the earliest kMaxShots. error is set when an item
+// cannot be read (then there are none) or when some were dropped (the rest stay).
+struct ShotList {
+    std::vector<Ms> times;
+    std::string error;
+};
+inline ShotList ParseShots(std::string_view text) {
+    ShotList list;
+    for (std::size_t start = 0;;) {
+        const auto comma = text.find(',', start);
+        std::string_view item = text.substr(start, comma == text.npos ? text.npos : comma - start);
+        const auto first = item.find_first_not_of(" \t\r\n");
+        item = first == item.npos ? std::string_view{} : item.substr(first, item.find_last_not_of(" \t\r\n") - first + 1);
+        const auto at = Seconds(item);
+        if (!at) {
+            list.times.clear();
+            list.error = "bad time '" + std::string{item} + "'";
+            return list;
+        }
+        list.times.push_back(*at);
+        if (comma == text.npos) break;
+        start = comma + 1;
+    }
+    std::sort(list.times.begin(), list.times.end());
+    list.times.erase(std::unique(list.times.begin(), list.times.end()), list.times.end());
+    if (list.times.size() > kMaxShots) {
+        list.error = "kept the first " + std::to_string(kMaxShots) + " of " + std::to_string(list.times.size());
+        list.times.resize(kMaxShots);
+    }
+    return list;
+}
+// game-frame-95.ppm, game-frame-95.5.ppm: the time as written, without trailing zeros.
+inline std::string ShotName(Ms at) {
+    std::string text = SecondsText(at);
+    while (text.back() == '0') text.pop_back();
+    if (text.back() == '.') text.pop_back();
+    return "game-frame-" + text + ".ppm";
 }
 
 // One line of a script, added to events. False with error set when it cannot be read.
@@ -329,6 +382,7 @@ namespace detail {
 struct Settings {
     std::string boot, script;
     bool record = false;
+    std::vector<Ms> shots;  // EDEN_TEST_SHOTS, read by Start
 };
 inline Settings settings;  // set by Start, before any game
 inline bool boot_armed = false;  // Start found kBootOnceFile
@@ -421,10 +475,22 @@ inline detail::Settings ReadSettings(const std::string& boot, const std::string&
 inline void Start() {
     const std::string boot = detail::Trimmed("EDEN_TEST_BOOT"), script = detail::Trimmed("EDEN_TEST_SCRIPT");
     const bool record = detail::Trimmed("EDEN_TEST_RECORD") == "1";
-    if (boot.empty() && script.empty() && !record) return;
+    const std::string shots = detail::Trimmed("EDEN_TEST_SHOTS");
+    if (boot.empty() && script.empty() && !record && shots.empty()) return;
     detail::settings = ReadSettings(boot, script, record);
     Report("test", ("EDEN_TEST on boot=" + detail::settings.boot + " script=" + detail::settings.script +
                     " record=" + (detail::settings.record ? "1" : "0")).c_str());
+    // A title that could not be read turns the shots off too (ReadSettings).
+    if (!shots.empty() && (boot.empty() || !detail::settings.boot.empty())) {
+        ShotList list = ParseShots(shots);
+        if (!list.error.empty())
+            Report("test", ((list.times.empty() ? "EDEN_TEST bad_shots value=" : "EDEN_TEST shots_trimmed value=") +
+                            shots + " " + list.error).c_str());
+        detail::settings.shots = std::move(list.times);
+        std::string times;
+        for (const Ms at : detail::settings.shots) times += (times.empty() ? "" : ",") + SecondsText(at);
+        if (!times.empty()) Report("test", ("EDEN_TEST shots times=" + times).c_str());
+    }
     const std::string file = std::string{kDataDir} + "/" + std::string{kQuitFile};
     if (std::remove(file.c_str()) == 0) Report("test", "EDEN_TEST stale_quit_removed");
     detail::boot_armed = std::remove((std::string{kDataDir} + "/" + std::string{kBootOnceFile}).c_str()) == 0;
@@ -526,4 +592,64 @@ private:
     std::optional<Player> player;
     bool finished = false;
 };
+
+// EDEN_TEST_SHOTS's times for this session: empty without the setting, and in any game but the
+// booted one (ForGame).
+inline std::vector<Ms> ShotsFor(const char* game, std::uint64_t title) {
+    if (detail::settings.shots.empty()) return {};
+    if (!ForGame(detail::settings.boot, detail::booted, game, title)) {
+        Report("test", "EDEN_TEST shots_skipped reason=not_the_booted_game");
+        return {};
+    }
+    return detail::settings.shots;
+}
+
+// One session's shots, on a thread of their own (main.cpp). At each time from start,
+// capture(name) asks the renderer for its next frame and returns a std::shared_future<bool> that
+// turns true when logs/<name> is written. The renderer reads the frame back on the GPU thread and
+// gives the bytes to a new thread to write (VideoCore::RendererBase::RequestScreenshot), so the
+// file never holds up a frame. One request at a time: the renderer drops a second while one is
+// pending, and that one then reports ok=0. stopped() ends the wait between shots and for a file.
+template <typename Stopped, typename Capture>
+void TakeShots(Stopped&& stopped, Clock::time_point start, const std::vector<Ms>& shots, Capture&& capture) {
+    // This session's list first, and none of its names left from an earlier run.
+    if (std::FILE* list = std::fopen(LogFile(kShotListFile).c_str(), "w")) {
+        for (const Ms at : shots) {
+            (void)std::remove(LogFile(ShotName(at)).c_str());
+            std::fprintf(list, "%s %s\n", SecondsText(at).c_str(), ShotName(at).c_str());
+        }
+        std::fclose(list);
+    }
+    Report("test", ("EDEN_TEST shots_start count=" + std::to_string(shots.size())).c_str());
+    // Short sleeps, so a stop is seen within 100 ms.
+    const auto wait_until = [&](Clock::time_point when) {
+        while (!stopped()) {
+            const auto now = Clock::now();
+            if (now >= when) return true;
+            std::this_thread::sleep_for(std::min<Clock::duration>(when - now, std::chrono::milliseconds(100)));
+        }
+        return false;
+    };
+    for (const Ms at : shots) {
+        if (!wait_until(start + std::chrono::milliseconds(at))) return;
+        const Ms asked = detail::Since(start);
+        const std::string name = ShotName(at);
+        auto written = capture(name);
+        const char* outcome = "timeout";
+        for (const auto limit = Clock::now() + kShotWait; !stopped() && Clock::now() < limit;) {
+            if (written.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) continue;
+            bool ok = false;
+            try {
+                ok = written.get();
+            } catch (...) {  // dropped: another picture was still pending
+            }
+            outcome = ok ? "1" : "0";
+            break;
+        }
+        if (outcome[0] == 't' && stopped()) outcome = "stopped";
+        Report("test", ("EDEN_TEST shot at=" + SecondsText(at) + " asked=" + SecondsText(asked) + " file=" + name +
+                        " ok=" + outcome).c_str());
+    }
+    Report("test", "EDEN_TEST shots_done");
+}
 } // namespace Eden::TestHarness

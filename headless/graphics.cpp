@@ -781,16 +781,18 @@ std::unique_ptr<Core::Frontend::GraphicsContext> GraphicsWindow::CreateSharedCon
     }
 }
 std::shared_future<bool> GraphicsWindow::CaptureNextFrame(VideoCore::RendererBase& renderer,
-                                                       std::function<void()> on_complete) {
+                                                       std::function<void()> on_complete,
+                                                       std::string file_name) {
     const auto layout = GetFramebufferLayout();
     auto pixels = std::make_shared<std::vector<unsigned char>>(layout.width * layout.height * 4);
     auto done = std::make_shared<std::promise<bool>>();
     auto result = done->get_future().share();
-    renderer.RequestScreenshot(pixels->data(), [pixels, done, layout, on_complete](bool flip) {
+    renderer.RequestScreenshot(pixels->data(), [pixels, done, layout, on_complete,
+                                                file_name = std::move(file_name)](bool flip) {
         // Renderer owns GPU readback; its completion callback only writes the captured bytes.
-        const auto path_text = Eden::LogFile("game-frame.ppm");
+        const auto path_text = Eden::LogFile(file_name);
         const char* path = path_text.c_str();
-        const auto partial_text = Eden::LogFile("game-frame.ppm.partial");
+        const auto partial_text = path_text + ".partial";
         const char* partial = partial_text.c_str();
         std::FILE* output = std::fopen(partial, "wb");
         bool ok = output != nullptr;

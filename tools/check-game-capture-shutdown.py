@@ -26,9 +26,13 @@ release_wait = '#else\n                        completion->wake.wait(lock, compl
 assert main.count(release_wait) == 1
 development_wait = main.split('#ifdef EDEN_DEV_PROFILE\n                        for ', 1)[1].split(release_wait, 1)[0]
 assert main.count('Performance::Snapshot()') == development_wait.count('Performance::Snapshot()') == 1
-assert main.count('window.CaptureNextFrame(') == 1 + development_wait.count('window.CaptureNextFrame(') == 4
+# EDEN_TEST_SHOTS (headless/test_harness.h) is the one release capture: only a test session that
+# set it starts the thread that asks for pictures.
+shots = main.split('const auto test_shots = Eden::TestHarness::ShotsFor(guest, game_title);', 1)[1].split('#endif', 1)[0]
+assert 'if (!test_shots.empty())' in shots and shots.count('window.CaptureNextFrame(') == 1
+assert main.count('window.CaptureNextFrame(') == 2 + development_wait.count('window.CaptureNextFrame(') == 5
 assert 'completion->wake.wait(lock, completed);' in development_wait
 assert '#elif defined(EDEN_DEV_ROM_ID)' in development_wait
 assert 'sample < observation_samples' in development_wait and 'sample == observation_samples - 1' in development_wait
 assert 'completion->return_to_menu = true;' in development_wait
-print('Native gameplay has no automatic GPU readback or frame capture')
+print('Native gameplay has no automatic GPU readback or frame capture (EDEN_TEST_SHOTS only when set)')

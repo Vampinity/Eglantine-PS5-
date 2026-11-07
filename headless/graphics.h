@@ -4,6 +4,7 @@
 #include <atomic>
 #include <future>
 #include <functional>
+#include <string>
 #include "core/frontend/emu_window.h"
 
 namespace VideoCore { class RendererBase; }
@@ -19,8 +20,11 @@ public:
 #endif
     void CheckPresentation(Core::Frontend::GraphicsContext& context);
     void SetSystem(Core::System& value) { system = &value; }
+    // The next frame, lossless, to logs/<file_name> (PPM). The file is written on a thread of its
+    // own; the future turns true when it is there.
     std::shared_future<bool> CaptureNextFrame(VideoCore::RendererBase& renderer,
-                                            std::function<void()> on_complete);
+                                            std::function<void()> on_complete,
+                                            std::string file_name = "game-frame.ppm");
     bool IsShown() const override { return true; }
     void OnFrameDisplayed() override;
     std::unique_ptr<Core::Frontend::GraphicsContext> CreateSharedContext() const override;

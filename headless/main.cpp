@@ -1982,6 +1982,22 @@ int main(int argc, char** argv) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(4));
                     }
                 });
+#ifdef EDEN_PS5_OPENGL
+                // EDEN_TEST_SHOTS (test_harness.h): lossless pictures of this session at fixed guest
+                // seconds, the same frames in every build. Release builds too, but only when a test
+                // asks: without the setting test_shots is empty and no thread starts.
+                std::jthread shot_worker;
+                if (game) {
+                    const auto test_shots = Eden::TestHarness::ShotsFor(guest, game_title);
+                    if (!test_shots.empty())
+                        shot_worker = std::jthread([&window, &system, session_start, test_shots](std::stop_token stop) {
+                            Eden::TestHarness::TakeShots([&stop] { return stop.stop_requested(); }, session_start,
+                                test_shots, [&](const std::string& name) {
+                                    return window.CaptureNextFrame(system.GPU().Renderer(), [] {}, name);
+                                });
+                        });
+                }
+#endif
                 {
                     std::unique_lock lock(completion->mutex);
                     constexpr unsigned stop_delays_ms[] = {0, 1, 10, 100, 1000, 30000};
@@ -2099,6 +2115,11 @@ int main(int argc, char** argv) {
                 }
                 input_worker.request_stop();
                 if (input_worker.joinable()) input_worker.join();
+#ifdef EDEN_PS5_OPENGL
+                // No picture is asked for once the game is being stopped.
+                shot_worker.request_stop();
+                if (shot_worker.joinable()) shot_worker.join();
+#endif
                 if (pad) {
                     const auto neutral = ps5::pad::neutral_data();
                     pad->Consume({&neutral, 1});

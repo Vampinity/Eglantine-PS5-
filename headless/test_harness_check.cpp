@@ -226,6 +226,34 @@ static void CheckBootSetting() {
     REQUIRE(!BootArmed());  // no test-boot-once: a left-behind env.txt boots nothing
 }
 
+// EDEN_TEST_SHOTS: times as the script's, sorted, each once, at most kMaxShots, and none at all
+// when one cannot be read.
+static void CheckShots() {
+    const ShotList list = ParseShots(" 150, 95.5 ,120,95.5");
+    REQUIRE(list.error.empty() && list.times == (std::vector<Ms>{95500, 120000, 150000}));
+    REQUIRE(ShotName(95500) == "game-frame-95.5.ppm" && ShotName(120000) == "game-frame-120.ppm");
+    REQUIRE(ShotName(250) == "game-frame-0.25.ppm" && ShotName(0) == "game-frame-0.ppm");
+    for (const char* wrong : {"", "95,,100", "95;100", "-1", "1e3", "95 100"}) {
+        const ShotList bad = ParseShots(wrong);
+        REQUIRE(bad.times.empty() && !bad.error.empty());
+    }
+    const ShotList many = ParseShots("14,13,12,11,10,9,8,7,6,5,4,3,2,1");
+    REQUIRE(many.times.size() == kMaxShots && many.times.front() == 1000 && many.times.back() == 12000);
+    REQUIRE(!many.error.empty());
+    // Only the booted game takes them, as a script.
+    detail::settings = {};
+    detail::settings.boot = "0400486024DEC000";
+    detail::settings.shots = {120000};
+    detail::booted = false;
+    REQUIRE(ShotsFor("/roms/Zelda.nup", 0x0400486024DEC000ULL).empty());
+    detail::booted = true;
+    REQUIRE(ShotsFor("/roms/Zelda.nup", 0x0400486024DEC000ULL).size() == 1);
+    REQUIRE(ShotsFor("/roms/Kart.nup", 0x0400FF0011223000ULL).empty());
+    detail::settings = {};
+    detail::booted = false;
+    REQUIRE(ShotsFor("/roms/Zelda.nup", 0x0400486024DEC000ULL).empty());
+}
+
 int main() {
     CheckTimes();
     CheckScript();
@@ -236,5 +264,6 @@ int main() {
     CheckQuit();
     CheckBadBoot();
     CheckBootSetting();
+    CheckShots();
     std::puts("Test harness: script, player, recorder, inert without settings, test-quit PASS");
 }

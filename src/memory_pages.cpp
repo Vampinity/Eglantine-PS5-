@@ -307,6 +307,7 @@ SparseRange* SparseRangeOf(std::uintptr_t address) {
 extern "C" int eden_direct_high(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
 // Where the system puts it: a 2 MiB block of this file's, which a session gives back.
 extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
+extern "C" int eden_direct_guest(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
 #endif
 
 #ifdef PS5_NATIVE
@@ -321,8 +322,8 @@ std::atomic<std::uintptr_t> slot_view_hint{cpu_mapping_hint};
 constexpr std::uintptr_t slot_view_high = 0x3800000000ull;
 
 // A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
-bool ZeroedBlock(std::int64_t* physical) {
-    if (eden_direct_low(SparseSlot, SparseSlot, 12, physical) != 0)
+bool ZeroedBlock(std::int64_t* physical, bool guest = false) {
+    if ((guest ? eden_direct_guest : eden_direct_low)(SparseSlot, SparseSlot, 12, physical) != 0)
         return false;
     void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, *physical, SparseSlot) != 0) {
@@ -368,14 +369,14 @@ void* ReserveSparse(std::size_t span, [[maybe_unused]] bool guest = false) {
 #ifdef PS5_NATIVE
 bool TableReserveBlock(std::int64_t* physical) noexcept; // guest_memory_service.inc
 #endif
-bool OwnSlot(std::uintptr_t at, std::int64_t* physical) {
+bool OwnSlot(std::uintptr_t at, std::int64_t* physical, [[maybe_unused]] bool guest = false) {
 #ifdef PS5_NATIVE
     // The block is zeroed before it appears in the table: a JIT thread may read the slot at any
     // moment, and the mapping changes in one step.
     // A table slot has nowhere to go if this fails (CommitSparsePage ends the app), so it may
     // take a block of the guest reserve, as the guest writes do: run 62 ended here with 242 MiB
     // of the reserve idle.
-    if (!ZeroedBlock(physical) && !TableReserveBlock(physical)) return false;
+    if (!ZeroedBlock(physical, guest) && !TableReserveBlock(physical)) return false;
     if (MapSlot(at, PROT_READ | PROT_WRITE, *physical)) return true;
     (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
     return false;
@@ -681,7 +682,7 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
     }
     const std::lock_guard lock{sparse_mutex};
     if (range->owned[slot].load(std::memory_order_relaxed)) return;
-    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) {
+    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot], range->guest)) {
         // Out of memory in the middle of a guest mapping: there is no table to continue with.
         ReportSparseCommitFailure(*range, slot);
         Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
