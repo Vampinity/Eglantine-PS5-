@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 23:20:00 +0100
+Subject: [PATCH] radv/ps5: EDEN_NX2_RADV_WAIT_REALTIME=1 gives the sync wait a realtime deadline
+
+Driver patch, after lead-mesh-12. Off unless set. The CPU wait for a signal not yet submitted sleeps on
+sync_cond with a deadline made from os_time_get_nano(), a monotonic time, while cnd_timedwait counts on the
+realtime clock. The deadline is therefore long past and every wait returns at once, so the loop spins.
+heydemoura found and measured this (EglantinePS5 PR 11: a 5 ms wait expired in 2 to 5 us on a PS5) and fixed
+it with Mesa's monotonic condition helpers; this is a smaller fix of our own with a switch, for an A/B test.
+---
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c b/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
+@@ -4,6 +4,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <stdlib.h>
++#include <time.h>
+ #include "radv_ps5_winsys.h"
+ 
+ #include "util/os_time.h"
+@@ -160,8 +162,28 @@
+        * millisecond passes so running work is polled too. */
+       struct timespec until;
+       const uint64_t wake = MIN2(abs_timeout_ns, now + 1000000);
+-      until.tv_sec = wake / 1000000000;
+-      until.tv_nsec = wake % 1000000000;
++      /* EDEN_NX2_RADV_WAIT_REALTIME=1: cnd_timedwait counts on the realtime clock, and `wake` is on
++       * the monotonic one, so the deadline is long past and the wait returns at once: the loop spins
++       * with sync_lock taken in turn (heydemoura PR 11 measured 2-5 us for a 5 ms wait on a PS5).
++       * Turn the same distance into a realtime deadline. Off: as before. */
++      static int realtime = -1;
++      if (realtime < 0) {
++         const char *value = getenv("EDEN_NX2_RADV_WAIT_REALTIME");
++         realtime = value && value[0] == '1';
++      }
++      if (realtime) {
++         const uint64_t add = wake > now ? wake - now : 0;
++         clock_gettime(CLOCK_REALTIME, &until);
++         until.tv_sec += add / 1000000000;
++         until.tv_nsec += add % 1000000000;
++         if (until.tv_nsec >= 1000000000) {
++            until.tv_sec++;
++            until.tv_nsec -= 1000000000;
++         }
++      } else {
++         until.tv_sec = wake / 1000000000;
++         until.tv_nsec = wake % 1000000000;
++      }
+       cnd_timedwait(&queue->sync_cond, &queue->sync_lock, &until);
+    }
+ }
