@@ -36,6 +36,14 @@ extern const char __eden_text_start[];
 extern const char __eden_text_end[];
 }
 
+extern "C" {
+// The Vulkan driver's stall dump on request: RADV's winsys sets this when it creates its queue, with
+// EDEN_NX2_RADV_STALL_DUMP=1 (radv_ps5_winsys.c, radv_ps5_offer_stall_dump); null otherwise. The
+// core's hang watch calls it (vk_scheduler.cpp, ReportStall). RADV's own ten-second check runs only
+// while a thread polls a submission's marker, and in exploitizm's Ocarina hang none did.
+void (*eden_radv_stall_dump)(void) = nullptr;
+}
+
 namespace Eden::Crash {
 namespace {
 
@@ -68,6 +76,7 @@ std::atomic<std::uintptr_t> reporter{0};  // the thread writing the report
 std::atomic<bool> helper_failed{false};   // the system refused both the restart and the exit
 std::atomic<bool> leave{false};           // close the app instead of starting it again
 std::atomic<bool> game_started{false};
+std::atomic<bool> gpu_stalled{false};     // the driver found its GPU stopped (eden_gpu_stalled)
 
 bool installed = false;
 bool restarted_process = false;
@@ -441,7 +450,8 @@ void WriteReport(const Kind* kind, int code, std::uint64_t address, const Regist
     // Right after a restart, with no game started since: the crash comes with starting the app,
     // and starting it again would only repeat it.
     // After the GPU itself hung, starting again has left the console without controller input.
-    const bool gpu_hung = reason && std::strstr(reason, "VK_ERROR_DEVICE_LOST");
+    const bool gpu_hung = gpu_stalled.load(std::memory_order_acquire) ||
+                          (reason && std::strstr(reason, "VK_ERROR_DEVICE_LOST"));
     const bool restart = !gpu_hung &&
                          !(restarted_process && !game_started.load(std::memory_order_relaxed) &&
                            std::time(nullptr) - started_at < 60);
@@ -638,4 +648,16 @@ Last TakeLast(const std::string& logs_folder, const std::string& eden_log) {
     return last;
 }
 
+void NoteGpuStalled() noexcept {
+    gpu_stalled.store(true, std::memory_order_release);
+}
+
 } // namespace Eden::Crash
+
+// The driver's stall dump (radv_ps5_winsys.c, from Belladonna 318deb146da) calls this before
+// anything there could fault, once a submission has made no progress. RADV declares it weak;
+// defined here it is not left as an import the system cannot provide. From exploitizm's
+// EglantinePS5 (headless/crash_report.cpp).
+extern "C" void eden_gpu_stalled(void) {
+    Eden::Crash::NoteGpuStalled();
+}

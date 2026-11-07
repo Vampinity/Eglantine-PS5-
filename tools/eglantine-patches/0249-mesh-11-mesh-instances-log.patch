@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:50:00 +0100
+Subject: [PATCH] vulkan: say when a native task or mesh draw asks for
+ instances
+
+Core patch on mig020-core (T42). A log line, once per run, on a path T42 never reaches: with
+EDEN_NX2_NO_MESH set no mesh draw gets this far.
+
+The native mesh draw calls DrawMeshTasksEXT(groups, 1, 1) and drops the draw's instance count without
+a word. The core's own compute path already logs this. Same line here, so a plant test can tell a
+draw that lost its instances from one that worked.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1017,6 +1017,15 @@
+                 }
+                 return;
+             }
++            // Instances are not run here either: say so, or a draw that lost them looks like any
++            // other in a plant test.
++            if (num_instances > 1) {
++                static bool logged{};
++                if (!std::exchange(logged, true)) {
++                    LOG_WARNING(Render_Vulkan, "Task/mesh draw with {} instances: one run",
++                                num_instances);
++                }
++            }
+             scheduler.Record([this, groups](vk::CommandBuffer cmdbuf) {
+                 if (scheduler.GraphicsPipelineMissing()) {
+                     return;

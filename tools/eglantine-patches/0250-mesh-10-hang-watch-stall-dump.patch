@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:45:00 +0100
+Subject: [PATCH] vulkan: the hang watch asks the driver for its stall dump
+
+Core patch on mig020-core (T42), off unless EDEN_NX2_HANG_WATCH=1 and EDEN_NX2_RADV_STALL_DUMP=1.
+
+exploitizm's hang watch lives in his frontend (WriteHangReport, 30 s without a frame). Ours is the
+core's ReportStall, at 3 s in a GPU tick wait, so the call to the driver's dump goes there. Needs
+lead-mesh-08, which defines the pointer: the package check refuses an undefined weak import.
+
+The ask sits before ReportStall's limit of four detailed reports, so four slow waits early in a run
+do not use it up: it can be made on each of the 64 reports. Each ask at a GPU that is still moving
+costs one second's sleep and one line on the thread that already waited 3 s, and does not spend the
+dump.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -31,6 +31,10 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
++// The driver's stall dump on request: the app defines this (headless/crash_report.cpp) and RADV
++// sets it with EDEN_NX2_RADV_STALL_DUMP=1. Weak, for a link without that app.
++extern "C" void (*eden_radv_stall_dump)(void) __attribute__((weak));
++
+ namespace Vulkan {
+ 
+ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
+@@ -95,8 +99,9 @@
+     }
+ }
+ 
+-// Never blocks: it copies what it can get and logs without the lock. Pipelines for the first few
+-// reports, and silence after 64, so that a GPU that stays slow cannot flood the log.
++// Never blocks on the lock: it copies what it can get and logs without it. Pipelines for the first
++// few reports, and silence after 64, so that a GPU that stays slow cannot flood the log. With
++// EDEN_NX2_RADV_STALL_DUMP=1 the driver's dump can sleep a second and write a long dump here.
+ void Scheduler::ReportStall(u64 tick, u64 gpu_tick, u64 next_tick) {
+     static std::atomic<u32> reports{};
+     const u32 report = reports.fetch_add(1, std::memory_order_relaxed);
+@@ -119,6 +124,15 @@
+                 "Hang watch: waited 3 s for GPU tick {}; the GPU is at tick {}, the last "
+                 "submitted tick is {}, the next to record is {}",
+                 tick, gpu_tick, last_submitted, next_tick);
++    // What the GPU is stuck on, in stderr.log. RADV's own check only runs while a thread polls a
++    // submission's marker, and with the submitting thread blocked in the kernel none does. Asked on
++    // every report, not only the first few: four slow waits early on must not use up the ask before
++    // a real hang. The dump goes once, and a GPU that moves within a second does not spend it.
++    if (&eden_radv_stall_dump != nullptr) {
++        if (const auto dump = __atomic_load_n(&eden_radv_stall_dump, __ATOMIC_ACQUIRE)) {
++            dump();
++        }
++    }
+     if (report >= 4) {
+         return;
+     }

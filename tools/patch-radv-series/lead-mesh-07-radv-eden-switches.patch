@@ -1,0 +1,454 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:35:00 +0100
+Subject: [PATCH] radv/ps5: mesh shaders as compute behind
+ EDEN_NX2_RADV_MESH_COMPUTE, and nothing left on the NGG path
+
+Driver patch for EglantinePS5 on Mesa f5610fe2709, after exploitizm's e10371e0d3 and f822c1e9df
+(lead-mesh-05, lead-mesh-06) and the stall dump (lead-mesh-01 to 04). Off unless the switches are set.
+
+EDEN_NX2_RADV_MESH_COMPUTE=1 turns the path on. His build has it on by default; unset here, so a
+T42 env behaves as T42. /data/eglantineps5/radv-mesh-compute.txt holding 0 still turns it off.
+
+With the path on, a mesh draw of a pipeline the path refused is dropped and logged. His build leaves
+such a pipeline on the NGG mesh path, the one that hangs this GPU, and an Ocarina log has a mesh
+program with 4 per-primitive lines, which his limits refuse. Those pipelines ask for no 320 MiB
+mesh scratch ring either. Each refusal says why ("mesh shader not run as compute: ...").
+
+The cache's UUID stays as it was: his line changed it for every pipeline, and a cold boot has ended
+out of memory on this console (runs 135, 146, 150). The switch goes into the hash of pipelines with
+a task shader only.
+
+EDEN_NX2_RADV_MESH_COMPUTE_MIB=<8 to 512> sizes the buffer (128 unset; it is in the same hash).
+EDEN_NX2_RADV_MESH_COMPUTE_PASSES=<n> caps the passes of a chunk: every pass costs its flushes even
+when empty, and mesh workgroups past the last pass are left out.
+
+EDEN_NX2_RADV_STALL_DUMP=1 turns the stall dump and the offer of it to the app on. The dump names
+the compute pass as "mesh-as-compute".
+
+One fix to his code. In radv_mesh_compute_draw's indirect branch the task pass's own block_va hid the
+draw's, so radv_mesh_compute_chunk got the radv_task_emu_block's address, and its compute pass read
+records, payload, header and slots from the wrong memory. The inner one is task_block_va now. His
+head f822c1e9df has the same line. Our core skips indirect task and mesh draws today, so nothing
+reaches this yet.
+
+A refused buffer says so on stderr ("no memory for the mesh compute buffer"): the task pipeline fails
+with it, and with EDEN_NX2_PIPELINE_FAIL_SOFT=1 that looks like draws that show nothing.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/radv_cmd_buffer.c            | 35 ++++++++-
+ src/amd/vulkan/radv_mesh_compute.c          | 94 +++++++++++++++++++++----
+ src/amd/vulkan/radv_mesh_compute.h          | 12 +++-
+ src/amd/vulkan/radv_physical_device.c       | 12 ----
+ src/amd/vulkan/radv_pipeline.c              |  3 +
+ src/amd/vulkan/radv_pipeline_graphics.c     | 16 ++++-
+ src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c | 16 ++++-
+ 7 files changed, 153 insertions(+), 35 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index fa3909d..0b54dbb 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -9028,6 +9028,11 @@ radv_bind_mesh_shader(struct radv_cmd_buffer *cmd_buffer, const struct radv_shad
+ {
+    radv_bind_pre_rast_shader(cmd_buffer, ms);
+ 
++#ifdef RADV_GS_COMPUTE
++   /* EglantinePS5: its draws are dropped (radv_mesh_draw_dropped): no 320 MiB ring for them. */
++   if (radv_mesh_compute_enabled())
++      return;
++#endif
+    cmd_buffer->queue_state.mesh_scratch_ring_needed |= ms->info.ms.needs_ms_scratch_ring;
+ }
+ 
+@@ -15740,7 +15745,8 @@ radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_ta
+    const struct radv_pipeline *pipeline = &cmd_buffer->state.graphics_pipeline->base;
+    struct radv_cmd_stream *cs = cmd_buffer->cs;
+    const uint32_t capacity = pipeline->mesh_compute_capacity;
+-   const uint32_t passes = MIN2(DIV_ROUND_UP(RADV_MESH_COMPUTE_CHUNK_WORKGROUPS, capacity), RADV_MESH_COMPUTE_MAX_PASSES);
++   const uint32_t passes = MIN3(DIV_ROUND_UP(RADV_MESH_COMPUTE_CHUNK_WORKGROUPS, capacity), RADV_MESH_COMPUTE_MAX_PASSES,
++                                radv_mesh_compute_pass_limit());
+    const uint64_t header_va = radv_buffer_get_va(device->mesh_compute_bo);
+ 
+    radv_meta_mesh_compute_records(cmd_buffer, emu->draw_ring_va, AC_TASK_DRAW_ENTRY_BYTES, count_va, count,
+@@ -15857,9 +15863,11 @@ radv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_dra
+                                   chunks, emu.entries, out_va);
+ 
+             for (uint32_t i = 0; i < draws * chunks; i++) {
+-               const uint64_t block_va = out_va + i * sizeof(struct radv_task_emu_block);
++               /* EglantinePS5: its own name. As block_va this hid the draw's block, and the chunk's
++                * compute pass read records, payload, header and slots from the wrong memory. */
++               const uint64_t task_block_va = out_va + i * sizeof(struct radv_task_emu_block);
+                const uint64_t args_va = out_va + draws * chunks * sizeof(struct radv_task_emu_block) + i * 16;
+-               radv_task_emu_dispatch(cmd_buffer, &emu, block_va, 0, args_va);
++               radv_task_emu_dispatch(cmd_buffer, &emu, task_block_va, 0, args_va);
+                radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, first_draw + i / chunks, emu.entries, args_va);
+             }
+          }
+@@ -15878,6 +15886,21 @@ radv_mesh_compute_bound(const struct radv_cmd_buffer *cmd_buffer)
+ {
+    return cmd_buffer->state.graphics_pipeline && cmd_buffer->state.graphics_pipeline->base.mesh_compute;
+ }
++
++/* EglantinePS5: with the path on, a mesh draw of a pipeline it refused (mesh_compute_refused) is
++ * dropped, as EDEN_NX2_NO_MESH drops them all. exploitizm leaves those on the NGG mesh path, the
++ * one that stops this GPU. */
++static bool
++radv_mesh_draw_dropped(const struct radv_cmd_buffer *cmd_buffer)
++{
++   if (!radv_mesh_compute_enabled())
++      return false;
++   static uint32_t told;
++   if (told < 32 && p_atomic_inc_return(&told) <= 32)
++      fprintf(stderr, "radv/ps5: mesh draw dropped: pipeline %016" PRIx64 " is not run as compute\n",
++              cmd_buffer->state.graphics_pipeline ? cmd_buffer->state.graphics_pipeline->base.pipeline_hash : 0);
++   return true;
++}
+ #endif
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -15893,6 +15916,8 @@ radv_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y,
+       radv_mesh_compute_draw(cmd_buffer, NULL, x, y, z);
+       return;
+    }
++   if (radv_mesh_draw_dropped(cmd_buffer))
++      return;
+ #endif
+ 
+    info.count = x * y * z;
+@@ -15961,6 +15986,8 @@ radv_CmdDrawMeshTasksIndirect2EXT(VkCommandBuffer commandBuffer, const VkDrawInd
+       radv_mesh_compute_draw(cmd_buffer, &info, 0, 0, 0);
+       return;
+    }
++   if (radv_mesh_draw_dropped(cmd_buffer))
++      return;
+ #endif
+ 
+    const uint64_t records_va = radv_mesh_draw_records(cmd_buffer, &info);
+@@ -16031,6 +16058,8 @@ radv_CmdDrawMeshTasksIndirectCount2EXT(VkCommandBuffer commandBuffer, const VkDr
+       radv_mesh_compute_draw(cmd_buffer, &info, 0, 0, 0);
+       return;
+    }
++   if (radv_mesh_draw_dropped(cmd_buffer))
++      return;
+ #endif
+ 
+    const uint64_t records_va = radv_mesh_draw_records(cmd_buffer, &info);
+diff --git a/src/amd/vulkan/radv_mesh_compute.c b/src/amd/vulkan/radv_mesh_compute.c
+index 46323b6..511608c 100644
+--- a/src/amd/vulkan/radv_mesh_compute.c
++++ b/src/amd/vulkan/radv_mesh_compute.c
+@@ -20,6 +20,7 @@
+ #include "util/simple_mtx.h"
+ #include "util/u_atomic.h"
+ 
++#include <inttypes.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+@@ -28,22 +29,49 @@ radv_mesh_compute_enabled(void)
+ {
+    static int enabled = -1;
+    if (enabled < 0) {
+-      int value = 1;
+-      FILE *f = fopen("/data/eglantineps5/radv-mesh-compute.txt", "r");
++      const char *const asked = getenv("EDEN_NX2_RADV_MESH_COMPUTE");
++      int value = asked && asked[0] == '1';
++      FILE *f = value ? fopen("/data/eglantineps5/radv-mesh-compute.txt", "r") : NULL;
+       if (f) {
+          char text[8] = {0};
+-         if (fread(text, 1, sizeof(text) - 1, f) > 0 && text[0] == '0')
++         if (fread(text, 1, sizeof(text) - 1, f) > 0 && text[0] == '0') {
+             value = 0;
++            fprintf(stderr, "radv/ps5: mesh shaders as compute turned off by radv-mesh-compute.txt\n");
++         }
+          fclose(f);
+       }
+-      if (!value)
+-         fprintf(stderr, "radv/ps5: mesh shaders of emulated task draws run as mesh shaders "
+-                         "(radv-mesh-compute.txt)\n");
++      if (value)
++         fprintf(stderr, "radv/ps5: mesh shaders of emulated task draws run as compute "
++                         "(EDEN_NX2_RADV_MESH_COMPUTE)\n");
+       p_atomic_set(&enabled, value);
+    }
+    return enabled;
+ }
+ 
++uint32_t
++radv_mesh_compute_bytes(void)
++{
++   static uint32_t bytes;
++   if (!bytes) {
++      const char *const value = getenv("EDEN_NX2_RADV_MESH_COMPUTE_MIB");
++      const unsigned long mib = value ? strtoul(value, NULL, 10) : 0;
++      p_atomic_set(&bytes, mib >= 8 && mib <= 512 ? (uint32_t)mib << 20 : RADV_MESH_COMPUTE_BYTES);
++   }
++   return bytes;
++}
++
++uint32_t
++radv_mesh_compute_pass_limit(void)
++{
++   static uint32_t limit;
++   if (!limit) {
++      const char *const value = getenv("EDEN_NX2_RADV_MESH_COMPUTE_PASSES");
++      const unsigned long passes = value ? strtoul(value, NULL, 10) : 0;
++      p_atomic_set(&limit, passes ? (uint32_t)MIN2(passes, UINT32_MAX) : UINT32_MAX);
++   }
++   return limit;
++}
++
+ VkResult
+ radv_mesh_compute_init(struct radv_device *device)
+ {
+@@ -53,7 +81,7 @@ radv_mesh_compute_init(struct radv_device *device)
+    simple_mtx_lock(&lock);
+    if (!device->mesh_compute_bo) {
+       struct radeon_winsys_bo *bo;
+-      result = radv_bo_create(device, NULL, RADV_MESH_COMPUTE_BYTES, 4096, RADEON_DOMAIN_VRAM,
++      result = radv_bo_create(device, NULL, radv_mesh_compute_bytes(), 4096, RADEON_DOMAIN_VRAM,
+                               RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING,
+                               RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
+       if (result == VK_SUCCESS) {
+@@ -64,6 +92,12 @@ radv_mesh_compute_init(struct radv_device *device)
+             p_atomic_set(&device->mesh_compute_bo, bo);
+          }
+       }
++      /* EglantinePS5: the task pipeline fails with this, and with EDEN_NX2_PIPELINE_FAIL_SOFT=1 that
++       * looks like mesh draws that show nothing. */
++      static uint32_t told;
++      if (result != VK_SUCCESS && told < 8 && p_atomic_inc_return(&told) <= 8)
++         fprintf(stderr, "radv/ps5: no memory for the mesh compute buffer (%u MiB): task pipeline refused\n",
++                 radv_mesh_compute_bytes() >> 20);
+    }
+    simple_mtx_unlock(&lock);
+    return result;
+@@ -117,6 +151,20 @@ radv_mesh_compute_lower_block(nir_shader *nir, const struct radv_shader_stage *s
+ 
+ static const uint64_t allowed_vertex_outputs = VARYING_BIT_POS | BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32);
+ 
++/* Why a mesh shader stays out of this path. With the path on its draws are then dropped
++ * (radv_mesh_draw_dropped in radv_cmd_buffer.c), so this line names what is left to do. */
++static void
++mesh_compute_refused(const nir_shader *mesh, const char *why)
++{
++   static uint32_t told;
++   if (told < 64 && p_atomic_inc_return(&told) <= 64)
++      fprintf(stderr,
++              "radv/ps5: mesh shader not run as compute: %s (vertices %u, primitives %u, outputs 0x%" PRIx64
++              ", per primitive 0x%" PRIx64 ")\n",
++              why, mesh->info.mesh.max_vertices_out, mesh->info.mesh.max_primitives_out, mesh->info.outputs_written,
++              mesh->info.per_primitive_outputs);
++}
++
+ bool
+ radv_mesh_compute_wanted(const struct radv_graphics_state_key *gfx_state, const struct radv_shader_stage *stages)
+ {
+@@ -124,31 +172,47 @@ radv_mesh_compute_wanted(const struct radv_graphics_state_key *gfx_state, const
+    const nir_shader *task = stages[MESA_SHADER_TASK].nir;
+    const nir_shader *fs = stages[MESA_SHADER_FRAGMENT].nir;
+ 
+-   if (!mesh || !task || !radv_mesh_compute_enabled())
++   if (!mesh || !radv_mesh_compute_enabled())
++      return false;
++   if (!task) {
++      mesh_compute_refused(mesh, "no task shader");
+       return false;
++   }
+ 
+    /* First slice: triangles, outputs that are positions and generic varyings, no
+     * per-primitive outputs but the indices, no multiview. */
+-   if (mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES || gfx_state->has_multiview_view_index)
++   if (mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES || gfx_state->has_multiview_view_index) {
++      mesh_compute_refused(mesh, "not triangles, or multiview");
+       return false;
++   }
+    if (!mesh->info.mesh.max_vertices_out || mesh->info.mesh.max_vertices_out > 256 ||
+-       !mesh->info.mesh.max_primitives_out || mesh->info.mesh.max_primitives_out > 256)
++       !mesh->info.mesh.max_primitives_out || mesh->info.mesh.max_primitives_out > 256) {
++      mesh_compute_refused(mesh, "vertex or primitive count out of range");
+       return false;
++   }
+ 
+    const uint64_t written = mesh->info.outputs_written;
+    const uint64_t per_prim = mesh->info.per_primitive_outputs;
+-   if ((written & ~per_prim) & ~allowed_vertex_outputs)
++   if ((written & ~per_prim) & ~allowed_vertex_outputs) {
++      mesh_compute_refused(mesh, "a vertex output other than position and generics");
+       return false;
+-   if ((written & per_prim) != VARYING_BIT_PRIMITIVE_INDICES)
++   }
++   if ((written & per_prim) != VARYING_BIT_PRIMITIVE_INDICES) {
++      mesh_compute_refused(mesh, "per-primitive outputs besides the indices");
+       return false;
+-   if (!(written & VARYING_BIT_POS))
++   }
++   if (!(written & VARYING_BIT_POS)) {
++      mesh_compute_refused(mesh, "no position");
+       return false;
++   }
+ 
+    if (fs) {
+       nir_foreach_shader_in_variable (var, fs) {
+          if (var->data.per_primitive || var->data.location == VARYING_SLOT_PRIMITIVE_ID ||
+-             var->data.location == VARYING_SLOT_LAYER || var->data.location == VARYING_SLOT_VIEWPORT)
++             var->data.location == VARYING_SLOT_LAYER || var->data.location == VARYING_SLOT_VIEWPORT) {
++            mesh_compute_refused(mesh, "a per-primitive fragment input");
+             return false;
++         }
+       }
+    }
+    return true;
+@@ -434,7 +498,7 @@ radv_mesh_compute_split(const struct radv_compiler_info *compiler_info, struct r
+    l.max_primitives = mesh->info.mesh.max_primitives_out;
+    l.prim_offset = 16 + l.max_vertices * l.num_vtx_slots * 16;
+    l.stride = align(l.prim_offset + l.max_primitives * 4, 64);
+-   l.capacity = MIN2((RADV_MESH_COMPUTE_BYTES - RADV_MESH_COMPUTE_HEADER_BYTES) / l.stride,
++   l.capacity = MIN2((radv_mesh_compute_bytes() - RADV_MESH_COMPUTE_HEADER_BYTES) / l.stride,
+                      RADV_MESH_COMPUTE_CHUNK_WORKGROUPS);
+    l.payload_stride = align(MAX2(stages[MESA_SHADER_TASK].nir->info.task_payload_size, 16), 16);
+    l.address32_hi = compiler_info->hw.address32_hi;
+diff --git a/src/amd/vulkan/radv_mesh_compute.h b/src/amd/vulkan/radv_mesh_compute.h
+index 41540f6..f5632e1 100644
+--- a/src/amd/vulkan/radv_mesh_compute.h
++++ b/src/amd/vulkan/radv_mesh_compute.h
+@@ -57,10 +57,18 @@ struct radv_mesh_compute_block {
+    uint64_t slots;   /* its slots, after the header */
+ };
+ 
+-/* Whether mesh shaders of emulated task draws take this path: unless
+- * /data/eglantineps5/radv-mesh-compute.txt says 0 (read once). */
++/* Whether mesh shaders of emulated task draws take this path: EDEN_NX2_RADV_MESH_COMPUTE=1 in
++ * env.txt, unless /data/eglantineps5/radv-mesh-compute.txt says 0 (read once). Off otherwise: no
++ * task pipeline splits, the buffer is not made and mesh draws go as they did before. */
+ bool radv_mesh_compute_enabled(void);
+ 
++/* The buffer's size: EDEN_NX2_RADV_MESH_COMPUTE_MIB (8 to 512), RADV_MESH_COMPUTE_BYTES unset. */
++uint32_t radv_mesh_compute_bytes(void);
++
++/* The passes a chunk may take: EDEN_NX2_RADV_MESH_COMPUTE_PASSES (at least 1), all unset. Every
++ * pass costs its flushes even when it is empty; mesh workgroups past the last pass are left out. */
++uint32_t radv_mesh_compute_pass_limit(void);
++
+ struct radv_device;
+ /* The device's buffer, made once (the first pipeline with a task shader). */
+ VkResult radv_mesh_compute_init(struct radv_device *device);
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index bac9dd2..c0826e5 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -30,9 +30,6 @@
+ #include "radv_entrypoints.h"
+ #include "radv_instance.h"
+ #include "radv_physical_device.h"
+-#ifdef RADV_GS_COMPUTE
+-#include "radv_mesh_compute.h"
+-#endif
+ #include "radv_pipeline_rt.h"
+ #include "radv_video.h"
+ #include "radv_wsi.h"
+@@ -394,15 +391,6 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+       return -1;
+ #endif
+ 
+-#ifdef RADV_GS_COMPUTE
+-   {
+-      /* Whether emulated task draws' mesh shaders run as compute (radv_mesh_compute.h): their
+-       * pipelines are compiled differently. */
+-      const uint8_t mesh_compute = radv_mesh_compute_enabled();
+-      _mesa_blake3_update(&ctx, &mesh_compute, sizeof(mesh_compute));
+-   }
+-#endif
+-
+    _mesa_blake3_final(&ctx, blake3);
+ 
+    memcpy(uuid, blake3, VK_UUID_SIZE);
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 8b99f74..d42ea44 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -1279,6 +1279,9 @@ radv_ps5_note_pipeline_shaders(struct radv_pipeline *pipeline)
+          radv_ps5_note_shader(shader->va, shader->code_size, gs_compute_names[i], kind, pipeline->pipeline_hash,
+                               handle);
+    }
++   if (pipeline->mesh_compute)
++      radv_ps5_note_shader(pipeline->mesh_compute->va, pipeline->mesh_compute->code_size, "mesh-as-compute", kind,
++                           pipeline->pipeline_hash, handle);
+ }
+ #endif
+ 
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+index ad8d315..663824c 100644
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -3071,6 +3071,18 @@ radv_graphics_pipeline_hash(const struct radv_device *device, const struct radv_
+       }
+    }
+ 
++#ifdef RADV_GS_COMPUTE
++   /* EglantinePS5: with mesh shaders as compute a pipeline with a task shader compiles to something
++    * else, its slots sized to the buffer. Only those pipelines change: this takes the place of
++    * exploitizm's line in the cache's UUID, which made every saved pipeline useless, and a cold
++    * boot has ended out of memory on this console (runs 135, 146, 150). */
++   if (gfx_state->stages && gfx_state->stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE &&
++       radv_mesh_compute_enabled()) {
++      const uint32_t mesh_compute_bytes = radv_mesh_compute_bytes();
++      _mesa_blake3_update(&ctx, &mesh_compute_bytes, sizeof(mesh_compute_bytes));
++   }
++#endif
++
+    _mesa_blake3_final(&ctx, hash);
+ }
+ 
+@@ -3127,8 +3139,8 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
+ 
+ #ifdef RADV_GS_COMPUTE
+    /* An emulated task shader's mesh shader may run as compute (radv_mesh_compute.h), whose draws
+-    * need the device's buffer. Whether that path is on is in the cache's UUID
+-    * (radv_device_get_cache_uuid). */
++    * need the device's buffer. Whether that path is on is in the pipeline's hash
++    * (radv_graphics_pipeline_hash). */
+    if (stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE && device->task_emu_bo && radv_mesh_compute_enabled()) {
+       result = radv_mesh_compute_init(device);
+       if (result != VK_SUCCESS)
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+index 3f85062..96727b8 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -901,9 +901,23 @@ radv_ps5_dump_stuck(const uint32_t *words, uint32_t count, uint64_t seq)
+    radv_ps5_dump_task_emu();
+ }
+ 
++/* EglantinePS5: the dump and the offer of it to the app are off unless EDEN_NX2_RADV_STALL_DUMP=1. */
++static bool
++radv_ps5_stall_dump_enabled(void)
++{
++   static int enabled = -1;
++   if (enabled < 0) {
++      const char *const value = getenv("EDEN_NX2_RADV_STALL_DUMP");
++      p_atomic_set(&enabled, value && value[0] == '1');
++   }
++   return enabled;
++}
++
+ static void
+ radv_ps5_dump_stall(struct radv_ps5_queue *queue, uint64_t seq, uint64_t completed)
+ {
++   if (!radv_ps5_stall_dump_enabled())
++      return;
+    /* Once per process: the console may hang right after, and a short burst is all it can flush. */
+    static uint32_t dumped;
+    if (p_atomic_cmpxchg(&dumped, 0u, 1u) != 0u)
+@@ -1032,7 +1046,7 @@ extern void (*eden_radv_stall_dump)(void) __attribute__((weak));
+ static void
+ radv_ps5_offer_stall_dump(void)
+ {
+-   if (&eden_radv_stall_dump)
++   if (&eden_radv_stall_dump && radv_ps5_stall_dump_enabled())
+       p_atomic_set(&eden_radv_stall_dump, radv_ps5_dump_stall_now);
+ }
+ 

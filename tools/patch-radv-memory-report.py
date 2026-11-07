@@ -40,6 +40,7 @@ if sys.argv[1:2] == ['--digest']:
     raise SystemExit(0)
 source = root.parent/'mihawk-vulkan-review/.deps/work/radv-src'
 pristine = root.parent/'mihawk-mesa-review'
+series = root.parent/'mihawk-vulkan-review/.deps/work/radv-series'  # tools/patch-radv-series.py
 MARK = 'EglantinePS5 memory report'
 # tools/patch-radv-wsi.py rewrites these from the pinned source and adapts them: taken from the export.
 ADAPTED_FIRST = {'src/amd/vulkan/radv_physical_device.c'}
@@ -225,7 +226,8 @@ edits = {
 changed = False
 for relative, replacements in edits.items():
     path = source/relative
-    text = (path if relative in ADAPTED_FIRST else pristine/relative).read_text()
+    start = series/relative if (series/relative).exists() else pristine/relative
+    text = (path if relative in ADAPTED_FIRST else start).read_text()
     if MARK not in text:
         for old, new in replacements:
             if text.count(old) != 1:

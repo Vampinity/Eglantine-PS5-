@@ -45,6 +45,7 @@ p.write_text(s)
 PY
 bash "$vulkan/tools/setup-native-dependencies.sh"
 bash "$vulkan/tools/build-radv.sh" release
+python3 "$root/tools/patch-radv-series.py"
 python3 "$root/tools/patch-radv-wsi.py"
 python3 "$root/tools/patch-radv-memory-report.py"
 bash "$vulkan/tools/build-radv.sh" release

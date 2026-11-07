@@ -79,6 +79,17 @@ DRIVER_ADAPTATIONS = {
          'static void\nradv_task_emu_draw_indirect(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{\n'
          '   radv_task_emu_depth++;\n   radv_task_emu_draw_indirect_body(cmd_buffer, info);\n   radv_task_emu_depth--;\n}\n\n'
          'static void\nradv_task_emu_draw_indirect_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{'),
+        # The same for a draw whose mesh shader runs as compute (tools/patch-radv-series): its chunks'
+        # records pass is a dispatch too, and a split there would leave its copy draws without the
+        # graphics state. exploitizm's build has no such guard. The split that falls due goes first,
+        # where radv_before_taskmesh_draw puts it for an emulated task draw: the only split point of
+        # this draw is the radv_before_draw inside the guard, and a run of these draws alone would
+        # otherwise never split and pass the submission limit.
+        ('static void\nradv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,\n                       uint32_t z)\n{',
+         'static void\nradv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,\n                            uint32_t z);\n\n'
+         'static void\nradv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,\n                       uint32_t z)\n{\n'
+         '   radv_split_cmd_stream_if_due(cmd_buffer);\n   radv_task_emu_depth++;\n   radv_mesh_compute_draw_body(cmd_buffer, info, x, y, z);\n   radv_task_emu_depth--;\n}\n\n'
+         'static void\nradv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,\n                            uint32_t z)\n{'),
         # EglantinePS5: a command buffer's upload buffer (push descriptors, push constants, vertex
         # descriptors) only ever doubles and stays at the largest size any recording needed, and the
         # pool cycles through every command buffer it ever made. With EDEN_RADV_UPLOAD_TRIM_KIB=<n> one over
@@ -354,7 +365,9 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
 }
 # The driver is rebuilt when the WSI text's hash changes (--check, tools/prepare-build.sh): the
 # driver adaptations' digest goes into that text as a comment, so a change to them rebuilds it too.
-text += '\n/* EglantinePS5 driver adaptations: ' + hashlib.sha256(repr(sorted(DRIVER_ADAPTATIONS.items())).encode()).hexdigest() + ' */\n'
+# The driver series (tools/patch-radv-series.py) counts the same way.
+series = [patch.read_bytes() for patch in sorted((root/'tools/patch-radv-series').glob('*.patch'))]
+text += '\n/* EglantinePS5 driver adaptations: ' + hashlib.sha256(repr((sorted(DRIVER_ADAPTATIONS.items()), series)).encode()).hexdigest() + ' */\n'
 if sys.argv[1:2] == ['--check']:
     # Is the driver that was built (its recorded display source, EDEN_WSI_SHA256) this adaptation?
     recorded = Path(sys.argv[2]).read_text().split()[0] if Path(sys.argv[2]).is_file() else ''
@@ -370,7 +383,10 @@ if changed:
 print(f'RADV WSI adaptation changed={changed} sha256={hashlib.sha256(text.encode()).hexdigest()}')
 
 for relative, replacements in DRIVER_ADAPTATIONS.items():
-    original = root.parent/'mihawk-mesa-review'/relative
+    # What tools/patch-radv-series.py made of the file, if it touched it.
+    original = root.parent/'mihawk-vulkan-review/.deps/work/radv-series'/relative
+    if not original.exists():
+        original = root.parent/'mihawk-mesa-review'/relative
     destination = root.parent/'mihawk-vulkan-review/.deps/work/radv-src'/relative
     adapted = original.read_text()
     for old, new in replacements:

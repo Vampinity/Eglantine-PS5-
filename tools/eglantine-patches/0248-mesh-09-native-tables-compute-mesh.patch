@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 02:40:00 +0100
+Subject: [PATCH] shader: EDEN_NX2_NATIVE_TABLES=compute+mesh keeps pointers
+ read through memory for task and mesh programs
+
+Core patch on mig020-core (T42), a new value of an existing switch. Unset and every value used so far
+behave as before.
+
+T42 runs with EDEN_NX2_NATIVE_TABLES=compute, and that mode takes the =0 path for task and mesh
+programs: a pointer read through memory a constant buffer pointer points to is not bound, and the
+access stays global, which reads 0 outside the bound storage buffers. Duck912's message on Lichii
+bf3f395c96 says Ocarina's grass task and mesh programs load their pool base that way, and that reads
+of 0 made the task shader cull every blade. Our patch 0201 says the same in its header: only worth
+setting with tables on and mesh draws running. So mesh draws with =compute are expected to run and
+still show no grass. This value is the one to use for a plant test.
+
+It leaves vertex and fragment programs on the =0 path, the part of a tables run that costs memory in
+every draw's bindings. A pointer read through memory comes back as an indirect binding, so
+EDEN_NX2_TABLE_POOL_MIB applies to it in BindGraphicsStorageBuffer. Table entries stay compute only;
+Lichii's pass has the same rule for graphics stages, so task and mesh programs reach what they reach
+there.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+--- a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
++++ b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+@@ -1107,8 +1107,11 @@
+ /// pointer, the part of a tables run that costs memory in every draw's bindings. A run with
+ /// tables on dies on memory (run56, translating mesh programs): this says whether the compute
+ /// side alone changes the picture.
++/// EDEN_NX2_NATIVE_TABLES=compute+mesh: as compute, and task and mesh programs keep those pointers
++/// too, with mesh draws running again. Vertex and fragment programs still take the =0 path, and
++/// table entries stay compute only (below).
+ bool NativeTablesEnabled(Stage stage) {
+-    enum class Mode { Off, Compute, On };
++    enum class Mode { Off, Compute, ComputeMesh, On };
+     static const Mode mode = [] {
+         const char* const value = std::getenv("EDEN_NX2_NATIVE_TABLES");
+         if (value == nullptr) {
+@@ -1120,9 +1123,13 @@
+         if (std::string_view{value} == "compute") {
+             return Mode::Compute;
+         }
++        if (std::string_view{value} == "compute+mesh") {
++            return Mode::ComputeMesh;
++        }
+         return Mode::On;
+     }();
+-    return mode == Mode::On || (mode == Mode::Compute && stage == Stage::Compute);
++    return mode == Mode::On || (mode != Mode::Off && stage == Stage::Compute) ||
++           (mode == Mode::ComputeMesh && (stage == Stage::Task || stage == Stage::Mesh));
+ }
+ 
+ /// Native programs: every constant buffer pointer the low address can come from, following only
