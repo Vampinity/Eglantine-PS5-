@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 23:40:00 +0100
+Subject: [PATCH] EDEN_NX2_MASK_COMPONENTS=1: mask colour channels a fragment shader does not write
+
+Off unless set. From Lichii PR 353 (static pipeline mask part only, no extended dynamic state 3), rewritten here by
+ChatGPT and checked by Claude. Per attachment, the colour write mask becomes the game's mask ANDed with the channels
+the fragment shader writes, and the pipeline key carries it. Aimed at the one-frame sun dropout in Ocarina of Time,
+whose sun pass writes only some channels (ocarina-recomp PR 81). Unproven on the console.
+---
+diff --git a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+index 1ef3851..a591127 100644
+--- a/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
++++ b/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp
+@@ -458,9 +458,12 @@ void VisitUsages(Info& info, IR::Inst& inst) {
+     case IR::Opcode::SetAttributeIndexed:
+         info.stores_indexed_attributes = true;
+         break;
+-    case IR::Opcode::SetFragColor:
+-        info.stores_frag_color[inst.Arg(0).U32()] = true;
++    case IR::Opcode::SetFragColor: {
++        const u32 render_target = inst.Arg(0).U32();
++        info.stores_frag_color[render_target] = true;
++        info.frag_color_components[render_target] |= static_cast<u8>(1U << inst.Arg(1).U32());
+         break;
++    }
+     case IR::Opcode::SetSampleMask:
+         info.stores_sample_mask = true;
+         break;
+diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
+index 5985d13..4ae1a0d 100644
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -304,6 +304,8 @@ struct Info {
+     bool loads_indexed_attributes{};
+ 
+     std::array<bool, 8> stores_frag_color{};
++    // Lichii PR 353: written components, bit 0 = R through bit 3 = A.
++    std::array<u8, 8> frag_color_components{};
+     bool stores_sample_mask{};
+     bool stores_frag_depth{};
+ 
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+index 6d91041..4cf36e2 100644
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+ #include "video_core/fsr.h"
++#include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+ 
+ #include "common/div_ceil.h"
+ #include "common/settings.h"
+@@ -806,6 +807,10 @@ void BlitImageHelper::BlitColor(const Framebuffer* dst_framebuffer, VkImageView
+         cmdbuf.Draw(3, 1, 0, 0);
+         cmdbuf.EndRenderPass();
+     });
++    // Lichii PR 353: the blit replaced the guest pipeline and its static write mask.
++    if (MaskComponentsEnabled()) {
++        scheduler.InvalidateState();
++    }
+ }
+ 
+ void BlitImageHelper::TemporalUpscale(const Framebuffer* dst_framebuffer,
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index bd978f3..5b9d7de 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
++#include <cstdlib>
+ #include <bit>
+ #include <numeric>
+ #include <ranges>
+@@ -103,6 +104,14 @@ void RefreshXfbState(VideoCommon::TransformFeedbackState& state, const Maxwell&
+ }
+ } // Anonymous namespace
+ 
++bool MaskComponentsEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_MASK_COMPONENTS");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return enabled;
++}
++
+ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features) {
+     const Maxwell& regs = maxwell3d.regs;
+     const auto topology_ = maxwell3d.draw_manager.draw_state.topology;
+@@ -115,6 +124,8 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+     extended_dynamic_state_2.Assign(features.has_extended_dynamic_state_2 ? 1 : 0);
+     extended_dynamic_state_2_logic_op.Assign(features.has_extended_dynamic_state_2_logic_op ? 1 : 0);
+     extended_dynamic_state_3_blend.Assign(features.has_extended_dynamic_state_3_blend ? 1 : 0);
++    // Lichii PR 353, static blending only. Keep the mode in the hashed/serialized key.
++    mask_components.Assign(MaskComponentsEnabled() && !features.has_extended_dynamic_state_3_blend);
+     extended_dynamic_state_3_enables.Assign(features.has_extended_dynamic_state_3_enables ? 1 : 0);
+     color_write_enable_dynamic.Assign(features.has_color_write_enable ? 1 : 0);
+     dynamic_vertex_input.Assign(features.has_dynamic_vertex_input ? 1 : 0);
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.h b/src/video_core/renderer_vulkan/fixed_pipeline_state.h
+index 1fe5cd7..2f3ca4f 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.h
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.h
+@@ -20,6 +20,9 @@ namespace Vulkan {
+ 
+ using Maxwell = Tegra::Engines::Maxwell3D::Regs;
+ 
++// Read once per process; only the exact value "1" enables the experiment.
++bool MaskComponentsEnabled();
++
+ struct DynamicFeatures {
+     u32 driver_id;
+     u32 driver_version;
+@@ -215,6 +218,7 @@ struct FixedPipelineState {
+         BitField<20, 1, u32> color_write_enable_dynamic;
+ 
+         BitField<21, 1, u32> attachment0_dual_source_blend;
++        BitField<22, 1, u32> mask_components;
+ 
+         BitField<24, 4, Maxwell::PrimitiveTopology> topology;
+         BitField<28, 4, Tegra::Texture::MsaaMode> msaa_mode;
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 20e2e5c..7cfc643 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -303,6 +303,7 @@ GraphicsPipeline::GraphicsPipeline(
+     }
+     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+     fragment_writes_color = stage_infos[NUM_STAGES - 1].stores_frag_color;
++    fragment_color_components = stage_infos[NUM_STAGES - 1].frag_color_components;
+ 
+     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, RunsMeshAsCompute())};
+     // Task and mesh programs run as compute read the rescaling words and the MeshComputeLayout
+@@ -1070,6 +1071,13 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     if (dynamic.depth_bounds_enable && !device.IsDepthBoundsSupported()) {
+         LOG_WARNING(Render_Vulkan, "Depth bounds is enabled but not supported");
+     }
++    if (key.state.mask_components) {
++        static const bool logged = [] {
++            LOG_INFO(Render_Vulkan, "EDEN_NX2_MASK_COMPONENTS=1: static component masking active");
++            return true;
++        }();
++        (void)logged;
++    }
+     static_vector<VkPipelineColorBlendAttachmentState, Maxwell::NumRenderTargets> cb_attachments;
+     const size_t num_attachments{NumAttachments(key.state)};
+     for (size_t index = 0; index < num_attachments; ++index) {
+@@ -1095,6 +1103,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+             (index >= fragment_writes_color.size() || !fragment_writes_color[index])) {
+             write_mask = 0;
+         }
++        if (key.state.mask_components) {
++            write_mask &= fragment_color_components[index];
++        }
+         cb_attachments.push_back({
+             .blendEnable = blend.enable != 0,
+             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index e01f3b9..877ae6c 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -233,6 +233,7 @@ private:
+     u32 num_textures{};
+     bool fragment_has_color0_output{};
+     std::array<bool, 8> fragment_writes_color{};
++    std::array<u8, 8> fragment_color_components{};
+ 
+     vk::DescriptorSetLayout descriptor_set_layout;
+     DescriptorAllocator descriptor_allocator;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 5fc1922..ab50372 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1321,7 +1321,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+             return;
+         }
+ 
+-        if ((key.state.extended_dynamic_state != 0) !=
++        if ((key.state.mask_components != 0) !=
++                (MaskComponentsEnabled() && !dynamic_features.has_extended_dynamic_state_3_blend) ||
++            (key.state.extended_dynamic_state != 0) !=
+                 dynamic_features.has_extended_dynamic_state ||
+             (key.state.extended_dynamic_state_2 != 0) !=
+                 dynamic_features.has_extended_dynamic_state_2 ||
