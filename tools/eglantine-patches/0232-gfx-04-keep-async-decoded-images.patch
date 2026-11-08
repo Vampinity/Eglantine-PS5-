@@ -15,7 +15,7 @@ anything unused for 10 frames, CostlyLoad or not: the four runs 147, 155, 161 an
 textures new 14 to 21 times each, and 2 to 10 of those decodes were dropped for want of a heap block
 (the decode needs a 32 MiB input copy, a 48 MiB output and a 151 MiB RGBA8 scratch for level 0,
 single blocks that come from the pool above 32 MiB), after which the texture stayed black until the
-game wrote it again. Robin sees the floor appear slowly.
+game wrote it again. The floor appears slowly on screen.
 
 EDEN_NX2_TC_KEEP_ASYNC=<frames>: such an image is left alone by RunGarbageCollector in every mode
 and by CollectForBuffer, until it has gone unused for EDEN_NX2_TC_OLD_AGE frames (1800); and a

@@ -9,7 +9,7 @@ one image, cbuf0+0xc0 = 0x8113971000 1920x1080 E5B9G9R9 (format 32), and stores 
 0x81252ff000 1920x1080 B10G11R11 (format 33). No other handle. Without a same-size rule the
 stand-in found no pair in them, fell to the cbuf0 scan and blitted a 256x256 image onto a
 512x512 one (131.7 s), later a 64x36 onto a 128x72 one (193.6 s): the speckled 8-pixel cells and
-blurred limbs of Robin's clip, while the real output stayed unwritten and the world black.
+blurred limbs of the test clip, while the real output stayed unwritten and the world black.
 
 EDEN_NX2_UPSCALE_HANDLES_ONLY=1: a program whose own read and store are one size is copied from
 that read to that store, E5B9G9R9 through the existing source-format override into B10G11R11,
