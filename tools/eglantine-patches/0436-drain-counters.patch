@@ -1,0 +1,582 @@
+Subject: [PATCH] Drain counters per site in the GPU profile (EDEN_NX2_GPU_PROFILE / EDEN_NX2_SPLIT_WAITS: 21 sites incl. macro dma read, acquire check/recheck/poll, list writers) and EDEN_UP_DRAIN_SKIP_SAME=1 (skip a semaphore re-read drain when nothing was sent to the back since the last drained read of that word); off by default
+
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 315c52e..c28567d 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -102,6 +102,7 @@ add_library(video_core STATIC
+     gpu.h
+     gpu_split.cpp
+     gpu_split.h
++    gpu_split_sites.h
+     gpu_thread.cpp
+     gpu_thread.h
+     guest_memory.h
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 964fdb2..b01ee27 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -598,7 +598,7 @@ bool DmaPusher::Step() {
+         first_drain && unsynced_first_entries != 0 && !resumed_entry) {
+         --unsynced_first_entries;
+         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+-            split.Drain(VideoCommon::DrainSite::ListWriters);
++            split.Drain(VideoCommon::DrainSite::ListFirstDrain);
+         }
+     }
+     dma_state.dma_get = header.addr;
+@@ -1675,7 +1675,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
+     // channels' work queued meanwhile. Always false with the switch off.
+     const bool resumed = std::exchange(resumed_list_read, false);
+     if (split.Active() && !resumed) {
+-        split.WaitForWriters();
++        split.WaitForWriters(VideoCommon::DrainSite::ListGpuWritten);
+     }
+     // Suspending needs the split's back running: only it submits a deferred copy, and
+     // IsGpuTickDone answers done without it (the same test, or a stopping split would suspend
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index a3bcdf0..4f1889c 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -2201,7 +2201,7 @@ bool KeplerCompute::FrontDropsWrite(FrontState& fs, u32 method, u32 argument) {
+ }
+ 
+ void KeplerCompute::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+-    split.Drain();
++    split.Drain(VideoCommon::DrainSite::FrontVerify);
+     static u64 checks{};
+     static u64 differences{};
+     ++checks;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 8983b72..014ccc8 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1606,7 +1606,7 @@ void Maxwell3D::FrontDmaReadAhead(VideoCommon::GpuSplit& split, FrontState& fs,
+         }
+         VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+     });
+-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++    split.Drain(VideoCommon::DrainSite::DmaReadAhead);
+     // Taken after the drain: the whole pages are current up to what was sent.
+     const u64 position = split.SentPosition();
+     if (device) {
+@@ -1679,7 +1679,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+             if (!hit || !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12)) {
+                 thread_local std::vector<u32> snap_words;
+                 snap_words.resize(words);
+-                const auto drained_read = [&](u32* out) {
++                const auto drained_read = [&](u32* out, VideoCommon::DrainSite site) {
+                     split.Defer([memory = &memory_manager, rasterizer_ptr = rasterizer, macro,
+                                  method, source, read_bytes] {
+                         VideoCommon::QueryDma::BeforeRead(*memory, *rasterizer_ptr, macro, method,
+@@ -1697,7 +1697,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                         VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer_ptr, source,
+                                                                 read_bytes);
+                     });
+-                    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++                    split.Drain(site);
+                     memory_manager.ReadBlockUnsafe(source, out, read_bytes);
+                 };
+                 if (hit) {
+@@ -1705,7 +1705,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                     if (snapshot_mode == 2) {
+                         std::vector<u32> exact(words);
+-                        drained_read(exact.data());
++                        drained_read(exact.data(), VideoCommon::DrainSite::DmaSnapshotCheck);
+                         if (exact != snap_words) {
+                             if (differences++ < 32) {
+                                 LOG_WARNING(HW_GPU,
+@@ -1718,7 +1718,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                     }
+                 } else {
+                     ++misses;
+-                    drained_read(snap_words.data());
++                    drained_read(snap_words.data(), VideoCommon::DrainSite::DmaSnapshotMiss);
+                     if (fs.dma_snapshots.size() > 8192) {
+                         fs.dma_snapshots.clear();
+                     }
+@@ -1754,7 +1754,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+             }
+             VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+         });
+-        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++        split.Drain(method == 0x158 ? VideoCommon::DrainSite::MacroDmaRead
++                                    : VideoCommon::DrainSite::MacroDmaReadRam);
+     } else {
+         FrontDmaReadAhead(split, fs, macro, method, source, words);
+     }
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index d67b317..937467b 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -25,6 +25,7 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
+ #include "video_core/rasterizer_interface.h"
++#include "video_core/readback_wait.h"
+ 
+ namespace Tegra::Engines {
+ 
+@@ -125,11 +126,46 @@ void ReleaseFencesOnBack(VideoCore::RasterizerInterface* rasterizer) {
+     DrainBack(VideoCommon::DrainSite::FenceRelease);
+ }
+ 
++u64 ReleaseKey(const DmaPusher& dma_pusher, GPUVAddr address) {
++    return (u64{dma_pusher.memory_manager.GetID()} << 48) | address;
++}
++
+ // Reads a semaphore word, flushing a GPU-written copy out of the buffer cache first. The flush
+ // reaches the scheduler (buffer cache downloads), which belongs to the back thread even once it
+ // has drained: run it there, after everything sent so far, and wait for it. The wait is the drain
+-// the callers needed anyway, so this adds no round trip.
+-u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
++// the callers needed anyway, so this adds no round trip. `site`: which read it is, for the drain
++// counts (EDEN_NX2_SPLIT_WAITS, EDEN_NX2_GPU_PROFILE).
++// EDEN_UP_DRAIN_SKIP_SAME=1 (GpuSplit::SameReadCurrent): a word read again with nothing sent to
++// the back since its drained read is read without the flush and the drain: a suspended channel's
++// polls while the front sends nothing else (each drained poll woke the back for a flush and its
++// idle hook). Never the second read of an acquire (ReleaseFences is sent in between) nor the
++// delayed-fence poll (likewise). Off with EDEN_NX2_READBACK_WAIT, whose held syncpoint increments
++// the back makes on its turns, which drained polls gave it. Off unless exactly "1"; read once.
++bool SkipSameReads() {
++    static const bool enabled = [] {
++        if (!Common::PeSwitch("EDEN_UP_DRAIN_SKIP_SAME")) {
++            return false;
++        }
++        if (VideoCore::Readback::Mode() != 0) {
++            LOG_WARNING(HW_GPU, "EDEN_UP_DRAIN_SKIP_SAME=1 ignored with EDEN_NX2_READBACK_WAIT");
++            return false;
++        }
++        LOG_INFO(HW_GPU, "EDEN_UP_DRAIN_SKIP_SAME=1: semaphore words read again with nothing "
++                         "sent to the back since skip the drain");
++        return true;
++    }();
++    return enabled;
++}
++
++u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address, VideoCommon::DrainSite site) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    const bool same_reads = SkipSameReads() && split.Active();
++    const u64 key = same_reads ? ReleaseKey(dma_pusher, address) : 0;
++    if (same_reads && split.SameReadCurrent(key)) {
++        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SameWordReads, 1);
++        return dma_pusher.memory_manager.Read<u32>(address);
++    }
++    const bool chain = same_reads && split.SameReadsHold();
+     if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
+         OnBack([rasterizer = dma_pusher.rasterizer, device = *device] {
+             if (rasterizer->MustFlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
+@@ -137,13 +173,13 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
+             }
+         });
+     }
+-    DrainBack();
++    DrainBack(site);
++    if (same_reads) {
++        split.NoteSameRead(key, chain);
++    }
+     return dma_pusher.memory_manager.Read<u32>(address);
+ }
+ 
+-u64 ReleaseKey(const DmaPusher& dma_pusher, GPUVAddr address) {
+-    return (u64{dma_pusher.memory_manager.GetID()} << 48) | address;
+-}
+ void NoteRelease(const DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+     auto& split = VideoCommon::GpuSplit::Get();
+     if (split.Active()) split.NoteRelease(ReleaseKey(dma_pusher, address), value);
+@@ -245,7 +281,8 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+     }
+     // The release may still be queued for the split GPU thread's back half: ReadSemaphoreWord
+     // waits for it (and flushes the caches there).
+-    const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
++    const u32 current =
++        ReadSemaphoreWord(dma_pusher, pending_acquire->address, VideoCommon::DrainSite::AcquirePoll);
+     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+         if (static std::atomic<u32> rescued{};
+             !pending_acquire->Matches(current) && rescued.fetch_add(1) < 64) {
+@@ -270,7 +307,8 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+         pending_acquire->last_fences = now;
+         ReleaseFencesOnBack(dma_pusher.rasterizer);
+         if (Nx2SemaphoreWaiters::Get().Latched(this) ||
+-            pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
++            pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address,
++                                                       VideoCommon::DrainSite::AcquirePoll))) {
+             return true;
+         }
+     }
+@@ -449,7 +487,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+         u32 word{};
+         const bool readable = SemaphoreReadableNow(dma_pusher, acquire.address, word);
+         if (readable ? acquire.Matches(word)
+-                     : acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
++                     : acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address,
++                                                         VideoCommon::DrainSite::AcquireCheck))) {
+             return;
+         }
+         // Registered before the fences run, so a release among them that meets the value counts
+@@ -463,7 +502,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+         const bool met_now = readable
+                                  ? (SemaphoreReadableNow(dma_pusher, acquire.address, word) &&
+                                     acquire.Matches(word))
+-                                 : acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
++                                 : acquire.Matches(ReadSemaphoreWord(
++                                       dma_pusher, acquire.address,
++                                       VideoCommon::DrainSite::AcquireRecheck));
+         if (!waiters.Latched(this) && !met_now) {
+             pending_acquire = acquire;
+             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index f2c9e48..22b3442 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -190,6 +190,8 @@ void GpuSplit::Stop() {
+     front_reports.clear();
+     reported_words.clear();
+     sync_position = 0;
++    same_read_count = 0;
++    same_read_position = 0;
+     back_engine_now.store(nullptr, std::memory_order_relaxed);
+     hang_reports = 0;
+     hang_dumped_position = ~u64{0};
+@@ -354,13 +356,17 @@ bool GpuSplit::WritePending(u64 key) {
+ }
+ 
+ void GpuSplit::Drain() {
++    DrainAt(DrainSite::Other);
++}
++
++void GpuSplit::DrainAt(DrainSite site) {
+     CloseRegs();
+     consumed_cache = consumed.load(std::memory_order_acquire);
+     if (consumed_cache == write_position && BackQuiet()) {
+         return;
+     }
+     Publish();
+-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
++    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain, site};
+     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
+     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
+@@ -403,19 +409,19 @@ void GpuSplit::Drain() {
+ 
+ void GpuSplit::Drain(DrainSite site) {
+     if (!SplitWaitsEnabled()) {
+-        Drain();
++        DrainAt(site);
+         return;
+     }
+     const bool behind = consumed.load(std::memory_order_acquire) != write_position;
+     const u64 start = WaitClockNs();
+-    Drain();
++    DrainAt(site);
+     if (behind) {
+         NoteWait(site, start);
+     }
+ }
+ 
+-bool GpuSplit::WaitForWriters() {
+-    return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
++bool GpuSplit::WaitForWriters(DrainSite site) {
++    return WaitFor(std::min(last_writer_position, write_position), site);
+ }
+ 
+ // From Lichii (zortos293/Lichii, nx2 at 27226d2568): one wait with a site for the report. It waits
+@@ -431,7 +437,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+         wait_target.store(target, std::memory_order_seq_cst);
+     }
+     Publish();
+-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
++    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain, site};
+     const u64 start = SplitWaitsEnabled() ? WaitClockNs() : 0;
+     std::chrono::steady_clock::time_point next_report{};
+     for (u32 spins = 0;; ++spins) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 7b85fa0..2d87ff1 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -19,6 +19,7 @@
+ 
+ #include "common/common_types.h"
+ #include "common/hang_site.h"
++#include "video_core/gpu_split_sites.h"
+ 
+ namespace Core {
+ class System;
+@@ -30,27 +31,6 @@ class EngineInterface;
+ 
+ namespace VideoCommon {
+ 
+-/// Why the front waits for the back (EDEN_NX2_SPLIT_WAITS=1 logs the time spent per site).
+-enum class DrainSite : u32 {
+-    Other,
+-    RingFull,      ///< The ring is full: over 8 MiB of work is queued
+-    Acquire,       ///< A semaphore acquire reads a word the back may release or hold
+-    FenceRelease,  ///< The puller's acquires release the pending fences
+-    SemExecute,    ///< A SEM_EXECUTE acquire
+-    ListWriters,   ///< GPU-written command lists: the dispatches and copies sent before them
+-    ListFlush,     ///< Command lists on GPU-written pages: drain and flush the pages
+-    MacroDmaRead,  ///< The front's macros read memory (MME DMA)
+-    Map,           ///< GPU memory maps before later command reads
+-    FrontStart,    ///< The front takes an engine's macros over
+-    FrontVerify,   ///< EDEN_NX2_SPLIT_VERIFY
+-    Count,
+-};
+-
+-inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
+-    "other",        "ring full",  "acquire",        "fence release", "sem execute", "list writers",
+-    "list flush",   "macro dma read", "map",        "front start",   "front verify",
+-};
+-
+ // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
+ // CPU's commands, parses command lists and runs the puller; engine method calls and everything
+ // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a
+@@ -299,9 +279,44 @@ public:
+     void Publish();
+     /// Waits until the back executed everything sent so far.
+     void Drain();
+-    /// As Drain, counting the wait under `site` (EDEN_NX2_SPLIT_WAITS).
++    /// As Drain, counting the wait under `site` (EDEN_NX2_SPLIT_WAITS, EDEN_NX2_GPU_PROFILE).
+     void Drain(DrainSite site);
+ 
++    // EDEN_UP_DRAIN_SKIP_SAME=1 (puller.cpp ReadSemaphoreWord): a semaphore word read again with
++    // nothing sent to the back since its drained read (flush the word on the back, drain, read)
++    // needs no second drain. Once that drain returned, the back had run everything sent, flushed
++    // the word's buffer cache copy and run its idle hook; with nothing sent since, it has done
++    // nothing more, and a second drained read would only read guest memory again. What can still
++    // change the word (the CPU, fences landing on the fencing thread) a plain read sees as well.
++    /// Front: whether the drained read of the word at `key` (address space and GPU address) still
++    /// holds: since it, nothing was sent but other words' drained reads, and the back ran it all
++    /// and went quiet (what Drain's own early return checks).
++    [[nodiscard]] bool SameReadCurrent(u64 key) const {
++        if (!SameReadsHold() || consumed.load(std::memory_order_acquire) != write_position ||
++            !BackQuiet()) {
++            return false;
++        }
++        const auto end = same_read_keys.begin() + same_read_count;
++        return std::find(same_read_keys.begin(), end, key) != end;
++    }
++    /// Front, before a drained word read sends its flush: whether the reads noted so far hold
++    /// (nothing sent since the last one, no register block open).
++    [[nodiscard]] bool SameReadsHold() const {
++        return same_read_count != 0 && regs_entry == nullptr && write_position == same_read_position;
++    }
++    /// Front, after the drained read of the word at `key`. `chain`: SameReadsHold() before its
++    /// flush was sent (the words noted earlier stay current: only this word's flush came after).
++    void NoteSameRead(u64 key, bool chain) {
++        if (!chain || same_read_count == same_read_keys.size()) {
++            same_read_count = 0;
++        }
++        const auto end = same_read_keys.begin() + same_read_count;
++        if (std::find(same_read_keys.begin(), end, key) == end) {
++            same_read_keys[same_read_count++] = key;
++        }
++        same_read_position = write_position;
++    }
++
+     /// Compute or copy work was just sent: what can write GPU-written command lists.
+     void NoteWriter() {
+         CloseRegs();
+@@ -309,7 +324,7 @@ public:
+     }
+     /// Waits until the back executed the compute and copy work sent so far (not what came after).
+     /// Returns whether any of it was still queued.
+-    bool WaitForWriters();
++    bool WaitForWriters(DrainSite site = DrainSite::ListWriters);
+ 
+     // EDEN_NX2_DMA_SNAPSHOT (Frizti/Fritchii 8ac3666f7b, EvilOOT's dma-snapshot fix): the front
+     // notes the guest memory the work it sends may write, so a macro DMA read of a page a drained
+@@ -447,6 +462,8 @@ private:
+         }
+     }
+     void WaitForSpace(size_t words);
++    /// Drain, its wait counted under `site` by EDEN_NX2_GPU_PROFILE.
++    void DrainAt(DrainSite site);
+     /// Waits until the back consumed `target`; returns whether it had to wait.
+     bool WaitFor(u64 target, DrainSite site);
+     /// Front thread, EDEN_NX2_SPLIT_WAITS=1: adds a wait that began at `start`.
+@@ -517,6 +534,10 @@ private:
+     std::unordered_map<u64, u64> front_reports; ///< key of each word -> write_position after it
+     std::unordered_set<u64> reported_words;     ///< every word a report was sent to
+     u64 sync_position{};
++    /// EDEN_UP_DRAIN_SKIP_SAME: the words whose drained reads hold at same_read_position.
++    std::array<u64, 4> same_read_keys{};
++    size_t same_read_count{};
++    u64 same_read_position{};
+     /// EDEN_NX2_SPLIT_WAITS=1: nanoseconds, waits and longest wait per site since the last report.
+     std::array<u64, static_cast<size_t>(DrainSite::Count)> wait_ns{};
+     std::array<u64, static_cast<size_t>(DrainSite::Count)> wait_count{};
+diff --git a/src/video_core/gpu_split_sites.h b/src/video_core/gpu_split_sites.h
+new file mode 100644
+index 0000000..be50e77
+--- /dev/null
++++ b/src/video_core/gpu_split_sites.h
+@@ -0,0 +1,50 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <cstddef>
++
++#include "common/common_types.h"
++
++namespace VideoCommon {
++
++/// Why the split GPU thread's front waits for its back (gpu_split.h). EDEN_NX2_SPLIT_WAITS=1 logs
++/// the waits per site every 10 s; EDEN_NX2_GPU_PROFILE=1 adds them to the GPU thread's line.
++enum class DrainSite : u32 {
++    Other,
++    RingFull,      ///< The ring is full: over 8 MiB of work is queued
++    Acquire,       ///< Other semaphore acquires (non-Switch 2 acquires, DrainTo)
++    FenceRelease,  ///< The puller's acquires release the pending fences
++    SemExecute,    ///< A SEM_EXECUTE acquire
++    ListWriters,   ///< A command list entry waits for the dispatches and copies sent before it
++    ListFlush,     ///< Command lists on GPU-written pages: drain and flush the pages
++    MacroDmaRead,  ///< The front's macros read memory into the load FIFO (MME_DMA_READ_FIFOED)
++    Map,           ///< GPU memory maps before later command reads
++    FrontStart,    ///< The front takes an engine's macros over
++    FrontVerify,   ///< EDEN_NX2_SPLIT_VERIFY
++    AcquireCheck,  ///< The first read of a Switch 2 acquire's word (ProcessSemaphoreTriggerMethod)
++    AcquireRecheck, ///< Its second read, after the pending fences were released
++    AcquirePoll,   ///< A suspended channel's acquire polled (CanResumeAcquire)
++    ListGpuWritten, ///< A command list on a GPU-written page waits for its writers
++    ListFirstDrain, ///< EDEN_UP_SPLIT_FIRST_DRAIN: a new channel's first entries
++    MacroDmaReadRam, ///< The front's macros read memory into their data RAM (MME_DMA_READ)
++    DmaSnapshotMiss, ///< EDEN_NX2_DMA_SNAPSHOT: a macro read no snapshot covers
++    DmaSnapshotCheck, ///< EDEN_NX2_DMA_SNAPSHOT=2: a covered read checked against a drained one
++    DmaReadAhead,  ///< EDEN_PE_DMA_READ_AHEAD: a macro read that could not run ahead
++    MapOnBack,     ///< EDEN_NX2_MAP_ON_BACK: the map's own drain
++    Count,
++};
++
++inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
++    "other",          "ring full",       "acquire",          "fence release",
++    "sem execute",    "list writers",    "list flush",       "macro dma read",
++    "map",            "front start",     "front verify",     "acquire check",
++    "acquire recheck", "acquire poll",   "list gpu-written", "list first drain",
++    "macro dma read ram", "dma snapshot miss", "dma snapshot check", "dma read ahead",
++    "map on back",
++};
++static_assert(drain_site_names.back() != nullptr, "a drain site without a name");
++
++} // namespace VideoCommon
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 59cf8c2..30bf747 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -270,7 +270,7 @@ void ThreadManager::Run(std::function<void()>&& func, bool is_async, bool before
+             auto& split = VideoCommon::GpuSplit::Get();
+             if (split.Active()) {
+                 split.DeferFunction(std::move(work));
+-                split.Drain();
++                split.Drain(VideoCommon::DrainSite::MapOnBack);
+             } else {
+                 work();
+             }
+diff --git a/src/video_core/nx2_profile.h b/src/video_core/nx2_profile.h
+index 3456202..37de6ba 100644
+--- a/src/video_core/nx2_profile.h
++++ b/src/video_core/nx2_profile.h
+@@ -16,6 +16,7 @@
+ #include "common/common_types.h"
+ #include "common/logging.h"
+ #include "common/cpu_features.h"
++#include "video_core/gpu_split_sites.h"
+ 
+ // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
+ // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
+@@ -103,7 +104,10 @@ struct FrameData {
+ struct ThreadData {
+     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
+-    std::array<u64, 9> counters{}; ///< See Counter
++    std::array<u64, 10> counters{}; ///< See Counter
++    /// Split GPU thread, front: its waits for the back (zone SplitDrain) and their time, per site.
++    std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
++    std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
+     u64 child_ns{};    ///< Time of the zones nested in the current one
+     u64 window_start{};
+     FrameData frame{}; ///< Kept across Report's 10 s reset
+@@ -136,6 +140,10 @@ public:
+         t_data.child_ns = 0;
+         start = Now();
+     }
++    /// A split drain zone, its time also counted under `site_` (the GPU thread's "drains" list).
++    Scope(Zone zone_, DrainSite site_) : Scope(zone_) {
++        site = static_cast<u32>(site_) + 1;
++    }
+ 
+     ~Scope() {
+         if (!enabled) {
+@@ -149,6 +157,10 @@ public:
+         data.frame.ns[index] += elapsed - data.child_ns;
+         ++data.frame.count[index];
+         data.child_ns = parent_child_ns + elapsed;
++        if (site != 0) {
++            data.drain_ns[site - 1] += elapsed;
++            ++data.drain_count[site - 1];
++        }
+         if (t_place != nullptr) {
+             t_place->zone.store(parent_zone, std::memory_order_relaxed);
+         }
+@@ -161,6 +173,7 @@ private:
+     Zone zone;
+     bool enabled;
+     u32 parent_zone{};
++    u32 site{}; ///< DrainSite + 1; 0: not a drain
+     u64 start{};
+     u64 parent_child_ns{};
+ };
+@@ -176,6 +189,7 @@ enum class Counter : u32 {
+     AcquireChecks,  ///< Semaphore acquires evaluated
+     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+     AcquirePending, ///< Split GPU thread: acquires met by a release the back has not run yet
++    SameWordReads,  ///< EDEN_UP_DRAIN_SKIP_SAME: semaphore words read again without a drain
+ };
+ 
+ /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
+@@ -385,6 +399,42 @@ inline void Report(const char* thread_name = "GPU thread") {
+                         static_cast<double>(data.counters[6]) * 1e9 / window,
+                         static_cast<double>(data.counters[7]) * 1e9 / window,
+                         static_cast<double>(data.counters[8]) * 1e9 / window);
++    // Split GPU thread, front: what it waited for the back for (the "split drain" zone above,
++    // with the ring-full and list-writer waits), per site, longest first: "name ms (waits/s,
++    // mean wait)". Drain calls that found the back caught up and quiet wait for nothing and are
++    // not counted.
++    u64 drain_total_ns{};
++    u64 drain_total{};
++    std::array<size_t, static_cast<size_t>(DrainSite::Count)> sites{};
++    for (size_t i = 0; i < sites.size(); ++i) {
++        sites[i] = i;
++        drain_total_ns += data.drain_ns[i];
++        drain_total += data.drain_count[i];
++    }
++    if (drain_total != 0) {
++        std::sort(sites.begin(), sites.end(),
++                  [&data](size_t a, size_t b) { return data.drain_ns[a] > data.drain_ns[b]; });
++        line += fmt::format(" | drains {:.1f} ms ({:.0f}/s)",
++                            static_cast<double>(drain_total_ns) * 1000.0 / window,
++                            static_cast<double>(drain_total) * 1e9 / window);
++        char separator = ':';
++        for (const size_t i : sites) {
++            if (data.drain_count[i] == 0) {
++                continue;
++            }
++            line += fmt::format("{} {} {:.1f} ms ({:.0f}/s, {:.1f} us)", separator,
++                                drain_site_names[i],
++                                static_cast<double>(data.drain_ns[i]) * 1000.0 / window,
++                                static_cast<double>(data.drain_count[i]) * 1e9 / window,
++                                static_cast<double>(data.drain_ns[i]) / 1e3 /
++                                    static_cast<double>(data.drain_count[i]));
++            separator = ',';
++        }
++    }
++    if (data.counters[9] != 0) {
++        line += fmt::format(" | semaphore rereads without a drain {:.0f}/s",
++                            static_cast<double>(data.counters[9]) * 1e9 / window);
++    }
+     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+     const FrameData frame = data.frame;
+     data = {};
