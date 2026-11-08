@@ -1761,10 +1761,38 @@ int main(int argc, char** argv) {
 #endif
                 const auto session_start = std::chrono::steady_clock::now();
                 [[maybe_unused]] double session_seconds = 0;  // guest-fault relaunch (PS5 only)
+                // A pad script's WAIT lines look at the game's frames (test_harness.h): read back as
+                // EDEN_TEST_SHOTS's are, into memory. Asked for only while a WAIT looks, at most every
+                // kLookEvery. The last buffer is used again once its picture came (or was dropped):
+                // the harness has read it by the time it asks for the next one.
+                Eden::TestHarness::LookFunction test_look;
+#ifdef EDEN_PS5_OPENGL
+                if (game) test_look = [&window, &system, spare = std::shared_ptr<Eden::TestHarness::Picture>{},
+                                       last = Eden::TestHarness::PictureFuture{}]() mutable {
+                    const auto layout = window.GetFramebufferLayout();
+                    if (!spare || (last.valid() && last.wait_for(std::chrono::seconds(0)) != std::future_status::ready))
+                        spare = std::make_shared<Eden::TestHarness::Picture>();
+                    auto picture = spare;
+                    picture->width = layout.width;
+                    picture->height = layout.height;
+                    picture->bgra.resize(std::size_t{layout.width} * layout.height * 4);
+                    auto done = std::make_shared<std::promise<std::shared_ptr<const Eden::TestHarness::Picture>>>();
+                    Eden::TestHarness::PictureFuture result = done->get_future().share();
+                    // A request the renderer drops (one is pending) destroys the callback, and the
+                    // future then reports a broken promise: the harness asks again later.
+                    system.GPU().Renderer().RequestScreenshot(picture->bgra.data(), [picture, done](bool flip) {
+                        picture->flip = flip;
+                        done->set_value(picture);
+                    }, layout);
+                    last = result;
+                    return result;
+                };
+#endif
                 std::jthread input_worker;
                 if (pad) input_worker = std::jthread([&](std::stop_token stop) {
                     // Empty without EDEN_TEST_SCRIPT and EDEN_TEST_RECORD (test_harness.h).
-                    Eden::TestHarness::Session test_session{pad->Mapping(), session_start, guest, game_title};
+                    Eden::TestHarness::Session test_session{pad->Mapping(), session_start, guest, game_title,
+                                                            test_look};
 #ifdef EDEN_DEV_PROFILE
                     // The timed input replay drives the profile's own title (EDEN_DEV_PROFILE_TITLE);
                     // other development titles take runner commands (compat-input.txt).

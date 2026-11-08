@@ -52,17 +52,45 @@
 // The script goes through Pad::Consume as the controller's samples do, so the mapping, the grips
 // and the Touchpad + L1 shortcut all apply. While a press is held the controller is not read;
 // between presses it is, so someone can step in.
+//
+// A script can wait for the screen instead of guessing a time:
+//
+//   <seconds> WAIT <timeout_s> LOOK <x> <y> <w> <h> <cols>x<rows>:<hex> [<min>]
+//   <seconds> WAIT <timeout_s> GONE <x> <y> <w> <h> <cols>x<rows>:<hex> [<min>]
+//   <seconds> MAYBE ...                        the same, but a timeout goes on instead of stopping
+//   <seconds> END                              the script is done here
+//
+// The lines between two WAITs are a section, and a section's seconds count from the moment the
+// WAIT before it was met (the first section's from the guest starting, as above). A WAIT starts
+// looking at its own seconds. LOOK is met when the region looks like the grid, GONE when it no
+// longer does. Then the next section starts at once: lines of the WAIT's section that have not
+// started are dropped and presses still held are let go. So "1 A, 4 A, then WAIT for the next
+// screen" presses A again only while that screen has not come, and "LSTICK up for 4 s, WAIT for a
+// prompt" runs until the prompt shows. A WAIT that times out stops the script: nothing more is
+// pressed, so a screen that came late or never cannot take a press meant for another one.
+//
+// The region is x, y, w, h in per mille of the picture, cut into cols x rows cells; hex is each
+// cell's mean brightness, two digits a cell, row by row (make-look.py cuts one from a picture).
+// The app reads the game's frame back as EDEN_TEST_SHOTS does, but into memory, every kLookEvery
+// while a WAIT is looking and never otherwise, and scores the region's cells against the grid by
+// correlation, 0 to 100: brightness and contrast do not count, the shapes do. min is the score a
+// LOOK needs (default 85). EDEN_TEST wait_met, wait_timeout and wait_skipped lines say when, the
+// best score and, on a timeout, the grid that was seen. A look and a shot share the renderer's one
+// screenshot slot: one asked for while the other is pending is dropped (the look tries again).
 #pragma once
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -93,6 +121,9 @@ inline constexpr std::size_t kMaxShots = 12;
 inline constexpr std::string_view kShotListFile = "game-shots.txt";
 // How long a shot waits for its file before the next one is due anyway.
 inline constexpr std::chrono::seconds kShotWait{10};
+// How often a WAIT asks for a picture. Each one is a GPU readback of the whole frame.
+inline constexpr std::uint64_t kLookEvery = 500;  // ms
+inline constexpr unsigned kMaxCells = 256;  // so a timeout's seen= grid fits a Report line (900 characters)
 
 struct NamedButton {
     std::string_view name;
@@ -129,6 +160,7 @@ struct Event {
     ps5::pad::ButtonMask buttons = 0;
     StickSide stick = StickSide::none;
     std::uint8_t x = 128, y = 128;
+    unsigned section = 0;  // the WAITs before it in the script
 };
 
 // Plain digits, by hand: a script's numbers need no locale, and the console's C library is
@@ -254,37 +286,243 @@ inline bool ParseLine(std::string_view line, const ButtonMapping& mapping, std::
     return true;
 }
 
+// The game's frame as the renderer reads it back: 4 bytes a pixel in B, G, R, A order, the last
+// row first when flip is set (graphics.cpp's CaptureNextFrame writes the same bytes to a file).
+struct Picture {
+    unsigned width = 0, height = 0;
+    bool flip = false;
+    std::vector<unsigned char> bgra;
+};
+using PictureFuture = std::shared_future<std::shared_ptr<const Picture>>;
+// Asks the renderer for its next frame (main.cpp). Empty when there is none to ask.
+using LookFunction = std::function<PictureFuture()>;
+
+struct Look {
+    unsigned x = 0, y = 0, w = 0, h = 0;  // per mille of the picture's width and height
+    unsigned cols = 0, rows = 0;
+    std::vector<std::uint8_t> grid;  // cols * rows mean brightnesses, row by row
+    int min = 85;                    // the score a LOOK needs
+    bool gone = false;               // GONE: met when the score is below min
+};
+struct Wait {
+    Ms at = 0, timeout = 0;  // in its section's seconds; the timeout counts from at
+    bool end = false;        // END
+    bool maybe = false;      // MAYBE: a timeout goes on to the next section
+    Look look;
+    unsigned line = 0;
+};
+
+// The mean brightness, (29 B + 150 G + 77 R) / 256, of each of the look's cells in this picture,
+// row by row (make-look.py does the same sums). Empty when the picture has no pixels.
+inline std::vector<std::uint8_t> GridOf(const Picture& picture, const Look& look) {
+    const std::uint64_t width = picture.width, height = picture.height;
+    if (!width || !height || picture.bgra.size() < width * height * 4 || !look.cols || !look.rows) return {};
+    const std::uint64_t x0 = look.x * width / 1000, y0 = look.y * height / 1000;
+    const std::uint64_t x1 = std::max(x0 + 1, (look.x + look.w) * width / 1000);
+    const std::uint64_t y1 = std::max(y0 + 1, (look.y + look.h) * height / 1000);
+    std::vector<std::uint8_t> grid;
+    grid.reserve(std::size_t{look.cols} * look.rows);
+    for (unsigned row = 0; row < look.rows; ++row) {
+        const std::uint64_t ya = y0 + (y1 - y0) * row / look.rows;
+        const std::uint64_t yb = std::min(height, std::max(ya + 1, y0 + (y1 - y0) * (row + 1) / look.rows));
+        for (unsigned col = 0; col < look.cols; ++col) {
+            const std::uint64_t xa = x0 + (x1 - x0) * col / look.cols;
+            const std::uint64_t xb = std::min(width, std::max(xa + 1, x0 + (x1 - x0) * (col + 1) / look.cols));
+            std::uint64_t total = 0, count = 0;
+            for (std::uint64_t y = ya; y < yb; ++y) {
+                const std::uint64_t source = picture.flip ? height - 1 - y : y;
+                const unsigned char* pixel = picture.bgra.data() + (source * width + xa) * 4;
+                for (std::uint64_t x = xa; x < xb; ++x, pixel += 4)
+                    total += 29u * pixel[0] + 150u * pixel[1] + 77u * pixel[2];
+                count += xb - xa;
+            }
+            grid.push_back(static_cast<std::uint8_t>(total / (256 * std::max<std::uint64_t>(count, 1))));
+        }
+    }
+    return grid;
+}
+
+// How alike two grids are: their correlation in percent, -100 to 100. Brightness and contrast
+// do not count. A grid with no shape at all (one brightness) scores 0.
+inline int Score(const std::vector<std::uint8_t>& want, const std::vector<std::uint8_t>& seen) {
+    if (want.empty() || want.size() != seen.size()) return 0;
+    double want_mean = 0, seen_mean = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        want_mean += want[i];
+        seen_mean += seen[i];
+    }
+    want_mean /= static_cast<double>(want.size());
+    seen_mean /= static_cast<double>(seen.size());
+    double both = 0, want_spread = 0, seen_spread = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        const double a = want[i] - want_mean, b = seen[i] - seen_mean;
+        both += a * b;
+        want_spread += a * a;
+        seen_spread += b * b;
+    }
+    if (want_spread <= 0 || seen_spread <= 0) return 0;
+    return static_cast<int>(std::lround(100 * both / std::sqrt(want_spread * seen_spread)));
+}
+
+inline std::string GridText(const Look& look, const std::vector<std::uint8_t>& grid) {
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string text = std::to_string(look.cols) + 'x' + std::to_string(look.rows) + ':';
+    for (const std::uint8_t cell : grid) {
+        text += kDigits[cell >> 4];
+        text += kDigits[cell & 15];
+    }
+    return text;
+}
+
+// A WAIT, MAYBE or END line, as its words. False with error set when it cannot be read.
+inline bool ParseWait(const std::vector<std::string>& words, Wait& wait, std::string& error) {
+    const auto at = Seconds(words[0]);
+    if (!at) {
+        error = "bad time";
+        return false;
+    }
+    wait.at = *at;
+    if (words[1] == "END") {
+        wait.end = true;
+        if (words.size() == 2) return true;
+        error = "wrong number of fields";
+        return false;
+    }
+    wait.maybe = words[1] == "MAYBE";
+    if (words.size() != 9 && words.size() != 10) {
+        error = "wrong number of fields";
+        return false;
+    }
+    const auto timeout = Seconds(words[2]);
+    if (!timeout || *timeout == 0) {
+        error = "bad timeout";
+        return false;
+    }
+    wait.timeout = *timeout;
+    if (words[3] != "LOOK" && words[3] != "GONE") {
+        error = "unknown condition " + words[3];
+        return false;
+    }
+    Look& look = wait.look;
+    look.gone = words[3] == "GONE";
+    const auto x = Number(words[4], 1000), y = Number(words[5], 1000);
+    const auto w = Number(words[6], 1000), h = Number(words[7], 1000);
+    if (!x || !y || !w || !h || *w == 0 || *h == 0 || *x + *w > 1000 || *y + *h > 1000) {
+        error = "region outside 0-1000";
+        return false;
+    }
+    look.x = static_cast<unsigned>(*x);
+    look.y = static_cast<unsigned>(*y);
+    look.w = static_cast<unsigned>(*w);
+    look.h = static_cast<unsigned>(*h);
+    const std::string_view grid{words[8]};
+    const auto cross = grid.find('x'), colon = grid.find(':');
+    if (cross == grid.npos || colon == grid.npos || colon < cross) {
+        error = "bad grid, not <cols>x<rows>:<hex>";
+        return false;
+    }
+    const auto cols = Number(grid.substr(0, cross), 64), rows = Number(grid.substr(cross + 1, colon - cross - 1), 64);
+    if (!cols || !rows || *cols == 0 || *rows == 0 || *cols * *rows > kMaxCells) {
+        error = "bad grid size";
+        return false;
+    }
+    look.cols = static_cast<unsigned>(*cols);
+    look.rows = static_cast<unsigned>(*rows);
+    const std::string_view hex = grid.substr(colon + 1);
+    if (hex.size() != 2 * *cols * *rows) {
+        error = "the grid needs " + std::to_string(2 * *cols * *rows) + " hex digits";
+        return false;
+    }
+    const auto digit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    double mean = 0;
+    for (std::size_t i = 0; i < hex.size(); i += 2) {
+        const int high = digit(hex[i]), low = digit(hex[i + 1]);
+        if (high < 0 || low < 0) {
+            error = "bad hex digit";
+            return false;
+        }
+        look.grid.push_back(static_cast<std::uint8_t>(high * 16 + low));
+        mean += look.grid.back();
+    }
+    mean /= static_cast<double>(look.grid.size());
+    double spread = 0;
+    for (const std::uint8_t cell : look.grid) spread += (cell - mean) * (cell - mean);
+    if (spread / static_cast<double>(look.grid.size()) < 4) {
+        error = "flat grid: nothing to recognise";
+        return false;
+    }
+    if (words.size() == 10) {
+        const auto min = Number(words[9], 100);
+        if (!min || *min == 0) {
+            error = "bad min, 1-100";
+            return false;
+        }
+        look.min = static_cast<int>(*min);
+    }
+    return true;
+}
+
 struct Script {
-    std::vector<Event> events;  // by start time; a recording's lines are by end time
+    std::vector<Event> events;  // by section, then start time; a recording's lines are by end time
+    std::vector<Wait> waits;    // waits[i] ends section i
     std::string error;          // not empty: the script must not be played
 };
 inline Script ParseScript(std::istream& input, const ButtonMapping& mapping) {
     Script script;
     unsigned number = 0;
+    bool ended = false;
     for (std::string line; std::getline(input, line);) {
         ++number;
-        if (!ParseLine(line, mapping, script.events, script.error)) {
+        std::istringstream fields{line.substr(0, line.find('#'))};
+        std::vector<std::string> words;
+        for (std::string word; fields >> word;) words.push_back(std::move(word));
+        if (words.empty()) continue;
+        bool ok = !ended;
+        if (!ok) {
+            script.error = "a line after END";
+        } else if (words.size() > 1 && (words[1] == "WAIT" || words[1] == "MAYBE" || words[1] == "END")) {
+            Wait wait;
+            wait.line = number;
+            ok = ParseWait(words, wait, script.error);
+            if (ok) {
+                ended = wait.end;
+                script.waits.push_back(std::move(wait));
+            }
+        } else if ((ok = ParseLine(line, mapping, script.events, script.error))) {
+            script.events.back().section = static_cast<unsigned>(script.waits.size());
+        }
+        if (!ok) {
             script.error = "line " + std::to_string(number) + ": " + script.error;
             script.events.clear();
+            script.waits.clear();
             return script;
         }
     }
-    std::stable_sort(script.events.begin(), script.events.end(),
-                     [](const Event& a, const Event& b) { return a.start < b.start; });
+    std::stable_sort(script.events.begin(), script.events.end(), [](const Event& a, const Event& b) {
+        return a.section != b.section ? a.section < b.section : a.start < b.start;
+    });
     return script;
 }
 
 // The pad state a script asks for at a moment.
 class Player {
 public:
-    explicit Player(std::vector<Event> script) : events{std::move(script)} {}
+    explicit Player(std::vector<Event> script, std::vector<Wait> wait_lines = {})
+        : events{std::move(script)}, waits{std::move(wait_lines)} {}
     // Empty while the script presses nothing: the controller plays then. A press is seen at least
     // once however short it is and however late the caller comes, and one neutral sample follows
     // the last press so that the controller's own state takes over from nothing held.
     std::optional<ps5::pad::Data> Sample(Ms now) {
-        for (; next < events.size() && events[next].start <= now; ++next) {
-            active.push_back(events[next]);
-            active.back().end = std::max(active.back().end, now + 1);
+        for (; next < events.size() && events[next].section == section && zero + events[next].start <= now; ++next) {
+            Event event = events[next];
+            event.start += zero;
+            event.end = std::max(event.end + zero, now + 1);
+            active.push_back(event);
         }
         std::erase_if(active, [now](const Event& event) { return event.end <= now; });
         if (active.empty()) {
@@ -301,8 +539,31 @@ public:
         }
         return sample;
     }
-    bool Done() const { return next == events.size() && active.empty() && !held; }
+    // The WAIT or END of the section that plays, once its seconds have come. Null otherwise.
+    const Wait* Waiting(Ms now) const {
+        if (section >= waits.size() || now < zero + waits[section].at) return nullptr;
+        return &waits[section];
+    }
+    bool TimedOut(Ms now) const {
+        return section < waits.size() && now >= zero + waits[section].at + waits[section].timeout;
+    }
+    // The WAIT was met: the next section starts now. What is left of this one is dropped and what
+    // it holds is let go (one neutral sample follows).
+    void Pass(Ms now) {
+        while (next < events.size() && events[next].section <= section) ++next;
+        active.clear();
+        ++section;
+        zero = now;
+    }
+    // Nothing more is pressed: END, or a WAIT that timed out.
+    void Stop() {
+        next = events.size();
+        active.clear();
+        section = static_cast<unsigned>(waits.size());
+    }
+    bool Done() const { return next == events.size() && active.empty() && !held && section >= waits.size(); }
     std::size_t Size() const { return events.size(); }
+    std::size_t WaitCount() const { return waits.size(); }
 
 private:
     static ps5::pad::Data Neutral() {
@@ -311,7 +572,10 @@ private:
         return sample;
     }
     std::vector<Event> events;
+    std::vector<Wait> waits;
     std::size_t next = 0;
+    unsigned section = 0;  // the WAITs met so far
+    Ms zero = 0;           // when this section started
     std::vector<Event> active;
     bool held = false;
 };
@@ -514,11 +778,13 @@ inline void Record(const ps5::pad::Data& raw) {
 }
 
 // One game session's script or recording, from the input worker. start is when the guest started;
-// game and title are that session's ROM path and title id.
+// game and title are that session's ROM path and title id; look asks for a picture of the game for
+// the script's WAIT lines (empty: a WAIT stops the script at its first look).
 class Session {
 public:
-    Session(const ButtonMapping& mapping, Clock::time_point start, const char* game, std::uint64_t title)
-        : origin{start} {
+    Session(const ButtonMapping& mapping, Clock::time_point start, const char* game, std::uint64_t title,
+            LookFunction look_function = {})
+        : origin{start}, look{std::move(look_function)} {
         if (detail::settings.script.empty() && !detail::settings.record) return;
         if (!ForGame(detail::settings.boot, detail::booted, game, title)) {
             Report("test", "EDEN_TEST session_skipped reason=not_the_booted_game");
@@ -548,15 +814,85 @@ public:
     std::optional<ps5::pad::Data> Sample() {
         if (!player) return {};
         const Ms now = detail::Since(origin);
+        if (const Wait* wait = player->Waiting(now)) Check(*wait, now);
         auto sample = player->Sample(now);
         if (!finished && player->Done()) {
             finished = true;
-            Report("test", ("EDEN_TEST script_done at=" + SecondsText(now)).c_str());
+            // script_stopped: a WAIT timed out, so the route did not run to its end.
+            Report("test", ((stopped ? "EDEN_TEST script_stopped at=" : "EDEN_TEST script_done at=") +
+                            SecondsText(now)).c_str());
         }
         return sample;
     }
 
 private:
+    // One step of a WAIT, on every Sample while it looks: score a picture that came, give up at
+    // the timeout, ask for the next picture. The input worker only asks; the renderer reads the
+    // frame back on its own thread and the future turns ready a frame or two later.
+    void Check(const Wait& wait, Ms now) {
+        const auto where = [&] { return "line=" + std::to_string(wait.line) + " at=" + SecondsText(now); };
+        if (wait.end) {
+            Report("test", ("EDEN_TEST script_end " + where()).c_str());
+            player->Stop();
+            return;
+        }
+        if (pending.valid() && pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            std::shared_ptr<const Picture> picture;
+            try {
+                picture = pending.get();
+            } catch (...) {  // dropped: the renderer had a picture pending already (a shot)
+            }
+            pending = {};
+            if (picture) seen = GridOf(*picture, wait.look);
+            if (picture && !seen.empty()) {
+                const int score = Score(wait.look.grid, seen);
+                ++looks;
+                best = std::max(best, score);
+                if (wait.look.gone ? score < wait.look.min : score >= wait.look.min) {
+                    Report("test", ("EDEN_TEST wait_met " + where() + " score=" + std::to_string(score) +
+                                    " looks=" + std::to_string(looks)).c_str());
+                    player->Pass(now);
+                    Reset(now);
+                    return;
+                }
+            }
+        }
+        if (player->TimedOut(now)) {
+            Report("test", (std::string(wait.maybe ? "EDEN_TEST wait_skipped " : "EDEN_TEST wait_timeout ") + where() +
+                            " best=" + std::to_string(best) + " looks=" + std::to_string(looks) +
+                            " seen=" + GridText(wait.look, seen)).c_str());
+            if (wait.maybe) {
+                player->Pass(now);
+            } else {
+                stopped = true;
+                player->Stop();
+            }
+            Reset(now);
+            return;
+        }
+        if (pending.valid() || now < next_look) return;
+        next_look = now + kLookEvery;
+        if (!look) {
+            Report("test", ("EDEN_TEST wait_error " + where() + " reason=no_pictures").c_str());
+            stopped = true;
+            player->Stop();
+            return;
+        }
+        try {
+            pending = look();
+        } catch (...) {
+            pending = {};
+        }
+    }
+    // A new WAIT: a picture still on its way was asked for the last one and is not used.
+    void Reset(Ms now) {
+        pending = {};
+        seen.clear();
+        looks = 0;
+        best = -100;
+        next_look = now;
+    }
+
     void LoadScript(const ButtonMapping& mapping) {
         const std::string& name = detail::settings.script;
         std::ifstream file(std::string{kDataDir} + "/" + name);
@@ -569,8 +905,9 @@ private:
             Report("test", ("EDEN_TEST script_error file=" + name + " " + script.error).c_str());
             return;
         }
-        player.emplace(std::move(script.events));
-        Report("test", ("EDEN_TEST script_start file=" + name + " events=" + std::to_string(player->Size())).c_str());
+        player.emplace(std::move(script.events), std::move(script.waits));
+        Report("test", ("EDEN_TEST script_start file=" + name + " events=" + std::to_string(player->Size()) +
+                        " waits=" + std::to_string(player->WaitCount())).c_str());
     }
     void BeginRecording() {
         const std::string path = LogFile(kRecordFile);
@@ -589,8 +926,15 @@ private:
         Report("test", ("EDEN_TEST record_start file=" + path).c_str());
     }
     Clock::time_point origin;
+    LookFunction look;
     std::optional<Player> player;
     bool finished = false;
+    bool stopped = false;  // a WAIT timed out
+    PictureFuture pending;
+    std::vector<std::uint8_t> seen;  // the last picture's grid, for the timeout's report
+    unsigned looks = 0;
+    int best = -100;
+    Ms next_look = 0;
 };
 
 // EDEN_TEST_SHOTS's times for this session: empty without the setting, and in any game but the
