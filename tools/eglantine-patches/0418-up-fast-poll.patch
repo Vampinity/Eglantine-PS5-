@@ -1,0 +1,58 @@
+Subject: [PATCH] EDEN_UP_FAST_POLL: poll suspended GPU channels every 50 us, 1 ms after 2 s (zortos293/Lichii acb9c18d65, Lichii #446), off by default
+
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 68b6be6..59cf8c2 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -10,6 +10,7 @@
+ #include <thread>
+ 
+ #include "common/assert.h"
++#include "common/pe_switch.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+@@ -28,6 +29,21 @@ namespace VideoCommon::GPUThread {
+ 
+ namespace {
+ 
++// EDEN_UP_FAST_POLL=1 (zortos293/Lichii acb9c18d65, Lichii #446 as merged): poll the pending
++// channels every 50 us instead of 250 us, and every 1 ms instead of 250 us once a channel has
++// waited 2 s (menus, loading). An explicit EDEN_NX2_PENDING_POLL_US still sets the short poll. It
++// also turns the #621 progress fix on, as the knobs do (EDEN_NX2_PENDING_PROGRESS=0 keeps it off).
++// Upstream also sets PR_SET_TIMERSLACK to 1 ns, Linux only. The PS5 has no equivalent and needs
++// none: its sleeps are not rounded to a 1 ms tick but overrun by a fixed ~110 us (EDEN_PERF_SLEEP,
++// nanosleep: 1000 -> 1109 us, 16667 -> 16706..16779 us). This wait is a condition variable timed
++// wait, assumed to overrun the same, so 50 us should cost ~160 us against ~360 us for 250 (not
++// measured). No spin fallback: OoT suspends ~330 times a second, and a spin would hold the GPU
++// thread's core for as long as a channel waits. Unset: exactly as before. Read once.
++bool FastPoll() {
++    static const bool on = Common::PeSwitch("EDEN_UP_FAST_POLL");
++    return on;
++}
++
+ // EDEN_NX2_PENDING_SPIN_US / EDEN_NX2_PENDING_POLL_US (Lichii #446): how long the GPU thread yields
+ // after the last command arrived, then how often it polls the channel's semaphores while it
+ // sleeps for new commands. Unset: 500 and 250, the values below have always been. Lichii polls every
+@@ -54,7 +70,7 @@ bool PendingProgressFix() {
+         const char* const knob = std::getenv(name);
+         return knob != nullptr && knob[0] != '\0';
+     };
+-    return set("EDEN_NX2_PENDING_SPIN_US") || set("EDEN_NX2_PENDING_POLL_US");
++    return set("EDEN_NX2_PENDING_SPIN_US") || set("EDEN_NX2_PENDING_POLL_US") || FastPoll();
+ }
+ 
+ std::chrono::microseconds PendingKnob(const char* name, long long fallback, long long min) {
+@@ -107,9 +123,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+         namespace Profile = VideoCommon::Nx2Profile;
+         auto& split = VideoCommon::GpuSplit::Get();
+         static const auto pending_spin = PendingKnob("EDEN_NX2_PENDING_SPIN_US", 500, 0);
+-        static const auto pending_poll = PendingKnob("EDEN_NX2_PENDING_POLL_US", 250, 1);
++        static const auto pending_poll =
++            PendingKnob("EDEN_NX2_PENDING_POLL_US", FastPoll() ? 50 : 250, 1);
+         static const auto pending_poll_long =
+-            (std::max)(pending_poll, std::chrono::microseconds{250});
++            (std::max)(pending_poll, std::chrono::microseconds{FastPoll() ? 1000 : 250});
+         static const bool progress_fix = PendingProgressFix();
+         while (!stop_token.stop_requested()) {
+             Profile::Report();

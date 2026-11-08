@@ -1,0 +1,525 @@
+Subject: [PATCH] held CPU writes vs downloads, EDEN_UP_HELD_VS_DOWNLOAD (off by default): pages a guest CPU write is held back on (OnCPUWrite) are kept out of every buffer download until the round of applies that took the write ends, cores re-report a page after each gather, held writes still reach the texture cache and async texture flushes skip CPU-modified images, the apply's own page download and write-ahead marking are exempt, empty-layer unswizzle guard (MythosOfs/Orchid f2eb04babd + texture-cache part of cc04f48b3d)
+
+diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
+index 12692cc..736bb4f 100644
+--- a/src/core/gpu_dirty_memory_manager.h
++++ b/src/core/gpu_dirty_memory_manager.h
+@@ -11,6 +11,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "common/pe_switch.h"
+ #include "core/device_memory_manager.h"
+ 
+ namespace Core {
+@@ -37,6 +38,14 @@ public:
+         return keep;
+     }
+ 
++    /// EDEN_UP_HELD_VS_DOWNLOAD=1 (MythosOfs/Orchid f2eb04babd): a core reports a page to the GPU
++    /// (OnCPUWrite, which holds it back from downloads) again on its first write after each
++    /// Gather, see CollectWrite. Off: as before, one report per page until the core moves on.
++    [[nodiscard]] static bool HeldVsDownload() {
++        static const bool on = Common::PeSwitch("EDEN_UP_HELD_VS_DOWNLOAD");
++        return on;
++    }
++
+     void Collect(PAddr address, size_t size) {
+         TransformAddress t = BuildTransform(address, size);
+         TransformAddress tmp, original;
+@@ -57,8 +66,47 @@ public:
+                 return;
+             }
+             tmp.mask |= t.mask;
+-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
+-                                                std::memory_order_relaxed));
++        } while (HeldVsDownload()
++                     ? !current.compare_exchange_weak(original, tmp, std::memory_order_acq_rel,
++                                                      std::memory_order_relaxed)
++                     : !current.compare_exchange_weak(original, tmp, std::memory_order_release,
++                                                      std::memory_order_relaxed));
++    }
++
++    /// EDEN_UP_HELD_VS_DOWNLOAD: moves on with each Gather. A page the core reported to the GPU
++    /// before must be reported again on its next write: the write held back for it has been
++    /// applied. Read after Collect, it tells whether the write went into the list after a Gather.
++    [[nodiscard]] u64 Generation() const {
++        return generation.load(std::memory_order_acquire);
++    }
++
++    /// The page a core last reported to the GPU, and in which generation.
++    struct ReportedPage {
++        PAddr page{~PAddr{}};
++        u64 generation{};
++    };
++
++    /// EDEN_UP_HELD_VS_DOWNLOAD: collects a CPU write to GPU-cached memory at `page`. `report`
++    /// (the GPU's OnCPUWrite, which holds the page back) runs for the first write to a page in
++    /// each generation; when it returns false the write is not collected.
++    template <typename Report>
++    void CollectWrite(PAddr address, size_t size, PAddr page, ReportedPage& last, Report&& report) {
++        const u64 seen = Generation();
++        if (last.page != page || last.generation != seen) {
++            if (!report()) {
++                return;
++            }
++            last = {page, seen};
++        }
++        Collect(address, size);
++        // A Gather took the list since the generation was read: the write may have gone with it
++        // (applied before the caller stores it) or into the next list (while the round releases
++        // the page). Report and collect it again for the next round.
++        if (const u64 now = Generation(); now != seen) {
++            report();
++            Collect(address, size);
++            last.generation = now;
++        }
+     }
+ 
+     /// Calls `callback` for each write collected and not yet gathered, without consuming them. With
+@@ -85,7 +133,15 @@ public:
+         std::scoped_lock gather_lk(gather_guard);
+         {
+             std::scoped_lock lk(guard);
+-            TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
++            TransformAddress t;
++            if (HeldVsDownload()) {
++                // Before the exchange: a Collect that lands in the next list sees the new
++                // generation.
++                generation.fetch_add(1, std::memory_order_relaxed);
++                t = current.exchange(default_transform, std::memory_order_acq_rel);
++            } else {
++                t = current.exchange(default_transform, std::memory_order_relaxed);
++            }
+             front_buffer.swap(back_buffer);
+             if (IsValid(t.address)) {
+                 front_buffer.emplace_back(t);
+@@ -169,6 +225,7 @@ private:
+     }
+ 
+     std::atomic<TransformAddress> current{};
++    std::atomic<u64> generation{}; ///< EDEN_UP_HELD_VS_DOWNLOAD only
+     std::mutex guard;
+     std::mutex gather_guard;
+     std::vector<TransformAddress> back_buffer;
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 929e9bb..53833f0 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -913,6 +913,17 @@ struct Memory::Impl {
+                 sys_core_guard.unlock();
+             }
+         };
++        if (Core::GPUDirtyMemoryManager::HeldVsDownload()) {
++            // EDEN_UP_HELD_VS_DOWNLOAD (MythosOfs/Orchid f2eb04babd): report a page again after
++            // each gather, so the GPU holds it back from downloads until this write is applied.
++            gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
++                gpu_dirty_managers[core].CollectWrite(
++                    address, size, address >> YUZU_PAGEBITS, rasterizer_reported_pages[core], [&] {
++                        return address != 0 && size != 0 && system.GPU().OnCPUWrite(address, size);
++                    });
++            });
++            return;
++        }
+         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+             auto& current_area = rasterizer_write_areas[core];
+             PAddr subaddress = address >> YUZU_PAGEBITS;
+@@ -970,6 +981,8 @@ struct Memory::Impl {
+     std::atomic<size_t> armed_read_trap_count{};
+     std::mutex read_trap_mutex;
+     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
++    std::array<Core::GPUDirtyMemoryManager::ReportedPage, Core::Hardware::NUM_CPU_CORES>
++        rasterizer_reported_pages{}; ///< EDEN_UP_HELD_VS_DOWNLOAD only
+     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
+     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
+     std::mutex sys_core_guard;
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 3d74f65..f3fdb05 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -271,7 +271,17 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
+                 return;
+             }
+         }
+-        DownloadMemory(page_begin, page_end - page_begin);
++        if (HeldVsDownload()) {
++            // EDEN_UP_HELD_VS_DOWNLOAD: the page is still held for the write applied here (it is
++            // released when the round ends). Skipping it would drop the GPU-written bytes
++            // elsewhere on it for good: they leave gpu_modified_ranges in DownloadMemory, and
++            // the page's next upload sends the stale guest copy over them.
++            const bool bypass = std::exchange(held_download_bypass, true);
++            DownloadMemory(page_begin, page_end - page_begin);
++            held_download_bypass = bypass;
++        } else {
++            DownloadMemory(page_begin, page_end - page_begin);
++        }
+     }
+     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+     MarkVertexBuffersStale(device_addr, size);
+@@ -300,7 +310,32 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+ }
+ 
+ template <class P>
+-bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
++bool BufferCache<P>::HeldVsDownload() {
++    static const bool on = Common::PeSwitch("EDEN_UP_HELD_VS_DOWNLOAD");
++    return on;
++}
++
++template <class P>
++void BufferCache<P>::BeginCachedWrites() {
++    // Rounds can overlap (fences and the held-writes split gather from different threads): the
++    // pages are released when the last one ends, never earlier.
++    if (cached_write_rounds++ == 0) {
++        cpu_recent_held_ranges.Clear();
++    }
++}
++
++template <class P>
++void BufferCache<P>::EndCachedWrites() {
++    // Writes held back before the round were gathered by it and are applied now. The page of
++    // one gathered while a core collected the next write to it is held again, after the round
++    // began (Core::GPUDirtyMemoryManager::CollectWrite), and stays held until the next one.
++    if (cached_write_rounds != 0 && --cached_write_rounds == 0) {
++        cpu_held_ranges = std::move(cpu_recent_held_ranges);
++    }
++}
++
++template <class P>
++bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size, bool hold_back) {
+     const bool is_dirty = IsRegionRegistered(device_addr, size);
+     if (!is_dirty) {
+         return false;
+@@ -309,6 +344,18 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
+         if (Tegra::Nx2ListCpuSync()) {
+             Nx2NoteListHostWrite(device_addr, size);
+         }
++        if (HeldVsDownload() && hold_back) {
++            // MythosOfs/Orchid f2eb04babd: held back until the GPU thread applies it. Downloads
++            // taken before hold older bytes; the core reports one write per page and generation,
++            // so the whole page is held.
++            const DAddr page_start = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
++            const u64 page_size = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE) - page_start;
++            for (auto& ranges : pending_download_ranges) {
++                ranges.Subtract(page_start, page_size);
++            }
++            cpu_held_ranges.Add(page_start, page_size);
++            cpu_recent_held_ranges.Add(page_start, page_size);
++        }
+         return true;
+     }
+     WriteMemory(device_addr, size);
+@@ -1099,6 +1146,12 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+         normalized_copies.push_back(second_copy);
+     }
+     runtime.PostCopyBarrier();
++    if (HeldVsDownload()) {
++        // A held-back CPU write is newer than this copy: its pages never land from it.
++        cpu_held_ranges.ForEach([&](DAddr start, DAddr end) {
++            download_ranges.Subtract(start, end - start);
++        });
++    }
+     pending_downloads.emplace_back(std::move(normalized_copies));
+     pending_download_ranges.emplace_back(std::move(download_ranges));
+     if (VideoCore::Readback::Mode() != 0) {
+@@ -1291,7 +1344,10 @@ Common::RangeSet<DAddr> BufferCache<P>::GuardedCpuWriteRanges() {
+ template <class P>
+ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
+                                            DAddr device_addr, const u8* data, u64 size) {
+-    if (!cpu_written.Intersects(device_addr, size)) {
++    // EDEN_UP_HELD_VS_DOWNLOAD: nor over a page whose CPU write is held back (not yet applied).
++    const bool held = HeldVsDownload() && !held_download_bypass &&
++                      cpu_held_ranges.Intersects(device_addr, size);
++    if (!held && !cpu_written.Intersects(device_addr, size)) {
+         device_memory.WriteBlockUnsafe(device_addr, data, size);
+         return;
+     }
+@@ -1303,6 +1359,11 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
+         on_list_page = on_list_page || Tegra::Nx2IsCommandListPage(start) ||
+                        Tegra::Nx2IsCommandListPage(end - 1);
+     });
++    if (held) {
++        cpu_held_ranges.ForEachInRange(device_addr, size, [&](DAddr start, DAddr end) {
++            parts.Subtract(start, end - start);
++        });
++    }
+     parts.ForEach([&](DAddr start, DAddr end) {
+         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+     });
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 5f97e42..ef59322 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -266,9 +266,19 @@ public:
+ 
+     void CachedWriteMemory(DAddr device_addr, u64 size);
+ 
++    /// EDEN_UP_HELD_VS_DOWNLOAD: around each round of applied CPU writes (GPU::InvalidateGPUCache
++    /// and the held-writes split): the writes held back before it are the ones it applies.
++    void BeginCachedWrites();
++    void EndCachedWrites();
++
++    /// EDEN_UP_HELD_VS_DOWNLOAD=1 (MythosOfs/Orchid f2eb04babd), read once.
++    [[nodiscard]] static bool HeldVsDownload();
++
+     void ClearDownload(DAddr base_addr, u64 size);
+ 
+-    bool OnCPUWrite(DAddr device_addr, u64 size);
++    /// hold_back (EDEN_UP_HELD_VS_DOWNLOAD only): false for a page no write was made to (the
++    /// rasterizer's write-ahead marking), which must not be held back from downloads.
++    bool OnCPUWrite(DAddr device_addr, u64 size, bool hold_back = true);
+ 
+     void DownloadMemory(DAddr device_addr, u64 size);
+ 
+@@ -855,6 +865,20 @@ private:
+     /// write was recorded over. They still land (a guest waiting for this fence reads them; the
+     /// newer download lands after them), but stay GPU-modified so the newer one is still taken.
+     std::deque<Common::RangeSet<DAddr>> pending_download_superseded;
++    /// EDEN_UP_HELD_VS_DOWNLOAD only: pages of GPU-written memory the guest CPU wrote whose writes
++    /// the GPU thread has not applied yet (OnCPUWrite holds them back). Guest memory holds the
++    /// newest bytes there: no download may write over them before the write is applied, or the
++    /// apply reads the downloaded bytes back and the CPU's write is lost.
++    Common::RangeSet<DAddr> cpu_held_ranges;
++    /// The pages of cpu_held_ranges held since the current round of applies began: their writes
++    /// may sit in the cores' new write lists, so the round's applies do not release them.
++    Common::RangeSet<DAddr> cpu_recent_held_ranges;
++    /// Rounds of applies running (BeginCachedWrites without its EndCachedWrites).
++    u32 cached_write_rounds{};
++    /// EDEN_UP_HELD_VS_DOWNLOAD only: set while WriteMemory downloads the GPU-written bytes
++    /// elsewhere on the pages a CPU write is applied to. Those must land (the page turns CPU
++    /// modified after it); the CPU's own bytes are no longer GPU-modified, so none are touched.
++    bool held_download_bypass{};
+ 
+     /// GPU thread reads of guest memory for buffers (uploads, streamed uniforms): counts ahead
+     /// reads for EDEN_NX2_OVERWRITE_CHECK. Off, or with nothing ahead: returns at once.
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 051eaff..e2e46fe 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -145,11 +145,20 @@ struct GPU::Impl {
+         std::vector<std::pair<DAddr, u64>> writes;
+         std::function<void(PAddr, size_t)> callback_writes(
+             [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
++        // EDEN_UP_HELD_VS_DOWNLOAD (MythosOfs/Orchid f2eb04babd): a round of applies, after which
++        // the buffer cache releases the pages it held back for them.
++        const bool held_vs_download = Core::GPUDirtyMemoryManager::HeldVsDownload();
++        if (held_vs_download) {
++            renderer->ReadRasterizer()->BeginCachedWrites();
++        }
+         system.GatherGPUDirtyMemory(callback_writes);
+         if (!writes.empty()) {
+             renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+             ForgetHandedOutWrites();
+         }
++        if (held_vs_download) {
++            renderer->ReadRasterizer()->EndCachedWrites();
++        }
+     }
+ 
+     /// EDEN_NX2_DOWNLOAD_GUARDS=2: the gathered writes are applied, downloads may land there again.
+@@ -177,11 +186,19 @@ struct GPU::Impl {
+             ++count;
+             bytes += size;
+         });
++        // EDEN_UP_HELD_VS_DOWNLOAD (MythosOfs/Orchid f2eb04babd): a round of applies.
++        const bool held_vs_download = Core::GPUDirtyMemoryManager::HeldVsDownload();
++        if (held_vs_download) {
++            renderer->ReadRasterizer()->BeginCachedWrites();
++        }
+         system.GatherGPUDirtyMemory(callback_writes);
+         if (!writes.empty()) {
+             renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+             ForgetHandedOutWrites();
+         }
++        if (held_vs_download) {
++            renderer->ReadRasterizer()->EndCachedWrites();
++        }
+         if (count >= next_log) {
+             next_log = count * 2;
+             LOG_INFO(HW_GPU, "CPU writes applied before a command list: {} so far, {} KiB", count,
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 23e0f70..3cca494 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -183,6 +183,10 @@ public:
+         }
+     }
+ 
++    /// EDEN_UP_HELD_VS_DOWNLOAD: around each round of OnCacheInvalidations (one gather).
++    virtual void BeginCachedWrites() {}
++    virtual void EndCachedWrites() {}
++
+     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
+         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;
+         OnCacheInvalidation(addr, size);
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+index 7dd336c..a3f850c 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
++++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+@@ -577,6 +577,16 @@ bool RasterizerOpenGL::OnCPUWrite(DAddr addr, u64 size) {
+     return false;
+ }
+ 
++void RasterizerOpenGL::BeginCachedWrites() {
++    std::scoped_lock lock{buffer_cache.mutex};
++    buffer_cache.BeginCachedWrites();
++}
++
++void RasterizerOpenGL::EndCachedWrites() {
++    std::scoped_lock lock{buffer_cache.mutex};
++    buffer_cache.EndCachedWrites();
++}
++
+ void RasterizerOpenGL::OnCacheInvalidation(DAddr addr, u64 size) {
+     if (addr == 0 || size == 0) {
+         return;
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.h b/src/video_core/renderer_opengl/gl_rasterizer.h
+index 70b161f..b05cdbc 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.h
++++ b/src/video_core/renderer_opengl/gl_rasterizer.h
+@@ -102,6 +102,8 @@ public:
+     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
+     void OnCacheInvalidation(PAddr addr, u64 size) override;
+     bool OnCPUWrite(PAddr addr, u64 size) override;
++    void BeginCachedWrites() override;
++    void EndCachedWrites() override;
+     void InvalidateGPUCache() override;
+     void UnmapMemory(DAddr addr, u64 size) override;
+     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index d8ef646..7302c76 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1991,24 +1991,38 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+ 
+ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+     DEBUG_ASSERT(addr != 0 || size != 0);
++    // EDEN_UP_HELD_VS_DOWNLOAD (MythosOfs/Orchid cc04f48b3d): a held write still reaches the
++    // texture cache, so the images over it don't download their older bytes over it before it
++    // is applied. Only the pipeline cache waits for the apply.
++    static const bool held_vs_download = Common::PeSwitch("EDEN_UP_HELD_VS_DOWNLOAD");
++    bool held = false;
+     {
+         std::scoped_lock lock{buffer_cache.mutex};
+         if (buffer_cache.OnCPUWrite(addr, size)) {
+-            return true;
++            if (!held_vs_download) {
++                return true;
++            }
++            held = true;
+         }
+         static const bool ahead = Common::PeSwitch("EDEN_PE_CPU_WRITE_AHEAD");
+-        if (ahead && size != 0 && addr <= ~DAddr{0} - size) {
++        if (!held && ahead && size != 0 && addr <= ~DAddr{0} - size) {
+             DAddr page = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+             for (unsigned marked = 0; marked < 64 && page != 0 &&
+                  page <= ~DAddr{0} - Core::DEVICE_PAGESIZE;
+                  ++marked, page += Core::DEVICE_PAGESIZE) {
+                 if (!buffer_cache.IsRegionRegistered(page, Core::DEVICE_PAGESIZE) ||
+-                    buffer_cache.OnCPUWrite(page, Core::DEVICE_PAGESIZE)) {
++                    buffer_cache.OnCPUWrite(page, Core::DEVICE_PAGESIZE, false)) {
+                     break;
+                 }
+             }
+         }
+     }
++    if (held) {
++        // Not the pipeline cache: it waits for the apply (OnCacheInvalidations).
++        std::scoped_lock texture_lock{texture_cache.mutex};
++        texture_cache.WriteMemory(addr, size);
++        return true;
++    }
+     {
+         std::scoped_lock lock{texture_cache.mutex};
+         texture_cache.WriteMemory(addr, size);
+@@ -2017,6 +2031,16 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+     return false;
+ }
+ 
++void RasterizerVulkan::BeginCachedWrites() {
++    std::scoped_lock lock{buffer_cache.mutex};
++    buffer_cache.BeginCachedWrites();
++}
++
++void RasterizerVulkan::EndCachedWrites() {
++    std::scoped_lock lock{buffer_cache.mutex};
++    buffer_cache.EndCachedWrites();
++}
++
+ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+     if (addr == 0 || size == 0) {
+         return;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 8f03027..5d45b85 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -118,6 +118,8 @@ public:
+     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+     void OnCacheInvalidation(DAddr addr, u64 size) override;
+     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
++    void BeginCachedWrites() override;
++    void EndCachedWrites() override;
+     bool TryCacheInvalidation(DAddr addr, u64 size) override;
+     bool OnCPUWrite(DAddr addr, u64 size) override;
+     void InvalidateGPUCache() override;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 312852c..dc955b3 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2247,7 +2247,13 @@ void TextureCache<P>::PopAsyncFlushes() {
+                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
+                 std::span<u8> download_span =
+                     download_buffer.mapped_span.subspan(download_buffer.offset);
+-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
++                // EDEN_UP_HELD_VS_DOWNLOAD (MythosOfs/Orchid cc04f48b3d): written by the CPU
++                // since the download was taken, these bytes are older.
++                static const bool held_vs_download = Common::PeSwitch("EDEN_UP_HELD_VS_DOWNLOAD");
++                if (!held_vs_download || False(image.flags & ImageFlagBits::CpuModified)) {
++                    SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span,
++                                 swizzle_data_buffer);
++                }
+             } else {
+                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
+                 std::span<u8> download_span =
+@@ -2295,7 +2301,11 @@ void TextureCache<P>::PopAsyncFlushes() {
+             }
+             const ImageBase& image = download_info.GetImage(slot_images);
+             const auto copies = FullDownloadCopies(image.info);
+-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
++            static const bool held_vs_download = Common::PeSwitch("EDEN_UP_HELD_VS_DOWNLOAD");
++            if (!held_vs_download || False(image.flags & ImageFlagBits::CpuModified)) {
++                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span,
++                             swizzle_data_buffer);
++            }
+             download_map.offset += image.unswizzled_size_bytes;
+             download_span = download_span.subspan(image.unswizzled_size_bytes);
+         }
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index 1f57f5b..958baca 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -22,6 +22,7 @@
+ #include "common/bit_util.h"
+ #include "common/common_types.h"
+ #include "common/div_ceil.h"
++#include "common/pe_switch.h"
+ #include "common/scratch_buffer.h"
+ #include "common/settings.h"
+ #include "video_core/compatible_formats.h"
+@@ -931,6 +932,16 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
+ 
+         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
+             const std::span<u8> dst = output.subspan(host_offset);
++            // EDEN_UP_HELD_VS_DOWNLOAD (MythosOfs/Orchid f2eb04babd): no guest bytes behind this
++            // layer (an image over a range that read as empty): reading would start past the end
++            // of `input`, at null for an empty one. Fill zeros instead.
++            static const bool empty_layer_guard = Common::PeSwitch("EDEN_UP_HELD_VS_DOWNLOAD");
++            if (empty_layer_guard && guest_offset + guest_layer_offset >= input.size()) {
++                std::fill_n(dst.begin(), (std::min<size_t>)(host_bytes_per_layer, dst.size()), u8{0});
++                guest_layer_offset += layer_stride;
++                host_offset += host_bytes_per_layer;
++                continue;
++            }
+             const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);
+             UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
+                              num_tiles.depth, block.height, block.depth, stride_alignment, gpu_memory.UsesNativeTiling());

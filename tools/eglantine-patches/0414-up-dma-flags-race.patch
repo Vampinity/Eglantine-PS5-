@@ -1,0 +1,37 @@
+Subject: [PATCH] DmaPusher flags as plain bools, synced atomic: the fence callback's bitfield write could restore a stale dma_increment_once (zortos293/Lichii 12fc47e8aa; pure data-race fix, unconditional, no switch)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 45750bb..4abe0da 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -589,7 +589,7 @@ bool DmaPusher::Step() {
+ 
+     if (signal_sync && !synced) {
+         std::unique_lock lk(sync_mutex);
+-        sync_cv.wait(lk, [this]() { return synced; });
++        sync_cv.wait(lk, [this]() { return synced.load(); });
+         signal_sync = false;
+         synced = false;
+     }
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index c1a6cd0..4331d67 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -434,10 +434,13 @@ public:
+     /// The entry parsed next was suspended on pending_list_tick, which is done now.
+     bool resumed_list_read{};
+ 
+-    const bool ib_enable : 1 = true; ///< IB mode enabled
+-    bool dma_increment_once : 1 = false;
+-    bool signal_sync : 1 = false;
+-    bool synced : 1 = false;
++    // Not bitfields (zortos293/Lichii 12fc47e8aa): the fence callback sets synced on the split's
++    // back, and a bitfield write rewrites the byte it shares with dma_increment_once and
++    // signal_sync, which can restore a stale dma_increment_once the front just changed.
++    const bool ib_enable = true; ///< IB mode enabled
++    bool dma_increment_once = false;
++    bool signal_sync = false;
++    std::atomic<bool> synced{false};
+ };
+ 
+ } // namespace Tegra

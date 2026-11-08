@@ -1,0 +1,43 @@
+Subject: [PATCH] split: a new channel's first 8 entries wait until the back ran everything sent (heydemoura/EglantinePS5 206dc0de9b, core patch 0036; EDEN_UP_SPLIT_FIRST_DRAIN, off by default)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 4abe0da..964fdb2 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -585,6 +585,22 @@ bool DmaPusher::Step() {
+ 
+     auto& current_command = command_list.command_lists[dma_pushbuffer_subindex];
+     const CommandListHeader& header = current_command;
++    // EDEN_UP_SPLIT_FIRST_DRAIN (heydemoura/EglantinePS5 core patch 0036, 206dc0de9b): a new
++    // channel's first command lists can be filled by GPU work queued on another channel (the
++    // guest waits for it on events signalled at once). With the GPU thread split the front read
++    // them before the back had run that work: Bananza's second channel decoded stale words, ran
++    // garbage methods and crashed on an out-of-range syncpoint or hung loading. Its first 8
++    // entries wait until the back ran everything sent: upstream's DrainToLastWriter is a full
++    // Drain unless EDEN_NX2_LIST_DRAIN_TO_WRITER=1 (waiting only up to the last counted writer
++    // crashed Mario Kart World loading: something the front does not count as a writer fills
++    // those lists). An entry resumed after a list copy (EDEN_NX2_LIST_ASYNC) already waited.
++    if (static const bool first_drain = Common::PeSwitch("EDEN_UP_SPLIT_FIRST_DRAIN");
++        first_drain && unsynced_first_entries != 0 && !resumed_entry) {
++        --unsynced_first_entries;
++        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++            split.Drain(VideoCommon::DrainSite::ListWriters);
++        }
++    }
+     dma_state.dma_get = header.addr;
+ 
+     if (signal_sync && !synced) {
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index 4331d67..06b0625 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -367,6 +367,9 @@ public:
+     std::array<ParsedEntry, 64> parsed_entries{};
+     size_t parsed_entry_count{};
+     std::vector<ParkedMethod> parked_methods;
++    /// EDEN_UP_SPLIT_FIRST_DRAIN: entries of a new channel still read only after the split's back
++    /// ran everything sent (see Step).
++    u32 unsynced_first_entries = 8;
+     GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
+ 
+     // EDEN_NX2_JUNK_GUARD=1 (off unless set): an Increasing header whose method + count passes 0x1000 is

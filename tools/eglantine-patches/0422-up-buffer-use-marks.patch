@@ -1,0 +1,120 @@
+Subject: [PATCH] buffer usage marks, EDEN_UP_BUFFER_USE_MARKS (off by default): uploads that stay in the main command buffer, ObtainCPUBuffer users, unchanged vertex bindings and draw indirect buffers mark their bytes as used, so a later stale upload is not reordered ahead of them (MythosOfs/Orchid 225ed15fb3)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index f3fdb05..c3afd0e 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -670,6 +670,12 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
+     default:
+         break;
+     }
++    if (BufferUseMarks()) {
++        // MythosOfs/Orchid 225ed15fb3: the caller's GPU work (DMA buffer/image copies, indirect
++        // dispatches, query writes) uses these bytes: without this a later upload to them in the
++        // same command buffer was reordered in front of that work, so it read the newer data.
++        buffer.MarkUsage(buffer.Offset(device_addr), size);
++    }
+ 
+     return {&buffer, buffer.Offset(device_addr)};
+ }
+@@ -1609,14 +1615,23 @@ void BufferCache<P>::BindHostVertexBuffers() {
+                 SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+                 synced = {binding.buffer_id, binding.device_addr, binding.size, epoch};
+             }
++            const u32 offset = buffer.Offset(binding.device_addr);
++            const bool use_marks = BufferUseMarks();
++            if (use_marks) {
++                // MythosOfs/Orchid 225ed15fb3: still read by this draw when the binding is
++                // unchanged: unmarked, a later upload to these vertices was reordered in front
++                // of this draw once TickFrame reset the tracker.
++                buffer.MarkUsage(offset, binding.size);
++            }
+             if (!flags[Dirty::VertexBuffer0 + index]) {
+                 flush_bindings();
+                 continue;
+             }
+             flags[Dirty::VertexBuffer0 + index] = false;
+             const u32 stride = maxwell3d->regs.vertex_streams[index].stride;
+-            const u32 offset = buffer.Offset(binding.device_addr);
+-            buffer.MarkUsage(offset, binding.size);
++            if (!use_marks) {
++                buffer.MarkUsage(offset, binding.size);
++            }
+             if (!bindings.buffers.empty() && index != last_index + 1) {
+                 flush_bindings();
+             }
+@@ -1677,6 +1692,11 @@ void BufferCache<P>::BindHostDrawIndirectBuffers() {
+         Buffer& buffer = slot_buffers[binding.buffer_id];
+         TouchBuffer(buffer, binding.buffer_id);
+         SynchronizeBuffer(buffer, binding.device_addr, binding.size);
++        if (BufferUseMarks()) {
++            // MythosOfs/Orchid 225ed15fb3: the draw reads these parameters: keep later uploads
++            // to them behind it.
++            buffer.MarkUsage(buffer.Offset(binding.device_addr), binding.size);
++        }
+     };
+     if (current_draw_indirect->include_count) {
+         bind_buffer(channel_state->count_buffer_binding);
+@@ -3298,6 +3318,25 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
+         }
+         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
++        if (BufferUseMarks()) {
++            MarkUploaded(buffer, copies);
++        }
++    }
++}
++
++template <class P>
++bool BufferCache<P>::BufferUseMarks() {
++    static const bool on = Common::PeSwitch("EDEN_UP_BUFFER_USE_MARKS");
++    return on;
++}
++
++template <class P>
++void BufferCache<P>::MarkUploaded(Buffer& buffer, std::span<const BufferCopy> copies) {
++    // MythosOfs/Orchid 225ed15fb3: an upload that stayed in this command buffer (its region was
++    // in use, or the stream buffer was full) did not mark its bytes: a later upload to them was
++    // reordered in front of it, and this older copy overwrote the newer data.
++    for (const BufferCopy& copy : copies) {
++        buffer.MarkUsage(copy.dst_offset, copy.size);
+     }
+ }
+ 
+@@ -3320,6 +3359,9 @@ void BufferCache<P>::UploadInPieces([[maybe_unused]] Buffer& buffer,
+                 }};
+                 const bool can_reorder = runtime.CanReorderUpload(buffer, part);
+                 runtime.CopyBuffer(buffer, upload_staging.buffer, part, true, can_reorder);
++                if (BufferUseMarks()) {
++                    MarkUploaded(buffer, part);
++                }
+                 done += size;
+             }
+             if (copy.size >= 256_KiB) {
+@@ -3373,6 +3415,9 @@ bool BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
+         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
+         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
++        if (BufferUseMarks()) {
++            MarkUploaded(buffer, copies);
++        }
+     } else {
+         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
+     }
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index ef59322..8d42d54 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -554,6 +554,12 @@ private:
+ 
+     void BindHostIndexBuffer();
+ 
++    /// EDEN_UP_BUFFER_USE_MARKS=1 (MythosOfs/Orchid 225ed15fb3), read once.
++    [[nodiscard]] static bool BufferUseMarks();
++
++    /// EDEN_UP_BUFFER_USE_MARKS: marks an upload's bytes as used by the command buffer.
++    void MarkUploaded(Buffer& buffer, std::span<const BufferCopy> copies);
++
+     void BindHostVertexBuffers();
+ 
+     void BindHostDrawIndirectBuffers();

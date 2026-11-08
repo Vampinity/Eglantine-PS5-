@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 14:00:00 +0100
+Subject: [PATCH] radv/ps5: RADV_PS5_APU_BUDGET_FIX=1 counts the driver once
+ in the memory budget
+
+Driver patch, after lead-mesh-19. Off unless the switch is exactly "1"; read once.
+From finding 3 of heydemoura/EglantinePS5 PR 81 (diag/mkw-leak, open; the PR
+itself only documents it, this is the fix it names).
+
+radv_query_heap_info on the PS5 reports the driver's bytes as both
+allocated_vram and allocated_vram_vis, and both APU paths of
+radv_get_memory_budget_properties add the two. So the visible VRAM heap's
+heapUsage read twice what the driver holds, and the remaining space of that
+heap (vram_vis_heap_size - usage) ran out at half the heap, which cuts the room
+VMA's WITHIN_BUDGET allocations get (heapBudget - heapUsage). With the switch
+on, allocated_vram is 0 and the driver is counted once, as visible VRAM. That
+room then never shrinks; it grows once the driver holds more than about half
+the heap. heapBudget itself can read lower, by up to the driver's bytes, since
+it is that room plus heapUsage. The pool's free figure and the 2/3 split stay
+as they were (the total free space changes only where twice the driver read
+more than the pool's used figure). The driver count still includes GTT-domain
+buffers, as before; allocated_gtt stays 0.
+
+viejunerd/Eglantine-PS5- docs/MEMORY-CPU-EXPERIMENTS.md notes the same bug
+("Texture cache: device memory" and "VMA heap 1: usage" count the driver
+twice). Our core's texture and buffer caches already avoid it by default
+(performance.h graphics_usage_from_pool: usage from the pool's free block);
+this fixes the figure itself for VMA, graphics_usage=driver and the logs.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/radv_physical_device.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index c0826e5..bc5d7f8 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -3262,6 +3262,12 @@ struct radeon_winsys_heap_info {
+    uint64_t gtt_usage;
+ };
+ 
++#ifdef RADV_PS5
++#include <stdio.h>
++#include <stdlib.h>
++#include "util/u_atomic.h"
++#endif
++
+ static void
+ radv_query_heap_info(struct radv_physical_device *pdev, struct radeon_winsys_heap_info *heap_info)
+ {
+@@ -3273,6 +3279,19 @@ radv_query_heap_info(struct radv_physical_device *pdev, struct radeon_winsys_hea
+    radv_ps5_winsys_heap_usage(&pool, &available, &driver);
+    heap_info->allocated_vram = driver;
+    heap_info->allocated_vram_vis = driver;
++   /* EglantinePS5 (heydemoura/EglantinePS5 PR 81, finding 3): the budget's APU paths add
++    * allocated_vram and allocated_vram_vis, and on the PS5 both are the same driver bytes, so the
++    * visible VRAM heap's usage read twice what the driver holds and its free space ran out at half
++    * the heap. With RADV_PS5_APU_BUDGET_FIX=1 the driver is counted once, as visible VRAM. Read once. */
++   static int apu_budget_fix = -1;
++   if (unlikely(apu_budget_fix < 0)) {
++      const char *const value = getenv("RADV_PS5_APU_BUDGET_FIX");
++      const int on = value && value[0] == '1' && value[1] == '\0';
++      if (p_atomic_cmpxchg(&apu_budget_fix, -1, on) == -1 && on)
++         fprintf(stderr, "radv/ps5: the memory budget counts the driver once (RADV_PS5_APU_BUDGET_FIX)\n");
++   }
++   if (apu_budget_fix)
++      heap_info->allocated_vram = 0;
+    heap_info->vram_usage = pool - MIN2(available, pool);
+    heap_info->vram_vis_usage = heap_info->vram_usage;
+ #endif
+-- 
+2.54.0

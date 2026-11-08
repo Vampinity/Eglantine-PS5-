@@ -1,0 +1,42 @@
+Subject: [PATCH] EDEN_UP_STAGING_REUSE=1: keep two idle upload staging buffers per size level up to 32 MiB, zortos293/Lichii 794602bfbd (off by default)
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 8ec7cce..1e65b99 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -17,6 +17,7 @@
+ #include "common/common_types.h"
+ #include "common/literals.h"
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+@@ -431,6 +432,27 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+     auto& entries = staging.entries;
+     const size_t old_size = entries.size();
+ 
++    // EDEN_UP_STAGING_REUSE=1 (zortos293/Lichii 794602bfbd, from Fritchii v4): keep two idle
++    // upload buffers per level up to 32 MiB (under 128 MiB in all). Each level is swept every 64
++    // frames, so after a pause each upload over one stream ring region (8 MiB) got a new dedicated
++    // allocation, written to for the first time (2-68 ms upload stalls). Unset: swept as before.
++    static const bool keep_uploads = Common::PeSwitch("EDEN_UP_STAGING_REUSE");
++    constexpr size_t KeepMaxLog2 = 25;
++    constexpr size_t KeepPerLevel = 2;
++    if (keep_uploads && &cache == &upload_cache && log2 <= KeepMaxLog2) {
++        // Upstream tests only the tick. A deferred buffer's tick is u64 max, so this changes
++        // nothing; it states that a handed-out deferred buffer is never counted or freed here.
++        size_t idle = 0;
++        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
++            return !entry.deferred && scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
++        });
++        staging.delete_index = 0;
++        if (staging.iterate_index > entries.size()) {
++            staging.iterate_index = 0;
++        }
++        return;
++    }
++
+     const auto is_deletable = [this](const StagingBuffer& entry) {
+         return scheduler.IsFree(entry.tick);
+     };
