@@ -14,6 +14,7 @@ playtendoh-prosperoeden-2026-11-07.md. The supplied mail patches carry
 zero commit IDs; individual upstream commit IDs were not supplied.
 ---
 diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+index 87a07f4..c3b873f 100644
 --- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
 +++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
 @@ -17,6 +17,7 @@
@@ -24,7 +25,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys
  #include "ac_linux_drm.h"
  #include "sid.h"
  #if defined(__PROSPERO__)
-@@ -91,7 +92,21 @@
+@@ -91,7 +92,21 @@ radv_ps5_queue_poll(struct radv_ps5_queue *queue)
  #define RADV_PS5_STALL_NS (UINT64_C(10) * 1000000000)
  /* Before sleeping, the marker is checked in a loop for this long: most waits
   * end well inside a millisecond (PS5_Vulkan R36). */
@@ -47,7 +48,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys
  
  /* ProsperoEden (tools/patch-radv-submission-dump.py): the 32-bit value at a GPU address, as the
   * CPU reads it now. A buffer's GPU address is its CPU address (radv_ps5_bo.c), but the address may
-@@ -978,7 +993,7 @@
+@@ -978,7 +993,7 @@ radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs
     if (completed >= seq)
        return true;
     uint64_t now = os_time_get_nano();
@@ -56,7 +57,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys
     uint64_t progress_at = now;
     uint64_t last = completed;
     for (;;) {
-@@ -1002,7 +1017,7 @@
+@@ -1002,7 +1017,7 @@ radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs
        if (now < spin_until)
           __builtin_ia32_pause();
        else
@@ -65,7 +66,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys
     }
  }
  
-@@ -1485,6 +1500,7 @@
+@@ -1485,6 +1500,7 @@ VkResult
  radv_ps5_winsys_create(const struct radeon_info *info, uint64_t debug_flags, uint64_t perftest_flags,
                         struct radeon_winsys **winsys)
  {

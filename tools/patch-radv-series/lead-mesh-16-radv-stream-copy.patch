@@ -16,20 +16,21 @@ playtendoh-prosperoeden-2026-11-07.md. The supplied mail patches carry
 zero commit IDs; individual upstream commit IDs were not supplied.
 ---
 diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+index b754c9c..a278cc0 100644
 --- a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
 +++ b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
-@@ -17,6 +17,10 @@
- #include "util/u_debug.h"
+@@ -18,6 +18,10 @@
  #include "util/u_thread.h"
  #include "sid.h"
-+
+ 
 +#if defined(__SSE2__)
 +#include <emmintrin.h>
 +#endif
- 
++
  /* Command streams. The console faults a PM4 INDIRECT_BUFFER into title memory
   * (PS5_Vulkan B8), so nothing is chained: a stream's words stay in CPU memory,
-@@ -683,6 +687,59 @@
+  * in chunks that never move, and a submission copies every stream it carries
+@@ -683,6 +687,59 @@ radv_ps5_stream_pieces(const struct radv_ps5_cs *cs, struct util_dynarray *piece
                                  }));
  }
  
@@ -89,7 +90,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5
  static uint32_t
  radv_ps5_count_streams(struct ac_cmdbuf **streams, unsigned count)
  {
-@@ -697,12 +754,9 @@
+@@ -697,12 +754,9 @@ radv_ps5_copy_streams(uint32_t *at, struct ac_cmdbuf **streams, unsigned count)
  {
     for (unsigned i = 0; i < count; i++) {
        const struct radv_ps5_cs *const cs = radv_ps5_cs(streams[i]);
@@ -105,7 +106,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5
     }
     return at;
  }
-@@ -767,6 +821,7 @@
+@@ -769,6 +823,7 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
           return radv_ps5_cs(submit->cs_array[i])->status;
     }
  
@@ -113,7 +114,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5
     call_once(&radv_ps5_submitter_once, radv_ps5_submitter_start);
     if (radv_ps5_submission_failed())
        return VK_ERROR_DEVICE_LOST;
-@@ -890,12 +945,18 @@
+@@ -892,12 +947,18 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
                                                : util_dynarray_num_elements(&pieces, struct radv_ps5_cs_chunk);
        for (unsigned p = unit->first_piece; p < end; p++) {
           const struct radv_ps5_cs_chunk *const piece = util_dynarray_element(&pieces, struct radv_ps5_cs_chunk, p);

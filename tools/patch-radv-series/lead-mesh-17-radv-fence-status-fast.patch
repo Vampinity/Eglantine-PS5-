@@ -14,9 +14,10 @@ playtendoh-prosperoeden-2026-11-07.md. The supplied mail patches carry
 zero commit IDs; individual upstream commit IDs were not supplied.
 ---
 diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c b/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
+index 39d7f63..f013468 100644
 --- a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
 +++ b/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
-@@ -7,7 +7,22 @@
+@@ -9,8 +9,23 @@
  #include "radv_ps5_winsys.h"
  
  #include "util/os_time.h"
@@ -24,7 +25,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c b/src/amd/vulkan/winsys/p
 +#include <stdlib.h>
 +#include <string.h>
  #include "vk_sync.h"
-+
+ 
 +static bool radv_ps5_fence_status_fast;
 +static once_flag radv_ps5_fence_status_once = ONCE_FLAG_INIT;
 +
@@ -36,10 +37,11 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c b/src/amd/vulkan/winsys/p
 +   if (radv_ps5_fence_status_fast)
 +      fprintf(stderr, "radv/ps5: zero-timeout fence status without clock (EDEN_NX2_RADV_FENCE_STATUS_FAST)\n");
 +}
- 
++
  /* A binary sync object on the console's one queue. It is signalled by the
   * submission that carries it -- the GPU has run it once the queue's marker
-@@ -119,6 +134,7 @@
+  * passes that submission's sequence number -- or by the host at once. Every
+@@ -121,6 +136,7 @@ radv_ps5_sync_wait_many(struct vk_device *device, uint32_t wait_count, const str
     (void)device;
     struct radv_ps5_queue *const queue = radv_ps5_sync_queue();
     const bool any = flags & VK_SYNC_WAIT_ANY;
@@ -47,7 +49,7 @@ diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c b/src/amd/vulkan/winsys/p
  
     mtx_lock(&queue->sync_lock);
     for (;;) {
-@@ -144,6 +160,12 @@
+@@ -146,6 +162,12 @@ radv_ps5_sync_wait_many(struct vk_device *device, uint32_t wait_count, const str
           mtx_unlock(&queue->sync_lock);
           return VK_SUCCESS;
        }
