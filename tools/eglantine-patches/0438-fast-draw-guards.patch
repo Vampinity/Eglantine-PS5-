@@ -1,0 +1,29 @@
+Subject: [PATCH] Fast-draw guards on top of 0437: ResolveMemoizedTextures stops at the first deleted image, PrepareImageView returns for NULL_IMAGE_VIEW_ID as for an invalid id (the T74 SIGBUS on GPUBack was the null image's lru_index SIZE_MAX); only changes behaviour where the null view was prepared
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index a43d896..968ae0f 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1342,6 +1342,10 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
+         if (entry.view != NULL_IMAGE_VIEW_ID) {
+             PrepareImageView(entry.view, false, false);
+         }
++        if (has_deleted_images) {
++            // The memo's later views may be among the deleted ones: stop before preparing one.
++            break;
++        }
+     }
+     if (has_deleted_images) {
+         // Preparing an image deleted others: the full path resolves the views again.
+@@ -5478,7 +5482,10 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool
+ template <class P>
+ void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modification,
+                                        bool invalidate) {
+-    if (!image_view_id) {
++    // The null view's image is never registered: its lru_index is SIZE_MAX, and Touch indexed the
++    // LRU pool far out of range (T74: SIGBUS in PrepareImage from a texture memo hit). There is
++    // nothing to prepare for it.
++    if (!image_view_id || image_view_id == NULL_IMAGE_VIEW_ID) {
+         return;
+     }
+     const ImageViewBase& image_view = slot_image_views[image_view_id];
