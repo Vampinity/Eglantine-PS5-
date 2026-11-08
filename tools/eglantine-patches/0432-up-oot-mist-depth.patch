@@ -1,0 +1,340 @@
+Subject: [PATCH] EDEN_UP_OOT_MIST_DEPTH (+ _ULPS): idea of seedds/nxnative 877c7eca2a: snap gl_FragCoord.z to a sampled depth just below it in fragment compares (mist dark specks); off by default
+
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index 4c2f290..947886d 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -25,6 +25,7 @@
+ #include "shader_recompiler/frontend/maxwell/translate/translate.h"
+ #include "shader_recompiler/frontend/maxwell/translate_program.h"
+ #include "shader_recompiler/host_translate_info.h"
++#include "shader_recompiler/ir_opt/frag_z_snap.h"
+ #include "shader_recompiler/ir_opt/passes.h"
+ 
+ namespace Shader::Maxwell {
+@@ -497,6 +498,8 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
+     Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
+     Optimization::GeometryCompactionPass(program, normalized_host_info);
+     Optimization::TexturePass(env, program, normalized_host_info);
++    // EDEN_UP_OOT_MIST_DEPTH=1: gl_FragCoord.z against a depth of its own surface (frag_z_snap.h)
++    Optimization::FragZSnapPass(program);
+ 
+     if (Settings::values.resolution_info.active) {
+         Optimization::RescalingPass(program);
+diff --git a/src/shader_recompiler/ir_opt/frag_z_snap.h b/src/shader_recompiler/ir_opt/frag_z_snap.h
+new file mode 100644
+index 0000000..463cf32
+--- /dev/null
++++ b/src/shader_recompiler/ir_opt/frag_z_snap.h
+@@ -0,0 +1,311 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <cstdlib>
++#include <unordered_map>
++#include <iterator>
++#include <utility>
++#include <vector>
++
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "shader_recompiler/frontend/ir/basic_block.h"
++#include "shader_recompiler/frontend/ir/ir_emitter.h"
++#include "shader_recompiler/frontend/ir/program.h"
++#include "shader_recompiler/frontend/ir/value.h"
++
++namespace Shader::Optimization {
++
++// EDEN_UP_OOT_MIST_DEPTH=1 (the idea of seedds/nxnative 877c7eca2a and 8e4a993ba0, not their code):
++// a pixel shader that compares gl_FragCoord.z with a depth it read from a texture of its own
++// surface must find them equal. Ocarina of Time's mist discards a fragment whose gl_FragCoord.z is
++// above the depth its depth-only pass (the same geometry) stored. On Maxwell the stored depth is
++// exactly the z the pixel shader reads. On a host GPU it can be a little lower: nxnative measured
++// one ulp (plus a fraction of fwidth(z)) on Apple's M4, while an M6 stores exactly z (8e4a993ba0),
++// so the gap is the GPU's own. Whether RADV on the PS5 leaves one is not measured: its depth unit
++// and the shader's FragCoord.z are computed apart, a D24 target (where the host has one) rounds the
++// stored value to 2^-24, and the depth-only and colour pipelines are separate compiles. Where a gap
++// exists the mist rejects its own surface at scattered pixels: dark specks flickering in the mist.
++//
++// Where a gl_FragCoord.z read meets a value read from a texture in one floating-point comparison,
++// through any arithmetic on either side (the mist's z > d, the foliage's z * k > d * k), the z read
++// becomes d when d lies in [z - N ulp(z) - 2^-24, z) and stays z otherwise. A comparison of a
++// fragment with its own surface's stored depth then sees equality, whatever its operator. z against
++// constants or uniforms, texture values that do not dominate the z read, and a pair where either
++// side reaches both kinds are left alone. N is EDEN_UP_OOT_MIST_DEPTH_ULPS (1 to 64, default 2).
++// Unset, the pass does nothing and the shader is translated exactly as before.
++namespace FragZSnapDetail {
++
++inline bool IsFpCompare32(IR::Opcode opcode) {
++    switch (opcode) {
++    case IR::Opcode::FPOrdEqual32:
++    case IR::Opcode::FPUnordEqual32:
++    case IR::Opcode::FPOrdNotEqual32:
++    case IR::Opcode::FPUnordNotEqual32:
++    case IR::Opcode::FPOrdLessThan32:
++    case IR::Opcode::FPUnordLessThan32:
++    case IR::Opcode::FPOrdGreaterThan32:
++    case IR::Opcode::FPUnordGreaterThan32:
++    case IR::Opcode::FPOrdLessThanEqual32:
++    case IR::Opcode::FPUnordLessThanEqual32:
++    case IR::Opcode::FPOrdGreaterThanEqual32:
++    case IR::Opcode::FPUnordGreaterThanEqual32:
++        return true;
++    default:
++        return false;
++    }
++}
++
++inline bool IsFragZRead(const IR::Inst& inst) {
++    return inst.GetOpcode() == IR::Opcode::GetAttribute && inst.Arg(0).IsImmediate() &&
++           inst.Arg(0).Attribute() == IR::Attribute::PositionZ;
++}
++
++// A scalar read from a texture (a depth image): one component of a plain sample or fetch. Not a
++// depth-compare sample or a gather, as in nxnative.
++inline bool IsTextureScalar(const IR::Inst& inst) {
++    if (inst.GetOpcode() != IR::Opcode::CompositeExtractF32x4 || inst.Arg(0).IsImmediate()) {
++        return false;
++    }
++    switch (inst.Arg(0).InstRecursive()->GetOpcode()) {
++    case IR::Opcode::ImageSampleImplicitLod:
++    case IR::Opcode::ImageSampleExplicitLod:
++    case IR::Opcode::ImageFetch:
++    case IR::Opcode::ImageGradient:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// The z reads and texture scalars a value is computed from. False when the walk ran out of budget,
++// and the caller then leaves the comparison alone.
++inline bool Walk(const IR::Value& root, std::vector<IR::Inst*>& z_reads,
++                 std::vector<IR::Inst*>& texels) {
++    if (root.IsImmediate()) {
++        return true;
++    }
++    std::vector<IR::Inst*> stack{root.InstRecursive()};
++    std::vector<const IR::Inst*> seen;
++    size_t budget{256};
++    while (!stack.empty()) {
++        if (budget-- == 0) {
++            return false;
++        }
++        IR::Inst* const inst{stack.back()};
++        stack.pop_back();
++        if (std::ranges::find(seen, inst) != seen.end()) {
++            continue;
++        }
++        seen.push_back(inst);
++        if (IsFragZRead(*inst)) {
++            z_reads.push_back(inst);
++            continue;
++        }
++        if (IsTextureScalar(*inst)) {
++            texels.push_back(inst);
++            continue;
++        }
++        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
++            const IR::Value value{inst->Arg(arg)};
++            if (!value.IsImmediate()) {
++                stack.push_back(value.InstRecursive());
++            }
++        }
++    }
++    return true;
++}
++
++// Immediate dominators over the program's post order (Cooper, Harvey and Kennedy).
++class Dominators {
++public:
++    explicit Dominators(const IR::Program& program) {
++        const auto& post_order{program.post_order_blocks};
++        if (post_order.empty()) {
++            return;
++        }
++        for (size_t i = 0; i < post_order.size(); ++i) {
++            number[post_order[i]] = i;
++        }
++        entry = post_order.back();
++        idom[entry] = entry;
++        for (bool changed = true; changed;) {
++            changed = false;
++            for (auto it = post_order.rbegin(); it != post_order.rend(); ++it) {
++                IR::Block* const block{*it};
++                if (block == entry) {
++                    continue;
++                }
++                IR::Block* next{};
++                for (IR::Block* const pred : block->ImmPredecessors()) {
++                    if (!idom.contains(pred)) {
++                        continue;
++                    }
++                    next = next ? Intersect(pred, next) : pred;
++                }
++                const auto current{idom.find(block)};
++                if (next && (current == idom.end() || current->second != next)) {
++                    idom[block] = next;
++                    changed = true;
++                }
++            }
++        }
++    }
++
++    bool Dominates(const IR::Block* a, const IR::Block* b) const {
++        while (true) {
++            if (a == b) {
++                return true;
++            }
++            const auto up{idom.find(b)};
++            if (up == idom.end() || b == entry) {
++                return false;
++            }
++            b = up->second;
++        }
++    }
++
++private:
++    IR::Block* Intersect(IR::Block* a, IR::Block* b) const {
++        while (a != b) {
++            while (number.at(a) < number.at(b)) {
++                a = idom.at(a);
++            }
++            while (number.at(b) < number.at(a)) {
++                b = idom.at(b);
++            }
++        }
++        return a;
++    }
++
++    std::unordered_map<const IR::Block*, size_t> number;
++    std::unordered_map<const IR::Block*, IR::Block*> idom;
++    IR::Block* entry{};
++};
++
++inline bool Before(IR::Block& block, const IR::Inst* first, const IR::Inst* second) {
++    for (const IR::Inst& inst : block.Instructions()) {
++        if (&inst == first) {
++            return true;
++        }
++        if (&inst == second) {
++            return false;
++        }
++    }
++    return false;
++}
++
++inline u32 WindowUlps() {
++    const char* const text{std::getenv("EDEN_UP_OOT_MIST_DEPTH_ULPS")};
++    if (text == nullptr) {
++        return 2;
++    }
++    char* end{};
++    const long value{std::strtol(text, &end, 10)};
++    return end != text && value >= 1 && value <= 64 ? static_cast<u32>(value) : 2;
++}
++
++// d when it lies in [z - ulps ulp(z) - 2^-24, z) and z is positive, z otherwise (NaN takes z).
++inline IR::F32 Snap(IR::IREmitter& ir, const IR::F32& z, const IR::F32& d, u32 ulps) {
++    const IR::U32 bits{ir.BitCast<IR::U32>(z)};
++    const IR::F32 below{ir.BitCast<IR::F32>(IR::U32{ir.ISub(bits, ir.Imm32(ulps))})};
++    const IR::F32 low{ir.FPAdd(below, ir.Imm32(-0x1p-24f))};
++    const IR::U1 positive{ir.FPGreaterThan(z, ir.Imm32(0.0f))};
++    const IR::U1 under{ir.FPLessThan(d, z)};
++    const IR::U1 close{ir.FPGreaterThanEqual(d, low)};
++    return IR::F32{ir.Select(ir.LogicalAnd(ir.LogicalAnd(positive, under), close), d, z)};
++}
++
++} // namespace FragZSnapDetail
++
++// Returns the number of gl_FragCoord.z reads rewritten (0 when the switch is unset).
++inline size_t FragZSnapPass(IR::Program& program) {
++    using namespace FragZSnapDetail;
++    static const bool enabled{Common::PeSwitch("EDEN_UP_OOT_MIST_DEPTH")};
++    if (!enabled || program.stage != Stage::Fragment) {
++        return 0;
++    }
++    std::vector<std::pair<IR::Inst*, std::vector<IR::Inst*>>> pairs; // z read, texture scalars
++    const auto add_pair{[&pairs](IR::Inst* z_read, const std::vector<IR::Inst*>& texels) {
++        auto it{std::ranges::find_if(pairs, [z_read](const auto& p) { return p.first == z_read; })};
++        if (it == pairs.end()) {
++            pairs.emplace_back(z_read, std::vector<IR::Inst*>{});
++            it = std::prev(pairs.end());
++        }
++        for (IR::Inst* const texel : texels) {
++            if (std::ranges::find(it->second, texel) == it->second.end()) {
++                it->second.push_back(texel);
++            }
++        }
++    }};
++    for (IR::Block* const block : program.blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            if (!IsFpCompare32(inst.GetOpcode())) {
++                continue;
++            }
++            std::vector<IR::Inst*> z_reads[2];
++            std::vector<IR::Inst*> texels[2];
++            if (!Walk(inst.Arg(0), z_reads[0], texels[0]) ||
++                !Walk(inst.Arg(1), z_reads[1], texels[1])) {
++                continue;
++            }
++            for (int side = 0; side < 2; ++side) {
++                const int other{1 - side};
++                if (z_reads[side].empty() || !texels[side].empty() || texels[other].empty() ||
++                    !z_reads[other].empty()) {
++                    continue;
++                }
++                for (IR::Inst* const z_read : z_reads[side]) {
++                    add_pair(z_read, texels[other]);
++                }
++            }
++        }
++    }
++    if (pairs.empty()) {
++        return 0;
++    }
++    std::unordered_map<const IR::Inst*, IR::Block*> block_of;
++    for (IR::Block* const block : program.blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            block_of.emplace(&inst, block);
++        }
++    }
++    const Dominators dominators{program};
++    const u32 ulps{WindowUlps()};
++    size_t rewritten{};
++    for (auto& [z_read, texels] : pairs) {
++        IR::Block* const z_block{block_of.at(z_read)};
++        IR::IREmitter ir{*z_block, IR::Block::InstructionList::s_iterator_to(*z_read)};
++        bool snapped{};
++        IR::F32 z{};
++        for (IR::Inst* const texel : texels) {
++            IR::Block* const texel_block{block_of.at(texel)};
++            // The texture value must be computed before the read, in a block every path to it
++            // passes through.
++            const bool usable{texel_block == z_block ? Before(*z_block, texel, z_read)
++                                                     : dominators.Dominates(texel_block, z_block)};
++            if (!usable) {
++                continue;
++            }
++            if (!snapped) {
++                z = ir.GetAttribute(IR::Attribute::PositionZ); // inserted before the old read
++                snapped = true;
++            }
++            z = Snap(ir, z, IR::F32{IR::Value{texel}}, ulps);
++        }
++        if (snapped) {
++            z_read->ReplaceUsesWith(z);
++            ++rewritten;
++        }
++    }
++    if (rewritten != 0) {
++        LOG_INFO(Shader, "EDEN_UP_OOT_MIST_DEPTH: {} gl_FragCoord.z read(s) compared with a "
++                         "texture value snapped ({} ulp window)",
++                 rewritten, ulps);
++    }
++    return rewritten;
++}
++
++} // namespace Shader::Optimization

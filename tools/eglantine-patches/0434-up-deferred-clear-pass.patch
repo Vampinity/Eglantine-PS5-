@@ -1,0 +1,32 @@
+Subject: [PATCH] EDEN_UP_DEFERRED_CLEAR_PASS: Lichii #699 (ac166ebc64): keep drawing in the render pass a deferred clear began (Ocarina); off by default
+
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 5ea2fa2008..df7e6c65ed 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -19,6 +19,7 @@
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
+ 
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+@@ -502,7 +503,16 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
+     const VkRenderPass renderpass = framebuffer->RenderPass();
+     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
+     const VkExtent2D render_area = framebuffer->RenderArea();
+-    if (renderpass == state.renderpass && framebuffer_handle == state.framebuffer &&
++    // EDEN_UP_DEFERRED_CLEAR_PASS=1 (zortos293/Lichii ac166ebc64, #699): a draw continues the
++    // active pass whenever the same framebuffer and area are bound, also when a deferred clear
++    // began that pass with its loadOp=CLEAR render-pass variant. Comparing the exact handle made
++    // the first draw after every deferred clear end the pass and begin it again with LOAD. The
++    // variant and base passes are render-pass compatible (only load/store ops differ). An active
++    // pass is required, because EndRenderPass keeps the framebuffer and area. Off: as before.
++    static const bool deferred_clear_pass = Common::PeSwitch("EDEN_UP_DEFERRED_CLEAR_PASS");
++    const bool same_pass = deferred_clear_pass ? state.renderpass != VkRenderPass{}
++                                               : renderpass == state.renderpass;
++    if (same_pass && framebuffer_handle == state.framebuffer &&
+         render_area.width == state.render_area.width &&
+         render_area.height == state.render_area.height) {
+         return;

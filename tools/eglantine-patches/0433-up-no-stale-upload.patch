@@ -1,0 +1,386 @@
+Subject: [PATCH] EDEN_UP_NO_STALE_UPLOAD: Lichii #818 (451f309925): no upload of stale guest memory into new images on Switch 2 titles; off by default
+
+diff --git a/src/video_core/texture_cache/stale_pages.h b/src/video_core/texture_cache/stale_pages.h
+new file mode 100644
+index 0000000..ea247df
+--- /dev/null
++++ b/src/video_core/texture_cache/stale_pages.h
+@@ -0,0 +1,138 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <type_traits>
++#include <vector>
++
++#include "common/common_types.h"
++
++namespace VideoCommon {
++
++/// Device pages whose guest memory lost the GPU's data (TextureCache::MarkStale), one bit each.
++/// Mark and Clear call on_run(addr, size) for every run of pages whose state they changed.
++class StalePages {
++public:
++    /// Device memory pages (Core::Memory::YUZU_PAGEBITS), not the texture cache's lookup pages.
++    static constexpr u64 STALE_PAGE_BITS = 12;
++    static constexpr u64 STALE_PAGE_SIZE = u64{1} << STALE_PAGE_BITS;
++
++    /// Marks the pages wholly inside [addr, addr + size): a page shared with other data keeps
++    /// that data's state.
++    template <typename OnRun>
++    void Mark(DAddr addr, u64 size, OnRun&& on_run) {
++        const u64 first = (addr + STALE_PAGE_SIZE - 1) >> STALE_PAGE_BITS;
++        const u64 end = (addr + size) >> STALE_PAGE_BITS;
++        if (end <= first || end > MAX_PAGES) {
++            return;
++        }
++        if (bits.size() * 64 < end) {
++            bits.resize((end + 63) / 64);
++        }
++        Run<std::remove_reference_t<OnRun>> run{on_run};
++        for (u64 page = first; page < end; ++page) {
++            u64& word = bits[page / 64];
++            const u64 bit = u64{1} << (page % 64);
++            if ((word & bit) != 0) {
++                run.Flush();
++                continue;
++            }
++            word |= bit;
++            ++count;
++            run.Add(page);
++        }
++        run.Flush();
++    }
++
++    /// Clears every page [addr, addr + size) touches.
++    template <typename OnRun>
++    void Clear(DAddr addr, u64 size, OnRun&& on_run) {
++        if (count == 0 || size == 0) {
++            return;
++        }
++        const u64 first = addr >> STALE_PAGE_BITS;
++        const u64 end = (std::min<u64>)((addr + size + STALE_PAGE_SIZE - 1) >> STALE_PAGE_BITS, bits.size() * 64);
++        Run<std::remove_reference_t<OnRun>> run{on_run};
++        for (u64 page = first; page < end;) {
++            u64& word = bits[page / 64];
++            if (word == 0 && page % 64 == 0) {
++                run.Flush();
++                page += 64;
++                continue;
++            }
++            const u64 bit = u64{1} << (page % 64);
++            if ((word & bit) != 0) {
++                word &= ~bit;
++                --count;
++                run.Add(page);
++            } else {
++                run.Flush();
++            }
++            ++page;
++        }
++        run.Flush();
++    }
++
++    /// Whether every page [addr, addr + size) touches is marked.
++    [[nodiscard]] bool IsAll(DAddr addr, u64 size) const {
++        if (count == 0 || size == 0) {
++            return false;
++        }
++        const u64 first = addr >> STALE_PAGE_BITS;
++        const u64 end = (addr + size + STALE_PAGE_SIZE - 1) >> STALE_PAGE_BITS;
++        if (end > bits.size() * 64) {
++            return false;
++        }
++        for (u64 page = first; page < end;) {
++            const u64 word = bits[page / 64];
++            if (page % 64 == 0 && page + 64 <= end) {
++                if (word != ~u64{0}) {
++                    return false;
++                }
++                page += 64;
++                continue;
++            }
++            if (((word >> (page % 64)) & 1) == 0) {
++                return false;
++            }
++            ++page;
++        }
++        return true;
++    }
++
++    [[nodiscard]] u64 Count() const {
++        return count;
++    }
++
++private:
++    /// Bounds the bitmap (1 TiB of device memory); the stand-in addresses of images without CPU
++    /// backing lie far past it.
++    static constexpr u64 MAX_PAGES = u64{1} << 28;
++
++    template <typename OnRun>
++    struct Run {
++        OnRun& on_run;
++        u64 begin{};
++        u64 pages{};
++
++        void Add(u64 page) {
++            if (pages == 0) {
++                begin = page;
++            }
++            ++pages;
++        }
++        void Flush() {
++            if (pages != 0) {
++                on_run(begin << STALE_PAGE_BITS, pages << STALE_PAGE_BITS);
++                pages = 0;
++            }
++        }
++    };
++
++    std::vector<u64> bits;
++    u64 count{};
++};
++
++} // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index dc955b3..dcf167d 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -264,6 +264,13 @@ void TextureCache<P>::RunGarbageCollector() {
+             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+             ++gc_download_deletes;
+         }
++        // EDEN_UP_NO_STALE_UPLOAD. Kept apart from the download above: the Vulkan port
++        // (prepare-vulkan-port.py) also writes such an image back from a prefetched copy.
++        if (!must_download) {
++            MarkStale(image); // before UntrackImage (see MarkStale)
++        } else {
++            ClearStaleImage(image);
++        }
+         if (True(image.flags & ImageFlagBits::Tracked)) {
+             UntrackImage(image, image_id);
+         }
+@@ -374,6 +381,75 @@ void TextureCache<P>::RunGarbageCollector() {
+     }
+ }
+ 
++/// False only when no page of [device_address, device_address + size) has been GPU-written
++/// through the buffer cache (Tegra::Nx2MarkGpuWritten). Ranges past the bitmap answer true.
++/// Lichii's Tegra::Nx2MayBeGpuWritten, kept here for EDEN_UP_NO_STALE_UPLOAD.
++[[nodiscard]] inline bool StaleNx2MayBeGpuWritten(u64 device_address, u64 size) {
++    if (size == 0) {
++        return false;
++    }
++    const u64 first = device_address >> Tegra::Nx2WrittenPageBits;
++    const u64 last = (device_address + size - 1) >> Tegra::Nx2WrittenPageBits;
++    if (last < first || last >= Tegra::g_nx2_gpu_written_pages.size() * 64) {
++        return true;
++    }
++    for (u64 page = first; page <= last; ++page) {
++        if ((Tegra::g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >>
++             (page % 64)) & 1) {
++            return true;
++        }
++    }
++    return false;
++}
++
++template <class P>
++void TextureCache<P>::MarkStale(const ImageBase& image) {
++    if (!NoStaleUpload() || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
++        False(image.flags & ImageFlagBits::GpuModified) ||
++        True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Sparse |
++                            ImageFlagBits::Unbacked))) {
++        return;
++    }
++    // Tracked from here on so CPU writes reach WriteMemory. Marking before the image's own
++    // tracking goes keeps the pages' write protection from switching off and on again.
++    stale_pages.Mark(image.cpu_addr, image.guest_size_bytes, [this](DAddr addr, u64 size) {
++        device_memory.UpdatePagesCachedCount(addr, size, 1);
++    });
++}
++
++template <class P>
++void TextureCache<P>::ClearStale(DAddr addr, size_t size) {
++    // Nothing is marked with EDEN_UP_NO_STALE_UPLOAD off: this returns at once.
++    stale_pages.Clear(addr, size, [this](DAddr run_addr, u64 run_size) {
++        device_memory.UpdatePagesCachedCount(run_addr, run_size, -1);
++    });
++}
++
++template <class P>
++void TextureCache<P>::ClearStaleImage(const ImageBase& image) {
++    if (stale_pages.Count() == 0) {
++        return;
++    }
++    if (False(image.flags & ImageFlagBits::Sparse)) {
++        ClearStale(image.cpu_addr, image.guest_size_bytes);
++        return;
++    }
++    ClearStaleGpu(image.gpu_addr, image.guest_size_bytes);
++}
++
++template <class P>
++void TextureCache<P>::ClearStaleGpu(GPUVAddr gpu_addr, size_t size) {
++    if (stale_pages.Count() == 0) {
++        return;
++    }
++    // Each piece is contiguous in device memory (GetSubmappedRange splits where it is not).
++    for (const auto& [piece_addr, piece_size] : gpu_memory->GetSubmappedRange(gpu_addr, size)) {
++        if (const auto device_addr = gpu_memory->GpuToCpuAddress(piece_addr)) {
++            ClearStale(*device_addr, piece_size);
++        }
++    }
++}
++
+ template <class P>
+ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
+@@ -837,6 +913,7 @@ void TextureCache<P>::RefusalDownloadEvict() {
+         Image& image = slot_images[entry.image_id];
+         SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies, entry.map.mapped_span,
+                      swizzle_data_buffer);
++        ClearStaleImage(image);
+         ++gc_download_deletes;
+         bytes += ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
+         if (True(image.flags & ImageFlagBits::Tracked)) {
+@@ -1040,6 +1117,14 @@ void TextureCache<P>::TickFrame() {
+                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
+         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
+                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
++        if (NoStaleUpload()) {
++            LOG_INFO(HW_GPU,
++                     "Texture cache last 600 frames: stale uploads skipped {} ({} MiB), {} uploaded "
++                     "for buffer-written pages; {} MiB of pages marked stale",
++                     tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
++                     (stale_pages.Count() << StalePages::STALE_PAGE_BITS) >> 20);
++            tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
++        }
+         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+         astc_opaque_images = astc_alpha_images = 0;
+         std::vector<std::pair<u32, u64>> shapes;
+@@ -1594,6 +1679,7 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
+ 
+ template <class P>
+ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
++    ClearStale(cpu_addr, size);
+     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
+         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
+             // Written at last: a backed image replaces it where it is used next.
+@@ -1649,6 +1735,11 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
+     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
+         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
+     });
++    // EDEN_UP_NO_STALE_UPLOAD: these images are written back below (or by the Vulkan port's own
++    // batch, prepare-vulkan-port.py). Clearing a mark early only costs an upload later.
++    for (const ImageId stale_id : images) {
++        ClearStaleImage(slot_images[stale_id]);
++    }
+     // Record the copies of a batch, wait for the GPU once, then swizzle in modification order
+     // (the copies only read, so they do not depend on each other). A batch is capped so the
+     // staging memory held at once stays bounded.
+@@ -1727,6 +1818,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
+         UnregisterImage(id);
+         DeleteImage(id);
+     }
++    ClearStale(cpu_addr, size);
+ }
+ 
+ template <class P>
+@@ -2253,6 +2345,7 @@ void TextureCache<P>::PopAsyncFlushes() {
+                 if (!held_vs_download || False(image.flags & ImageFlagBits::CpuModified)) {
+                     SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span,
+                                  swizzle_data_buffer);
++                    ClearStaleImage(image);
+                 }
+             } else {
+                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
+@@ -2260,6 +2353,7 @@ void TextureCache<P>::PopAsyncFlushes() {
+                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                 gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
+                                              buffer_info.size);
++                ClearStaleGpu(buffer_info.address, buffer_info.size);
+                 slot_buffer_downloads.erase(download_info.object_id);
+             }
+         }
+@@ -2305,6 +2399,7 @@ void TextureCache<P>::PopAsyncFlushes() {
+             if (!held_vs_download || False(image.flags & ImageFlagBits::CpuModified)) {
+                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span,
+                              swizzle_data_buffer);
++                ClearStaleImage(image);
+             }
+             download_map.offset += image.unswizzled_size_bytes;
+             download_span = download_span.subspan(image.unswizzled_size_bytes);
+@@ -2460,6 +2555,23 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         TrackImage(image, image_id);
+     }
+ 
++    // EDEN_UP_NO_STALE_UPLOAD: made where a dropped GPU-written image left stale bytes
++    // (MarkStale): nothing to upload. Pages the buffer cache wrote on the GPU may hold data
++    // written back since: upload those. Nothing is marked with the switch off.
++    if (stale_pages.Count() != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
++        image.dirty_layers.empty() &&
++        False(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
++                             ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
++        stale_pages.IsAll(image.cpu_addr, image.guest_size_bytes)) {
++        if (!StaleNx2MayBeGpuWritten(image.cpu_addr, image.guest_size_bytes)) {
++            ++tc_stale_skips;
++            tc_stale_skip_bytes += image.guest_size_bytes;
++            runtime.TransitionImageLayout(image);
++            return;
++        }
++        ++tc_stale_gpu_written;
++    }
++
+     // Vectors, staging and unswizzle scratch, as for a whole image further down.
+     try {
+         if (True(image.flags & ImageFlagBits::SparseLayers)) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index eec341a..82871c5 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -30,6 +30,7 @@
+ #include "common/hash.h"
+ #include "common/literals.h"
+ #include "common/lru_cache.h"
++#include "common/pe_switch.h"
+ #include <ranges>
+ #include "common/scratch_buffer.h"
+ #include "common/slot_vector.h"
+@@ -47,6 +48,7 @@
+ #include "video_core/texture_cache/image_info.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/render_targets.h"
++#include "video_core/texture_cache/stale_pages.h"
+ #include "video_core/texture_cache/types.h"
+ #include "video_core/textures/texture.h"
+ 
+@@ -661,6 +663,26 @@ private:
+     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
+     void ApplyThresholdOverrides(bool log = true);
+ 
++    /// EDEN_UP_NO_STALE_UPLOAD (zortos293/Lichii 451f309925, #818): a GPU-written image the
++    /// collector drops without writing it back leaves its guest memory stale (the GPU's data is
++    /// gone). Its whole pages are marked here and kept tracked, so CPU writes, unmaps and
++    /// write-backs clear them. An image made entirely on marked pages starts without an upload:
++    /// the upload would only copy stale bytes the GPU overwrites. Switch 2 titles only: the
++    /// buffer cache feeds the GPU-written page bitmap for them alone. Off: nothing is marked.
++    [[nodiscard]] static bool NoStaleUpload() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_NO_STALE_UPLOAD");
++        return enabled;
++    }
++    void MarkStale(const ImageBase& image);
++    void ClearStale(DAddr addr, size_t size);
++    void ClearStaleImage(const ImageBase& image);
++    /// Clears every device range [gpu_addr, gpu_addr + size) maps to.
++    void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
++    StalePages stale_pages;
++    u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
++    u64 tc_stale_skip_bytes{};
++    u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
++
+     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
+     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
+ 
