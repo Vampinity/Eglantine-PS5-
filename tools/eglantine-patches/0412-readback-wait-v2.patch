@@ -1,0 +1,1068 @@
+Subject: [PATCH] readback wait v2: hold only on downloads not yet landed, superseded downloads, release ordering, EDEN_NX2_OVERWRITE_CHECK log (both off by default)
+
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index cb66041..53c160b 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -34,6 +34,7 @@
+ #include "core/core.h"
+ #include "core/device_memory.h"
+ #include "video_core/rasterizer_interface.h"
++#include "video_core/readback_wait.h"
+ #include "video_core/renderer_base.h"
+ #include "core/frontend/framebuffer_layout.h"
+ #include "core/perf_stats.h"
+@@ -1883,6 +1884,12 @@ private:
+                                    (oot_wait && app_program_id == OcarinaOfTimeProgramId))) {
+             frames_ahead = 0;
+         }
++        // EDEN_NX2_OVERWRITE_CHECK: guest CPU writes from here on are the next frame's.
++        if (VideoCore::Readback::OverwriteCheck()) {
++            VideoCore::Readback::g_present_fence.store((u64{~w[22]} << 32) | u64{w[24]},
++                                                       std::memory_order_release);
++            VideoCore::Readback::g_present_number.store(m_presents, std::memory_order_release);
++        }
+         const auto entered = std::chrono::steady_clock::now();
+         if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
+             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index aa0987b..3d74f65 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include "common/pe_switch.h"
++#include "video_core/readback_wait.h"
+ #include <algorithm>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -1100,6 +1101,9 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+     runtime.PostCopyBarrier();
+     pending_downloads.emplace_back(std::move(normalized_copies));
+     pending_download_ranges.emplace_back(std::move(download_ranges));
++    if (VideoCore::Readback::Mode() != 0) {
++        pending_download_superseded.emplace_back();
++    }
+     async_buffers.emplace_back(download_staging);
+ }
+ 
+@@ -1174,6 +1178,88 @@ void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> range
+     }
+ }
+ 
++template <class P>
++void BufferCache<P>::OverwriteNoteCpuWrites(std::span<const std::pair<DAddr, u64>> ranges,
++                                            bool ahead) {
++    for (const auto& [device_addr, size] : ranges) {
++        if (size == 0) {
++            continue;
++        }
++        // Early write: the GPU's result for these bytes is queued for a fence download or in
++        // one that has not landed, and the CPU writes them already.
++        bool not_landed = uncommitted_gpu_modified_ranges.Intersects(device_addr, size);
++        for (const auto& range_set : committed_gpu_modified_ranges) {
++            not_landed = not_landed || range_set.Intersects(device_addr, size);
++        }
++        for (const auto& range_set : pending_download_ranges) {
++            not_landed = not_landed || range_set.Intersects(device_addr, size);
++        }
++        if (not_landed) {
++            if (overwrite_counts.early_writes == 0) {
++                overwrite_counts.first_early_write = device_addr;
++            }
++            ++overwrite_counts.early_writes;
++            overwrite_counts.early_write_bytes += size;
++        }
++        if (ahead) {
++            overwrite_ahead_ranges.Add(device_addr, size);
++            overwrite_ahead_active = true;
++            ++overwrite_counts.ahead_writes;
++            overwrite_counts.ahead_write_bytes += size;
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::OverwriteClearAhead() {
++    overwrite_ahead_ranges.Clear();
++    overwrite_ahead_active = false;
++}
++
++template <class P>
++void BufferCache<P>::OverwriteCloseWindow(u64 present_number) {
++    const OverwriteCounts counts = overwrite_counts;
++    overwrite_counts = {};
++    OverwriteSummary& summary = overwrite_summary;
++    const auto now = std::chrono::steady_clock::now();
++    if (summary.frames == 0 && summary.start == std::chrono::steady_clock::time_point{}) {
++        summary.start = now;
++    }
++    if (present_number != ~u64{0}) {
++        ++summary.frames;
++        summary.frames_ahead_writes += counts.ahead_writes != 0 ? 1 : 0;
++        summary.frames_ahead_reads += counts.ahead_reads != 0 ? 1 : 0;
++        summary.frames_early_writes += counts.early_writes != 0 ? 1 : 0;
++        summary.frames_both += counts.ahead_reads != 0 && counts.early_writes != 0 ? 1 : 0;
++    }
++    if (present_number != ~u64{0} && (counts.ahead_reads != 0 || counts.early_writes != 0) &&
++        summary.lines < 20000) {
++        ++summary.lines;
++        // Wall clock: the video's flash times are lined up by it (the frame file names and the
++        // recording start are wall clock).
++        const s64 wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                std::chrono::system_clock::now().time_since_epoch())
++                                .count();
++        LOG_INFO(HW_GPU,
++                 "OverwriteCheck present #{} wall {}: ahead writes {} ({} B), ahead reads {} ({} "
++                 "B, first {:#x}); early writes {} ({} B, first {:#x})",
++                 present_number, wall_ms, counts.ahead_writes, counts.ahead_write_bytes,
++                 counts.ahead_reads, counts.ahead_read_bytes, counts.first_ahead_read,
++                 counts.early_writes, counts.early_write_bytes, counts.first_early_write);
++    }
++    if (now - summary.start >= std::chrono::seconds{5}) {
++        LOG_INFO(HW_GPU,
++                 "OverwriteCheck 5 s: {} frames, {} with ahead writes, {} with ahead reads, {} "
++                 "with early writes, {} with both",
++                 summary.frames, summary.frames_ahead_writes, summary.frames_ahead_reads,
++                 summary.frames_early_writes, summary.frames_both);
++        const u64 lines = summary.lines;
++        summary = {};
++        summary.start = now;
++        summary.lines = lines;
++    }
++}
++
+ template <class P>
+ int BufferCache<P>::DownloadGuards() {
+     static const int level = [] {
+@@ -1254,6 +1340,11 @@ void BufferCache<P>::PopAsyncBuffers() {
+     // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since the
+     // copy was taken are newer than it, and the GPU thread hasn't dropped them from `ranges` yet.
+     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
++    // EDEN_NX2_READBACK_WAIT only (null otherwise).
++    const Common::RangeSet<DAddr>* const superseded =
++        VideoCore::Readback::Mode() != 0 && !pending_download_superseded.empty()
++            ? &pending_download_superseded.front()
++            : nullptr;
+     for (const auto& copy : downloads) {
+         const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
+         const u64 dst_offset = copy.dst_offset - base_offset;
+@@ -1263,13 +1354,29 @@ void BufferCache<P>::PopAsyncBuffers() {
+         ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+             WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
+                                   end - start);
+-            gpu_modified_ranges.Subtract(start, end - start);
++            if (superseded == nullptr || !superseded->Intersects(start, end - start)) {
++                gpu_modified_ranges.Subtract(start, end - start);
++                return;
++            }
++            // A newer GPU write's download is still to come: keep its range GPU-modified.
++            VideoCore::Readback::g_superseded_landed.fetch_add(1, std::memory_order_relaxed);
++            Common::RangeSet<DAddr> landed;
++            landed.Add(start, end - start);
++            superseded->ForEachInRange(start, end - start, [&](DAddr lower, DAddr upper) {
++                landed.Subtract(lower, upper - lower);
++            });
++            landed.ForEach([&](DAddr lower, DAddr upper) {
++                gpu_modified_ranges.Subtract(lower, upper - lower);
++            });
+         });
+     }
+     async_buffers_death_ring.emplace_back(*async_buffer);
+     async_buffers.pop_front();
+     pending_downloads.pop_front();
+     pending_download_ranges.pop_front();
++    if (superseded != nullptr) {
++        pending_download_superseded.pop_front();
++    }
+ }
+ 
+ template <class P>
+@@ -1632,6 +1739,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
+             && !memory_tracker.IsRegionGpuModified(device_addr, size));
+     if (use_fast_buffer) {
++        OverwriteNoteRead(device_addr, size);
+         if constexpr (IS_OPENGL) {
+             if (runtime.HasFastBufferSubData()) {
+                 // Fast path for Nvidia
+@@ -2021,6 +2129,7 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
+              !memory_tracker.IsRegionGpuModified(binding.device_addr, size));
+         if constexpr (!IS_OPENGL) {
+             if (use_fast_buffer) {
++                OverwriteNoteRead(binding.device_addr, size);
+                 const std::span<u8> span =
+                     runtime.BindMappedUniformBuffer(0, binding_index, size);
+                 device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
+@@ -2386,8 +2495,17 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+     // The downloads already taken over this range hold older bytes: when their fences pop
+     // they must not write them over this write's result in guest memory, nor drop the range
+     // from gpu_modified_ranges (the next fence downloads it instead).
+-    for (auto& ranges : pending_download_ranges) {
+-        ranges.Subtract(device_addr, size);
++    // EDEN_NX2_READBACK_WAIT: they still write them. Their bytes are this range at their fence,
++    // which a guest waiting for that fence must read (it read guest memory's older bytes
++    // instead), and this write's download lands after them; only the range stays GPU-modified.
++    if (VideoCore::Readback::Mode() != 0) {
++        for (auto& superseded : pending_download_superseded) {
++            superseded.Add(device_addr, size);
++        }
++    } else {
++        for (auto& ranges : pending_download_ranges) {
++            ranges.Subtract(device_addr, size);
++        }
+     }
+     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+     MarkVertexBuffersStale(device_addr, size);
+@@ -2998,6 +3116,7 @@ bool BufferCache<P>::SynchronizeBufferPages(Buffer& buffer, DAddr device_addr, u
+         const auto add_upload = [&](DAddr start, DAddr end) {
+             if (start == end) return;
+             const u64 range_size = end - start;
++            OverwriteNoteRead(start, range_size);
+             upload_copies.push_back(BufferCopy{
+                 .src_offset = total_size_bytes,
+                 .dst_offset = start - buffer_start,
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 7493f0d..5f97e42 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -348,6 +348,17 @@ public:
+     /// on the pages it writes).
+     void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges);
+ 
++    /// EDEN_NX2_OVERWRITE_CHECK (readback_wait.h), under the cache's lock on the thread that
++    /// applies gathered CPU writes: counts writes over downloads not landed yet ("early writes")
++    /// and, when `ahead`, remembers the ranges so reads of them before the present's fence count
++    /// as "ahead reads".
++    void OverwriteNoteCpuWrites(std::span<const std::pair<DAddr, u64>> ranges, bool ahead);
++    /// The present's fence was reached: later reads of those ranges are that frame's own.
++    void OverwriteClearAhead();
++    /// The CPU presented again: logs the counters of CPU frame `present_number` (when any is
++    /// above 0) and the 5 s summary, and starts new ones.
++    void OverwriteCloseWindow(u64 present_number);
++
+     /// Return true when there are uncommitted buffers to be downloaded
+     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
+ 
+@@ -840,6 +851,52 @@ private:
+     /// fence pops. A write to a range after a download was taken removes it from that download
+     /// (and every other pending one): its bytes are older than the write.
+     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
++    /// EDEN_NX2_READBACK_WAIT only, one per pending download: the parts of its ranges a newer GPU
++    /// write was recorded over. They still land (a guest waiting for this fence reads them; the
++    /// newer download lands after them), but stay GPU-modified so the newer one is still taken.
++    std::deque<Common::RangeSet<DAddr>> pending_download_superseded;
++
++    /// GPU thread reads of guest memory for buffers (uploads, streamed uniforms): counts ahead
++    /// reads for EDEN_NX2_OVERWRITE_CHECK. Off, or with nothing ahead: returns at once.
++    void OverwriteNoteRead(DAddr device_addr, u64 size) {
++        if (!overwrite_ahead_active || size == 0 ||
++            !overwrite_ahead_ranges.Intersects(device_addr, size)) {
++            return;
++        }
++        u64 bytes = 0;
++        overwrite_ahead_ranges.ForEachInRange(device_addr, size, [&](DAddr lower, DAddr upper) {
++            bytes += upper - lower;
++        });
++        if (overwrite_counts.ahead_reads == 0) {
++            overwrite_counts.first_ahead_read = device_addr;
++        }
++        ++overwrite_counts.ahead_reads;
++        overwrite_counts.ahead_read_bytes += bytes;
++    }
++    struct OverwriteCounts {
++        u64 ahead_writes{};
++        u64 ahead_write_bytes{};
++        u64 ahead_reads{};
++        u64 ahead_read_bytes{};
++        DAddr first_ahead_read{};
++        u64 early_writes{};
++        u64 early_write_bytes{};
++        DAddr first_early_write{};
++    };
++    /// Empty unless EDEN_NX2_OVERWRITE_CHECK=1 (only OverwriteNoteCpuWrites adds to it).
++    Common::RangeSet<DAddr> overwrite_ahead_ranges;
++    bool overwrite_ahead_active{}; ///< overwrite_ahead_ranges is not empty
++    OverwriteCounts overwrite_counts{};
++    struct OverwriteSummary {
++        u64 frames{};
++        u64 frames_ahead_writes{};
++        u64 frames_ahead_reads{};
++        u64 frames_early_writes{};
++        u64 frames_both{};
++        u64 lines{};
++        std::chrono::steady_clock::time_point start{};
++    };
++    OverwriteSummary overwrite_summary{};
+     PendingCpuWrites pending_cpu_writes;
+     std::optional<Async_Buffer> current_buffer;
+ 
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 43ea2f8..a3bcdf0 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -37,11 +37,35 @@
+ #include "video_core/macro_turing_jit.h"
+ #endif
+ #include "video_core/rasterizer_interface.h"
++#include "video_core/readback_wait.h"
+ #include "video_core/textures/decoders.h"
+ 
+ namespace Tegra::Engines {
+ 
+ namespace {
++/// EDEN_NX2_READBACK_WAIT=2 and up: around the SignalFence of a semaphore release, makes it wait
++/// for its fence (after downloads in flight) as the query cache's reports do. Off: does nothing.
++class ReleaseHoldScope {
++public:
++    ReleaseHoldScope() : hold{VideoCore::Readback::HoldRelease()} {
++        if (hold) {
++            VideoCore::g_signaling_query_report_fence = true;
++            VideoCore::Readback::g_signaling_held_release = true;
++        }
++    }
++    ~ReleaseHoldScope() {
++        if (hold) {
++            VideoCore::g_signaling_query_report_fence = false;
++            VideoCore::Readback::g_signaling_held_release = false;
++        }
++    }
++    ReleaseHoldScope(const ReleaseHoldScope&) = delete;
++    ReleaseHoldScope& operator=(const ReleaseHoldScope&) = delete;
++
++private:
++    bool hold;
++};
++
+ // EDEN_NX2_NO_UPLOAD_STORE=1: a native channel doesn't list its inline uploads. Only the older
+ // class's launch method reads that list and clears it, and ProcessNativeMethod never lets a native
+ // channel get there, so the list only grew: 24 bytes an upload, about 2,900 a second.
+@@ -121,6 +145,7 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
+     }
+     if ((argument >> 3) & 1) {
+         const u32 reduction = (argument >> 9) & 7;
++        const ReleaseHoldScope release_hold;
+         rasterizer->SignalFence([this, address, payload, reduction] {
+             const u32 old_value = memory_manager.Read<u32>(address);
+             const u32 value = reduction == 0   ? old_value + payload
+@@ -383,6 +408,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
+             [&](u64 address, u32 payload, u32 flags) {
+                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
+                 if (flags & (1U << 26)) {
++                    const ReleaseHoldScope release_hold;
+                     rasterizer->SignalFence([this, address, payload] {
+                         const u32 value = memory_manager.Read<u32>(address) + payload;
+                         memory_manager.Write<u32>(address, value);
+@@ -403,6 +429,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
+                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
+                     // releases also advance: a plain write would move it backwards and leave
+                     // GEQ acquires waiting forever.
++                    const ReleaseHoldScope release_hold;
+                     rasterizer->SignalFence([this, address, payload] {
+                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
+                         memory_manager.Write<u32>(address, value);
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index ed87aaa..611e063 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -32,6 +32,7 @@
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/rasterizer_interface.h"
++#include "video_core/readback_wait.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -91,46 +92,28 @@ public:
+ private:
+     static constexpr u32 NoSyncpoint = ~u32{0};
+ 
+-    /// EDEN_NX2_READBACK_WAIT (unset or 0: off). The guest's fences are syncpoints, and the GPU
+-    /// thread raises a syncpoint's guest value as soon as it records the increment. GPU writes to
+-    /// memory the CPU has read back before (Preflushable ranges) reach guest memory only later,
+-    /// when the host GPU has run the work and the fencing thread pops that fence (the download at
+-    /// fences). A guest that waits for its fence and then reads the result could read guest
+-    /// memory before that download landed (stale data), and its next write (Ocarina's exposure
+-    /// meter: read the sum, store 0) could land before the download, which then overwrote it.
+-    /// Running a frame ahead (and a faster JIT) puts the CPU's read closer to the GPU thread's
+-    /// increment. EDEN_UP_OOT_FRAME_WAIT / EDEN_NX2_FRAMES_AHEAD=0 avoid that by stalling every
+-    /// present until the frame is recorded. This holds back only the increments that could expose
+-    /// stale data instead: a syncpoint increment whose fence commits a download, and every later
+-    /// one while such a fence or a held increment is outstanding (syncpoint values stay in order),
+-    /// is made after the fence popped, i.e. after the downloads landed. All other increments stay
+-    /// immediate. Held increments are still made on the GPU split's back, never on the fencing
+-    /// thread: a guest action on a syncpoint can composite (Vulkan scheduler, back only). The
+-    /// back makes them at its next fence, between entries when the fencing thread asks (idle
+-    /// hook), and before it sleeps, where it first waits for all of them so none stays held while
+-    /// nothing runs. Needs the split's back (Vulkan); elsewhere increments stay immediate.
+-    /// =1: buffer and texture downloads; =2: query reports too; =3: hold every syncpoint
+-    /// increment until its fence pops (diagnostic, the most waiting).
++    /// EDEN_NX2_READBACK_WAIT (readback_wait.h; unset or 0: off). The guest's fences are
++    /// syncpoints, and the GPU thread raises a syncpoint's guest value as soon as it records the
++    /// increment. GPU writes to memory the CPU has read back before (Preflushable ranges) reach
++    /// guest memory only later, when the host GPU has run the work and the fencing thread pops
++    /// that fence (the download at fences). A guest that waits for its fence and then reads the
++    /// result could read guest memory before that download landed. v2 (after T65's 0410): an
++    /// increment is held only while a download committed up to it has not landed, and only for
++    /// that long. Held increments never keep later ones held by themselves: once every download
++    /// committed before an increment landed, it and everything held before it are made, in
++    /// order (T65 counted held increments as pending, so in practice every increment was held).
++    /// Held increments are made on the GPU split's back only (a guest action on a syncpoint can
++    /// composite: Vulkan scheduler): at its next syncpoint fence, between entries when the
++    /// fencing thread reports the downloads landed (idle hook), and before it sleeps, where it
++    /// first waits for those downloads (bounded; it leaves at once when new work arrives).
++    /// Needs the split's back (Vulkan); elsewhere increments stay immediate.
+     static int ReadbackWait() {
+-        static const int mode = [] {
+-            const char* value = std::getenv("EDEN_NX2_READBACK_WAIT");
+-            const int parsed = value != nullptr && value[0] >= '1' && value[0] <= '3' &&
+-                                       value[1] == '\0'
+-                                   ? value[0] - '0'
+-                                   : 0;
+-            if (parsed != 0) {
+-                LOG_INFO(HW_GPU,
+-                         "EDEN_NX2_READBACK_WAIT={}: syncpoint increments after downloads wait "
+-                         "until the downloads land",
+-                         parsed);
+-            }
+-            return parsed;
+-        }();
+-        return mode;
++        return VideoCore::Readback::Mode();
+     }
+ 
+     /// EDEN_NX2_READBACK_WAIT: one line per 5 s with how many syncpoint increments were held and
+-    /// for how long (the cost of the switch). Counts are relaxed atomics: the line is a guide.
++    /// for how long, what the back's waits before sleeping cost, and the release counters.
++    /// Counts are relaxed atomics: the line is a guide.
+     void NoteReadbackIncrement(bool held) {
+         readback_stats_increments.fetch_add(1, std::memory_order_relaxed);
+         if (held) {
+@@ -153,9 +136,18 @@ private:
+         const u64 released = readback_stats_released.exchange(0, std::memory_order_relaxed);
+         const u64 held_us = readback_stats_held_us.exchange(0, std::memory_order_relaxed);
+         const u64 max_us = readback_stats_max_us.exchange(0, std::memory_order_relaxed);
++        const u64 quiet_waits = readback_quiet_waits.exchange(0, std::memory_order_relaxed);
++        const u64 quiet_us = readback_quiet_us.exchange(0, std::memory_order_relaxed);
++        const u64 quiet_max_us = readback_quiet_max_us.exchange(0, std::memory_order_relaxed);
++        const u64 quiet_left = readback_quiet_left.exchange(0, std::memory_order_relaxed);
++        const u64 forced = readback_forced.exchange(0, std::memory_order_relaxed);
++        using namespace VideoCore::Readback;
+         LOG_INFO(HW_GPU,
+                  "ReadbackWait 5 s: {} syncpoint increments, {} held ({:.1f}%), held for mean "
+-                 "{:.2f} ms, max {:.2f} ms, {} fences with downloads in flight",
++                 "{:.2f} ms, max {:.2f} ms; back waited before sleeping {} times, mean {:.2f} "
++                 "ms, max {:.2f} ms, left for new work {}, gave up {}; releases during "
++                 "downloads {}, held {}; superseded downloads landed {}; {} fences with "
++                 "downloads in flight",
+                  increments, held_count,
+                  increments != 0 ? 100.0 * static_cast<double>(held_count) /
+                                        static_cast<double>(increments)
+@@ -163,8 +155,38 @@ private:
+                  released != 0 ? static_cast<double>(held_us) / static_cast<double>(released) /
+                                      1000.0
+                                : 0.0,
+-                 static_cast<double>(max_us) / 1000.0,
+-                 readback_pending.load(std::memory_order_relaxed));
++                 static_cast<double>(max_us) / 1000.0, quiet_waits,
++                 quiet_waits != 0 ? static_cast<double>(quiet_us) /
++                                        static_cast<double>(quiet_waits) / 1000.0
++                                  : 0.0,
++                 static_cast<double>(quiet_max_us) / 1000.0, quiet_left, forced,
++                 g_releases_during_downloads.exchange(0, std::memory_order_relaxed),
++                 g_releases_held.exchange(0, std::memory_order_relaxed),
++                 g_superseded_landed.exchange(0, std::memory_order_relaxed),
++                 g_downloads_in_flight.load(std::memory_order_relaxed));
++    }
++
++    static void NoteMax(std::atomic<u64>& max, u64 value) {
++        u64 seen = max.load(std::memory_order_relaxed);
++        while (value > seen &&
++               !max.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
++        }
++    }
++
++    /// Back only: publishes what the fencing thread compares landed downloads against.
++    void PublishHeldFront() {
++        held_front_needs.store(held_increments.empty() ? ~u64{0} : held_increments.front().needs,
++                               std::memory_order_seq_cst);
++    }
++
++    /// Back only, after a held increment was queued: publishes the front, and asks for the idle
++    /// hook when its downloads already landed (the fencing thread may have compared before the
++    /// store and not woken the back; seq_cst on both sides, so one of them sees the other).
++    void PublishHeldPush() {
++        PublishHeldFront();
++        if (downloads_landed.load(std::memory_order_seq_cst) >= held_increments.front().needs) {
++            GpuSplit::Get().RequestIdleHook();
++        }
+     }
+ 
+     void SignalFenceImpl(std::function<void()>&& func, u32 syncpoint) {
+@@ -185,17 +207,27 @@ private:
+             ApplyReleasedIncrements(false);
+         }
+         auto [should_flush, committed_flushes] = CommitCacheFlushes();
+-        // EDEN_NX2_READBACK_WAIT: whether this fence carries a download, and whether its
+-        // syncpoint increment waits for the fence to pop. Off (0): neither, as before.
++        // EDEN_NX2_READBACK_WAIT: whether this fence carries a download (it then counts in
++        // downloads_committed and lowers the in-flight count when it pops), and whether its
++        // syncpoint increment is held. Off (0): neither, as before.
+         bool carries_readback = false;
+         bool hold_increment = false;
+         if (const int readback_mode = ReadbackWait(); readback_mode != 0) {
+             carries_readback = committed_flushes != 0 ||
+-                               (readback_mode >= 2 && query_cache.HasUncommittedFlushes());
++                               (readback_mode >= 2 && query_cache.HasUncommittedFlushes()) ||
++                               (readback_mode >= 3 && syncpoint != NoSyncpoint);
+             if (syncpoint != NoSyncpoint) {
+                 const bool can_hold = GpuSplit::Get().BackRunning() && GpuSplit::OnBackThread();
+-                hold_increment = can_hold && (readback_mode >= 3 || carries_readback ||
+-                                              readback_pending.load(std::memory_order_acquire) != 0);
++                // Held when this fence's own downloads, or any committed before, have not landed.
++                // held_increments not being empty only matters re-entrantly (a guest action of a
++                // held increment being made signals another one) or when downloads landed since
++                // ApplyReleasedIncrements above: the new one then queues behind the older ones,
++                // which go first.
++                hold_increment =
++                    can_hold && (carries_readback ||
++                                 downloads_landed.load(std::memory_order_acquire) <
++                                     downloads_committed.load(std::memory_order_acquire) ||
++                                 !held_increments.empty());
+                 if (!can_hold) {
+                     static std::atomic_flag logged;
+                     if (!logged.test_and_set(std::memory_order_relaxed)) {
+@@ -211,9 +243,15 @@ private:
+                 NoteReadbackIncrement(hold_increment);
+             }
+         }
+-        if (!hold_increment && !carries_readback && !delay_fence && committed_flushes == 0 &&
+-            SkipEmptyFence()) {
++        if (!carries_readback && !delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
+             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
++            if (hold_increment) {
++                // Waits for downloads of earlier fences only: this fence is not needed.
++                held_increments.push_back({syncpoint,
++                                           downloads_committed.load(std::memory_order_acquire),
++                                           std::chrono::steady_clock::now()});
++                PublishHeldPush();
++            }
+             func();
+             rasterizer.InvalidateGPUCache();
+             return;
+@@ -229,28 +267,42 @@ private:
+             std::scoped_lock lock{uncommitted_guard};
+             if (delay_fence) {
+                 uncommitted_operations.emplace_back(std::move(func));
++                // EDEN_NX2_READBACK_WAIT=2 and up: a held release's operation ran; later releases
++                // may be written at once again (readback_wait.h). Never set when off.
++                if (VideoCore::Readback::g_signaling_held_release) {
++                    uncommitted_operations.emplace_back([] {
++                        VideoCore::Readback::g_held_releases_pending.fetch_sub(
++                            1, std::memory_order_acq_rel);
++                    });
++                }
+             }
+-            // Run by the fencing thread after this fence's downloads (and every earlier fence's)
+-            // landed in guest memory: hands the increment to the back (ApplyReleasedIncrements).
+-            // readback_pending counts held increments until the back made them, and fences with
+-            // downloads until they popped; while it is not 0 every later syncpoint increment is
+-            // held too, so values stay in order.
+-            if (hold_increment) {
+-                readback_pending.fetch_add(1, std::memory_order_acq_rel);
+-                held_outstanding.fetch_add(1, std::memory_order_acq_rel);
+-                const auto held_at = std::chrono::steady_clock::now();
+-                uncommitted_operations.emplace_back([this, syncpoint, held_at] {
+-                    {
+-                        std::scoped_lock released_lock{released_guard};
+-                        released_increments.push_back({syncpoint, held_at});
++            // The download sequence is taken here, under the locks the fence queue is filled
++            // under, so it follows the order fences pop in. The operation runs on the fencing
++            // thread after this fence's downloads (and every earlier fence's) landed.
++            u64 needs = 0;
++            if (hold_increment && !carries_readback) {
++                needs = downloads_committed.load(std::memory_order_acquire);
++            }
++            if (carries_readback) {
++                needs = downloads_committed.fetch_add(1, std::memory_order_acq_rel) + 1;
++                VideoCore::Readback::g_downloads_in_flight.fetch_add(1,
++                                                                    std::memory_order_acq_rel);
++                uncommitted_operations.emplace_back([this] {
++                    const u64 landed = downloads_landed.fetch_add(1, std::memory_order_seq_cst) + 1;
++                    VideoCore::Readback::g_downloads_in_flight.fetch_sub(
++                        1, std::memory_order_acq_rel);
++                    if (landed >= held_front_needs.load(std::memory_order_seq_cst)) {
++                        {
++                            std::scoped_lock released_lock{released_guard};
++                        }
++                        released_cv.notify_all();
++                        GpuSplit::Get().RequestIdleHook();
+                     }
+-                    released_cv.notify_all();
+-                    GpuSplit::Get().RequestIdleHook();
+                 });
+-            } else if (carries_readback) {
+-                readback_pending.fetch_add(1, std::memory_order_acq_rel);
+-                uncommitted_operations.emplace_back(
+-                    [this] { readback_pending.fetch_sub(1, std::memory_order_acq_rel); });
++            }
++            if (hold_increment) {
++                held_increments.push_back({syncpoint, needs, std::chrono::steady_clock::now()});
++                PublishHeldPush();
+             }
+             pending_operations.emplace_back(std::move(uncommitted_operations));
+             uncommitted_operations.clear(); // moved-from: make it empty explicitly
+@@ -271,63 +323,102 @@ private:
+         rasterizer.InvalidateGPUCache();
+     }
+ 
+-public:
+-    /// EDEN_NX2_READBACK_WAIT, on the GPU split's back only (each fence, and its idle hook):
+-    /// makes the held syncpoint increments whose fences have popped, in order. going_quiet: the
+-    /// back is about to sleep, so first submit deferred work and wait until every held
+-    /// increment's fence popped: a guest waiting for one would otherwise wait for work that
+-    /// never comes. Off, or with nothing held: returns at once.
+-    void ApplyReleasedIncrements(bool going_quiet) {
+-        if (ReadbackWait() == 0 || held_outstanding.load(std::memory_order_acquire) == 0) {
+-            return;
++    /// Back only, going to sleep with increments held: submits deferred work and waits until the
++    /// downloads the newest held increment needs have landed. Leaves at once when the front
++    /// published new work (the back runs it and comes back here before it sleeps) or the split
++    /// stops; gives up after 4 s. Returns whether the held increments must be made anyway.
++    bool WaitForHeldDownloads() {
++        const u64 target = held_increments.back().needs;
++        if (downloads_landed.load(std::memory_order_acquire) >= target) {
++            return false;
+         }
+-        std::deque<ReleasedIncrement> ready;
++        SubmitDeferred();
++        auto& split = GpuSplit::Get();
++        const auto start = std::chrono::steady_clock::now();
++        const auto deadline = start + std::chrono::seconds{4};
++        bool force = false;
++        bool left = false;
+         {
+             std::unique_lock released_lock{released_guard};
+-            if (going_quiet && released_increments.size() <
+-                                   held_outstanding.load(std::memory_order_acquire)) {
+-                released_lock.unlock();
+-                SubmitDeferred();
+-                released_lock.lock();
+-                const auto start = std::chrono::steady_clock::now();
+-                auto next_log = start + std::chrono::seconds{2};
+-                while (released_increments.size() <
+-                       held_outstanding.load(std::memory_order_acquire)) {
+-                    released_cv.wait_for(released_lock, std::chrono::milliseconds{1});
+-                    if (const auto now = std::chrono::steady_clock::now(); now >= next_log) {
+-                        next_log = now + std::chrono::seconds{2};
++            while (downloads_landed.load(std::memory_order_acquire) < target) {
++                if (split.StopRequested()) {
++                    force = true;
++                    break;
++                }
++                if (split.HasUnconsumedWork()) {
++                    left = true;
++                    break;
++                }
++                if (std::chrono::steady_clock::now() >= deadline) {
++                    force = true;
++                    static std::atomic<u32> logged{};
++                    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                         LOG_WARNING(HW_GPU,
+-                                    "EDEN_NX2_READBACK_WAIT: the back waited {} s for {} of {} "
+-                                    "held syncpoint increments",
+-                                    std::chrono::duration_cast<std::chrono::seconds>(now - start)
+-                                        .count(),
+-                                    held_outstanding.load(std::memory_order_relaxed) -
+-                                        released_increments.size(),
+-                                    held_outstanding.load(std::memory_order_relaxed));
+-                        released_lock.unlock();
+-                        SubmitDeferred();
+-                        released_lock.lock();
++                                    "EDEN_NX2_READBACK_WAIT: downloads not landed in 4 s ({} of "
++                                    "{}): {} held syncpoint increments made anyway",
++                                    downloads_landed.load(std::memory_order_relaxed), target,
++                                    held_increments.size());
+                     }
++                    break;
+                 }
++                released_cv.wait_for(released_lock, std::chrono::milliseconds{1});
++            }
++        }
++        const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                            std::chrono::steady_clock::now() - start)
++                                            .count());
++        readback_quiet_waits.fetch_add(1, std::memory_order_relaxed);
++        readback_quiet_us.fetch_add(us, std::memory_order_relaxed);
++        NoteMax(readback_quiet_max_us, us);
++        if (left) {
++            readback_quiet_left.fetch_add(1, std::memory_order_relaxed);
++        }
++        if (force) {
++            readback_forced.fetch_add(1, std::memory_order_relaxed);
++        }
++        return force;
++    }
++
++public:
++    /// EDEN_NX2_READBACK_WAIT, on the GPU split's back only (each syncpoint fence, and its idle
++    /// hook): makes the held syncpoint increments whose downloads have landed, in order.
++    /// going_quiet: the back is about to sleep, so first wait for the rest (WaitForHeldDownloads):
++    /// a guest waiting for one would otherwise wait for work that never comes. Off, with nothing
++    /// held, or re-entered from a guest action of an increment being made: returns false at once.
++    /// Returns whether it made any (the caller submits what their guest actions deferred).
++    bool ApplyReleasedIncrements(bool going_quiet) {
++        if (ReadbackWait() == 0 || held_increments.empty() || applying_held) {
++            return false;
++        }
++        bool applied = false;
++        // Going quiet: a guest action of an increment made here can hold another one (it
++        // signalled a syncpoint with downloads in flight). Wait for that one too, a few rounds.
++        for (int round = 0; round < 4 && !held_increments.empty(); ++round) {
++            const bool force = going_quiet && WaitForHeldDownloads();
++            applying_held = true;
++            const auto now = std::chrono::steady_clock::now();
++            while (!held_increments.empty() &&
++                   (force || held_increments.front().needs <=
++                                 downloads_landed.load(std::memory_order_acquire))) {
++                const HeldIncrement released = held_increments.front();
++                held_increments.pop_front();
++                PublishHeldFront();
++                syncpoint_manager.IncrementGuest(released.syncpoint);
++                syncpoint_manager.IncrementHost(released.syncpoint);
++                applied = true;
++                const u64 us = static_cast<u64>(
++                    std::chrono::duration_cast<std::chrono::microseconds>(now - released.held_at)
++                        .count());
++                readback_stats_released.fetch_add(1, std::memory_order_relaxed);
++                readback_stats_held_us.fetch_add(us, std::memory_order_relaxed);
++                NoteMax(readback_stats_max_us, us);
+             }
+-            ready.swap(released_increments);
+-        }
+-        const auto now = std::chrono::steady_clock::now();
+-        for (const ReleasedIncrement& released : ready) {
+-            syncpoint_manager.IncrementGuest(released.syncpoint);
+-            syncpoint_manager.IncrementHost(released.syncpoint);
+-            held_outstanding.fetch_sub(1, std::memory_order_acq_rel);
+-            readback_pending.fetch_sub(1, std::memory_order_acq_rel);
+-            const u64 us = static_cast<u64>(
+-                std::chrono::duration_cast<std::chrono::microseconds>(now - released.held_at)
+-                    .count());
+-            readback_stats_released.fetch_add(1, std::memory_order_relaxed);
+-            readback_stats_held_us.fetch_add(us, std::memory_order_relaxed);
+-            u64 max_us = readback_stats_max_us.load(std::memory_order_relaxed);
+-            while (us > max_us && !readback_stats_max_us.compare_exchange_weak(
+-                                      max_us, us, std::memory_order_relaxed)) {
++            applying_held = false;
++            if (!going_quiet || GpuSplit::Get().HasUnconsumedWork()) {
++                break;
+             }
+         }
++        return applied;
+     }
+ 
+     void SignalSyncPoint(u32 value) {
+@@ -666,24 +757,33 @@ private:
+     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
+     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
+ 
+-    /// EDEN_NX2_READBACK_WAIT: fences with a download or a held syncpoint increment that have not
+-    /// popped yet (raised on the GPU thread, lowered by the fencing thread after the downloads).
+-    std::atomic<u64> readback_pending{};
++    /// EDEN_NX2_READBACK_WAIT: fences with downloads made so far (the GPU thread raises it under
++    /// the fence queue's locks) and popped so far (the fencing thread raises it after their
++    /// downloads landed). Fences pop in order, so downloads_landed >= n means the first n landed.
++    std::atomic<u64> downloads_committed{};
++    std::atomic<u64> downloads_landed{};
+     std::atomic<u64> readback_stats_increments{};
+     std::atomic<u64> readback_stats_held{};
+     std::atomic<u64> readback_stats_released{};
+     std::atomic<u64> readback_stats_held_us{};
+     std::atomic<u64> readback_stats_max_us{};
+     std::atomic<s64> readback_stats_start{};
+-    /// Held increments not made yet (raised and lowered on the back only).
+-    std::atomic<u64> held_outstanding{};
+-    struct ReleasedIncrement {
++    std::atomic<u64> readback_quiet_waits{};
++    std::atomic<u64> readback_quiet_us{};
++    std::atomic<u64> readback_quiet_max_us{};
++    std::atomic<u64> readback_quiet_left{};
++    std::atomic<u64> readback_forced{};
++    struct HeldIncrement {
+         u32 syncpoint;
++        u64 needs; ///< Made once downloads_landed reaches this
+         std::chrono::steady_clock::time_point held_at;
+     };
+-    /// Held increments whose fences popped, in fence order: the fencing thread adds, the back makes
+-    /// them (ApplyReleasedIncrements).
+-    std::deque<ReleasedIncrement> released_increments;
++    /// Held increments in signal order (back only; needs never decreases along it).
++    std::deque<HeldIncrement> held_increments;
++    /// The first held increment's needs, ~0 with none: the fencing thread wakes the back when
++    /// landed downloads reach it.
++    std::atomic<u64> held_front_needs{~u64{0}};
++    bool applying_held{}; ///< Back only: ApplyReleasedIncrements is running
+     std::mutex released_guard;
+     std::condition_variable released_cv;
+ 
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 60899be..7b85fa0 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -107,6 +107,16 @@ public:
+     [[nodiscard]] static bool BackGoingQuiet() {
+         return back_going_quiet;
+     }
++    /// Back thread, inside the idle hook: whether the front published entries the back has not
++    /// run yet (it runs them, and calls the hook again before it sleeps).
++    [[nodiscard]] bool HasUnconsumedWork() const {
++        return published.load(std::memory_order_acquire) !=
++               consumed.load(std::memory_order_acquire);
++    }
++    /// Any thread: whether the back thread was asked to stop.
++    [[nodiscard]] bool StopRequested() const {
++        return back_thread.get_stop_token().stop_requested();
++    }
+     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
+     void RequestIdleHook() {
+         hook_requested.store(true, std::memory_order_seq_cst);
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+index 27ab127..61c5d9a 100644
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -31,6 +31,7 @@
+ #include "video_core/query_cache/query_stream.h"
+ #include "video_core/query_cache/types.h"
+ #include "video_core/rasterizer_interface.h"
++#include "video_core/readback_wait.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -297,7 +298,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+         const char* const value = std::getenv("EDEN_NX2_QUERY_KEEP_PENDING");
+         return value != nullptr && value[0] != '0';
+     }();
+-    bool is_synced = !keep_pending && (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
++    // EDEN_NX2_READBACK_WAIT=2 and up (readback_wait.h): while downloads are in flight, a
++    // guest-visible release (fence-flagged, or a payload semaphore written at once below High)
++    // waits for its fence to pop, after the downloads, kept registered as with KEEP_PENDING.
++    const bool hold_release =
++        (is_fence || counter_type == QueryType::Payload) && VideoCore::Readback::HoldRelease();
++    bool is_synced = !keep_pending && !hold_release && (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+                                      pointer, pointer_timestamp, cpu_addr] {
+         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+@@ -338,9 +344,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+             impl->pending_unregister.push_back(query_location);
+         }
+     });
+-    if (is_fence) {
+-        VideoCore::g_signaling_query_report_fence = keep_pending;
++    if (is_fence || hold_release) {
++        VideoCore::g_signaling_query_report_fence = keep_pending || hold_release;
++        VideoCore::Readback::g_signaling_held_release = hold_release;
+         impl->rasterizer.SignalFence(std::move(operation));
++        VideoCore::Readback::g_signaling_held_release = false;
+         VideoCore::g_signaling_query_report_fence = false;
+     } else {
+         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+diff --git a/src/video_core/readback_wait.h b/src/video_core/readback_wait.h
+new file mode 100644
+index 0000000..632b232
+--- /dev/null
++++ b/src/video_core/readback_wait.h
+@@ -0,0 +1,115 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <cstdlib>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++
++/// State shared by EDEN_NX2_READBACK_WAIT (fence manager, query cache, compute engine, buffer
++/// cache) and EDEN_NX2_OVERWRITE_CHECK (nx2:vi2 present, buffer cache, Vulkan rasterizer).
++namespace VideoCore::Readback {
++
++/// EDEN_NX2_READBACK_WAIT (unset or 0: off, exactly T65's off path). The guest's syncpoint
++/// increments are made when the GPU thread records them, while GPU writes to ranges the CPU has
++/// read back before land in guest memory only when the host GPU ran them and the fencing thread
++/// popped their fence. While a fence with downloads is in flight (committed, not landed):
++///   1: syncpoint increments wait until every download committed up to them landed.
++///   2: as 1, and guest-visible semaphore/query release words (fence-flagged reports, payload
++///      semaphore releases, compute QMD releases) wait for their own fence to pop, which runs
++///      after the downloads (buffer cache pops come first on the fencing thread).
++///   3: as 2, and every syncpoint fence counts as a download (each increment waits for its own
++///      fence: the most waiting, a diagnostic).
++inline int Mode() {
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_READBACK_WAIT");
++        const int parsed = value != nullptr && value[0] >= '1' && value[0] <= '3' &&
++                                   value[1] == '\0'
++                               ? value[0] - '0'
++                               : 0;
++        if (parsed != 0) {
++            LOG_INFO(HW_GPU,
++                     "EDEN_NX2_READBACK_WAIT={} (v2): increments{} wait while downloads are in "
++                     "flight",
++                     parsed, parsed >= 2 ? " and semaphore/query releases" : "");
++        }
++        return parsed;
++    }();
++    return mode;
++}
++
++/// Fences with downloads committed and not yet landed (raised when the fence is made, lowered
++/// by the fencing thread after the downloads). Kept only while Mode() is not 0.
++inline std::atomic<u64> g_downloads_in_flight{};
++/// Guest-visible semaphore/query releases signalled while downloads were in flight, and how many
++/// of them waited for their fence (Mode() 2 and up). For the 5 s line.
++inline std::atomic<u64> g_releases_during_downloads{};
++inline std::atomic<u64> g_releases_held{};
++/// Download ranges a newer GPU write was recorded over before they landed, and that still landed
++/// (their bytes are what a guest waiting for that fence must read). For the 5 s line.
++inline std::atomic<u64> g_superseded_landed{};
++
++/// Mode() 2 and up: held releases whose operation has not run yet (raised by HoldRelease, lowered
++/// by the fencing thread right after the release's operation). While above 0 every later release
++/// is held too: release words then keep their order. Otherwise a plain or max release written at
++/// once (downloads landed meanwhile) was overwritten by an older held one landing after it, and
++/// the word moved backwards (GEQ acquires waiting forever, see the QMD max release).
++inline std::atomic<u64> g_held_releases_pending{};
++/// Set by the caller (this thread only) around the SignalFence of a release HoldRelease held: the
++/// fence manager then queues the matching decrement right after the release's operation.
++inline thread_local bool g_signaling_held_release = false;
++
++/// Called just before a guest-visible semaphore/query release is signalled: whether it must wait
++/// for its fence to pop (the caller then signals it as a delayed, never skipped fence, with
++/// g_signaling_held_release set).
++inline bool HoldRelease() {
++    if (Mode() == 0) {
++        return false;
++    }
++    const bool in_flight = g_downloads_in_flight.load(std::memory_order_acquire) != 0;
++    if (!in_flight && g_held_releases_pending.load(std::memory_order_acquire) == 0) {
++        return false;
++    }
++    if (in_flight) {
++        g_releases_during_downloads.fetch_add(1, std::memory_order_relaxed);
++    }
++    if (Mode() < 2) {
++        return false;
++    }
++    g_releases_held.fetch_add(1, std::memory_order_relaxed);
++    g_held_releases_pending.fetch_add(1, std::memory_order_acq_rel);
++    return true;
++}
++
++/// EDEN_NX2_OVERWRITE_CHECK=1: a log that tells the two flash theories apart in one run (run it
++/// with EDEN_NX2_READBACK_WAIT unset: held increments would make the back look behind).
++///  - overwrite: guest CPU writes made after the CPU presented frame P, applied while the GPU
++///    thread had not reached P's present fence yet ("ahead" writes), and the GPU thread then
++///    reading those bytes for frame P's remaining work ("ahead reads": P drawn with P+1's data);
++///  - readback: guest CPU writes over GPU-written ranges whose fence download has not landed
++///    ("early writes": the CPU acted on a readback before the GPU's result reached it, e.g. the
++///    exposure meter's read-the-sum-then-store-0).
++/// One line per CPU frame (present) with either count above 0, with the wall clock in ms for
++/// lining up with video flash times, and a 5 s summary.
++inline bool OverwriteCheck() {
++    static const bool on = [] {
++        const bool value = Common::PeSwitch("EDEN_NX2_OVERWRITE_CHECK");
++        if (value) {
++            LOG_INFO(HW_GPU, "EDEN_NX2_OVERWRITE_CHECK=1: per-frame ahead reads and early writes "
++                             "are logged as 'OverwriteCheck'");
++        }
++        return value;
++    }();
++    return on;
++}
++
++/// The latest present's fence, (id << 32) | value (~0: none), and its number. Set by nx2:vi2
++/// PresentClientBuffer before it waits, only with OverwriteCheck().
++inline std::atomic<u64> g_present_fence{~u64{0}};
++inline std::atomic<u64> g_present_number{};
++
++} // namespace VideoCore::Readback
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index b8523c4..d8ef646 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -37,6 +37,7 @@
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/native_query_trace.h"
++#include "video_core/readback_wait.h"
+ #include "video_core/indirect_reset.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/engines/kepler_compute.h"
+@@ -267,8 +268,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+             auto* const rasterizer = static_cast<RasterizerVulkan*>(argument);
+             rasterizer->scheduler.FlushDeferred();
+             // EDEN_NX2_READBACK_WAIT: syncpoint increments held for downloads (off: returns).
+-            rasterizer->fence_manager.ApplyReleasedIncrements(
+-                VideoCommon::GpuSplit::BackGoingQuiet());
++            // Their guest actions (composite) can defer work again: submit it before the back
++            // reports itself quiet.
++            if (rasterizer->fence_manager.ApplyReleasedIncrements(
++                    VideoCommon::GpuSplit::BackGoingQuiet())) {
++                rasterizer->scheduler.FlushDeferred();
++            }
+         },
+         this);
+     VideoCommon::GpuSplit::Get().SetHangReport(
+@@ -2028,7 +2033,49 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+     pipeline_cache.InvalidateRegion(addr, size);
+ }
+ 
++namespace {
++/// EDEN_NX2_OVERWRITE_CHECK: the thread that applies gathered guest CPU writes (the GPU thread or
++/// the split's back) only.
++struct OverwriteWindow {
++    u64 previous_fence = ~u64{0};  ///< Latest present's fence at the previous gather
++    u64 watched_fence = ~u64{0};   ///< Present whose fence the ahead writes wait for
++    u64 window_number = ~u64{0};   ///< CPU frame (present number) the counters belong to
++};
++OverwriteWindow overwrite_window;
++
++bool PresentFenceReached(Tegra::Host1x::SyncpointManager& syncpoints, u64 fence) {
++    const u32 id = static_cast<u32>(fence >> 32);
++    return fence == ~u64{0} || id >= Tegra::Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS ||
++           syncpoints.IsReadyGuest(id, static_cast<u32>(fence));
++}
++} // Anonymous namespace
++
+ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
++    if (VideoCore::Readback::OverwriteCheck()) {
++        // Writes gathered now were made after the previous gather, so after the present that
++        // was the latest then: if the GPU thread has not reached that present's fence, they are
++        // the next frame's bytes landing while it still records that frame ("ahead").
++        auto& syncpoints = gpu.Host1x().GetSyncpointManager();
++        OverwriteWindow& window = overwrite_window;
++        const u64 fence = VideoCore::Readback::g_present_fence.load(std::memory_order_acquire);
++        const u64 number = VideoCore::Readback::g_present_number.load(std::memory_order_acquire);
++        std::scoped_lock lock{buffer_cache.mutex};
++        if (number != window.window_number) {
++            buffer_cache.OverwriteCloseWindow(window.window_number);
++            window.window_number = number;
++        }
++        if (window.watched_fence != ~u64{0} &&
++            PresentFenceReached(syncpoints, window.watched_fence)) {
++            buffer_cache.OverwriteClearAhead();
++            window.watched_fence = ~u64{0};
++        }
++        const bool ahead = !PresentFenceReached(syncpoints, window.previous_fence);
++        if (ahead && window.watched_fence == ~u64{0}) {
++            window.watched_fence = window.previous_fence;
++        }
++        buffer_cache.OverwriteNoteCpuWrites(ranges, ahead);
++        window.previous_fence = fence;
++    }
+     {
+         std::scoped_lock lock{buffer_cache.mutex};
+         buffer_cache.ClaimCpuWrites(ranges);
