@@ -1,0 +1,993 @@
+Subject: [PATCH] memory cleanup by time (EDEN_NX2_CLEAN_BY_TIME=1) and free unused images before an allocation is refused (EDEN_NX2_REFUSAL_EVICT=1); frame-wait walk crash
+
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 0bebec8..315c52e 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -261,6 +261,7 @@ add_library(video_core STATIC
+     texture_cache/descriptor_table.h
+     texture_cache/formatter.cpp
+     texture_cache/formatter.h
++    texture_cache/frame_clock.h
+     texture_cache/format_lookup_table.cpp
+     texture_cache/format_lookup_table.h
+     texture_cache/image_base.cpp
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 5060b27..8ec7cce 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -221,11 +221,16 @@ void StagingBufferPool::CarryTick(u64 old_tick, u64 new_tick) {
+ }
+ 
+ void StagingBufferPool::TickFrame() {
+-    current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+-
+-    ReleaseCache(MemoryUsage::DeviceLocal);
+-    ReleaseCache(MemoryUsage::Upload);
+-    ReleaseCache(MemoryUsage::Download);
++    // EDEN_NX2_CLEAN_BY_TIME=1: one level is swept per 60 fps frame of time, up to 4 a frame, so
++    // finished staging buffers go back as soon at 15 fps as at 60. Unset: one a frame, as before.
++    const u32 steps = VideoCommon::CleanByTime() ? frame_steps.Next(4) : 1;
++    for (u32 step = 0; step < steps; ++step) {
++        current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
++
++        ReleaseCache(MemoryUsage::DeviceLocal);
++        ReleaseCache(MemoryUsage::Upload);
++        ReleaseCache(MemoryUsage::Download);
++    }
+ }
+ 
+ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size, bool may_wait) {
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index e27d637..3331ec7 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -12,6 +12,7 @@
+ #include <vector>
+ 
+ #include "common/common_types.h"
++#include "video_core/texture_cache/frame_clock.h"
+ 
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -158,6 +159,8 @@ private:
+     std::chrono::steady_clock::time_point refused_until{};
+ 
+     size_t current_delete_level = 0;
++    /// EDEN_NX2_CLEAN_BY_TIME: 60 fps frames per TickFrame (that many levels are swept).
++    VideoCommon::FrameSteps frame_steps;
+     u64 buffer_index = 0;
+     u64 unique_ids{};
+ };
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 567e264..5cfd714 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -2789,6 +2789,10 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
+ 
+ void TextureCacheRuntime::TickFrame() {
+     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
++    // EDEN_NX2_CLEAN_BY_TIME=1: the unused-frame counters below (decode images, copy buffers, MSAA
++    // scratch images) advance by the 60 fps frames this frame took, up to 8, instead of by 1: at
++    // 10 fps a copy buffer unused for EDEN_NX2_TC_TEMP_BUFFER_FRAMES=600 went after 60 s, now 10 s.
++    const u32 step = VideoCommon::CleanByTime() ? frame_steps.Next(8) : 1;
+     // Finished decode images wait for the next texture of their shape, up to this much memory.
+     // EDEN_NX2_TRANSCODE_KEEP_MIB=<MiB> (unset: 256, as before) lowers it. On the console the
+     // decode images of a loading screen's ASTC textures (four bytes a texel, every level) sat in
+@@ -2836,8 +2840,8 @@ void TextureCacheRuntime::TickFrame() {
+         }
+         pending_transcodes.pop_front();
+     }
+-    std::erase_if(free_transcodes, [](PendingTranscode& t) {
+-        return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
++    std::erase_if(free_transcodes, [step](PendingTranscode& t) {
++        return (t.unused_frames += step) > MAX_UNUSED_SCRATCH_FRAMES;
+     });
+     // EDEN_NX2_TC_TEMP_BUFFER_FRAMES=<frames> (unset: kept for the session, as before): a copy
+     // buffer from GetTemporaryBuffer (one per power of two, the size of the largest copy of that
+@@ -2857,7 +2861,7 @@ void TextureCacheRuntime::TickFrame() {
+             if (!buffers[level]) {
+                 continue;
+             }
+-            if (++buffer_unused_frames[level] > temp_buffer_frames &&
++            if ((buffer_unused_frames[level] += step) > temp_buffer_frames &&
+                 scheduler.IsFree(buffer_ticks[level])) {
+                 LOG_INFO(Render_Vulkan, "Copy buffer of {} MiB unused for {} frames: destroyed",
+                          (u64{1} << level) >> 20, buffer_unused_frames[level] - 1);
+@@ -2866,12 +2870,12 @@ void TextureCacheRuntime::TickFrame() {
+             }
+         }
+     }
+-    std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
++    std::erase_if(msaa_scratch_images, [this, step](MsaaScratchImage& scratch) {
+         if (!scheduler.IsFree(scratch.tick)) {
+             scratch.unused_frames = 0;
+             return false;
+         }
+-        return ++scratch.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
++        return (scratch.unused_frames += step) > MAX_UNUSED_SCRATCH_FRAMES;
+     });
+     std::erase_if(pending_resolve_shadows, [this](const auto& pending) {
+         return scheduler.IsFree(pending.first);
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 98a964d..e0c4d1f 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -123,6 +123,11 @@ public:
+         return memory_allocator.MemoryPressureEvents();
+     }
+ 
++    /// Allocations memory refused even over the budget so far (see MemoryAllocator).
++    u32 MemoryRefusalEvents() const noexcept {
++        return memory_allocator.MemoryRefusalEvents();
++    }
++
+     void LogMemoryStatistics() const;
+ 
+     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
+@@ -317,6 +322,8 @@ public:
+     /// (EDEN_NX2_TC_TEMP_BUFFER_FRAMES).
+     std::array<u64, indexing_slots> buffer_ticks{};
+     std::array<u32, indexing_slots> buffer_unused_frames{};
++    /// EDEN_NX2_CLEAN_BY_TIME: 60 fps frames per TickFrame for the unused-frame counters.
++    VideoCommon::FrameSteps frame_steps;
+     struct MsaaScratchKey {
+         VkFormat format;
+         VkImageType type;
+diff --git a/src/video_core/texture_cache/frame_clock.h b/src/video_core/texture_cache/frame_clock.h
+new file mode 100644
+index 0000000..3f2594b
+--- /dev/null
++++ b/src/video_core/texture_cache/frame_clock.h
+@@ -0,0 +1,118 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstddef>
++#include <optional>
++#include <utility>
++
++#include "common/common_types.h"
++#include "common/pe_switch.h"
++
++namespace VideoCommon {
++
++/// EDEN_NX2_CLEAN_BY_TIME=1 (unset: off, as before): the cleanups that count frames also count
++/// time. Every age and window of AreaEvict, the texture collector, the runtime's copy buffers and
++/// scratch images and the staging pool is in frames, and the game streams on wall time: at half
++/// the frame rate the cleanup came twice as late (Ocarina of Time with EDEN_UP_OOT_FRAME_WAIT=1,
++/// forest load, batch t64-x run 353: the pool ran out with ~810 images, ~2 GB, unused for 10
++/// frames or more). With the switch an age of N frames also counts as reached after N frames' time
++/// at 60 fps (N x 16.7 ms), but never under max(3, N/8) frames; per-frame budgets grow with the
++/// frame time, up to 4 times (8 for the runtime's counters).
++[[nodiscard]] inline bool CleanByTime() noexcept {
++    static const bool enabled = Common::PeSwitch("EDEN_NX2_CLEAN_BY_TIME");
++    return enabled;
++}
++
++/// EDEN_NX2_REFUSAL_EVICT=1 (unset: off, as before): a refused image allocation first frees images
++/// unused for 10 frames and 300 ms, then tries once more (TextureCache::RefusalEvict).
++[[nodiscard]] inline bool RefusalEvictEnabled() noexcept {
++    static const bool enabled = Common::PeSwitch("EDEN_NX2_REFUSAL_EVICT");
++    return enabled;
++}
++
++/// A frame count read as time at the reference rate of 60 frames a second.
++[[nodiscard]] constexpr std::chrono::microseconds FramesAsTime(u64 frames) noexcept {
++    return std::chrono::microseconds{static_cast<s64>((std::min)(frames, u64{1} << 40) * 1'000'000 / 60)};
++}
++
++/// When each of the last RingFrames frames ended, by frame number (TextureCache::TickFrame).
++class FrameClock {
++public:
++    using Clock = std::chrono::steady_clock;
++    static constexpr u64 RingFrames = 4096;
++
++    /// Frame `frame` ends now. Frames come in order; a gap starts the ring again.
++    void EndFrame(u64 frame, Clock::time_point now) noexcept {
++        if (count != 0 && frame != last + 1) {
++            count = 0;
++        }
++        last = frame;
++        ends[frame % RingFrames] = now;
++        count = (std::min)(count + 1, RingFrames);
++    }
++
++    /// The last frame that ended at or before `when`; empty when the ring holds none.
++    [[nodiscard]] std::optional<u64> LastEndedBy(Clock::time_point when) const noexcept {
++        if (count == 0) {
++            return std::nullopt;
++        }
++        u64 lo = last + 1 - count;
++        if (ends[lo % RingFrames] > when) {
++            return std::nullopt;
++        }
++        u64 hi = last;
++        while (lo < hi) { // ends[lo] <= when; the ends only grow with the frame number
++            const u64 mid = lo + (hi - lo + 1) / 2;
++            if (ends[mid % RingFrames] <= when) {
++                lo = mid;
++            } else {
++                hi = mid - 1;
++            }
++        }
++        return lo;
++    }
++
++    /// How many 60 fps frames each of the last (up to 8) frames took, rounded, from 1 to `max`.
++    [[nodiscard]] u32 Step(u32 max) const noexcept {
++        if (count < 2) {
++            return 1;
++        }
++        const u64 span = (std::min<u64>)(count - 1, 8);
++        const auto elapsed = ends[last % RingFrames] - ends[(last - span) % RingFrames];
++        const double frames =
++            std::chrono::duration<double>(elapsed).count() * 60.0 / static_cast<double>(span);
++        return static_cast<u32>(std::clamp(frames + 0.5, 1.0, static_cast<double>(max)));
++    }
++
++private:
++    std::array<Clock::time_point, RingFrames> ends{};
++    u64 last = 0;
++    u64 count = 0;
++};
++
++/// For a counter ticked once a frame (copy buffers, scratch images, staging levels): how many
++/// 60 fps frames passed since the last call, from 1 to `max` (a long hitch counts as `max`).
++class FrameSteps {
++public:
++    using Clock = std::chrono::steady_clock;
++
++    [[nodiscard]] u32 Next(u32 max) noexcept {
++        const auto now = Clock::now();
++        const auto previous = std::exchange(last, now);
++        if (previous == Clock::time_point{}) {
++            return 1;
++        }
++        const double frames = std::chrono::duration<double>(now - previous).count() * 60.0;
++        return static_cast<u32>(std::clamp(frames + 0.5, 1.0, static_cast<double>(max)));
++    }
++
++private:
++    Clock::time_point last{};
++};
++
++} // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 9230539..312852c 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -198,17 +198,23 @@ void TextureCache<P>::RunGarbageCollector() {
+     size_t num_iterations = 0;
+     size_t num_scanned = 0;
+     static const bool count_evictions = Common::PeSwitch("EDEN_PE_GC_EVICTIONS");
++    // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
++    static const u64 min_age = [] {
++        const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
++    }();
++    // EDEN_NX2_CLEAN_BY_TIME=1: the ages below also count as reached after their time at 60 fps
++    // (OldCutoff), and each pass may delete as many images more as the frame took 60 fps frames
++    // (up to 4 times): at 10 fps the collector would otherwise free a sixth as much per second.
++    const bool by_time = CleanByTime();
++    const u32 time_step = by_time ? frame_clock.Step(4) : 1;
+     const auto Configure = [&](bool allow_aggressive) {
+         high_priority_mode = total_used_memory >= expected_memory;
+         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
+         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
+-        // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
+-        static const u64 min_age = [] {
+-            const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
+-            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+-        }();
+         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
+         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
++        num_iterations *= time_step;
+         // Each pass gets its own scan budget, so the aggressive pass is not starved by earlier ones.
+         num_scanned = 0;
+     };
+@@ -282,12 +288,21 @@ void TextureCache<P>::RunGarbageCollector() {
+     // used). Among the oldest candidates (8 per image this pass may delete), those in the
+     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
+     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
++    // The LRU tick at or below which images are old enough for this pass.
++    const auto CollectBelow = [&]() -> u64 {
++        if (by_time) {
++            if (const std::optional<u64> below = OldCutoff(ticks_to_destroy, min_age)) {
++                return *below;
++            }
++        }
++        return frame_tick - ticks_to_destroy;
++    };
+     const auto Collect = [&] {
+         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
+             std::vector<ImageId> candidates;
+             static const bool wider = Common::PeSwitch("EDEN_PE_GC_BLOCK_ORDER");
+             const size_t limit = wider ? 1024 : num_iterations * 8;
+-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
++            lru_cache.ForEachItemBelow(CollectBelow(), [&](ImageId image_id) {
+                 candidates.push_back(image_id);
+                 return candidates.size() >= limit;
+             });
+@@ -328,7 +343,7 @@ void TextureCache<P>::RunGarbageCollector() {
+                 // Continue in age order, excluding ids already visited (some were deleted).
+                 // Sorted once so each LRU item costs a binary search, not a linear scan.
+                 std::sort(candidates.begin(), candidates.end());
+-                lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId id) {
++                lru_cache.ForEachItemBelow(CollectBelow(), [&](ImageId id) {
+                     if (std::binary_search(candidates.begin(), candidates.end(), id)) {
+                         return false;
+                     }
+@@ -336,7 +351,7 @@ void TextureCache<P>::RunGarbageCollector() {
+                 });
+             }
+         } else {
+-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
++            lru_cache.ForEachItemBelow(CollectBelow(), Cleanup);
+         }
+     };
+     Configure(false);
+@@ -344,9 +359,12 @@ void TextureCache<P>::RunGarbageCollector() {
+         const char* value = std::getenv("EDEN_NX2_TC_OLD_AGE");
+         return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
+     }();
+-    if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
++    const std::optional<u64> old_below =
++        by_time ? OldCutoff(old_age)
++                : (frame_tick > old_age ? std::optional<u64>{frame_tick - old_age} : std::nullopt);
++    if (high_priority_mode && old_age != 0 && old_below) {
+         evict_old_costly = true;
+-        lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
++        lru_cache.ForEachItemBelow(*old_below, Cleanup);
+         evict_old_costly = false;
+     }
+     Collect();
+@@ -421,6 +439,12 @@ void TextureCache<P>::CollectForBuffer(u64 wanted) {
+     std::fprintf(stderr, "EDEN_BUFFER_REFUSED %zu images, %llu MiB, deleted for %llu MiB\n",
+                  clean.size(), static_cast<unsigned long long>(total >> 20),
+                  static_cast<unsigned long long>(wanted >> 20));
++    // EDEN_NX2_REFUSAL_EVICT=1: the GPU-written images passed over here are copied back and
++    // deleted at the next frame's end (RefusalDownloadEvict), with the clean ones RefusalEvict
++    // takes there.
++    if (RefusalEvictEnabled()) {
++        refusal_seen_this_frame = true;
++    }
+ }
+ 
+ // EDEN_NX2_AREA_EVICT=<frames> (unset or 0: off, as before): when the game changes area, the
+@@ -442,6 +466,16 @@ void TextureCache<P>::CollectForBuffer(u64 wanted) {
+ // writes it again is lost. An image in use is touched every frame it is bound or sampled
+ // (PrepareImage), so it is never <frames> old and never a candidate.
+ // Lines in stderr: EDEN_AREA_EVICT burst/done, and one per frame with EDEN_NX2_TC_LOG.
++// EDEN_NX2_CLEAN_BY_TIME=1 changes two things. Ages: an image also counts as <frames> old after
++// <frames> frames' time at 60 fps (OldCutoff: 120 frames = 2 s, i.e. 20 frames at 10 fps, never
++// under max(3, frames / 8) frames), and up to 64 x (frame time in 60 fps frames, at most 4) images
++// go per frame. Window: without the switch it is 120 frames from the last burst, and an image
++// unused for <frames> frames inside it was last used <frames> frames before the window's frame, so
++// with <frames> 120 (or more) every image still used at or after the burst, the area being left,
++// could never go (run 353: one pass of 64 images, then 3 to 7). With the switch the window is
++// <frames> + 120 frames, and it ends early once that many frames' time at 60 fps has passed, but
++// not before max(3, <frames> / 8) + 15 frames (the time floor plus 15 frames of passes): every
++// image in use until the burst gets 120 frames, or 2 s, or 15 frames of passes once old enough.
+ template <class P>
+ void TextureCache<P>::AreaEvict() {
+     static const u64 age = [] {
+@@ -464,6 +498,30 @@ void TextureCache<P>::AreaEvict() {
+     constexpr u64 WindowFrames = 30;
+     constexpr u64 EvictFrames = 120;
+     constexpr size_t MaxPerFrame = 64;
++    const bool by_time = CleanByTime();
++    const auto now = std::chrono::steady_clock::now();
++    const u64 window_frames = by_time ? age + EvictFrames : EvictFrames;
++    const size_t max_per_frame = by_time ? MaxPerFrame * frame_clock.Step(4) : MaxPerFrame;
++    const auto window_open = [&] {
++        return frame_tick < area_evict_until &&
++               (!by_time || now < area_evict_until_time || frame_tick < area_evict_min_until);
++    };
++    const auto log_done = [&](size_t kept) {
++        std::fprintf(stderr,
++                     "EDEN_AREA_EVICT done at frame %llu: %llu images, %llu MiB deleted (%llu "
++                     "GPU-written, without a copy); %zu GPU-written images unused for %llu frames "
++                     "stay; %zu images hold %llu MiB\n",
++                     static_cast<unsigned long long>(frame_tick),
++                     static_cast<unsigned long long>(area_evicted_images),
++                     static_cast<unsigned long long>(area_evicted_bytes >> 20),
++                     static_cast<unsigned long long>(area_dropped_images), kept,
++                     static_cast<unsigned long long>(age), slot_images.size(),
++                     static_cast<unsigned long long>(total_used_memory >> 20));
++    };
++    if (by_time && area_window_open && !window_open()) {
++        area_window_open = false;
++        log_done(area_kept_last);
++    }
+     // Images created since the last frame, summed over a window of WindowFrames.
+     const u64 created = area_images_created - area_created_seen;
+     area_created_seen = area_images_created;
+@@ -473,33 +531,48 @@ void TextureCache<P>::AreaEvict() {
+     }
+     area_window_created += created;
+     if (area_window_created >= burst) {
+-        if (frame_tick >= area_evict_until) {
++        if (!window_open()) {
+             ++area_bursts;
+             area_evicted_images = area_evicted_bytes = area_dropped_images = 0;
+             std::fprintf(stderr,
+                          "EDEN_AREA_EVICT burst %llu at frame %llu: %llu new images in %llu frames; "
+                          "images unused for %llu frames go for the next %llu frames (%zu images "
+-                         "hold %llu MiB)\n",
++                         "hold %llu MiB)%s\n",
+                          static_cast<unsigned long long>(area_bursts),
+                          static_cast<unsigned long long>(frame_tick),
+                          static_cast<unsigned long long>(area_window_created),
+                          static_cast<unsigned long long>(frame_tick - area_window_frame + 1),
+                          static_cast<unsigned long long>(age),
+-                         static_cast<unsigned long long>(EvictFrames), slot_images.size(),
+-                         static_cast<unsigned long long>(total_used_memory >> 20));
++                         static_cast<unsigned long long>(window_frames), slot_images.size(),
++                         static_cast<unsigned long long>(total_used_memory >> 20),
++                         by_time ? ", or that many frames' time at 60 fps" : "");
++        }
++        area_evict_until = frame_tick + window_frames;
++        if (by_time) {
++            area_evict_until_time = now + FramesAsTime(window_frames);
++            area_evict_min_until = frame_tick + (std::max)(u64{3}, age / 8) + EvictFrames / 8;
+         }
+-        area_evict_until = frame_tick + EvictFrames;
+         area_window_frame = frame_tick;
+         area_window_created = 0;
+     }
+-    if (frame_tick >= area_evict_until || frame_tick <= age) {
++    if (by_time) {
++        if (!window_open()) {
++            return;
++        }
++        area_window_open = true;
++    } else if (frame_tick >= area_evict_until || frame_tick <= age) {
++        return;
++    }
++    const std::optional<u64> below =
++        by_time ? OldCutoff(age) : std::optional<u64>{frame_tick - age};
++    if (!below) {
+         return;
+     }
+     boost::container::small_vector<ImageId, MaxPerFrame> doomed;
+     u64 bytes = 0;
+     size_t dropped = 0;
+     size_t kept = 0;
+-    lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
++    lru_cache.ForEachItemBelow(*below, [&](ImageId image_id) {
+         const Image& image = slot_images[image_id];
+         if (True(image.flags & ImageFlagBits::IsDecoding) ||
+             (KeepAsyncDecodedFrames() != 0 &&
+@@ -515,7 +588,7 @@ void TextureCache<P>::AreaEvict() {
+         dropped += dirty ? 1 : 0;
+         bytes += ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
+         doomed.push_back(image_id);
+-        return doomed.size() == MaxPerFrame;
++        return doomed.size() == max_per_frame;
+     });
+     for (const ImageId image_id : doomed) {
+         Image& image = slot_images[image_id];
+@@ -538,6 +611,7 @@ void TextureCache<P>::AreaEvict() {
+     area_evicted_images += doomed.size();
+     area_evicted_bytes += bytes;
+     area_dropped_images += dropped;
++    area_kept_last = kept;
+     if (log_passes && !doomed.empty()) {
+         std::fprintf(stderr,
+                      "EDEN_AREA_EVICT frame %llu: %zu images, %llu MiB deleted (%zu GPU-written, "
+@@ -545,18 +619,237 @@ void TextureCache<P>::AreaEvict() {
+                      static_cast<unsigned long long>(frame_tick), doomed.size(),
+                      static_cast<unsigned long long>(bytes >> 20), dropped, kept);
+     }
+-    if (frame_tick + 1 == area_evict_until) {
++    if (!by_time && frame_tick + 1 == area_evict_until) {
++        log_done(kept);
++    }
++}
++
++// EDEN_NX2_CLEAN_BY_TIME=1: see OldCutoff in texture_cache_base.h. Without the switch: frames only.
++template <class P>
++std::optional<u64> TextureCache<P>::OldCutoff(u64 frames, u64 floor) const {
++    std::optional<u64> below;
++    if (frame_tick >= frames) {
++        below = frame_tick - frames;
++    }
++    if (!CleanByTime()) {
++        return below;
++    }
++    const u64 min_frames = (std::max)({floor, u64{3}, frames / 8});
++    if (frame_tick < min_frames) {
++        return below;
++    }
++    const auto ended = frame_clock.LastEndedBy(std::chrono::steady_clock::now() - FramesAsTime(frames));
++    if (!ended) {
++        return below;
++    }
++    // An image used in frame f was last used before frame f ended: by time it is that old once
++    // frame f ended that long ago.
++    const u64 by_time = (std::min)(*ended, frame_tick - min_frames);
++    return below ? (std::max)(*below, by_time) : by_time;
++}
++
++// EDEN_NX2_REFUSAL_EVICT=1 (unset: off, as before). When memory refuses an image, the cache had
++// nothing to give back: the collector and AreaEvict run at a frame's end, by age in frames, and the
++// refusal path freed 1 to 32 MiB of staging while ~810 images, ~2 GB, sat unused for 10 frames or
++// more (batch t64-x run 353, the forest load, crash with the largest free block at 0). Here the
++// refused image first frees images unused for 10 frames and 300 ms: clean ones only (uploaded again
++// from guest memory when used again, as after AreaEvict), and the images the new one is being
++// joined with stay. "Clean" is the meaning AreaEvict, CollectForBuffer and the collector use: not
++// IsDownloadable. That includes images the GPU wrote that cannot be copied back (MSAA without
++// CanDownloadMsaa, TrimmedLevels, unbacked/sparse, also written by the CPU): those go without a
++// copy here too, mid-frame and at the frame's end, as they do in those passes. Inside JoinImages
++// the GPU is then waited for and the images this pass deleted, and only those, are destroyed now:
++// images deleted earlier in the same draw's setup (JoinImages' own overlap deletes) stay until
++// TickFrame, since their views may already be in the draw's pushed descriptors
++// (GraphicsPipeline::ConfigureImpl pushes before UpdateRenderTargets). Then the image is made once
++// more. GPU-written images need a staging buffer as large as each
++// to copy back, which is what a refusing pool does not have: they wait for the end of the frame
++// (RefusalDownloadEvict). Images found this frame are touched when found (FindImage), so an image a
++// caller holds while it makes another one is never 10 frames old; the callers that look up several
++// images already go again when one was deleted (has_deleted_images), as for JoinImages' own deletes.
++// Lines in stderr: EDEN_REFUSAL_EVICT, the first 16 and then every 64th.
++template <class P>
++u64 TextureCache<P>::RefusalEvict(u64 wanted, bool in_join) {
++    constexpr u64 MinFrames = 10;
++    constexpr auto MinAge = std::chrono::milliseconds(300);
++    constexpr size_t MaxImages = 128;
++    constexpr size_t MaxVisits = 4096;
++    if (frame_tick <= MinFrames) {
++        return 0;
++    }
++    const auto ended = frame_clock.LastEndedBy(std::chrono::steady_clock::now() - MinAge);
++    if (!ended) {
++        return 0;
++    }
++    const u64 below = (std::min)(frame_tick - MinFrames, *ended);
++    const u64 target = std::clamp<u64>(wanted * 2, 64_MiB, 512_MiB);
++    const auto joining = [&](ImageId image_id) {
++        return in_join && (join_overlaps_found.contains(image_id) ||
++                           join_ignore_textures.contains(image_id) ||
++                           std::ranges::find(join_left_aliased_ids, image_id) !=
++                               join_left_aliased_ids.end() ||
++                           std::ranges::find(join_right_aliased_ids, image_id) !=
++                               join_right_aliased_ids.end() ||
++                           std::ranges::find(join_bad_overlap_ids, image_id) !=
++                               join_bad_overlap_ids.end());
++    };
++    boost::container::small_vector<ImageId, MaxImages> doomed;
++    u64 bytes = 0;
++    size_t visits = 0;
++    size_t dirty = 0;
++    lru_cache.ForEachItemBelow(below, [&](ImageId image_id) {
++        if (++visits > MaxVisits) {
++            return true;
++        }
++        const Image& image = slot_images[image_id];
++        if (True(image.flags & ImageFlagBits::IsDecoding) ||
++            (KeepAsyncDecodedFrames() != 0 &&
++             True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
++            joining(image_id)) {
++            return false;
++        }
++        if (IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap)) {
++            ++dirty;
++            return false;
++        }
++        bytes += ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
++        doomed.push_back(image_id);
++        return doomed.size() == MaxImages || bytes >= target;
++    });
++    // Entries this pass appends to gpu_sentenced_images start here (DeleteImage push_backs; an
++    // image retained for a queued download appends nothing).
++    const size_t sentenced_before = gpu_sentenced_images.size();
++    for (const ImageId image_id : doomed) {
++        Image& image = slot_images[image_id];
++        if (True(image.flags & ImageFlagBits::Tracked)) {
++            UntrackImage(image, image_id);
++        }
++        UnregisterImage(image_id);
++        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
++    }
++    if (dirty != 0) {
++        refusal_dirty_pending = true;
++    }
++    if (in_join && !doomed.empty()) {
++        // DeleteImage keeps each image until the GPU is past the tick being recorded. Wait for
++        // it (the collector's downloads and UploadLayers do the same mid-frame) and destroy the
++        // images this pass deleted: the entries appended above, from the back. Not
++        // ReleaseFinished(): that would also destroy images deleted earlier in this draw's setup
++        // (an overlap JoinImages deleted for the colour target) whose views the draw's pushed
++        // descriptors still point at; those stay for TickFrame as in T66. The doomed images are
++        // clean, unused for 10 frames and 300 ms, and not sampled by this draw (PrepareImageView
++        // touches what it samples), so nothing recorded or pushed refers to them after Finish.
++        // Their views stay in sentenced_image_view as for any deletion (never used again).
++        runtime.Finish();
++        if constexpr (requires { runtime.CurrentTick(); }) {
++            while (gpu_sentenced_images.size() > sentenced_before &&
++                   runtime.IsFree(gpu_sentenced_images.back().tick)) {
++                gpu_sentenced_bytes -= gpu_sentenced_images.back().bytes;
++                gpu_sentenced_images.pop_back();
++            }
++        }
++    }
++    ++refusal_evict_passes;
++    refusal_evict_images += doomed.size();
++    refusal_evict_bytes += bytes;
++    if (refusal_evict_passes <= 16 || refusal_evict_passes % 64 == 0) {
+         std::fprintf(stderr,
+-                     "EDEN_AREA_EVICT done at frame %llu: %llu images, %llu MiB deleted (%llu "
+-                     "GPU-written, without a copy); %zu GPU-written images unused for %llu frames "
+-                     "stay; %zu images hold %llu MiB\n",
+-                     static_cast<unsigned long long>(frame_tick),
+-                     static_cast<unsigned long long>(area_evicted_images),
+-                     static_cast<unsigned long long>(area_evicted_bytes >> 20),
+-                     static_cast<unsigned long long>(area_dropped_images), kept,
+-                     static_cast<unsigned long long>(age), slot_images.size(),
+-                     static_cast<unsigned long long>(total_used_memory >> 20));
++                     "EDEN_REFUSAL_EVICT %s at frame %llu for %llu MiB: %zu images, %llu MiB "
++                     "deleted, %zu GPU-written left for the frame's end, %zu looked at; %llu "
++                     "passes, %llu images, %llu MiB so far, %llu retries, %llu fitted\n",
++                     in_join ? "image" : "frame end", static_cast<unsigned long long>(frame_tick),
++                     static_cast<unsigned long long>(wanted >> 20), doomed.size(),
++                     static_cast<unsigned long long>(bytes >> 20), dirty, (std::min)(visits, MaxVisits),
++                     static_cast<unsigned long long>(refusal_evict_passes),
++                     static_cast<unsigned long long>(refusal_evict_images),
++                     static_cast<unsigned long long>(refusal_evict_bytes >> 20),
++                     static_cast<unsigned long long>(refusal_retries),
++                     static_cast<unsigned long long>(refusal_retries_fitted));
++    }
++    return bytes;
++}
++
++template <class P>
++void TextureCache<P>::RefusalDownloadEvict() {
++    constexpr u64 MinFrames = 10;
++    constexpr auto MinAge = std::chrono::milliseconds(300);
++    constexpr size_t MaxImages = 8;
++    constexpr u64 MaxImageBytes = 32_MiB;
++    constexpr u64 MaxBytes = 64_MiB;
++    constexpr size_t MaxVisits = 2048;
++    const auto now = std::chrono::steady_clock::now();
++    if (frame_tick <= MinFrames || now < refusal_download_next) {
++        refusal_dirty_pending = true; // still there for the next frame's end
++        return;
++    }
++    const auto ended = frame_clock.LastEndedBy(now - MinAge);
++    if (!ended) {
++        return;
++    }
++    const u64 below = (std::min)(frame_tick - MinFrames, *ended);
++    boost::container::small_vector<ImageId, MaxImages> chosen;
++    u64 chosen_bytes = 0;
++    size_t visits = 0;
++    lru_cache.ForEachItemBelow(below, [&](ImageId image_id) {
++        if (++visits > MaxVisits) {
++            return true;
++        }
++        const Image& image = slot_images[image_id];
++        if (True(image.flags & ImageFlagBits::IsDecoding) ||
++            (KeepAsyncDecodedFrames() != 0 &&
++             True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
++            !IsDownloadable(image) || True(image.flags & ImageFlagBits::BadOverlap)) {
++            return false;
++        }
++        const u64 size = image.unswizzled_size_bytes;
++        if (size > MaxImageBytes || chosen_bytes + size > MaxBytes) {
++            return false;
++        }
++        chosen.push_back(image_id);
++        chosen_bytes += size;
++        return chosen.size() == MaxImages;
++    });
++    using Map = decltype(runtime.DownloadStagingBuffer(size_t{}));
++    using Copies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
++    struct Pending {
++        ImageId image_id;
++        Map map;
++        Copies copies;
++    };
++    boost::container::small_vector<Pending, MaxImages> pending;
++    u64 bytes = 0;
++    for (const ImageId image_id : chosen) {
++        Image& image = slot_images[image_id];
++        auto map = TryDownloadStaging(runtime, image.unswizzled_size_bytes, false);
++        if (!map) {
++            break; // The pool has none: the collector copies the rest back when it gets to them.
++        }
++        auto copies = FullDownloadCopies(image.info);
++        image.DownloadMemory(*map, copies);
++        pending.push_back(Pending{image_id, *map, std::move(copies)});
++    }
++    if (pending.empty()) {
++        return;
+     }
++    refusal_download_next = now + std::chrono::milliseconds(250);
++    runtime.Finish();
++    for (Pending& entry : pending) {
++        Image& image = slot_images[entry.image_id];
++        SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies, entry.map.mapped_span,
++                     swizzle_data_buffer);
++        ++gc_download_deletes;
++        bytes += ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
++        if (True(image.flags & ImageFlagBits::Tracked)) {
++            UntrackImage(image, entry.image_id);
++        }
++        UnregisterImage(entry.image_id);
++        DeleteImage(entry.image_id, image.scale_tick > frame_tick + 5);
++    }
++    std::fprintf(stderr,
++                 "EDEN_REFUSAL_EVICT copied back at frame %llu: %zu GPU-written images, %llu MiB "
++                 "deleted (%zu chosen)\n",
++                 static_cast<unsigned long long>(frame_tick), pending.size(),
++                 static_cast<unsigned long long>(bytes >> 20), chosen.size());
+ }
+ 
+ template <class P>
+@@ -574,6 +867,9 @@ template <class P>
+ void TextureCache<P>::TickFrame() {
+     static const bool pe_busy = Common::PeSwitch("EDEN_PE_ASTC_BUSY_ASYNC");
+     if (pe_busy) Eden::AstcPolicy::Frame();
++    if (CleanByTime() || RefusalEvictEnabled()) {
++        frame_clock.EndFrame(frame_tick, std::chrono::steady_clock::now());
++    }
+     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
+     // rather than kept for the rest of the session.
+     // EDEN_TC_SCRATCH_KEEP_MIB=<0..64>: keep less of each between frames. A frame that needs more
+@@ -762,6 +1058,25 @@ void TextureCache<P>::TickFrame() {
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    if (RefusalEvictEnabled()) {
++        // EDEN_NX2_REFUSAL_EVICT=1: a refusal anywhere since the last frame's end (an image here,
++        // or the allocator: staging and other buffers, decode images, an image placed in host
++        // memory or left unbacked) frees clean images unused for 10 frames and 300 ms here, and
++        // GPU-written ones passed over by any pass are copied back and deleted, a few a frame.
++        bool refused = std::exchange(refusal_seen_this_frame, false);
++        if constexpr (requires { runtime.MemoryRefusalEvents(); }) {
++            const u32 events = runtime.MemoryRefusalEvents();
++            refused |= events != seen_refusal_events;
++            seen_refusal_events = events;
++        }
++        if (refused) {
++            RefusalEvict(64_MiB, false);
++        }
++        if (std::exchange(refusal_dirty_pending, false)) {
++            RefusalDownloadEvict();
++        }
++        refusal_evicts_this_frame = 0;
++    }
+     AreaEvict();
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+@@ -2807,15 +3122,23 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
+         return false;
+     };
+     ForEachImageInRegion(*cpu_addr, CalculateGuestSizeInBytes(info), lambda);
++    // EDEN_NX2_REFUSAL_EVICT=1: an image found is about to be used. Touched now, it is not among
++    // those RefusalEvict deletes when the caller makes another image before it prepares this one.
++    const auto found = [this](ImageId found_id) {
++        if (found_id && RefusalEvictEnabled()) {
++            lru_cache.Touch(slot_images[found_id].lru_index, frame_tick);
++        }
++        return found_id;
++    };
+     if (image_ids.size() <= 1) [[likely]] {
+-        return image_id;
++        return found(image_id);
+     }
+     auto image_ids_compare = [this](ImageId a, ImageId b) {
+         auto& image_a = slot_images[a];
+         auto& image_b = slot_images[b];
+         return image_a.modification_tick < image_b.modification_tick;
+     };
+-    return *std::ranges::max_element(image_ids, image_ids_compare);
++    return found(*std::ranges::max_element(image_ids, image_ids_compare));
+ }
+ 
+ template <class P>
+@@ -3635,7 +3958,48 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+         const u64 image_bytes = CalculateGuestSizeInBytes(new_info);
+         const auto now = std::chrono::steady_clock::now();
+         const bool paused = now < image_refused_until && image_bytes >= image_refused_bytes;
+-        if (paused || !runtime.SurvivesImageRefusal(make_image)) {
++        u32 refusals_before = 0;
++        if constexpr (requires { runtime.MemoryRefusalEvents(); }) {
++            refusals_before = runtime.MemoryRefusalEvents();
++        }
++        bool survived = !paused && runtime.SurvivesImageRefusal(make_image);
++        if (!paused && RefusalEvictEnabled()) {
++            // EDEN_NX2_REFUSAL_EVICT=1: refused outright, or made only as an unbacked stand-in
++            // after the allocator's fallbacks were refused too (the console's case: "does not fit;
++            // using an unbacked sparse image", which samples zero until a later use replaces it).
++            // Old clean images go (RefusalEvict) and the image is made once more; a stand-in is
++            // destroyed first (made a moment ago: nothing registered, recorded or bound with it).
++            // At most 2 passes a frame, none for 250 ms after one that freed nothing.
++            const auto stand_in = [](const ImageBase& image) {
++                return True(image.flags & ImageFlagBits::Unbacked) &&
++                       True(image.flags & ImageFlagBits::UnwrittenSparse) &&
++                       False(image.flags &
++                             (ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles));
++            };
++            bool refused_now = !survived;
++            if constexpr (requires { runtime.MemoryRefusalEvents(); }) {
++                refused_now |= runtime.MemoryRefusalEvents() != refusals_before;
++            }
++            const bool retry = !survived || (refused_now && stand_in(slot_images[new_image_id]));
++            refusal_seen_this_frame |= refused_now;
++            if (retry && refusal_evicts_this_frame < 2 && now >= refusal_evict_quiet_until) {
++                ++refusal_evicts_this_frame;
++                if (RefusalEvict(image_bytes, true) == 0) {
++                    refusal_evict_quiet_until = now + std::chrono::milliseconds(250);
++                } else {
++                    if (survived) {
++                        slot_images.erase(new_image_id);
++                        new_image_id = ImageId{};
++                    }
++                    ++refusal_retries;
++                    survived = runtime.SurvivesImageRefusal(make_image);
++                    if (survived && !stand_in(slot_images[new_image_id])) {
++                        ++refusal_retries_fitted;
++                    }
++                }
++            }
++        }
++        if (paused || !survived) {
+             if (!paused) {
+                 LOG_ERROR(HW_GPU, "No memory for the image at {:#x} ({}x{}, {} MiB): left out",
+                           gpu_addr, new_info.size.width, new_info.size.height, image_bytes >> 20);
+@@ -4082,15 +4446,23 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
+         return false;
+     };
+     ForEachImageInRegion(*cpu_addr, CalculateGuestSizeInBytes(info), lambda);
++    // EDEN_NX2_REFUSAL_EVICT=1: an image found is about to be used. Touched now, it is not among
++    // those RefusalEvict deletes when the caller makes another image before it prepares this one.
++    const auto found = [this](ImageId found_id) {
++        if (found_id && RefusalEvictEnabled()) {
++            lru_cache.Touch(slot_images[found_id].lru_index, frame_tick);
++        }
++        return found_id;
++    };
+     if (image_ids.size() <= 1) [[likely]] {
+-        return image_id;
++        return found(image_id);
+     }
+     auto image_ids_compare = [this](ImageId a, ImageId b) {
+         auto& image_a = slot_images[a];
+         auto& image_b = slot_images[b];
+         return image_a.modification_tick < image_b.modification_tick;
+     };
+-    return *std::ranges::max_element(image_ids, image_ids_compare);
++    return found(*std::ranges::max_element(image_ids, image_ids_compare));
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index bb495c6..eec341a 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -42,6 +42,7 @@
+ #include "video_core/game_dlss_status.h"
+ #include "video_core/surface.h"
+ #include "video_core/texture_cache/descriptor_table.h"
++#include "video_core/texture_cache/frame_clock.h"
+ #include "video_core/texture_cache/image_base.h"
+ #include "video_core/texture_cache/image_info.h"
+ #include "video_core/texture_cache/image_view_base.h"
+@@ -151,6 +152,30 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     u64 area_evicted_images{};  ///< This burst's totals (the done line)
+     u64 area_evicted_bytes{};
+     u64 area_dropped_images{};  ///< Of them, GPU-written images deleted without a copy
++    /// EDEN_NX2_CLEAN_BY_TIME: AreaEvict's window also ends no earlier than this (see AreaEvict)
++    std::chrono::steady_clock::time_point area_evict_until_time{};
++    u64 area_evict_min_until{}; ///< ...but not before this frame (very low frame rates)
++    bool area_window_open{};    ///< The window was open last frame (the done line, time mode)
++    size_t area_kept_last{};    ///< GPU-written images kept in the last pass (the done line)
++    /// EDEN_NX2_CLEAN_BY_TIME / EDEN_NX2_REFUSAL_EVICT: when each frame ended (TickFrame).
++    FrameClock frame_clock;
++    /// EDEN_NX2_REFUSAL_EVICT: allocator refusals already answered at a frame's end.
++    u32 seen_refusal_events{};
++    /// GPU-written images were passed over by RefusalEvict: the next TickFrame copies some back
++    /// and deletes them (RefusalDownloadEvict).
++    bool refusal_dirty_pending{};
++    /// An image was refused since the last TickFrame (JoinImages), with the switch on.
++    bool refusal_seen_this_frame{};
++    u32 refusal_evicts_this_frame{}; ///< RefusalEvict passes inside JoinImages this frame
++    /// After a pass inside JoinImages that freed nothing, none until then.
++    std::chrono::steady_clock::time_point refusal_evict_quiet_until{};
++    /// RefusalDownloadEvict waits for the GPU: at most one pass that copied anything per 250 ms.
++    std::chrono::steady_clock::time_point refusal_download_next{};
++    u64 refusal_evict_passes{};      ///< Totals for the stderr lines
++    u64 refusal_evict_images{};
++    u64 refusal_evict_bytes{};
++    u64 refusal_retries{};
++    u64 refusal_retries_fitted{};
+     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
+     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
+     u64 largest_upload{};    ///< Largest of them
+@@ -278,6 +303,28 @@ public:
+     /// Destroys the deleted images the GPU is done with, as TickFrame does. Mutex held.
+     void ReleaseFinished();
+ 
++    /// EDEN_NX2_CLEAN_BY_TIME: the LRU tick at or below which an image counts as unused for
++    /// `frames` frames: with the switch, also for that many frames' time at 60 fps when that is at
++    /// least max(floor, 3, frames / 8) frames. Empty when nothing can be that old yet.
++    [[nodiscard]] std::optional<u64> OldCutoff(u64 frames, u64 floor = 0) const;
++
++    /// EDEN_NX2_REFUSAL_EVICT=1: for an allocation of `wanted` bytes that memory refused, deletes
++    /// images unused for 10 frames and 300 ms that need no copy back (up to 128 images, until
++    /// twice `wanted`, 64 to 512 MiB, have gone; 4096 LRU entries looked at at most). GPU-written
++    /// ones are left for RefusalDownloadEvict at the next TickFrame. `in_join`: called from
++    /// JoinImages, mid-frame, mutex held: the images JoinImages is joining stay, and the GPU is
++    /// waited for so the memory of the images this pass deleted (only those; other sentenced
++    /// images wait for TickFrame) is back for the retry. "Need no copy back" = !IsDownloadable,
++    /// as in AreaEvict and the collector, so GPU-written images that cannot be copied back (MSAA
++    /// without CanDownloadMsaa, TrimmedLevels, unbacked) go without a copy. Returns bytes deleted.
++    u64 RefusalEvict(u64 wanted, bool in_join);
++
++    /// EDEN_NX2_REFUSAL_EVICT=1, at the end of a frame after RefusalEvict passed GPU-written
++    /// images over: copies back and deletes up to 8 of them, each up to 32 MiB and 64 MiB in all,
++    /// unused for 10 frames and 300 ms, as the collector does (one GPU wait), at most one such
++    /// pass per 250 ms. A staging buffer the pool refuses ends the pass. Mutex held.
++    void RefusalDownloadEvict();
++
+     /// Return a constant reference to the given image view id
+     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index fbd6208..669b0f8 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -251,6 +251,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+     }
+     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
++        refusal_events.fetch_add(1, std::memory_order_relaxed);
+         // Still out of device memory: a real image in host memory (slow, but valid) beats one
+         // with nothing bound, which AMD's drivers do not survive being sampled.
+         VmaAllocationCreateInfo host = alloc_ci;
+@@ -424,7 +425,12 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
+     VkMemoryPropertyFlags property_flags{};
+ 
+     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
+-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        const VkResult result =
++            vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++            refusal_events.fetch_add(1, std::memory_order_relaxed);
++        }
++        vk::Check(result);
+     }
+     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.h b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+index d1df008..5f8b876 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.h
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+@@ -133,6 +133,13 @@ namespace Vulkan {
+             return pressure_events.load(std::memory_order_relaxed);
+         }
+ 
++        /// Counts the allocations memory refused even over the budget: images that then went to
++        /// host memory, unbacked or nowhere, and buffers that failed. Only counted; the texture
++        /// cache answers it with EDEN_NX2_REFUSAL_EVICT=1.
++        u32 MemoryRefusalEvents() const noexcept {
++            return refusal_events.load(std::memory_order_relaxed);
++        }
++
+         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
+ 
+         /// A buffer in the space of the blocks held already: no new block, no budget, no report.
+@@ -173,6 +180,7 @@ namespace Vulkan {
+         VkDeviceSize buffer_image_granularity;            ///< Adjacent buffer/image granularity
+         u32 valid_memory_types{~0u};
+         mutable std::atomic<u32> pressure_events{0};
++        mutable std::atomic<u32> refusal_events{0};
+         mutable std::mutex buffer_type_mutex;
+         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
+         mutable std::unordered_map<u64, u32> buffer_memory_types;
