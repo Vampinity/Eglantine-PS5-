@@ -73,9 +73,11 @@ constexpr VkPipelineStageFlags COMPUTE_CONSUMER_STAGES =
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {"""),
-    ('        scheduler.RequestOutsideRenderPassOperationContext();\n        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),',
-     """        scheduler.RequestOutsideRenderPassOperationContext();
-        if (::Eden::DevVulkan::compute_barriers) {
+    # Anchored on the dispatch record itself: 0347-up-compute-indirect-order puts its own
+    # (switched) barrier between RequestOutsideRenderPassOperationContext and this record, and
+    # ours stays right before the dispatch, after it.
+    ('        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),',
+     """        if (::Eden::DevVulkan::compute_barriers) {
             scheduler.Record([](vk::CommandBuffer cmdbuf) {
                 cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
@@ -1594,6 +1596,18 @@ for old, new in shader_costs:
         old = old.replace('    return BuiltPipeline', mark_used + '    return BuiltPipeline')
         new = new.replace('    current_pipeline = pipeline.get();\n',
                           '    current_pipeline = pipeline.get();\n' + mark_used)
+    if old.startswith('    if (!is_new) {\n        return pipeline.get();\n    }\n') and old not in shader_source:
+        # 0345-up-null-pointer-slots puts its pointer-slot rebuild inside the !is_new block: keep it,
+        # and let that block fall through to the trace below instead of returning early.
+        tail = '\n        return pipeline.get();\n    }\n    pipeline = CreateComputePipeline(key, shader);\n    return pipeline.get();\n}'
+        if shader_source.count(tail) == 1:
+            old, new = tail, '\n    }\n' + new
+    if old == '    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {' and old not in shader_source:
+        # 0345-up-null-pointer-slots adds a `previous` parameter.
+        wider = '    const ComputePipelineCacheKey& key, const ShaderInfo* shader,\n    const ComputePipeline* previous) {'
+        if shader_source.count(wider) == 1:
+            new = new.replace(old, wider)
+            old = wider
     if 'Shader::TensorRejected' in old and 'Shader::TensorRejected' not in shader_source:
         old = ('    if (!is_new) {\n        return pipeline.get();\n    }\n'
                '    pipeline = CreateComputePipeline(key, shader);\n    return pipeline.get();\n}')
