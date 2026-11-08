@@ -1,0 +1,166 @@
+Subject: [PATCH] EDEN_GBB_PIPELINE_SAVE_20S: save vulkan_used.bin every 20 s while it grows, written off the GPU thread and renamed into place (GrowingBlackBeans gist 9998), off by default
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index f6f428a..695614c 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -698,6 +698,47 @@ u8 MaxUsedPipelineAge(const Device& device) {
+     return device.IsMoltenVK() ? UsedPipelinesMaxAgeMoltenVK : UsedPipelinesMaxAge;
+ }
+ 
++// EDEN_GBB_PIPELINE_SAVE_20S=1 (GrowingBlackBeans gist 9998, adapted): the used list is saved
++// at most every 20 s while it grows instead of every 2 minutes, and its last additions also when
++// no new pipeline follows them (TickFrame checks every 30 frames). A session quit from the PS menu
++// has no clean exit, so what it used after its last save was left out: each session built the
++// walk's ~300 pipelines on the GPU thread again (gist runs 43/50: ~390 builds during play, 76
++// with 20 s saves). What counts as a session is unchanged: a save less than 2 minutes after the
++// list loaded (the old first save) keeps the earlier sessions' ages, so a run that ends before
++// then ages nothing, as before. The list is gathered on the GPU thread, which owns graphics_cache
++// and the used sets, as the old save did; the file (8 bytes + 9 per hash, ~30 KB for two sessions
++// of ~1,500) is written on the serialization thread, beside the list and renamed over it, so a
++// kill mid-write keeps the previous list. The exit save stays synchronous.
++bool PipelineSave20s() {
++    static const bool on = Common::PeSwitch("EDEN_GBB_PIPELINE_SAVE_20S");
++    return on;
++}
++constexpr std::chrono::seconds UsedPipelinesSaveInterval{20};
++
++void WriteUsedPipelinesFile(const std::filesystem::path& path, const std::vector<char>& data) try {
++    auto partial = path;
++    partial += ".part";
++    std::error_code error;
++    {
++        std::ofstream file{partial, std::ios::binary | std::ios::trunc};
++        if (!file.write(data.data(), static_cast<std::streamsize>(data.size())) || !file.flush()) {
++            LOG_WARNING(Render_Vulkan, "Failed to write {}", Common::FS::PathToUTF8String(partial));
++            file.close();
++            std::filesystem::remove(partial, error);
++            return;
++        }
++    }
++    std::filesystem::rename(partial, path, error);
++    if (error) {
++        LOG_WARNING(Render_Vulkan, "Failed to replace {}: {}", Common::FS::PathToUTF8String(path),
++                    error.message());
++        std::filesystem::remove(partial, error);
++    }
++} catch (const std::exception& e) {
++    // On the serialization thread an escaped exception would end the emulator: keep the old list.
++    LOG_WARNING(Render_Vulkan, "Used pipeline list not saved: {}", e.what());
++}
++
+ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path, u8 max_age) {
+     std::unordered_map<u64, u8> used;
+     std::ifstream file{path, std::ios::binary};
+@@ -840,8 +881,9 @@ PipelineCache::~PipelineCache() {
+     }
+ }
+ 
+-void PipelineCache::SaveUsedPipelines() {
++void PipelineCache::SaveUsedPipelines(bool queue_write) {
+     used_pipelines_saved = std::chrono::steady_clock::now();
++    used_pipelines_dirty = false;
+     // A session too short to say what the game uses (a boot to the menu) keeps the old list.
+     constexpr size_t MinimumUsed = 64;
+     if (used_pipelines_filename.empty() ||
+@@ -858,10 +900,41 @@ void PipelineCache::SaveUsedPipelines() {
+     for (const u64 hash : used_and_evicted) {
+         next.emplace(hash, u8{0});
+     }
++    // EDEN_GBB_PIPELINE_SAVE_20S: a queued save in the first 2 minutes keeps the ages.
++    const bool keep_ages = PipelineSave20s() && queue_write &&
++                           used_pipelines_saved - used_pipelines_loaded <= std::chrono::minutes{2};
++    const int aging = keep_ages ? 0 : 1;
+     for (const auto& [hash, age] : used_pipelines) {
+-        if (age + 1 < MaxUsedPipelineAge(device)) {
+-            next.try_emplace(hash, static_cast<u8>(age + 1));
++        if (age + aging < MaxUsedPipelineAge(device)) {
++            next.try_emplace(hash, static_cast<u8>(age + aging));
++        }
++    }
++    if (PipelineSave20s()) {
++        const u32 count = static_cast<u32>(next.size());
++        std::vector<char> data(sizeof(UsedPipelinesMagic) + sizeof(count) +
++                               next.size() * (sizeof(u64) + sizeof(u8)));
++        char* out = data.data();
++        const auto put = [&out](const void* value, size_t size) {
++            std::memcpy(out, value, size);
++            out += size;
++        };
++        put(&UsedPipelinesMagic, sizeof(UsedPipelinesMagic));
++        put(&count, sizeof(count));
++        for (const auto& [hash, age] : next) {
++            put(&hash, sizeof(hash));
++            put(&age, sizeof(age));
++        }
++        if (!queue_write) {
++            WriteUsedPipelinesFile(used_pipelines_filename, data);
++            return;
+         }
++        // One serialization thread: queued saves land in order, after the pipeline records and
++        // driver cache flushes queued before them, and the exit save waits for all of them.
++        serialization_thread.QueueWork(
++            [path = used_pipelines_filename, data = std::move(data)] {
++                WriteUsedPipelinesFile(path, data);
++            });
++        return;
+     }
+     std::ofstream file{used_pipelines_filename, std::ios::binary | std::ios::trunc};
+     const u32 count = static_cast<u32>(next.size());
+@@ -1439,6 +1512,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     used_pipelines_filename = base_dir / "vulkan_used.bin";
+     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
+     used_pipelines_saved = std::chrono::steady_clock::now();
++    used_pipelines_loaded = used_pipelines_saved;
+     size_t skipped_pipelines = 0;
+     size_t queued_graphics = 0;
+ 
+@@ -1702,7 +1776,15 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+     if (!pipeline) {
+         return nullptr;
+     }
+-    if (used_this_session.insert(pipeline.get()).second &&
++    if (PipelineSave20s()) {
++        if (used_this_session.insert(pipeline.get()).second) {
++            used_pipelines_dirty = true;
++            if (std::chrono::steady_clock::now() - used_pipelines_saved >
++                UsedPipelinesSaveInterval) {
++                SaveUsedPipelines(true);
++            }
++        }
++    } else if (used_this_session.insert(pipeline.get()).second &&
+         std::chrono::steady_clock::now() - used_pipelines_saved > std::chrono::minutes{2}) {
+         SaveUsedPipelines();
+     }
+@@ -1723,6 +1805,12 @@ void PipelineCache::TickFrame() {
+     if (frame_count % EvictCheckFrames == 0) {
+         EvictUnusedPipelines();
+     }
++    // EDEN_GBB_PIPELINE_SAVE_20S: the last pipelines of a burst are saved too, though no new
++    // one follows them.
++    if (PipelineSave20s() && used_pipelines_dirty && frame_count % 30 == 0 &&
++        std::chrono::steady_clock::now() - used_pipelines_saved > UsedPipelinesSaveInterval) {
++        SaveUsedPipelines(true);
++    }
+ }
+ 
+ void PipelineCache::EvictUnusedPipelines() {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 170ac03..8aa2ee4 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -271,7 +271,13 @@ private:
+     std::unordered_set<const GraphicsPipeline*> used_this_session;
+     std::filesystem::path used_pipelines_filename;
+     std::chrono::steady_clock::time_point used_pipelines_saved{};
+-    void SaveUsedPipelines();
++    /// EDEN_GBB_PIPELINE_SAVE_20S: used_this_session grew since the last save.
++    bool used_pipelines_dirty{};
++    /// When the list was loaded (EDEN_GBB_PIPELINE_SAVE_20S: saves before 2 minutes keep ages).
++    std::chrono::steady_clock::time_point used_pipelines_loaded{};
++    /// queue_write (EDEN_GBB_PIPELINE_SAVE_20S only): the file is written on the serialization
++    /// thread, not the calling (GPU) thread.
++    void SaveUsedPipelines(bool queue_write = false);
+ 
+     std::filesystem::path vulkan_pipeline_cache_filename;
+     vk::PipelineCache vulkan_pipeline_cache;
