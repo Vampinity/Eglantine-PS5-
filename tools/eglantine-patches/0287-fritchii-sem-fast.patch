@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:20:00 +0100
+Subject: [PATCH] EDEN_NX2_SEM_FAST=1: semaphore acquires and their polls read the word without draining the back
+
+Off unless set. Port of Frizti/Fritchii 547ce11b4f (frizti-v3, "semaphore waits resolved
+without stopping the GPU threads", from zortos293/Lichii#231 by PantACRO4life, with thibaut's
+experiments) and abbe465fe0 (SEM_EXECUTE acquires without a drain). A Switch 2 acquire whose
+word is current is answered from the word: its page is not GPU-written (Nx2IsGpuWritten), the
+front has no release or report to its 16 bytes still queued for the back
+(GpuSplit::NotedWriteSince, the notes 0286 added), and the query cache lists no report there
+(HasCachedReports). Ocarina polls each waiting acquire about 12 times before it is met, and
+every poll drained the back (about 380 ms/s of the front's time on Frizti's PC). An acquire not
+met for 2 s takes the drained path, which reports it as before. The fast path is skipped with
+delayed fence operations (GPU accuracy High, Balanced/Accurate fences), where the drained path's
+periodic fence release is needed.
+=2 also lets SEM_EXECUTE acquires skip the drain and the check (their result only fed a
+warning), as Fritchii does; Fritchii pairs that with a NoteSync our split lacks, so this half is
+a guess.
+The 3D front's write notes (0286) are also on while this switch is set.
+Left out: Fritchii's Nx2Profile counters, the known-words overlay (=2 there) and the
+MetByQueuedRelease / AcquireLearning paths our tree does not have.
+---
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index dd5cd72..44bed0b 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -52,6 +52,55 @@ void DrainBack(VideoCommon::DrainSite site = VideoCommon::DrainSite::Acquire) {
+ // when it has drained: it can still be submitting deferred work before it sleeps, and the
+ // scheduler's chunk is empty for a moment then. Run them there and wait for them, so the caller
+ // sees what they released.
++// EDEN_NX2_SEM_FAST (Frizti/Fritchii 547ce11b4f + abbe465fe0, frizti-v3 "semaphore waits
++// resolved without stopping the GPU threads", from zortos293/Lichii#231 by PantACRO4life, with
++// thibaut's experiments): 1 = a Switch 2 semaphore acquire whose word is current (its page is not
++// GPU-written, no release or report to it is queued for the back or listed in the query cache)
++// is read without draining the back, at the acquire and at every poll while the channel waits.
++// Ocarina polls each waiting acquire about 12 times before it is met, and every poll drained the
++// back. 2 = SEM_EXECUTE acquires also skip the drain (their result only fed a warning). Off
++// unless set; read once at boot.
++int SemFastMode() {
++    static const int mode = [] {
++        const char* const value = std::getenv("EDEN_NX2_SEM_FAST");
++        if (value == nullptr || value[0] == '0') {
++            return 0;
++        }
++        return value[0] == '2' ? 2 : 1;
++    }();
++    return mode;
++}
++
++// Whether the word at `address` can be read without draining the back. Only without delayed
++// fence operations: with Balanced/Accurate fences a release queued after the acquire waits in
++// the caches for the next fence, and the drained path releases those now and then.
++bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    if (!split.Active() || SemFastMode() == 0) {
++        return false;
++    }
++    static const bool delayed = Settings::IsGPUFenceBehaviorDefault()
++                                    ? Settings::IsGPULevelHigh()
++                                    : Settings::IsGPUFenceBehaviorBalanced() ||
++                                          Settings::IsGPUFenceBehaviorAccurate();
++    if (delayed) {
++        return false;
++    }
++    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
++    if (!device || Nx2IsGpuWritten(*device)) {
++        return false;
++    }
++    const u64 line = *device & ~u64{0xf};
++    // A release or report to these bytes still queued for the back (the front's notes), or one
++    // the back ran whose value lands when its host query or fence completes (still listed).
++    if (split.NotedWriteSince(split.ConsumedNow(), line, 16) ||
++        dma_pusher.rasterizer->HasCachedReports(line, 16)) {
++        return false;
++    }
++    word = dma_pusher.memory_manager.Read<u32>(address);
++    return true;
++}
++
+ // EDEN_NX2_DMA_SNAPSHOT: a release just sent to the back writes 16 bytes at `address` (and at
+ // its Switch 2 mirror); a macro DMA read snapshot of that page ends there.
+ void NoteReleaseWrite(DmaPusher& dma_pusher, GPUVAddr address, GPUVAddr mirror = 0) {
+@@ -111,6 +160,19 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+     if (!pending_acquire) {
+         return true;
+     }
++    // EDEN_NX2_SEM_FAST: a poll answered from the word itself, without a drain. A poll that is
++    // not met for 2 s takes the drained path below, which reports it.
++    if (SemFastMode() != 0) {
++        if (Nx2SemaphoreWaiters::Get().Latched(this)) {
++            return true;
++        }
++        if (pending_acquire->reported ||
++            std::chrono::steady_clock::now() - pending_acquire->since < std::chrono::seconds{2}) {
++            if (u32 word{}; SemaphoreReadableNow(dma_pusher, pending_acquire->address, word)) {
++                return pending_acquire->Matches(word);
++            }
++        }
++    }
+     // The release may still be queued for the split GPU thread's back half: ReadSemaphoreWord
+     // waits for it (and flushes the caches there).
+     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+@@ -303,7 +365,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+             return;
+         }
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
++        // EDEN_NX2_SEM_FAST: the word is current (no queued or listed write the front knows of
++        // can change it): the value comes from the CPU or another channel later, and the polls
++        // in CanResumeAcquire pick it up without a drain.
++        u32 word{};
++        const bool readable = SemaphoreReadableNow(dma_pusher, acquire.address, word);
++        if (readable ? acquire.Matches(word)
++                     : acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+             return;
+         }
+         // Registered before the fences run, so a release among them that meets the value counts
+@@ -314,8 +382,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+         }
+         // ReadSemaphoreWord's drain also waits for the fences, so Latched is read after them.
+         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+-        const u32 word = ReadSemaphoreWord(dma_pusher, acquire.address);
+-        if (!waiters.Latched(this) && !acquire.Matches(word)) {
++        const bool met_now = readable
++                                 ? (SemaphoreReadableNow(dma_pusher, acquire.address, word) &&
++                                    acquire.Matches(word))
++                                 : acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
++        if (!waiters.Latched(this) && !met_now) {
+             pending_acquire = acquire;
+             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+@@ -395,6 +466,12 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+         return;
+     }
+     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
++    // EDEN_NX2_SEM_FAST=2 (Fritchii abbe465fe0): the result only feeds the warning below, so the
++    // pending fences are released in order on the back instead of after a drain.
++    if (auto& split = VideoCommon::GpuSplit::Get(); SemFastMode() >= 2 && split.Active()) {
++        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
++        return;
++    }
+     DrainBack(VideoCommon::DrainSite::SemExecute);
+     ReleaseFencesOnBack(dma_pusher.rasterizer);
+     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index eed6865..bf68b5f 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1027,6 +1027,16 @@ int DmaSnapshotMode() {
+     return mode;
+ }
+ 
++// EDEN_NX2_SEM_FAST (puller.cpp) reads semaphore words without a drain when no report to them is
++// queued: it needs the front's write notes as well.
++bool FrontMemoryNotesEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_SEM_FAST");
++        return DmaSnapshotMode() != 0 || (value != nullptr && value[0] != '0');
++    }();
++    return enabled;
++}
++
+ // The 3D methods whose work on the back writes guest memory at an address the front can name.
+ bool FrontWritesGuestMemory(u32 method) {
+     return method == MAXWELL3D_REG_INDEX(report_semaphore.query) ||
+@@ -1190,7 +1200,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+             break;
+         }
+     }
+-    if (DmaSnapshotMode() != 0 && FrontWritesGuestMemory(method)) {
++    if (FrontMemoryNotesEnabled() && FrontWritesGuestMemory(method)) {
+         FrontNoteMemoryWrite(split, fs, method, &value, 1);
+     }
+     if (from_macro && (execution_mask[method] || !FrontMacroSink())) {
+@@ -1302,7 +1312,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+             }
+         }
+     }
+-    if (DmaSnapshotMode() != 0 && amount != 0 && FrontWritesGuestMemory(method)) {
++    if (FrontMemoryNotesEnabled() && amount != 0 && FrontWritesGuestMemory(method)) {
+         FrontNoteMemoryWrite(split, fs, method, base_start, amount);
+     }
+     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);

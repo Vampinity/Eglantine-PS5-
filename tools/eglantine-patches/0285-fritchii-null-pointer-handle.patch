@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:00:00 +0100
+Subject: [PATCH] EDEN_NX2_NULL_POINTER_HANDLE=1: no texture for a handle word that is a storage buffer address
+
+Off unless set. Port of Frizti/Fritchii d603d98bb3 (fritchii-v4, "Water flicker, everywhere",
+Frizti's EXP21, on by default there). The water shader reads each light's texture per pixel: the
+handle is loaded per invocation, so the translation falls back to the constant buffer word at the
+descriptor's offset, which is where a storage buffer of the same program keeps its address. The
+low bits of that address name an unrelated texture, a different one whenever the game moves the
+buffer (every frame for a double-buffered one), so the surface flickers. With the switch, a
+texture descriptor whose handle word lies inside a storage buffer descriptor's 8-byte address of
+the same constant buffer gets NULL_TEXTURE_HANDLE (~0U): VisitImageView and GetSamplerId bind the
+null view and sampler for an index past the table limit. Draw-time evaluated handles
+(handle_program != ~0U) and paired (has_secondary) handles are never touched. Frizti counted 0
+flicker frames at the Zora's River waterfall against hundreds a minute before. Frizti's catch2
+test is left out.
+---
+diff --git a/src/video_core/shader_handle_program.h b/src/video_core/shader_handle_program.h
+index cfdc47a..6ac85b9 100644
+--- a/src/video_core/shader_handle_program.h
++++ b/src/video_core/shader_handle_program.h
+@@ -3,6 +3,10 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
++#include <cstdlib>
++#include <utility>
++
+ #include "common/common_types.h"
+ #include "shader_recompiler/shader_info.h"
+ #include "video_core/memory_manager.h"
+@@ -39,4 +43,35 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Tegra::MemoryMa
+         .value_or(0U);
+ }
+ 
++/// EDEN_NX2_NULL_POINTER_HANDLE=1 (Frizti/Fritchii d603d98bb3, fritchii-v4 "water flicker,
++/// everywhere"): whether texture descriptor `desc`'s handle word (element `index`) is where a
++/// storage buffer of the same program keeps its address. The translation falls back to such a word
++/// when the shader loads the handle per invocation, which no draw-time evaluation can give (a
++/// light's texture read in a clustered light loop, Ocarina of Time's water). Its low bits then
++/// name an unrelated texture, a different one whenever the game moves the buffer: every frame for
++/// a double-buffered one, so the surface flickers. Bind no texture for it instead.
++inline bool NullPointerHandlesEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_NULL_POINTER_HANDLE");
++        return value != nullptr && value[0] != '0';
++    }();
++    return enabled;
++}
++
++template <typename Descriptor>
++[[nodiscard]] bool HandleIsStoragePointer(const Shader::Info& info, const Descriptor& desc,
++                                          u32 index) {
++    if (desc.handle_program != ~0U || desc.has_secondary) {
++        return false;
++    }
++    const u32 offset = desc.cbuf_offset + (index << desc.size_shift);
++    return std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& storage) {
++        return storage.cbuf_index == desc.cbuf_index && offset >= storage.cbuf_offset &&
++               offset - storage.cbuf_offset < sizeof(u64);
++    });
++}
++
++/// A texture handle no table holds: the texture cache binds its null view and sampler.
++inline constexpr std::pair<u32, u32> NULL_TEXTURE_HANDLE{~0U, ~0U};
++
+ } // namespace VideoCommon
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 7cfc643..d96681e 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -496,9 +496,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+                 add_image(desc, false);
+             }
+         }
++        // EDEN_NX2_NULL_POINTER_HANDLE=1: no texture for a handle word that is a buffer address.
++        const bool null_pointer_handles{VideoCommon::NullPointerHandlesEnabled()};
+         for (const auto& desc : info.texture_descriptors) {
+             for (u32 index = 0; index < desc.count; ++index) {
+-                const auto handle{read_handle(desc, index)};
++                const auto handle{null_pointer_handles &&
++                                          VideoCommon::HandleIsStoragePointer(info, desc, index)
++                                      ? VideoCommon::NULL_TEXTURE_HANDLE
++                                      : read_handle(desc, index)};
+                 views.push_back({handle.first});
+ 
+                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index a82fc8c..27e6e8a 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -230,9 +230,14 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+     for (const auto& desc : info.image_buffer_descriptors) {
+         add_image(desc, false);
+     }
++    // EDEN_NX2_NULL_POINTER_HANDLE=1: no texture for a handle word that is a buffer address.
++    const bool null_pointer_handles{VideoCommon::NullPointerHandlesEnabled()};
+     for (const auto& desc : info.texture_descriptors) {
+         for (u32 index = 0; index < desc.count; ++index) {
+-            const auto handle{read_handle(desc, index)};
++            const auto handle{null_pointer_handles &&
++                                      VideoCommon::HandleIsStoragePointer(info, desc, index)
++                                  ? VideoCommon::NULL_TEXTURE_HANDLE
++                                  : read_handle(desc, index)};
+             views.push_back({handle.first});
+ 
+             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);

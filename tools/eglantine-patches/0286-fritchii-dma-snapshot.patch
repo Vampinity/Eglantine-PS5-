@@ -1,0 +1,568 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:10:00 +0100
+Subject: [PATCH] EDEN_NX2_DMA_SNAPSHOT=1: macro DMA reads of flushed pages skip the back drain
+
+Off unless set. Port of Frizti/Fritchii 8ac3666f7b + 28b262b59d + 526b9f240a (frizti-v3,
+"Evil's DMA snapshot fix", EvilOOT's dma-snapshot fix, on by default there: Lake Hylia 46.5 ->
+52.3 fps on PC, 0 differences in about 235,000 verified reads). Ocarina of Time reads an
+occlusion report for each object (MME_DMA_READ_FIFOED, method 0x158), about 35,000 times a
+second, and every read drained the split's back thread, so the front and the back took turns.
+With the switch a drained read flushes its whole device pages (buffer cache) and remembers the
+split position; a later read of those pages skips the drain while nothing sent since may write
+them and the query cache lists no report there. =2 also drains, reads again and logs the first
+32 differences (verify mode).
+
+What the front tracks for this (new, all idle unless the switch is set):
+- GpuSplit: NoteMemoryWrite(begin, size) ranges (4096-entry ring), NoteUnrangedWriter(),
+  MayBeWrittenSince(since, begin, size): compute/copy sent since (NoteWriter), an unranged
+  writer sent since, or a noted range that overlaps. Also NotedWriteSince() without the
+  compute/copy test, for a later semaphore port.
+- Maxwell3D front: report_semaphore.query (16 bytes at the report address), LAUNCH_DMA and
+  inline_data (the upload's range; unranged when the address is unmapped or the completion
+  releases a semaphore).
+- DmaPusher: KeplerMemory and Fermi2D methods are unranged writers.
+- Puller: semaphore releases (WriteLong, SemaphoreRelease, SEM_EXECUTE release) note 16 bytes
+  at the semaphore (and its Switch 2 mirror); syncpoint increments are unranged.
+- QueryCacheBase::HasCachedReports + RasterizerInterface/RasterizerVulkan::HasCachedReports:
+  whether a report is still listed in the range (pending, or written and not unregistered).
+Left out: Fritchii's known-words overlay (NoteMemoryWriteData), its Nx2Profile counters, the
+Nx2CmdPageDiag and MACRO_DMA_DRAIN interplay, and the MSAA discard hunk that rode along in the
+same commit. The existing path (Defer + Drain on every read, QueryDma hooks) is untouched when
+the switch is unset, when QUERY_DMA_TRACE or QUERY_FLIP_TRACE is on, and for 0x157 reads.
+---
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index b67f742..34cebb9 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -181,6 +181,72 @@ public:
+     /// Returns whether any of it was still queued.
+     bool WaitForWriters();
+ 
++    // EDEN_NX2_DMA_SNAPSHOT (Frizti/Fritchii 8ac3666f7b, EvilOOT's dma-snapshot fix): the front
++    // notes the guest memory the work it sends may write, so a macro DMA read of a page a drained
++    // read flushed whole can tell whether anything sent since may have changed it.
++    /// Memory-writing work whose range the front does not know was just sent (KeplerMemory and
++    /// Fermi2D methods, syncpoint operations). Ends every macro DMA read snapshot.
++    void NoteUnrangedWriter() {
++        last_memory_writer_position = write_position;
++        last_unranged_position = write_position;
++    }
++    /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
++    /// report, a semaphore release).
++    void NoteMemoryWrite(u64 begin, u64 size) {
++        last_memory_writer_position = write_position;
++        PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
++        write.begin = begin;
++        write.end = begin + size;
++        write.position = write_position;
++    }
++    /// The ring position of everything sent so far.
++    [[nodiscard]] u64 SentPosition() const {
++        return write_position;
++    }
++    /// The back's position now: work at positions above it is still queued.
++    [[nodiscard]] u64 ConsumedNow() const {
++        return consumed.load(std::memory_order_acquire);
++    }
++    /// The last compute/copy and unranged writer positions.
++    [[nodiscard]] u64 LastWriterPosition() const {
++        return last_writer_position;
++    }
++    [[nodiscard]] u64 LastUnrangedPosition() const {
++        return last_unranged_position;
++    }
++    /// Whether work sent after position `since` may write device bytes [begin, begin + size):
++    /// compute or copies (any range), unranged writers, or a noted write that overlaps the range.
++    /// Also true when more writes were noted since than are remembered.
++    [[nodiscard]] bool MayBeWrittenSince(u64 since, u64 begin, u64 size) const {
++        if (last_writer_position > since || last_unranged_position > since) {
++            return true;
++        }
++        return NotedWriteSince(since, begin, size);
++    }
++    /// As MayBeWrittenSince without the compute and copy work: only the noted (ranged) writes and
++    /// the unranged writers. For a word on a page the GPU does not write (Nx2IsGpuWritten).
++    [[nodiscard]] bool NotedWriteSince(u64 since, u64 begin, u64 size) const {
++        if (last_unranged_position > since) {
++            return true;
++        }
++        if (last_memory_writer_position <= since) {
++            return false;
++        }
++        const u64 end = begin + size;
++        const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
++        for (u64 scanned = 0; scanned < remembered; ++scanned) {
++            const PendingWrite& write =
++                pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
++            if (write.position <= since) {
++                return false;
++            }
++            if (write.begin < end && begin < write.end) {
++                return true;
++            }
++        }
++        return remembered == pending_writes.size();
++    }
++
+ private:
+     enum class Kind : u64 {
+         Wrap,   ///< The rest of the ring is unused: continue at its start
+@@ -247,6 +313,17 @@ private:
+     // Front side.
+     u64 write_position{};
+     u64 last_writer_position{};
++    /// EDEN_NX2_DMA_SNAPSHOT: the positions of the last memory-writing work the front noted, and
++    /// the ranges of the last noted writes (NoteMemoryWrite), newest last.
++    u64 last_memory_writer_position{};
++    u64 last_unranged_position{};
++    struct PendingWrite {
++        u64 begin;
++        u64 end;
++        u64 position;
++    };
++    std::array<PendingWrite, 4096> pending_writes{};
++    u64 pending_write_count{};
+     u64 published_local{};
+     u64 consumed_cache{};
+     /// Words between publishes: small right after a drain, while the back has nothing to do.
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index fd06025..37a887a 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3400,6 +3400,10 @@ private:
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                       u32 count);
++    /// EDEN_NX2_DMA_SNAPSHOT: notes the guest memory a report, LAUNCH_DMA or inline data write
++    /// just sent to the back may change (GpuSplit::NoteMemoryWrite).
++    void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
++                              const u32* words, u32 count);
+     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+     void FinishFrontMacro(Core::System& system);
+     std::unique_ptr<FrontState> front;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 2416cd2..eed6865 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -13,6 +13,7 @@
+ #include <limits>
+ #include <optional>
+ #include <string_view>
++#include <unordered_map>
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+ #include "common/scope_exit.h"
+@@ -992,6 +993,14 @@ struct Maxwell3D::FrontState {
+     /// then can it have a deferred instanced draw to issue at the end of a macro.
+     bool draw_pending{true};
+     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
++    /// EDEN_NX2_DMA_SNAPSHOT: the current inline upload (LAUNCH_DMA), for the write notes.
++    bool upload_known{};
++    u64 upload_device{};
++    u32 upload_size{};
++    u32 upload_offset{};
++    /// EDEN_NX2_DMA_SNAPSHOT: device pages a drained macro DMA read flushed whole, and the split
++    /// position right after. Cleared past 8192 pages.
++    std::unordered_map<u64, u64> dma_snapshots;
+ };
+ 
+ namespace {
+@@ -1003,6 +1012,28 @@ bool FrontVerifyEnabled() {
+     return verify;
+ }
+ 
++// EDEN_NX2_DMA_SNAPSHOT=1 (Frizti/Fritchii 8ac3666f7b, EvilOOT's dma-snapshot fix): macro DMA
++// reads of pages a drained read flushed whole skip the drain while nothing sent since may write
++// them (FrontDmaRead). =2 also drains, reads again and logs the differences (verify). Off unless
++// set. Read once at boot.
++int DmaSnapshotMode() {
++    static const int mode = [] {
++        const char* const value = std::getenv("EDEN_NX2_DMA_SNAPSHOT");
++        if (value == nullptr || value[0] == '0') {
++            return 0;
++        }
++        return value[0] == '2' ? 2 : 1;
++    }();
++    return mode;
++}
++
++// The 3D methods whose work on the back writes guest memory at an address the front can name.
++bool FrontWritesGuestMemory(u32 method) {
++    return method == MAXWELL3D_REG_INDEX(report_semaphore.query) ||
++           method == MAXWELL3D_REG_INDEX(launch_dma) ||
++           method == MAXWELL3D_REG_INDEX(inline_data);
++}
++
+ // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
+ bool FrontHandledOutsideDrawManager(u32 method) {
+     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+@@ -1159,6 +1190,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+             break;
+         }
+     }
++    if (DmaSnapshotMode() != 0 && FrontWritesGuestMemory(method)) {
++        FrontNoteMemoryWrite(split, fs, method, &value, 1);
++    }
+     if (from_macro && (execution_mask[method] || !FrontMacroSink())) {
+         split.MacroWrite(this, method, argument);
+     } else {
+@@ -1268,9 +1302,78 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+             }
+         }
+     }
++    if (DmaSnapshotMode() != 0 && amount != 0 && FrontWritesGuestMemory(method)) {
++        FrontNoteMemoryWrite(split, fs, method, base_start, amount);
++    }
+     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+ }
+ 
++void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
++                                     const u32* words, u32 count) {
++    // From Frizti/Fritchii's FrontNoteMemoryWrite, without the known-words overlay: every write
++    // is a range the macro DMA read snapshots check (GpuSplit::MayBeWrittenSince).
++    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
++        constexpr u32 base = MAXWELL3D_REG_INDEX(report_semaphore);
++        const GPUVAddr address = (GPUVAddr{fs.regs[base]} << 32) | fs.regs[base + 1];
++        const auto device = memory_manager.GpuToCpuAddress(address);
++        if (!device) {
++            return; // CounterReport writes nothing at an unmapped address.
++        }
++        // Counters and timed releases land when the host query completes, not when the back
++        // runs them: the snapshot also asks the query cache whether a report is still listed.
++        split.NoteMemoryWrite(*device, 16);
++        return;
++    }
++    constexpr u32 base = MAXWELL3D_REG_INDEX(upload);
++    if (method == MAXWELL3D_REG_INDEX(launch_dma)) {
++        const u64 line_length = fs.regs[base];
++        const u64 lines = (std::max)(fs.regs[base + 1], 1U);
++        const u64 pitch = (std::max<u64>)(fs.regs[base + 4], line_length);
++        const GPUVAddr address = (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3];
++        const u64 size = pitch * (lines - 1) + line_length;
++        const auto device = memory_manager.GpuToCpuAddress(address);
++        // LAUNCH_DMA: bit 0 pitch (linear) layout, bits 5:4 completion (2 releases a semaphore).
++        const u32 launch = words[count - 1];
++        const bool linear = (launch & 1) != 0;
++        if (((launch >> 4) & 3) == 2) {
++            split.NoteUnrangedWriter(); // The completion semaphore: an address the front lacks.
++        }
++        fs.upload_known = device && linear && lines == 1 && (*device & 3) == 0 &&
++                          memory_manager.GpuToCpuAddress(address + size - 1) ==
++                              *device + size - 1;
++        fs.upload_device = device.value_or(0);
++        fs.upload_size = static_cast<u32>((std::min<u64>)(size, ~0U));
++        fs.upload_offset = 0;
++        if (!fs.upload_known) {
++            if (!device || size == 0 || size > (u64{64} << 20)) {
++                split.NoteUnrangedWriter();
++                return;
++            }
++            split.NoteMemoryWrite(*device, size);
++        }
++        return;
++    }
++    // inline_data words of the current upload.
++    if (!fs.upload_known) {
++        const auto device = memory_manager.GpuToCpuAddress(
++            (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3]);
++        if (!device) {
++            split.NoteUnrangedWriter();
++            return;
++        }
++        split.NoteMemoryWrite(*device, fs.regs[base] * u64{(std::max)(fs.regs[base + 1], 1U)} +
++                                           u64{fs.regs[base + 4]} * fs.regs[base + 1]);
++        return;
++    }
++    const u32 remaining_bytes =
++        fs.upload_offset < fs.upload_size ? fs.upload_size - fs.upload_offset : 0;
++    const u32 written = (std::min<u32>)(count * 4, remaining_bytes);
++    if (written != 0) {
++        split.NoteMemoryWrite(fs.upload_device + fs.upload_offset, written);
++    }
++    fs.upload_offset += written;
++}
++
+ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
+                               FrontState& fs) {
+ #ifdef ARCHITECTURE_x86_64
+@@ -1337,6 +1440,110 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+     }
++    // EDEN_NX2_DMA_SNAPSHOT (Frizti/Fritchii 8ac3666f7b, EvilOOT's dma-snapshot fix): Ocarina
++    // reads an occlusion report for each object (MME_DMA_READ_FIFOED), ~35,000 times a second,
++    // and its pages are GPU-written, so each read drained the back: the front and the back took
++    // turns. A drained read now flushes its whole device pages and remembers the split position;
++    // later reads of those pages skip the drain while nothing sent since may write them
++    // (GpuSplit::MayBeWrittenSince) and the query cache lists no report there. 2 also drains,
++    // reads again and logs differences.
++    const int snapshot_mode = DmaSnapshotMode();
++    if (snapshot_mode != 0 && method == 0x158 && words != 0 &&
++        !VideoCommon::QueryDma::TraceEnabled() && !VideoCommon::QueryDma::FlipTraceEnabled()) {
++        const auto device = memory_manager.GpuToCpuAddress(source);
++        if (device &&
++            memory_manager.GpuToCpuAddress(source + read_bytes - 1) == *device + read_bytes - 1) {
++            static u64 hits{};
++            static u64 misses{};
++            static u64 differences{};
++            static u64 report_reads{};
++            static std::array<u64, 4> miss_reasons{};
++            const u64 first_page = *device >> 12;
++            const u64 last_page = (*device + read_bytes - 1) >> 12;
++            bool hit = true;
++            for (u64 page = first_page; page <= last_page && hit; ++page) {
++                const auto it = fs.dma_snapshots.find(page);
++                hit = it != fs.dma_snapshots.end() &&
++                      !split.MayBeWrittenSince(it->second, *device, read_bytes);
++                if (!hit) {
++                    // No snapshot, compute/copy sent since, unranged writer sent since, noted write.
++                    const u32 reason = it == fs.dma_snapshots.end()                   ? 0
++                                       : split.LastWriterPosition() > it->second   ? 1
++                                       : split.LastUnrangedPosition() > it->second ? 2
++                                                                                   : 3;
++                    ++miss_reasons[reason];
++                }
++            }
++            // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
++            // listed report may not be in guest memory yet: take the drained path.
++            if (!hit || !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12)) {
++                thread_local std::vector<u32> snap_words;
++                snap_words.resize(words);
++                const auto drained_read = [&](u32* out) {
++                    split.Defer([memory = &memory_manager, rasterizer_ptr = rasterizer, macro,
++                                 method, source, read_bytes] {
++                        VideoCommon::QueryDma::BeforeRead(*memory, *rasterizer_ptr, macro, method,
++                                                          source, read_bytes);
++                        // The GPU data of the whole pages (a flush of only the bytes read left
++                        // stale neighbours), the pending reports of the bytes read.
++                        const GPUVAddr flush_begin = source & ~GPUVAddr{0xfff};
++                        const GPUVAddr flush_end = (source + read_bytes + 0xfff) & ~GPUVAddr{0xfff};
++                        const size_t flush_bytes = static_cast<size_t>(flush_end - flush_begin);
++                        if (memory->IsMemoryDirty(flush_begin, flush_bytes,
++                                                  VideoCommon::CacheType::BufferCache)) {
++                            memory->FlushRegion(flush_begin, flush_bytes,
++                                                VideoCommon::CacheType::BufferCache);
++                        }
++                        VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer_ptr, source,
++                                                                read_bytes);
++                    });
++                    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++                    memory_manager.ReadBlockUnsafe(source, out, read_bytes);
++                };
++                if (hit) {
++                    ++hits;
++                    memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
++                    if (snapshot_mode == 2) {
++                        std::vector<u32> exact(words);
++                        drained_read(exact.data());
++                        if (exact != snap_words) {
++                            if (differences++ < 32) {
++                                LOG_WARNING(HW_GPU,
++                                            "DMA snapshot check: macro {:#x} read of {} words at "
++                                            "{:#x} differs from the drained read ({:#x} vs {:#x})",
++                                            macro, words, source, snap_words[0], exact[0]);
++                            }
++                            snap_words = std::move(exact);
++                        }
++                    }
++                } else {
++                    ++misses;
++                    drained_read(snap_words.data());
++                    if (fs.dma_snapshots.size() > 8192) {
++                        fs.dma_snapshots.clear();
++                    }
++                    // Taken after the drain: the whole pages are current up to what was sent.
++                    const u64 position = split.SentPosition();
++                    for (u64 page = first_page; page <= last_page; ++page) {
++                        fs.dma_snapshots[page] = position;
++                    }
++                }
++                if (((hits + misses) & 0x3ffff) == 0) {
++                    LOG_INFO(HW_GPU,
++                             "DMA snapshot: {} reads skipped the drain, {} drained, {} differed, "
++                             "{} reads of listed reports (drained path); misses: {} new page, {} "
++                             "compute/copy, {} unranged, {} noted write",
++                             hits, misses, differences, report_reads, miss_reasons[0],
++                             miss_reasons[1], miss_reasons[2], miss_reasons[3]);
++                }
++                for (u32 i = 0; i < words; ++i) {
++                    fs.parameters.push_back(snap_words[i]);
++                }
++                return;
++            }
++            ++report_reads;
++        }
++    }
+     split.Defer([this, memory = &memory_manager, macro, method, source, read_bytes] {
+         // EDEN_NX2_QUERY_DMA_TRACE / EDEN_NX2_QUERY_DMA_SYNC: below High accuracy, counter reports
+         // reach guest memory when a later fence pops, and nothing here waits for them.
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 926e9fb..d0343e9 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -843,9 +843,17 @@ void DmaPusher::CallMethod(u32 argument) {
+         const bool writer = split.Active() &&
+                             WritesMemory(subchannel, subchannel_type[dma_state.subchannel],
+                                          dma_state.method, 1);
++        // EDEN_NX2_DMA_SNAPSHOT: inline-to-memory and 2D engine methods write guest memory at
++        // addresses the front does not track.
++        const bool memory_writer =
++            split.Active() &&
++            (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::KeplerMemory ||
++             subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Fermi2D);
+         SCOPE_EXIT {
+             if (writer) {
+                 split.NoteWriter();
++            } else if (memory_writer) {
++                split.NoteUnrangedWriter();
+             }
+         };
+         if (split.Active()) {
+@@ -902,9 +910,16 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+         const bool writer = split.Active() &&
+                             WritesMemory(subchannel, subchannel_type[dma_state.subchannel],
+                                          dma_state.method, dma_state.non_incrementing ? 1 : num_methods);
++        // EDEN_NX2_DMA_SNAPSHOT: see CallMethod.
++        const bool memory_writer =
++            split.Active() &&
++            (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::KeplerMemory ||
++             subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Fermi2D);
+         SCOPE_EXIT {
+             if (writer) {
+                 split.NoteWriter();
++            } else if (memory_writer) {
++                split.NoteUnrangedWriter();
+             }
+         };
+         if (split.Active()) {
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index d6c3347..dd5cd72 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -52,6 +52,25 @@ void DrainBack(VideoCommon::DrainSite site = VideoCommon::DrainSite::Acquire) {
+ // when it has drained: it can still be submitting deferred work before it sleeps, and the
+ // scheduler's chunk is empty for a moment then. Run them there and wait for them, so the caller
+ // sees what they released.
++// EDEN_NX2_DMA_SNAPSHOT: a release just sent to the back writes 16 bytes at `address` (and at
++// its Switch 2 mirror); a macro DMA read snapshot of that page ends there.
++void NoteReleaseWrite(DmaPusher& dma_pusher, GPUVAddr address, GPUVAddr mirror = 0) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    if (!split.Active()) {
++        return;
++    }
++    for (const GPUVAddr target : {address, mirror}) {
++        if (target == 0) {
++            continue;
++        }
++        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(target)) {
++            split.NoteMemoryWrite(*device & ~u64{0xf}, 16);
++        } else {
++            split.NoteUnrangedWriter();
++        }
++    }
++}
++
+ void ReleaseFencesOnBack(VideoCore::RasterizerInterface* rasterizer) {
+     OnBack([rasterizer] { rasterizer->ReleaseFences(); });
+     DrainBack(VideoCommon::DrainSite::FenceRelease);
+@@ -221,6 +240,9 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+         OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
+             rasterizer->SignalSyncPoint(id);
+         });
++        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++            split.NoteUnrangedWriter(); // EDEN_NX2_DMA_SNAPSHOT: lands where the front can't say
++        }
+         break;
+     default:
+         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
+@@ -262,6 +284,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+                 rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
+             }
+         });
++        NoteReleaseWrite(dma_pusher, sequence_address, mirror);
+     } else if (g_nx2_ampere) {
+         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
+         // written the commands this channel runs next: suspend the channel until the value is
+@@ -338,6 +361,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
+         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
+                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
+     });
++    NoteReleaseWrite(dma_pusher, sequence_address);
+ }
+ 
+ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+@@ -367,6 +391,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+             rasterizer->Query(address, VideoCommon::QueryType::Payload,
+                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
+         });
++        NoteReleaseWrite(dma_pusher, address);
+         return;
+     }
+     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+index 5dd52e9..7eca6a1 100644
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -90,6 +90,15 @@ public:
+         return mask;
+     }
+ 
++    /// Whether a report in the region is still listed (pending host results, or written and not
++    /// unregistered yet). Only the cache mutex: callable from the split front
++    /// (EDEN_NX2_DMA_SNAPSHOT).
++    [[nodiscard]] bool HasCachedReports(VAddr addr, size_t size) {
++        bool result = false;
++        IterateCache<false>(addr, size, [&result](QueryLocation) { result = true; });
++        return result;
++    }
++
+     /// Return true when a CPU region is modified from the GPU
+     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size) {
+         bool result = false;
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 732517d..28c59c1 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -129,6 +129,14 @@ public:
+         return false;
+     }
+ 
++    /// Whether the query cache still lists a report in the range (pending host results, or
++    /// written and not unregistered yet). Takes only the query cache mutex: callable from the
++    /// split front (EDEN_NX2_DMA_SNAPSHOT). Conservative (true) where not implemented.
++    [[nodiscard]] virtual bool HasCachedReports([[maybe_unused]] DAddr addr,
++                                                [[maybe_unused]] u64 size) {
++        return true;
++    }
++
+     /// Flushes commands and blocks until a new fence has popped, which writes pending reports.
+     virtual void WaitForQueries() {}
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index d11204d..ffa1ada 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -106,6 +106,7 @@ public:
+                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+     bool HasPendingQueries(DAddr addr, u64 size) override;
++    bool HasCachedReports(DAddr addr, u64 size) override;
+     void WaitForQueries() override;
+     void FlushQueryResults(DAddr addr, u64 size) override;
+     void InvalidateRegion(DAddr addr, u64 size,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 8ec080c..7ee07f7 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1774,6 +1774,10 @@ bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
+     return query_cache.IsRegionGpuModified(addr, size);
+ }
+ 
++bool RasterizerVulkan::HasCachedReports(DAddr addr, u64 size) {
++    return query_cache.HasCachedReports(addr, size);
++}
++
+ void RasterizerVulkan::WaitForQueries() {
+     fence_manager.SignalAndWait();
+ }

@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:50:00 +0100
+Subject: [PATCH] EDEN_NX2_PIPELINE_CACHE_RESET=1: a driver-rejected pipeline cache file starts empty instead of aborting
+
+Off unless set. Port of the vk_pipeline_cache.cpp hunk of Frizti/Fritchii 5d11ac7216
+(fritchii-v4 "AMD: pipeline cache reset on driver rejection", zortos293/Lichii#679). A
+vulkan-pipeline blob written by another driver or driver version is rejected by
+vkCreatePipelineCache; with the switch the exception is caught, the file is deleted and the
+session starts with an empty driver cache. Also fixes the "Loaded Vulkan driver pipeline cache"
+log line, which had no {} for the path. Unset: the exception ends the boot, as before.
+---
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index e04adb0..e9a9499 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -2192,9 +2192,29 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
+         file.read(cache_data.data(), cache_size);
+ 
+         LOG_INFO(Render_Vulkan,
+-                 "Loaded Vulkan driver pipeline cache: ", Common::FS::PathToUTF8String(filename));
+-
+-        return create_pipeline_cache(cache_size, cache_data.data());
++                 "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
++
++        // EDEN_NX2_PIPELINE_CACHE_RESET=1 (Frizti/Fritchii 5d11ac7216, zortos293/Lichii#679
++        // "pipeline cache reset on driver rejection"): the blob came from another driver or driver
++        // version: the driver rejects it. Start empty instead of aborting, and drop the stale file
++        // so the next run doesn't retry it. Unset: the exception ends the boot, as before.
++        static const bool reset_on_rejection = [] {
++            const char* const value = std::getenv("EDEN_NX2_PIPELINE_CACHE_RESET");
++            return value != nullptr && value[0] != '0';
++        }();
++        if (!reset_on_rejection) {
++            return create_pipeline_cache(cache_size, cache_data.data());
++        }
++        try {
++            return create_pipeline_cache(cache_size, cache_data.data());
++        } catch (const vk::Exception& e) {
++            LOG_ERROR(Render_Vulkan,
++                      "Driver rejected the Vulkan pipeline cache file ({}), starting with an empty "
++                      "cache and deleting it",
++                      e.what());
++            Common::FS::RemoveFile(filename);
++            return create_pipeline_cache(0, nullptr);
++        }
+ 
+     } catch (const std::ios_base::failure& e) {
+         LOG_ERROR(Common_Filesystem, "{}", e.what());
