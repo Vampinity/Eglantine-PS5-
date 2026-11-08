@@ -248,8 +248,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {'''),
         prepared_pipeline = nullptr;
     };
     // update engine as channel may be different.'''),
-    ('        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {',
-     '        if (auto* gp = prepared_pipeline ? prepared_pipeline : pipeline_cache.CurrentGraphicsPipeline();\n            gp && gp->HasDynamicVertexInput()) {'),
+    # 0400 (EDEN_GBB_PIPELINE_ONCE) passes draw_pipeline; without it, keep using the prepared draw's pipeline.
+    ('            draw_pipeline != nullptr ? draw_pipeline : pipeline_cache.CurrentGraphicsPipeline();',
+     '            draw_pipeline != nullptr ? draw_pipeline\n            : prepared_pipeline   ? prepared_pipeline\n                                  : pipeline_cache.CurrentGraphicsPipeline();'),
     # Development GPU fault probe (dev_vulkan.h, pipeline_trace=on): once the runner
     # creates /app0/sync-draws.txt, report every draw/dispatch to klog and wait for the
     # GPU, so the last report before a fatal GPU fault names the operation.
