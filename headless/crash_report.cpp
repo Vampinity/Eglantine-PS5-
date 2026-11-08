@@ -12,6 +12,7 @@
 #include <ctime>
 #include <fcntl.h>
 #include <fstream>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -205,21 +206,25 @@ Stamp LocalNow() noexcept {
 // Memory that may not be readable is copied by the kernel, which answers a bad address with an
 // error where the handler itself would fault: a write into a pipe, read back. Never more than a
 // page at once, so the pipe always has room.
-bool Copy(const void* address, void* out, std::size_t bytes) noexcept {
-    if (probe_pipe[1] < 0 || bytes == 0 || bytes > 4096) return false;
-    const ssize_t written = write(probe_pipe[1], address, bytes);
+// Through the pipe `fds` (the report's, or the thread dump's own).
+bool CopyThrough(const int* fds, const void* address, void* out, std::size_t bytes) noexcept {
+    if (fds[1] < 0 || bytes == 0 || bytes > 4096) return false;
+    const ssize_t written = write(fds[1], address, bytes);
     std::size_t got = 0;
     char* target = static_cast<char*>(out);
     while (written == static_cast<ssize_t>(bytes) && got < bytes) {
-        const ssize_t count = read(probe_pipe[0], target + got, bytes - got);
+        const ssize_t count = read(fds[0], target + got, bytes - got);
         if (count > 0) got += static_cast<std::size_t>(count);
         else if (count == 0 || errno != EINTR) break;
     }
     if (got == bytes) return true;
     // Whatever a failed write left in the pipe goes (the read end does not block).
     char rest[256];
-    while (read(probe_pipe[0], rest, sizeof(rest)) > 0) {}
+    while (read(fds[0], rest, sizeof(rest)) > 0) {}
     return false;
+}
+bool Copy(const void* address, void* out, std::size_t bytes) noexcept {
+    return CopyThrough(probe_pipe, address, out, bytes);
 }
 
 // Whether the eight bytes that end at a code address end with a call instruction: then the
@@ -542,11 +547,267 @@ void CopyText(char* target, std::size_t size, const char* text) noexcept {
     target[length] = '\0';
 }
 
+// The thread dump (StartThreadDump, EDEN_THREAD_DUMP=1). The watcher asks one named thread at a
+// time: it sets the request number, then the target, and signals it. The target's handler takes
+// the request (sets the target back to 0, so a late answer from a thread the watcher gave up on
+// finds nothing to take), writes where it is into dump_thread with the report's stack scan, and
+// marks the request answered. Memory is read through a pipe of the dump's own, so a crash report
+// written meanwhile keeps its pipe.
+constexpr int kDumpSignal = SIGUSR1;
+int dump_pipe[2] = {-1, -1};
+std::atomic<std::uintptr_t> dump_target{0};
+std::atomic<unsigned> dump_asked{0};      // the request the target answers
+std::atomic<unsigned> dump_answered{0};   // the request answered last
+std::atomic<bool> dump_stopped{false};    // a handler never finished: dump_thread stays its
+Text<6 * 1024> dump_thread;               // one thread's answer, written by its handler
+Text<384 * 1024> dump;                    // the whole dump, written by the watcher
+Text<300> dump_path;
+Text<512> dump_line;
+char dump_trigger[300];
+std::uint64_t (*dump_presents)() = nullptr;
+
+// The calls on a dumped thread's stack, as PutCalls lists them for the report: up to 40 code
+// addresses that follow a call, from 64 KiB of stack, "?" where the code cannot be read.
+void PutDumpCalls(std::uint64_t stack) noexcept {
+    constexpr std::size_t kWords = 8 * 1024;
+    constexpr unsigned kMost = 40;
+    unsigned found = 0;
+    static std::uint64_t words[512];
+    std::uint64_t at = stack & ~std::uint64_t{7};
+    for (std::size_t seen = 0; seen < kWords && found < kMost;) {
+        const std::size_t bytes = std::min<std::size_t>(4096 - (at & 4095), sizeof(words));
+        if (!CopyThrough(dump_pipe, reinterpret_cast<const void*>(at), words, bytes)) break;
+        for (std::size_t i = 0; i < bytes / 8 && found < kMost; ++i) {
+            const std::uint64_t value = words[i];
+            if (!InCode(value) || value < CodeStart() + 8) continue;
+            unsigned char before[8];
+            const bool checked = CopyThrough(dump_pipe, reinterpret_cast<const void*>(value - 8), before, sizeof(before));
+            if (checked && !AfterCall(before)) continue;
+            dump_thread.Put("  ");
+            dump_thread.Address(value);
+            dump_thread.Put(checked ? "\n" : " ?\n");
+            ++found;
+        }
+        at += bytes;
+        seen += bytes / 8;
+    }
+    if (found == 0) dump_thread.Put("  none found\n");
+}
+
+void DumpSignal(int, siginfo_t*, void* context) {
+    const int saved_errno = errno;
+    std::uintptr_t self = (std::uintptr_t)pthread_self();
+    if (dump_target.compare_exchange_strong(self, 0, std::memory_order_acq_rel)) {
+        const unsigned request = dump_asked.load(std::memory_order_acquire);
+        const Registers r = FromContext(context);
+        // Not indented, so tools/symbolize-crash.py names the place itself, not its caller.
+        dump_thread.Clear();
+        dump_thread.Put("at ");
+        dump_thread.Address(r.rip);
+        dump_thread.Put(" rsp 0x");
+        dump_thread.Hex(r.rsp, 16);
+        dump_thread.Put('\n');
+        PutDumpCalls(r.rsp);
+        dump_answered.store(request, std::memory_order_release);
+    }
+    errno = saved_errno;
+}
+
+void NoteDump() noexcept {
+    // The kernel log too, line by line: it outlasts a console that has to be switched off.
+    dump_line.Clear();
+    for (std::size_t i = 0; i < dump.size; ++i) {
+        if (dump_line.size == 0) dump_line.Put("EDEN_THREADS ");
+        dump_line.Put(dump.data[i]);
+        if (dump.data[i] == '\n' || dump_line.size > 480) {
+            if (dump.data[i] != '\n') dump_line.Put('\n');
+            Note(dump_line.data);
+            dump_line.Clear();
+        }
+    }
+    if (dump_line.size) {
+        dump_line.Put('\n');
+        Note(dump_line.data);
+    }
+}
+
+void DumpThreads(const char* why, std::uint64_t presents) noexcept {
+    if (dump_stopped.load(std::memory_order_acquire)) return;
+    if (state.load(std::memory_order_acquire) != kIdle) return;  // a crash report is being written
+    const Stamp stamp = LocalNow();
+    dump.Clear();
+    // The report's version line and calls heading: tools/symbolize-crash.py reads a dump as it is.
+    dump.Put("EglantinePS5 thread dump\nversion: ");
+    dump.Put(version);
+    dump.Put(" (code size 0x");
+    dump.Hex(CodeEnd() - CodeStart());
+    dump.Put(")\nwhy: ");
+    dump.Put(why);
+    dump.Put("\npresents: ");
+    dump.Dec(presents);
+    dump.Put("\nrunning: ");
+    dump.Put(sessions[session_now.load(std::memory_order_acquire) & 1]);
+    dump.Put("\ncode: 0x");
+    dump.Hex(CodeStart(), 16);
+    dump.Put(" to 0x");
+    dump.Hex(CodeEnd(), 16);
+    dump.Put(" (eboot+offset is an address in the build's llvm-pie.elf)\n");
+    dump.Put("calls found on the stack, most recent first, per thread (\"?\": not checked against a call "
+             "instruction):\n");
+    const auto self = (std::uintptr_t)pthread_self();
+    const unsigned count = std::min(named_thread_count.load(std::memory_order_acquire), kNamedThreads);
+    unsigned asked = 0, answered = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const std::uintptr_t thread = named_threads[i].thread.load(std::memory_order_acquire);
+        if (thread == 0 || thread == self) continue;
+        ++asked;
+        dump.Put("\nthread ");
+        dump.Put(named_threads[i].name);
+        dump.Put(" (0x");
+        dump.Hex(thread);
+        dump.Put(")\n");
+        const unsigned request = dump_asked.load(std::memory_order_relaxed) + 1;
+        dump_asked.store(request, std::memory_order_release);
+        dump_target.store(thread, std::memory_order_release);
+        // A thread that ended keeps its entry until its handle is reused: the system answers ESRCH.
+        if (pthread_kill((pthread_t)thread, kDumpSignal) != 0) {
+            dump_target.store(0, std::memory_order_release);
+            dump.Put("  could not be signalled (ended?)\n");
+            continue;
+        }
+        bool got = false;
+        for (int wait = 0; wait < 50 && !got; ++wait) {
+            got = dump_answered.load(std::memory_order_acquire) == request;
+            if (!got) Sleep(10000);
+        }
+        if (!got) {
+            std::uintptr_t expected = thread;
+            if (dump_target.compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+                dump.Put("  no answer in 500 ms (the signal blocked, or the thread not scheduled)\n");
+                continue;
+            }
+            // Its handler took the request and is still writing: two seconds more, then no more
+            // dumps this session (dump_thread could be written while it is read).
+            for (int wait = 0; wait < 200 && !got; ++wait) {
+                got = dump_answered.load(std::memory_order_acquire) == request;
+                if (!got) Sleep(10000);
+            }
+            if (!got) {
+                dump_stopped.store(true, std::memory_order_release);
+                dump.Put("  its handler did not finish; the dump stops here, and no more dumps this session\n");
+                break;
+            }
+        }
+        dump.Put(dump_thread.data);
+        ++answered;
+    }
+    dump_path.Clear();
+    dump_path.Put(logs);
+    dump_path.Put("/threads-");
+    dump_path.Dec(static_cast<std::uint64_t>(stamp.year), 4);
+    dump_path.Dec(stamp.month, 2);
+    dump_path.Dec(stamp.day, 2);
+    dump_path.Put('-');
+    dump_path.Dec(stamp.hour, 2);
+    dump_path.Dec(stamp.minute, 2);
+    dump_path.Dec(stamp.second, 2);
+    dump_path.Put(".txt");
+    const bool saved = WriteFile(dump_path.data, dump.data, dump.size);
+    dump_line.Clear();
+    dump_line.Put("EDEN_THREADS dump why=\"");
+    dump_line.Put(why);
+    dump_line.Put("\" threads=");
+    dump_line.Dec(asked);
+    dump_line.Put(" answered=");
+    dump_line.Dec(answered);
+    dump_line.Put(saved ? " file=" : " file_not_written=");
+    dump_line.Put(dump_path.data);
+    dump_line.Put('\n');
+    Note(dump_line.data);
+    NoteDump();
+}
+
+// Every 500 ms: the trigger file, and how long the game has gone without presenting a frame.
+void DumpWatcher() {
+    NameThread("ThreadDump");
+    const auto trigger_stamp = [] {
+        struct stat trigger {};
+        if (!dump_trigger[0] || stat(dump_trigger, &trigger) != 0) return -1LL;
+        return static_cast<long long>(trigger.st_mtime) * 1000003 + static_cast<long long>(trigger.st_size);
+    };
+    // A file left there from before this start does not count; one that appears or changes does.
+    long long trigger_seen = trigger_stamp();
+    std::uint64_t last = 0;
+    unsigned quiet_ms = 0, stage = 0, stall_dumps = 0;
+    // 3 s catches a thread while it is stuck, even when the game gives up on a frame after 4 s and
+    // presents again (nx2:vi2 WaitForFrame); 10 s and 60 s show whether anything moved since. At
+    // most 12 of these a session.
+    static constexpr unsigned kQuietMs[] = {3000, 10000, 60000};
+    static constexpr const char* kQuietWhy[] = {"no frame presented for 3 s", "no frame presented for 10 s",
+                                                 "no frame presented for 60 s"};
+    for (;;) {
+        Sleep(500000);
+        const std::uint64_t now = dump_presents ? dump_presents() : 0;
+        if (const long long stamp = trigger_stamp(); stamp != trigger_seen) {
+            trigger_seen = stamp;
+            if (stamp != -1) DumpThreads("dump-threads.txt in the app folder", now);
+        }
+        // No game frame yet (launcher, loading), or frames moving: nothing to report.
+        if (now == 0 || now != last) {
+            last = now;
+            quiet_ms = 0;
+            stage = 0;
+            continue;
+        }
+        quiet_ms += 500;
+        if (stage < 3 && quiet_ms >= kQuietMs[stage] && stall_dumps < 12) {
+            DumpThreads(kQuietWhy[stage], now);
+            ++stage;
+            ++stall_dumps;
+        }
+    }
+}
+
 } // namespace
 
 bool Readable(const void* address, std::size_t bytes) noexcept {
     char buffer[4096];
     return Copy(address, buffer, bytes);
+}
+
+void StartThreadDump(const std::string& trigger, std::uint64_t (*presents)()) {
+    // EDEN_THREAD_DUMP=1, read once: anything else (unset) installs nothing, as before.
+    const char* const value = std::getenv("EDEN_THREAD_DUMP");
+    if (value == nullptr || std::strcmp(value, "1") != 0) return;
+    static bool started = false;
+    if (started) return;
+    started = true;
+    if (!installed) {  // the version, the logs folder and the session lines come from Install
+        std::fprintf(stderr, "EDEN_THREAD_DUMP installed=0 reason=no_crash_report\n");
+        return;
+    }
+    if (pipe(dump_pipe) != 0) {
+        dump_pipe[0] = dump_pipe[1] = -1;
+        std::fprintf(stderr, "EDEN_THREAD_DUMP installed=0 reason=no_pipe errno=%d\n", errno);
+        return;
+    }
+    fcntl(dump_pipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(dump_pipe[1], F_SETFL, O_NONBLOCK);
+    CopyText(dump_trigger, sizeof(dump_trigger), trigger.c_str());
+    dump_presents = presents;
+    // SIGUSR1 must be free: nothing in this tree uses it, but a library could.
+    struct sigaction old {}, action {};
+    if (sigaction(kDumpSignal, nullptr, &old) != 0 || (old.sa_flags & SA_SIGINFO) ||
+        (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN)) {
+        std::fprintf(stderr, "EDEN_THREAD_DUMP installed=0 reason=SIGUSR1_taken\n");
+        return;
+    }
+    action.sa_sigaction = DumpSignal;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    const bool handled = sigaction(kDumpSignal, &action, nullptr) == 0;
+    if (handled) std::thread(DumpWatcher).detach();
+    std::fprintf(stderr, "EDEN_THREAD_DUMP installed=%d trigger=%s\n", handled ? 1 : 0, dump_trigger);
 }
 
 void Install(const std::string& logs_folder, const char* app_version, bool restarted) {
@@ -660,4 +921,11 @@ void NoteGpuStalled() noexcept {
 // EglantinePS5 (headless/crash_report.cpp).
 extern "C" void eden_gpu_stalled(void) {
     Eden::Crash::NoteGpuStalled();
+}
+
+// For threads started outside the frontend's naming hook (src/guest_memory_service.inc's scanner,
+// keeper and swapper): they declare this weak and name themselves, so a crash report and a thread
+// dump (StartThreadDump) can find them.
+extern "C" void eden_crash_name_thread(const char* name) {
+    Eden::Crash::NameThread(name);
 }

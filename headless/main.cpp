@@ -544,6 +544,11 @@ int main(int argc, char** argv) {
                 std::printf("EDEN_ENV %s\n", entry.c_str());
             }
         }
+        // EDEN_THREAD_DUMP=1: every named thread's place on a freeze (no frame for 3, 10 and 60 s
+        // in a game) or when dump-threads.txt is dropped into the app folder (crash_report.h).
+        Eden::Crash::StartThreadDump(Eden::AppFile("dump-threads.txt"), [] {
+            return static_cast<std::uint64_t>(Core::g_nx2_present_count.load(std::memory_order_relaxed));
+        });
         // The heap's pool switches (EDEN_BIG_IMAGE_RESERVE_MIB, EDEN_BIG_IMAGE_NO_SPLIT) are read
         // now, with the environment complete and the pool still whole (headless/heap_pages.cpp).
         if (eden_heap_pool_init) eden_heap_pool_init();

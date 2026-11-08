@@ -1,0 +1,65 @@
+Subject: [PATCH] gbb-9991-pipeline-once (from GrowingBlackBeans' gist e3676cf2; Frizti/Hydro74000 originals for 9991-9993)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 11e711e..dfa269c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -72,6 +72,14 @@ using VideoCommon::ImageViewType;
+ 
+ 
+ namespace {
++// EDEN_GBB_PIPELINE_ONCE=1: PrepareDraw hands the pipeline it looked up to UpdateDynamicStates,
++// which otherwise looks it up a second time for the vertex input (~2.5% of the split's back thread
++// in Ocarina). Frizti v3 23f40d5d81, via GrowingBlackBeans' 9991. Unset: two lookups as before.
++bool GbbPipelineOnce() {
++    static const bool enabled = Common::PeSwitch("EDEN_GBB_PIPELINE_ONCE");
++    return enabled;
++}
++
+ struct DrawParams {
+     u32 base_instance;
+     u32 num_instances;
+@@ -768,7 +776,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ 
+     {
+         Profile::Scope scope{Profile::Zone::DynamicState};
+-        UpdateDynamicStates();
++        UpdateDynamicStates(GbbPipelineOnce() ? pipeline : nullptr);
+     }
+ 
+     query_cache.NotifySegment(true);
+@@ -2437,7 +2445,7 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
+     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
+ }
+ 
+-void RasterizerVulkan::UpdateDynamicStates() {
++void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* draw_pipeline) {
+     auto& regs = maxwell3d->regs;
+     auto& flags = maxwell3d->dirty.flags;
+     const auto topology = maxwell3d->draw_manager.draw_state.topology;
+@@ -2515,7 +2523,10 @@ void RasterizerVulkan::UpdateDynamicStates() {
+     }
+ 
+     if (device.IsExtVertexInputDynamicStateSupported()) {
+-        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {
++        // A draw under EDEN_GBB_PIPELINE_ONCE passes the pipeline it found; others look it up.
++        GraphicsPipeline* const gp =
++            draw_pipeline != nullptr ? draw_pipeline : pipeline_cache.CurrentGraphicsPipeline();
++        if (gp && gp->HasDynamicVertexInput()) {
+             UpdateVertexInput(regs);
+         }
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 5aecc2a..443f505 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -198,7 +198,8 @@ private:
+     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
+     void SubmitNx2ListCopies();
+ 
+-    void UpdateDynamicStates();
++    /// draw_pipeline: the draw's pipeline when the caller already looked it up, else null.
++    void UpdateDynamicStates(GraphicsPipeline* draw_pipeline = nullptr);
+ 
+     void HandleTransformFeedback();
+ 

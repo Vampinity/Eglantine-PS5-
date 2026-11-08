@@ -1,0 +1,42 @@
+Subject: [PATCH] gbb-snapshot-order-fix (from GrowingBlackBeans' gist e3676cf2; Frizti/Hydro74000 originals for 9991-9993)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 3daeb07..f53ed85 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1259,9 +1259,6 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+             break;
+         }
+     }
+-    if (FrontMemoryNotesEnabled() && FrontWritesGuestMemory(method)) {
+-        FrontNoteMemoryWrite(split, fs, method, &value, 1);
+-    }
+     constexpr u32 cb_data_first = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+     if (!execution_mask[method] && split.RegBlocks()) {
+         split.PlainWrite(this, method, argument);
+@@ -1272,6 +1269,12 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+     } else {
+         split.Method(this, method, argument, is_last_call, nullptr);
+     }
++    // Noted once sent, as NoteReport below: a note takes the split position, and only a position
++    // past the entry tells a snapshot taken right before it (a drained DMA read, SentPosition)
++    // that this write came after (GpuSplit::NotedWriteSince compares position <= since).
++    if (FrontMemoryNotesEnabled() && FrontWritesGuestMemory(method)) {
++        FrontNoteMemoryWrite(split, fs, method, &value, 1);
++    }
+     if (report_write) [[unlikely]] {
+         Regs::ReportSemaphore report;
+         std::memcpy(&report, &fs.regs[MAXWELL3D_REG_INDEX(report_semaphore)], sizeof(report));
+@@ -1386,10 +1389,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+             }
+         }
+     }
++    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
++    // Noted once sent (see FrontWrite).
+     if (FrontMemoryNotesEnabled() && amount != 0 && FrontWritesGuestMemory(method)) {
+         FrontNoteMemoryWrite(split, fs, method, base_start, amount);
+     }
+-    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+ }
+ 
+ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,

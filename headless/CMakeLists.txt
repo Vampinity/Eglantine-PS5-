@@ -3170,6 +3170,13 @@ if(EDEN_DEV_VULKAN)
     target_compile_definitions(eden-headless PRIVATE EDEN_DEV_VULKAN=1)
 endif()
 
+# Stack sampler (mkw_native_sample.inc, EDEN_SAMPLE_THREADS): frame pointers in all of video_core,
+# so samples of the GPU threads carry whole call chains. Costs a little speed: diagnostic builds only.
+option(EDEN_SAMPLER_FRAME_POINTERS "Keep frame pointers in video_core for the stack sampler" OFF)
+if(PS5_NATIVE AND EDEN_SAMPLER_FRAME_POINTERS)
+    target_compile_options(video_core PRIVATE -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer)
+endif()
+
 # Temporary MKW sampler: retain the conversion caller chain without rebuilding every core file.
 if(PS5_NATIVE)
     set_property(SOURCE "${PROJECT_SOURCE_DIR}/src/video_core/textures/decoders.cpp"

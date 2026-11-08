@@ -1,0 +1,57 @@
+Subject: [PATCH] gbb-9992-quad-no-wait (from GrowingBlackBeans' gist e3676cf2; Frizti/Hydro74000 originals for 9991-9993)
+
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index d4d57c7..3a3fa51 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -13,6 +13,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "common/pe_switch.h"
+ #include "video_core/buffer_cache/buffer_cache_base.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+ #include "video_core/renderer_vulkan/vertex_repack.h"
+@@ -181,13 +182,30 @@ public:
+     virtual ~QuadIndexBuffer() = default;
+ 
+     void UpdateBuffer(u32 num_indices_) {
++        // EDEN_GBB_QUAD_NO_WAIT=1: growing the buffer keeps the old one until the GPU is past the
++        // commands recorded so far instead of finishing the GPU (a ~150 ms stall in the middle of
++        // a load), and grows it by at least half so a creeping draw count doesn't redo this.
++        // Frizti v3 a20c9a969c (from Hydro74000/Edlws 034668a14e), via GrowingBlackBeans' 9992.
++        // Unset: Finish and the exact size as before.
++        static const bool no_wait = Common::PeSwitch("EDEN_GBB_QUAD_NO_WAIT");
++        while (!retired_buffers.empty() && scheduler.IsFree(retired_buffers.front().first)) {
++            retired_buffers.erase(retired_buffers.begin());
++        }
+         if (num_indices_ <= num_indices) {
+             return;
+         }
+ 
+-        scheduler.Finish();
+-
+-        num_indices = num_indices_;
++        if (no_wait) {
++            if (buffer) {
++                retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(buffer));
++            }
++            const u64 grown = u64{num_indices} + num_indices / 2;
++            num_indices = static_cast<u32>(
++                (std::max)(u64{num_indices_}, (std::min)(grown, u64{0xffffffff})));
++        } else {
++            scheduler.Finish();
++            num_indices = num_indices_;
++        }
+         index_type = IndexTypeFromNumElements(device, num_indices);
+ 
+         const u32 num_quads = GetQuadsNum(num_indices);
+@@ -278,6 +296,8 @@ protected:
+     StagingBufferPool& staging_pool;
+ 
+     vk::Buffer buffer{};
++    /// EDEN_GBB_QUAD_NO_WAIT: replaced buffers and the GPU tick that frees each one
++    std::vector<std::pair<u64, vk::Buffer>> retired_buffers;
+     MemoryCommit memory_commit{};
+     VkIndexType index_type{};
+     u32 num_indices = 0;

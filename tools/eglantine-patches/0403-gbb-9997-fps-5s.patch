@@ -1,0 +1,78 @@
+Subject: [PATCH] gbb-9997-fps-5s (from GrowingBlackBeans' gist e3676cf2; Frizti/Hydro74000 originals for 9991-9993)
+
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index 313d2c1..e43e484 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -1920,6 +1920,57 @@ private:
+                 !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
+                 ++m_stats.ran_ahead;
+             }
++            // EDEN_GBB_FPS_5S=1 (after GrowingBlackBeans' 9997): one "nx2:vi2 5 s:" line per 5 s
++            // with the game's fps, mean frame, 1% low (99th-percentile frame time), worst frame
++            // and the mean wait on the GPU fence per present. Log only; unset = no line.
++            static const bool gbb_fps_5s = [] {
++                const char* value = std::getenv("EDEN_GBB_FPS_5S");
++                return value != nullptr && std::strcmp(value, "1") == 0;
++            }();
++            if (gbb_fps_5s) {
++                auto& win = m_fps_window;
++                if (win.start == std::chrono::steady_clock::time_point{}) {
++                    win.start = entered;
++                    win.frames_us.reserve(512);
++                }
++                win.fence_us += to_us(waited - entered);
++                ++win.presents;
++                if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
++                    win.frames_us.push_back(to_us(entered - m_stats.last_present));
++                }
++                if (entered - win.start >= std::chrono::seconds{5}) {
++                    const size_t n = win.frames_us.size();
++                    if (n != 0) {
++                        long long sum = 0;
++                        for (const long long frame : win.frames_us) {
++                            sum += frame;
++                        }
++                        const long long worst =
++                            *std::max_element(win.frames_us.begin(), win.frames_us.end());
++                        const size_t p99_index = (std::min)((n * 99) / 100, n - 1);
++                        std::nth_element(
++                            win.frames_us.begin(),
++                            win.frames_us.begin() + static_cast<std::ptrdiff_t>(p99_index),
++                            win.frames_us.end());
++                        const long long p99 = win.frames_us[p99_index];
++                        const double seconds =
++                            static_cast<double>(to_us(entered - win.start)) / 1e6;
++                        LOG_INFO(Service,
++                                 "nx2:vi2 5 s: {} frames, {:.1f} fps, mean {:.1f} ms, 1% low "
++                                 "{:.1f} ms, worst {:.1f} ms, fence {:.1f} ms",
++                                 n, static_cast<double>(n) / seconds,
++                                 static_cast<double>(sum) / static_cast<double>(n) / 1000.0,
++                                 static_cast<double>(p99) / 1000.0,
++                                 static_cast<double>(worst) / 1000.0,
++                                 static_cast<double>(win.fence_us) /
++                                     static_cast<double>(win.presents) / 1000.0);
++                    }
++                    win.frames_us.clear();
++                    win.fence_us = 0;
++                    win.presents = 0;
++                    win.start = entered;
++                }
++            }
+             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
+                 const long long frame = to_us(entered - m_stats.last_present);
+                 m_stats.frame_us += frame;
+@@ -1955,6 +2006,13 @@ private:
+         u32 presents{}, ran_ahead{};
+         std::chrono::steady_clock::time_point last_present{};
+     } m_stats{};
++    // EDEN_GBB_FPS_5S: frame times of the current 5 s window (cleared, not freed, each window).
++    struct FpsWindow {
++        std::vector<long long> frames_us;
++        long long fence_us{};
++        u32 presents{};
++        std::chrono::steady_clock::time_point start{};
++    } m_fps_window{};
+     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
+     u32 m_previous_fence_value{};
+ 

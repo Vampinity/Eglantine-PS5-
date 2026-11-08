@@ -16,6 +16,8 @@
 #include <mutex>
 #include <thread>
 
+#include "crash_report.h"
+
 namespace Eden {
 class LogFlusher {
 public:
@@ -52,6 +54,7 @@ public:
 
 private:
     void Run() {
+        Eden::Crash::NameThread("LogFlusher");  // for a crash report or a thread dump
         for (bool stop = false; !stop;) {
             {
                 std::unique_lock lock{mutex};

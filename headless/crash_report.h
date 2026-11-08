@@ -77,4 +77,13 @@ void SetSession(const std::string& text, bool game) noexcept;
 
 // For the checks (tools/check-crash-report.py).
 bool Readable(const void* address, std::size_t bytes) noexcept;
+
+// EDEN_THREAD_DUMP=1 (off unless exactly "1"; after GrowingBlackBeans, viejunerd issue 21): a thread
+// dump when a game has presented no frame for 3 s, again at 10 s and 60 s (at most 12 such dumps a
+// session), and whenever the file at `trigger` appears or changes. Every named thread is
+// interrupted in turn (SIGUSR1) and writes where it is and the code addresses on its stack, to
+// logs/threads-YYYYMMDD-HHMMSS.txt and the kernel log (EDEN_THREADS lines), in the report's
+// address format: tools/symbolize-crash.py reads a dump as it is. `presents` reads the game's
+// present count (0 before its first frame). After Install, once the environment is complete.
+void StartThreadDump(const std::string& trigger, std::uint64_t (*presents)());
 } // namespace Eden::Crash

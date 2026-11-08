@@ -1,0 +1,70 @@
+Subject: [PATCH] gbb-9993-flush-page-check (from GrowingBlackBeans' gist e3676cf2; Frizti/Hydro74000 originals for 9991-9993)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 11e711e..d5ed2c0 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -60,6 +60,7 @@
+ #include "video_core/texture_cache/texture_cache_base.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "video_core/nx2.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/query_dma.h"
+ #include "video_core/zpass_cut.h"
+@@ -1759,7 +1760,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType
+ }
+ 
+ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+-    if ((True(which & VideoCommon::CacheType::BufferCache))) {
++    if ((True(which & VideoCommon::CacheType::BufferCache)) && MayBeGpuModified(addr, size)) {
+         std::scoped_lock lock{buffer_cache.mutex};
+         if (buffer_cache.IsRegionGpuModified(addr, size)) {
+             return true;
+@@ -1775,6 +1776,31 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
+     return false;
+ }
+ 
++bool RasterizerVulkan::MayBeGpuModified(DAddr addr, u64 size) {
++    // EDEN_GBB_FLUSH_PAGE_CHECK=1: a range with no page the GPU ever wrote through the buffer cache
++    // has nothing in gpu_modified_ranges, so it needs no look under the cache's mutex (the split's
++    // front asks this before each macro DMA read; the back holds the mutex through each draw).
++    // Both places that add to gpu_modified_ranges (the buffer copy and the GPU-write path) also mark
++    // the pages in g_nx2_gpu_written_pages, and those bits never clear within a session.
++    // Frizti v3 6247fd5126, via GrowingBlackBeans' 9993. Unset: always looks, as before.
++    static const bool enabled = Common::PeSwitch("EDEN_GBB_FLUSH_PAGE_CHECK");
++    if (!enabled || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
++        return true;
++    }
++    const u64 table_pages = u64{Tegra::g_nx2_gpu_written_pages.size()} * 64;
++    const u64 first = addr >> Tegra::Nx2WrittenPageBits;
++    const u64 last = (addr + size - 1) >> Tegra::Nx2WrittenPageBits;
++    if (last < first || last >= table_pages) {
++        return true; // wraps or lies past the page table: look the usual way
++    }
++    for (u64 page = first; page <= last; ++page) {
++        if (Tegra::Nx2IsGpuWritten(page << Tegra::Nx2WrittenPageBits)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
+     return query_cache.IsRegionGpuModified(addr, size);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 5aecc2a..c4b26cd 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -177,6 +177,10 @@ public:
+                                                             u32 pixel_stride);
+ 
+ private:
++    /// EDEN_GBB_FLUSH_PAGE_CHECK: false when no page of the range was ever written by the GPU
++    /// through the buffer cache. Always true with the switch unset.
++    bool MayBeGpuModified(DAddr addr, u64 size);
++
+     static constexpr const u64 NEEDS_D24[] = {
+         0x01006A800016E000ULL, // SSBU
+         0x0100E95004038000ULL, // XC2
