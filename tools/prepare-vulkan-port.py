@@ -1544,8 +1544,8 @@ shader_costs = [
      'std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {\n    auto timer = Eden::Performance::VulkanTimer(17);'),
     ('    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {',
      '    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {\n    auto timer = Eden::Performance::VulkanTimer(17);'),
-    ('                                                 u32 cache_version) try {',
-     '                                                 u32 cache_version) try {\n    auto timer = Eden::Performance::VulkanTimer(18);'),
+    ('                                                 u32 cache_version) {\n    // Written whole beside',
+     '                                                 u32 cache_version) {\n    auto timer = Eden::Performance::VulkanTimer(18);\n    // Written whole beside'),
     ('        device.SupportsTransformFeedbackProvokingVertexPreservation();\n}\n\nnamespace {',
      '        device.SupportsTransformFeedbackProvokingVertexPreservation();\n'
      '    if (Eden::Performance::vulkan_cost_enabled.load(std::memory_order_relaxed))\n'
