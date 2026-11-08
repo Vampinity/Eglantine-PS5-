@@ -1,0 +1,74 @@
+From bcf0269368db06ea18542315cf304ed463247bd9 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:02:33 +0100
+Subject: [PATCH] up: mod-root-null-guards
+
+Source: 34a791dbd8
+Switch: none (null safety fix)
+---
+ src/core/file_sys/bis_factory.cpp   |  2 ++
+ src/core/file_sys/patch_manager.cpp | 13 ++++++++++---
+ src/core/file_sys/sdmc_factory.cpp  |  3 +++
+ 3 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/file_sys/bis_factory.cpp b/src/core/file_sys/bis_factory.cpp
+index 6facd03..1091f66 100644
+--- a/src/core/file_sys/bis_factory.cpp
++++ b/src/core/file_sys/bis_factory.cpp
+@@ -55,6 +55,8 @@ VirtualDir BISFactory::GetModificationLoadRoot(u64 title_id) const {
+     // LayeredFS doesn't work on updates and title id-less homebrew
+     if (title_id == 0 || (title_id & 0xFFF) == 0x800)
+         return nullptr;
++    if (load_root == nullptr)
++        return nullptr;
+     return GetOrCreateDirectoryRelative(load_root, fmt::format("/{:016X}", title_id));
+ }
+ 
+diff --git a/src/core/file_sys/patch_manager.cpp b/src/core/file_sys/patch_manager.cpp
+index 1245039..5468ba4 100644
+--- a/src/core/file_sys/patch_manager.cpp
++++ b/src/core/file_sys/patch_manager.cpp
+@@ -414,7 +414,10 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
+     const auto load_dir = GetModificationLoadRoot();
+     const auto sdmc_load_dir = GetModificationLoadRoot(true);
+ 
+-    std::vector<VirtualDir> patch_dirs = {sdmc_load_dir};
++    std::vector<VirtualDir> patch_dirs;
++    if (sdmc_load_dir != nullptr) {
++        patch_dirs.push_back(sdmc_load_dir);
++    }
+     if (load_dir != nullptr) {
+         const auto load_patch_dirs = load_dir->GetSubdirectories();
+         patch_dirs.insert(patch_dirs.end(), load_patch_dirs.begin(), load_patch_dirs.end());
+@@ -632,8 +635,12 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
+     }
+ 
+     const auto disabled = GetDisabledAddons();
+-    std::vector<VirtualDir> patch_dirs = load_dir->GetSubdirectories();
+-    if (std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
++    std::vector<VirtualDir> patch_dirs;
++    if (load_dir != nullptr) {
++        patch_dirs = load_dir->GetSubdirectories();
++    }
++    if (std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend() &&
++        sdmc_load_dir != nullptr) {
+         patch_dirs.push_back(sdmc_load_dir);
+     }
+     std::sort(patch_dirs.begin(), patch_dirs.end(),
+diff --git a/src/core/file_sys/sdmc_factory.cpp b/src/core/file_sys/sdmc_factory.cpp
+index a2903db..30f05ae 100644
+--- a/src/core/file_sys/sdmc_factory.cpp
++++ b/src/core/file_sys/sdmc_factory.cpp
+@@ -35,6 +35,9 @@ VirtualDir SDMCFactory::GetSDMCModificationLoadRoot(u64 title_id) const {
+     if (title_id == 0 || (title_id & 0xFFF) == 0x800) {
+         return nullptr;
+     }
++    if (sd_mod_dir == nullptr) {
++        return nullptr;
++    }
+     return GetOrCreateDirectoryRelative(sd_mod_dir, fmt::format("/{:016X}", title_id));
+ }
+ 
+-- 
+2.54.0
+

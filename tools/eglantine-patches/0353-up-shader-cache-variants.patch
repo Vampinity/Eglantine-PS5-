@@ -1,0 +1,46 @@
+From fa4e312a67a9d1ace80c17c81eef1b6e034fa891 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:06:04 +0100
+Subject: [PATCH] up: shader-cache-variants
+
+Source: 900ab5a825/de4ed9d9d7/688c6fa7d8
+Switch: EDEN_UP_SHADOW_REGISTERS / EDEN_UP_WIDE_COMPUTE_SSBOS / EDEN_UP_NULL_POINTER_SLOTS
+Vulkan cache namespace follows shader experiment combination; all off uses exact T61 cache paths.
+Apply entire series before testing flags.
+Review fix: Common::FS::CreateDir is not recursive. With a switch on and no <title> folder yet
+(fresh install or wiped cache) creating <title>/up_v1_N failed and LoadDiskResources returned
+with no disk cache at all. The title folder is created first; with all switches off the calls
+are the same paths as before (CreateDir on an existing dir is a no-op).
+---
+ .../renderer_vulkan/vk_pipeline_cache.cpp         | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 127d449..f6f428a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1418,8 +1418,19 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     }
+ 
+     const auto shader_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir)};
+-    const auto base_dir{shader_dir / fmt::format("{:016x}", title_id)};
+-    if (!Common::FS::CreateDir(shader_dir) || !Common::FS::CreateDir(base_dir)) {
++    const auto title_dir{shader_dir / fmt::format("{:016x}", title_id)};
++    auto base_dir{title_dir};
++    static const unsigned up_shader_variant =
++        (Common::PeSwitch("EDEN_UP_SHADOW_REGISTERS") ? 1U : 0U) |
++        (Common::PeSwitch("EDEN_UP_WIDE_COMPUTE_SSBOS") ? 2U : 0U) |
++        (Common::PeSwitch("EDEN_UP_NULL_POINTER_SLOTS") ? 4U : 0U);
++    if (up_shader_variant != 0) {
++        // Versions the experimental translation policy, independently of T61's cache version.
++        base_dir /= fmt::format("up_v1_{:x}", up_shader_variant);
++    }
++    // CreateDir makes one level: with a variant, the title folder first.
++    if (!Common::FS::CreateDir(shader_dir) || !Common::FS::CreateDir(title_dir) ||
++        !Common::FS::CreateDir(base_dir)) {
+         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
+         return;
+     }
+-- 
+2.54.0
+

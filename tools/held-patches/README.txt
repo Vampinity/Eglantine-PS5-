@@ -1,0 +1,1 @@
+0406-lichii-tc-override-cap.patch: Lichii capy/port-tc-threshold-cap. Held 8 Nov: same idea as 0341-up-texture-budget-cap (upstream caps EDEN_NX2_TC_* overrides at the device budget) and conflicts with it. Use EDEN_UP_TC_BUDGET_CAP=1 instead; compare the two only if 0341 misbehaves.

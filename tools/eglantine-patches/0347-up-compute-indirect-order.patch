@@ -1,0 +1,41 @@
+From 27595f7c83a1a12f2e71ad85d22b92b827a874fa Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:03:52 +0100
+Subject: [PATCH] up: compute-indirect-order
+
+Source: 77bec76845
+Switch: EDEN_UP_COMPUTE_INDIRECT_ORDER
+T61 already has compute-to-draw and WFI barriers under existing EDEN_NX2 switches; only missing indirect-dispatch barrier is ported.
+---
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 11e711e..d2fea3e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1608,6 +1608,21 @@ void RasterizerVulkan::DispatchCompute() {
+             return;
+         }
+         scheduler.RequestOutsideRenderPassOperationContext();
++        static const bool indirect_order = Common::PeSwitch("EDEN_UP_COMPUTE_INDIRECT_ORDER");
++        if (indirect_order) {
++            scheduler.Record([](vk::CommandBuffer cmdbuf) {
++                static constexpr VkMemoryBarrier barrier{
++                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                    .pNext = nullptr,
++                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++                };
++                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                    0, barrier);
++            });
++            scheduler.NoteComputeWrites();
++        }
+         scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
+                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+             if (!pipeline->IsBound()) {
+-- 
+2.54.0
+

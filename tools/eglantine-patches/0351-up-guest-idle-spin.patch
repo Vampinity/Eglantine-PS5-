@@ -1,0 +1,87 @@
+From 5358d2df79d6dda05309ff086e48177065c5c73d Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:04:52 +0100
+Subject: [PATCH] up: guest-idle-spin
+
+Source: 8dc1e6e9c4
+Switch: EDEN_UP_IDLE_SPIN
+Existing EDEN_NX2_IDLE_SPIN_US override retained; only default 100us poll for NX2 is opt-in. Test CPU contention and power.
+---
+ src/core/cpu_manager.cpp              |  2 +-
+ src/core/hle/kernel/physical_core.cpp | 23 ++++++++++++++++++-----
+ src/core/hle/kernel/physical_core.h   |  2 +-
+ 3 files changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/src/core/cpu_manager.cpp b/src/core/cpu_manager.cpp
+index 23d5ac3..66db2ae 100644
+--- a/src/core/cpu_manager.cpp
++++ b/src/core/cpu_manager.cpp
+@@ -93,7 +93,7 @@ void CpuManager::MultiCoreRunIdleThread(Kernel::KernelCore& kernel) {
+     while (true) {
+         auto& physical_core = kernel.CurrentPhysicalCore();
+         if (!physical_core.IsInterrupted()) {
+-            physical_core.Idle();
++            physical_core.Idle(kernel);
+         }
+         HandleInterrupt(kernel);
+     }
+diff --git a/src/core/hle/kernel/physical_core.cpp b/src/core/hle/kernel/physical_core.cpp
+index c3ae762..a675fea 100644
+--- a/src/core/hle/kernel/physical_core.cpp
++++ b/src/core/hle/kernel/physical_core.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/pe_switch.h"
+ #include <chrono>
+ #include <cstdlib>
+ #include <thread>
+@@ -224,14 +225,26 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
+     }
+ }
+ 
+-void PhysicalCore::Idle() {
++void PhysicalCore::Idle(KernelCore& kernel) {
+     // Guest job systems hand work between cores many times per frame; blocking at once adds the
+     // host's thread wake-up latency to every handoff. EDEN_NX2_IDLE_SPIN_US=<n>: poll for that
+-    // many microseconds before blocking.
+-    static const auto spin = std::chrono::microseconds{[] {
++    // many microseconds before blocking. Switch 2 titles poll 100 us by default outside Android
++    // (title 1's frames: 42 ms without, 35 ms with 50 us, 34 ms with 100 us, 36 ms with 300 us).
++    static const long long spin_setting = [] {
+         const char* text = std::getenv("EDEN_NX2_IDLE_SPIN_US");
+-        return text ? std::strtoll(text, nullptr, 10) : 0LL;
+-    }()};
++        return text ? std::strtoll(text, nullptr, 10) : -1LL;
++    }();
++    long long spin_us = spin_setting;
++    if (spin_us < 0) {
++#ifdef __ANDROID__
++        spin_us = 0;
++#else
++        const KProcess* process = kernel.ApplicationProcess();
++        static const bool nx2_spin = Common::PeSwitch("EDEN_UP_IDLE_SPIN");
++        spin_us = nx2_spin && process != nullptr && process->IsSwitch2() ? 100 : 0;
++#endif
++    }
++    const auto spin = std::chrono::microseconds{spin_us};
+     if (spin.count() > 0) {
+         const auto deadline = std::chrono::steady_clock::now() + spin;
+         while (!m_is_interrupted.load(std::memory_order_acquire) &&
+diff --git a/src/core/hle/kernel/physical_core.h b/src/core/hle/kernel/physical_core.h
+index 20371d6..58e2582 100644
+--- a/src/core/hle/kernel/physical_core.h
++++ b/src/core/hle/kernel/physical_core.h
+@@ -51,7 +51,7 @@ public:
+     void LogBacktrace(KernelCore& kernel);
+ 
+     // Wait for an interrupt.
+-    void Idle();
++    void Idle(KernelCore& kernel);
+ 
+     // Interrupt this core.
+     void Interrupt();
+-- 
+2.54.0
+

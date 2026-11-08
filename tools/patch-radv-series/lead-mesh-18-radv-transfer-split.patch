@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:00:00 +0100
+Subject: [PATCH] radv/ps5: RADV_PS5_TRANSFER_SPLIT=1 lets a stream split
+ before transfers and barriers
+
+Driver patch, after lead-mesh-17. Off unless the switch is exactly "1"; read once.
+Port of the transfer half of heydemoura/EglantinePS5 PR 77 (branch
+perf/radv-robustness, tools/patch-radv-transfer-split.py), itself a backport
+from ProsperoEden (GPL-3.0-or-later).
+
+One AGC submission holds about a million words and the PS5 winsys splits a
+stream only where radv_split_cmd_stream_if_due runs, which this Mesa calls
+before draws and dispatches. An area load records long runs of uploads,
+copies and barriers with hardly a draw between them; the CP DMA paths of
+vkCmdFillBuffer, vkCmdCopyBuffer2 and vkCmdUpdateBuffer never dispatch, so
+such a run could pass the limit with nowhere to split, and the winsys gave up
+with "a submission holds more words between two splits than one AGC
+submission can" and VK_ERROR_DEVICE_LOST.
+
+With the switch on, the same check runs at the start of vkCmdFillBuffer,
+vkCmdCopyBuffer2, vkCmdUpdateBuffer, vkCmdCopyBufferToImage2,
+vkCmdCopyImageToBuffer2, vkCmdCopyImage2 and vkCmdPipelineBarrier2, under
+radv_split_cmd_stream_if_due's own conditions (streamout, conditional
+rendering, active queries, an inherited render pass defer it;
+tools/patch-radv-wsi.py's emulated task draw guard applies too).
+
+Differences from PR 77: radv_split_cmd_stream_if_due stays static, because
+tools/patch-radv-wsi.py anchors on "static void\nradv_split_cmd_stream_if_due";
+an exported wrapper, radv_ps5_split_before_transfer (declared in
+radv_cmd_buffer.h), carries the switch. PR 77 has no switch.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/meta/radv_meta_buffer.c |  3 +++
+ src/amd/vulkan/meta/radv_meta_copy.c   |  3 +++
+ src/amd/vulkan/radv_cmd_buffer.c       | 26 ++++++++++++++++++++++++++
+ src/amd/vulkan/radv_cmd_buffer.h       |  4 ++++
+ 4 files changed, 36 insertions(+)
+
+diff --git a/src/amd/vulkan/meta/radv_meta_buffer.c b/src/amd/vulkan/meta/radv_meta_buffer.c
+index 559272a..6445d07 100644
+--- a/src/amd/vulkan/meta/radv_meta_buffer.c
++++ b/src/amd/vulkan/meta/radv_meta_buffer.c
+@@ -325,6 +325,7 @@ radv_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSi
+                    uint32_t data)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_ps5_split_before_transfer(cmd_buffer); /* EglantinePS5: RADV_PS5_TRANSFER_SPLIT */
+    VK_FROM_HANDLE(radv_buffer, dst_buffer, dstBuffer);
+ 
+    radv_suspend_conditional_rendering(cmd_buffer);
+@@ -381,6 +382,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *pCopyBufferInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_ps5_split_before_transfer(cmd_buffer); /* EglantinePS5: RADV_PS5_TRANSFER_SPLIT */
+    VK_FROM_HANDLE(radv_buffer, src_buffer, pCopyBufferInfo->srcBuffer);
+    VK_FROM_HANDLE(radv_buffer, dst_buffer, pCopyBufferInfo->dstBuffer);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+@@ -481,6 +483,7 @@ radv_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDevice
+                      const void *pData)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_ps5_split_before_transfer(cmd_buffer); /* EglantinePS5: RADV_PS5_TRANSFER_SPLIT */
+    VK_FROM_HANDLE(radv_buffer, dst_buffer, dstBuffer);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const uint64_t dst_va = vk_buffer_address(&dst_buffer->vk, dstOffset);
+diff --git a/src/amd/vulkan/meta/radv_meta_copy.c b/src/amd/vulkan/meta/radv_meta_copy.c
+index b48ad04..16de5de 100644
+--- a/src/amd/vulkan/meta/radv_meta_copy.c
++++ b/src/amd/vulkan/meta/radv_meta_copy.c
+@@ -296,6 +296,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_ps5_split_before_transfer(cmd_buffer); /* EglantinePS5: RADV_PS5_TRANSFER_SPLIT */
+    VK_FROM_HANDLE(radv_buffer, src_buffer, pCopyBufferToImageInfo->srcBuffer);
+    VK_FROM_HANDLE(radv_image, dst_image, pCopyBufferToImageInfo->dstImage);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+@@ -508,6 +509,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_ps5_split_before_transfer(cmd_buffer); /* EglantinePS5: RADV_PS5_TRANSFER_SPLIT */
+    VK_FROM_HANDLE(radv_image, src_image, pCopyImageToBufferInfo->srcImage);
+    VK_FROM_HANDLE(radv_buffer, dst_buffer, pCopyImageToBufferInfo->dstBuffer);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+@@ -801,6 +803,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyImageInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_ps5_split_before_transfer(cmd_buffer); /* EglantinePS5: RADV_PS5_TRANSFER_SPLIT */
+    VK_FROM_HANDLE(radv_image, src_image, pCopyImageInfo->srcImage);
+    VK_FROM_HANDLE(radv_image, dst_image, pCopyImageInfo->dstImage);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 49a51e5..34840a8 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -14011,6 +14011,31 @@ radv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer)
+       radv_emit_rendering_area(cmd_buffer);
+ }
+ 
++#include <stdio.h>
++#include "util/u_atomic.h"
++
++/* EglantinePS5 (from ProsperoEden, by way of heydemoura/EglantinePS5 PR 77): with
++ * RADV_PS5_TRANSFER_SPLIT=1 a stream may also split where a transfer command or a pipeline
++ * barrier starts, not only before a draw or a dispatch. A game loading an area records long runs
++ * of buffer uploads, copies and barriers with hardly a draw between them; CP DMA copies, fills and
++ * inline updates never reach radv_before_dispatch, so such a run could outgrow one AGC submission
++ * with nowhere to split ("a submission holds more words between two splits than one AGC submission
++ * can", then VK_ERROR_DEVICE_LOST). The conditions are radv_split_cmd_stream_if_due's own, so
++ * whatever defers a split before a draw defers it here too. Read once; unset = as before. */
++void
++radv_ps5_split_before_transfer(struct radv_cmd_buffer *cmd_buffer)
++{
++   static int enabled = -1;
++   if (unlikely(enabled < 0)) {
++      const char *const value = getenv("RADV_PS5_TRANSFER_SPLIT");
++      const int on = value && value[0] == '1' && value[1] == '\0';
++      if (p_atomic_cmpxchg(&enabled, -1, on) == -1 && on)
++         fprintf(stderr, "radv/ps5: command streams may split before transfers and barriers (RADV_PS5_TRANSFER_SPLIT)\n");
++   }
++   if (enabled)
++      radv_split_cmd_stream_if_due(cmd_buffer);
++}
++
+ /* MUST inline this function to avoid massive perf loss in drawoverhead */
+ ALWAYS_INLINE static bool
+ radv_before_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t drawCount, bool dgc)
+@@ -17731,6 +17756,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo *pDependencyInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_ps5_split_before_transfer(cmd_buffer); /* EglantinePS5: RADV_PS5_TRANSFER_SPLIT */
+    enum rgp_barrier_reason barrier_reason;
+ 
+    if (cmd_buffer->vk.runtime_rp_barrier) {
+diff --git a/src/amd/vulkan/radv_cmd_buffer.h b/src/amd/vulkan/radv_cmd_buffer.h
+index 93d3af3..5ae5524 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.h
++++ b/src/amd/vulkan/radv_cmd_buffer.h
+@@ -913,4 +913,8 @@ radv_resume_conditional_rendering(struct radv_cmd_buffer *cmd_buffer)
+  * geometry shaders run as compute generate and write, which queries sample. */
+ uint64_t radv_gs_compute_query_counters(struct radv_cmd_buffer *cmd_buffer);
+ 
++/* EglantinePS5: radv_split_cmd_stream_if_due where a transfer or a barrier starts, with
++ * RADV_PS5_TRANSFER_SPLIT=1 (radv_cmd_buffer.c). */
++void radv_ps5_split_before_transfer(struct radv_cmd_buffer *cmd_buffer);
++
+ #endif /* RADV_CMD_BUFFER_H */

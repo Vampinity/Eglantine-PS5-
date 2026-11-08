@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:00:00 +0100
+Subject: [PATCH] radv/ps5: RADV_PS5_GS_COMPUTE_SINKS=1 points a dropped
+ geometry-shader compute draw at a sink
+
+Driver patch, after lead-mesh-18. Off unless the switch is exactly "1"; read once.
+Port of the geometry-shader half of heydemoura/EglantinePS5 PR 77 (branch
+perf/radv-robustness, tools/patch-radv-gs-compute.py), itself a backport from
+ProsperoEden (GPL-3.0-or-later).
+
+A draw that radv_gs_compute_setup drops (counts too large, or the heap out of
+room) left the vertex output, index, count and output index buffers at 0, and
+the passes that still ran read and wrote through them: a GPU page fault. With
+the switch on, radv_gs_compute_prepare starts them at a fresh 256-byte sink.
+
+Only the CPU half is ported. poly_vertex_params_init and
+poly_geometry_params_init zero these pointers, poly_*_params_set_draw does not
+touch them, and the setup kernels write them only when the draw fits, so a
+dropped draw keeps the sink without PR 77's change to cl/radv_gs_compute.cl.
+That kernel cannot read the switch, and leaving it alone keeps an unset switch
+identical to before.
+
+This path only runs for geometry shaders with transform feedback, or for every
+geometry shader with RADV_PS5_GS_COMPUTE=1.
+
+Not built, not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 34840a8..d8af00b 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -14425,6 +14425,9 @@ radv_gs_compute_dispatch(struct radv_cmd_buffer *cmd_buffer, const struct radv_s
+       RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE;
+ }
+ 
++#include <stdio.h>
++#include "util/u_atomic.h"
++
+ /* poly's parameters and the draw block, as far as the CPU knows them. With
+  * transform feedback active, returns where the buffers' offsets go for the
+  * passes (radv_gs_compute_run_passes), else 0. */
+@@ -14440,6 +14443,27 @@ radv_gs_compute_prepare(struct radv_cmd_buffer *cmd_buffer, const struct radv_gs
+    poly_vertex_params_init(vp, gsc->vs_outputs, wg_size);
+    poly_geometry_params_init(gp, mode, wg_size);
+ 
++   /* EglantinePS5 (from ProsperoEden, by way of heydemoura/EglantinePS5 PR 77): with
++    * RADV_PS5_GS_COMPUTE_SINKS=1 the pointers radv_gs_compute_setup and radv_gs_compute_tess_setup
++    * fill in only for a draw that fits start at a 256-byte sink, not 0. A draw the setup drops
++    * (its counts or the heap do not fit) left them at 0, and the passes that still ran read and
++    * wrote through them: a GPU page fault in a game's battles. poly_*_params_init zero them and
++    * poly_*_params_set_draw does not touch them, so a dropped draw keeps the sink. Read once. */
++   static int sinks = -1;
++   if (unlikely(sinks < 0)) {
++      const char *const value = getenv("RADV_PS5_GS_COMPUTE_SINKS");
++      const int on = value && value[0] == '1' && value[1] == '\0';
++      if (p_atomic_cmpxchg(&sinks, -1, on) == -1 && on)
++         fprintf(stderr, "radv/ps5: dropped geometry-shader compute draws point at a sink (RADV_PS5_GS_COMPUTE_SINKS)\n");
++   }
++   if (sinks) {
++      const uint64_t null_sink = radv_gs_compute_upload(cmd_buffer, 256, NULL, NULL);
++      vp->output_buffer = null_sink;
++      vp->index_buffer = null_sink;
++      gp->count_buffer = null_sink;
++      gp->output_index_buffer = null_sink;
++   }
++
+    /* Primitives generated and written per stream count into the command
+     * buffer's counters, which queries sample. */
+    const uint64_t sink = radv_gs_compute_upload(cmd_buffer, 256, NULL, NULL);

@@ -1,0 +1,210 @@
+From f8cd23ea180e54de2202c5f756b5f999b8914114 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:04:27 +0100
+Subject: [PATCH] up: wide-compute-ssbos
+
+Source: de4ed9d9d7
+Switch: EDEN_UP_WIDE_COMPUTE_SSBOS
+Preserves T61 pending-NVN binding reservation; all collection limits use gated per-stage cap.
+64-bit masks and arrays are passive capacity when off. Graphics stays 32.
+Review fix: AddNVNStorageBuffers (translate_program.cpp) also capped at Info::MAX_SSBOS, which
+this patch raises to 64 for every stage: with the switch unset a program could get 33+ bindings,
+and a graphics stage past 32 shifts 1U << 32 and writes past storage_buffers[stage][31]. It now
+uses the same gated cap.
+---
+ .../frontend/maxwell/translate_program.cpp    |  9 ++++++++-
+ .../global_memory_to_storage_buffer_pass.cpp  | 19 +++++++++++++------
+ src/shader_recompiler/shader_info.h           |  5 ++++-
+ src/video_core/buffer_cache/buffer_cache.h    |  4 ++--
+ .../buffer_cache/buffer_cache_base.h          | 12 +++++++-----
+ 5 files changed, 34 insertions(+), 15 deletions(-)
+
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index a29893f..4c2f290 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -15,6 +15,7 @@
+ #include <atomic>
+ #include <cstdlib>
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "common/settings.h"
+ #include "shader_recompiler/exception.h"
+ #include "shader_recompiler/frontend/ir/basic_block.h"
+@@ -121,6 +122,12 @@ void AddNVNStorageBuffers(IR::Program& program) {
+         throw InvalidArgument("Invalid stage {}", program.stage);
+     }()};
+     auto& descs{program.info.storage_buffers_descriptors};
++    // Info::MAX_SSBOS is 64 for EDEN_UP_WIDE_COMPUTE_SSBOS; graphics stages (32-bit enable masks,
++    // 32 bindings per stage in the buffer cache) and every stage with the switch unset keep 32.
++    static const bool wide_compute = ::Common::PeSwitch("EDEN_UP_WIDE_COMPUTE_SSBOS");
++    const size_t max_ssbos{wide_compute && program.stage == Stage::Compute
++                               ? Info::MAX_SSBOS
++                               : Info::MAX_GRAPHICS_SSBOS};
+     for (u32 index = 0; index < num_buffers; ++index) {
+         if (!program.info.nvn_buffer_used[index]) {
+             continue;
+@@ -133,7 +140,7 @@ void AddNVNStorageBuffers(IR::Program& program) {
+             it->is_written |= program.info.stores_global_memory;
+             continue;
+         }
+-        if (descs.size() >= Info::MAX_SSBOS) {
++        if (descs.size() >= max_ssbos) {
+             // A native program's tracked pointers can take every binding.
+             LOG_WARNING(Shader, "No storage buffer binding left for NVN slot {}", index);
+             continue;
+diff --git a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+index a5f4f39..61f8397 100644
+--- a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
++++ b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/pe_switch.h"
+ #include <algorithm>
+ #include <array>
+ #include <bit>
+@@ -31,6 +32,12 @@
+ 
+ namespace Shader::Optimization {
+ namespace {
++
++size_t StorageBufferLimit(const Environment& env) {
++    static const bool wide = Common::PeSwitch("EDEN_UP_WIDE_COMPUTE_SSBOS");
++    return wide && env.ShaderStage() == Stage::Compute ? Info::MAX_SSBOS : Info::MAX_GRAPHICS_SSBOS;
++}
++
+ /// Address in constant buffers to the storage buffer descriptor
+ struct StorageBufferAddr {
+     auto operator<=>(const StorageBufferAddr&) const noexcept = default;
+@@ -1376,7 +1383,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info,
+     // check below, as without the switch.
+     const bool paired_found =
+         paired_search && storage_buffer.has_value() &&
+-        (info.set.size() < Info::MAX_SSBOS || info.set.find(*storage_buffer) != info.set.end());
++        (info.set.size() < StorageBufferLimit(env) || info.set.find(*storage_buffer) != info.set.end());
+     if (native && (!storage_buffer || paired_found) && !low_addr.IsImmediate()) {
+         const IR::Inst* const start{low_addr.InstRecursive()};
+         auto it{info.native_candidates.find(start)};
+@@ -1416,7 +1423,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info,
+                 const bool table{std::ranges::find(info.table_candidates, candidate) !=
+                                  info.table_candidates.end()};
+                 if ((table && info.table_used + added > info.table_budget) ||
+-                    info.set.size() + added > Info::MAX_SSBOS) {
++                    info.set.size() + added > StorageBufferLimit(env)) {
+                     info.bindings_full = true;
+                     continue;
+                 }
+@@ -1487,7 +1494,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info,
+         LOG_DEBUG(Shader, "Storage buffer tracked without bias, index {} offset {}",
+                     storage_buffer->index, storage_buffer->offset);
+     }
+-    if (info.set.size() >= Info::MAX_SSBOS && info.set.find(*storage_buffer) == info.set.end()) {
++    if (info.set.size() >= StorageBufferLimit(env) && info.set.find(*storage_buffer) == info.set.end()) {
+         info.bindings_full = true;
+         return;
+     }
+@@ -1710,13 +1717,13 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
+     };
+     collect();
+     const size_t reserved{info.tables_seen ? PendingNvnBindings(program, info.set) : 0U};
+-    if (info.tables_seen && info.set.size() + reserved < Info::MAX_SSBOS) {
++    if (info.tables_seen && info.set.size() + reserved < StorageBufferLimit(env)) {
+         // Again with pointer table entries, in the bindings the first pass left free.
+         StorageInfo with_tables;
+         with_tables.iterator_words = std::move(info.iterator_words);
+         with_tables.atomic_pointers = std::move(info.atomic_pointers);
+         with_tables.tables_enabled = true;
+-        with_tables.table_budget = Info::MAX_SSBOS - info.set.size() - reserved;
++        with_tables.table_budget = StorageBufferLimit(env) - info.set.size() - reserved;
+         info = std::move(with_tables);
+         collect();
+     } else if (info.tables_seen) {
+@@ -1724,7 +1731,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
+     }
+     if (info.bindings_full) {
+         LOG_WARNING(Shader, "All {} storage buffer bindings taken, the rest stay global",
+-                    Info::MAX_SSBOS);
++                    StorageBufferLimit(env));
+     }
+     program.info.native_global_bounds |= info.native_runtime_bounds;
+     for (const StorageBufferAddr& storage_buffer : info.set) {
+diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
+index 4ae1a0d..f9bd412 100644
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -278,7 +278,10 @@ struct MeshInfo {
+ struct Info {
+     static constexpr size_t MAX_INDIRECT_CBUFS{14};
+     static constexpr size_t MAX_CBUFS{18};
+-    static constexpr size_t MAX_SSBOS{32};
++    /// Compute programs can bind up to MAX_SSBOS storage buffers; graphics programs and compute
++    /// programs with EDEN_NX2_WIDE_COMPUTE_SSBOS=0 keep the old limit of MAX_GRAPHICS_SSBOS.
++    static constexpr size_t MAX_SSBOS{64};
++    static constexpr size_t MAX_GRAPHICS_SSBOS{32};
+ 
+     bool is_task{}; ///< Switch 2 task program (Stage::Task)
+     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 28d5291..7aab5d3 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -879,8 +879,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+             }
+         }
+     }
+-    channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
+-    channel_state->written_compute_storage_buffers |= (is_written ? 1U : 0U) << ssbo_index;
++    channel_state->enabled_compute_storage_buffers |= u64{1} << ssbo_index;
++    channel_state->written_compute_storage_buffers |= u64{is_written ? 1U : 0U} << ssbo_index;
+     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
+         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
+             ++channel_state->total_compute_storage_buffers;
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index ac0b724..e4d9484 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -64,6 +64,8 @@ constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
+ constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
+ // Native compute shaders bind up to 18 global memory ranges; the enable masks are 32 bits wide.
+ constexpr u32 NUM_STORAGE_BUFFERS = 32;
++// Compute programs can take pointer table entries beyond 32 bindings (Shader::Info::MAX_SSBOS).
++constexpr u32 NUM_COMPUTE_STORAGE_BUFFERS = 64;
+ constexpr u32 NUM_TEXTURE_BUFFERS = 32;
+ constexpr u32 NUM_STAGES = 5;
+ 
+@@ -140,7 +142,7 @@ public:
+     Binding indirect_buffer_binding;
+ 
+     std::array<Binding, NUM_COMPUTE_UNIFORM_BUFFERS> compute_uniform_buffers;
+-    std::array<Binding, NUM_STORAGE_BUFFERS> compute_storage_buffers;
++    std::array<Binding, NUM_COMPUTE_STORAGE_BUFFERS> compute_storage_buffers;
+     std::array<TextureBufferBinding, NUM_TEXTURE_BUFFERS> compute_texture_buffers;
+ 
+     std::array<u32, NUM_STAGES> enabled_uniform_buffer_masks{};
+@@ -151,8 +153,8 @@ public:
+ 
+     std::array<u32, NUM_STAGES> enabled_storage_buffers{};
+     std::array<u32, NUM_STAGES> written_storage_buffers{};
+-    u32 enabled_compute_storage_buffers = 0;
+-    u32 written_compute_storage_buffers = 0;
++    u64 enabled_compute_storage_buffers = 0;
++    u64 written_compute_storage_buffers = 0;
+ 
+     u32 total_graphics_storage_buffers = 0;
+     u32 total_compute_storage_buffers = 0;
+@@ -492,8 +494,8 @@ public:
+     }
+ 
+ private:
+-    template <typename Func>
+-    static void ForEachEnabledBit(u32 enabled_mask, Func&& func) {
++    template <typename Mask, typename Func>
++    static void ForEachEnabledBit(Mask enabled_mask, Func&& func) {
+         for (u32 index = 0; enabled_mask != 0; ++index, enabled_mask >>= 1) {
+             const int disabled_bits = std::countr_zero(enabled_mask);
+             index += disabled_bits;
+-- 
+2.54.0
+

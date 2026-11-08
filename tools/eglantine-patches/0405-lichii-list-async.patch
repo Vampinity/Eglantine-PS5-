@@ -1,0 +1,375 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 28d5291..6cb5da2 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -2503,7 +2503,8 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
+ }
+ 
+ template <class P>
+-auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx2ListRead {
++auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, u64* pending_tick)
++    -> Nx2ListRead {
+     if constexpr (IS_OPENGL) {
+         return Nx2ListRead::Unknown;
+     } else {
+@@ -2540,6 +2541,10 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
+             }
+             tick = entry.copy_tick;
+             writes = entry.copy_writes;
++            if (pending_tick != nullptr) {
++                *pending_tick = tick;
++                return Nx2ListRead::Pending;
++            }
+         }
+         // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
+         runtime.WaitSubmittedTick(tick);
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index ac0b724..27963df 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -377,11 +377,14 @@ public:
+     }
+     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
+     bool Nx2CopyListPages(u64 tick);
+-    enum class Nx2ListRead { Unknown, Copied, Synced };
++    enum class Nx2ListRead { Unknown, Copied, Synced, Pending };
+     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
+     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
+     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
+-    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out);
++    /// With `pending_tick` (EDEN_NX2_LIST_ASYNC), a copy the GPU has not finished returns Pending
++    /// and sets the tick instead of waiting for it.
++    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out,
++                                u64* pending_tick = nullptr);
+     /// Front thread, the split drained: the command list page was flushed to guest memory.
+     void Nx2NoteListSynced(DAddr page);
+     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
+diff --git a/src/video_core/control/scheduler.cpp b/src/video_core/control/scheduler.cpp
+index 0e42bad..40db24e 100644
+--- a/src/video_core/control/scheduler.cpp
++++ b/src/video_core/control/scheduler.cpp
+@@ -50,6 +50,10 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
+         std::find(pending_channels.begin(), pending_channels.end(), channel_state) ==
+             pending_channels.end()) {
+         pending_channels.push_back(channel_state);
++    }
++    // any_pending (GPU::HasSuspendedChannels) counts semaphore suspensions only: a channel
++    // waiting for a list copy (EDEN_NX2_LIST_ASYNC) must not make a present give up its wait.
++    if (channel_state->payload->dma_pusher.HasPendingSemaphore()) {
+         any_pending.store(true, std::memory_order_release);
+     }
+     if (!pending_channels.empty()) {
+@@ -83,7 +87,12 @@ bool Scheduler::ResumePending(GPU& gpu) {
+     std::erase_if(pending_channels, [](const auto& state) {
+         return !state->payload->dma_pusher.HasPendingAcquire();
+     });
+-    any_pending.store(!pending_channels.empty(), std::memory_order_release);
++    any_pending.store(std::ranges::any_of(pending_channels,
++                                          [](const auto& state) {
++                                              return state->payload->dma_pusher
++                                                  .HasPendingSemaphore();
++                                          }),
++                      std::memory_order_release);
+     return any_progress;
+ }
+ 
+diff --git a/src/video_core/control/scheduler.h b/src/video_core/control/scheduler.h
+index 6b2f24c..4c0b392 100644
+--- a/src/video_core/control/scheduler.h
++++ b/src/video_core/control/scheduler.h
+@@ -43,7 +43,9 @@ private:
+ 
+     ::Common::unordered_map<s32, std::shared_ptr<ChannelState>> channels;
+     std::mutex scheduling_guard;
+-    std::vector<std::shared_ptr<ChannelState>> pending_channels; ///< Suspended on an acquire
++    /// Suspended on an acquire, or (EDEN_NX2_LIST_ASYNC) on a command list copy
++    std::vector<std::shared_ptr<ChannelState>> pending_channels;
++    /// Some pending channel waits on a semaphore acquire (HasPendingChannelsAnyThread)
+     std::atomic<bool> any_pending{};
+ };
+ 
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index d0343e9..cfbb1bf 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -8,7 +8,9 @@
+ #include <atomic>
+ #include <cstdlib>
+ #include <cstdio>
++#include <utility>
+ 
++#include "common/pe_switch.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+@@ -143,6 +145,25 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
+ 
+ DmaPusher::~DmaPusher() = default;
+ 
++// EDEN_NX2_LIST_ASYNC=1, from Lichii PR 752 (zortos293/Lichii, async-command-lists). A command
++// list the GPU wrote is read from the copy the buffer cache made after its writer, once the host
++// GPU finished that copy. Off, the front waits for it and both GPU threads stand still (Lichii:
++// ~2,400 waits a second in Kokiri Forest, the back idle throughout). On, the channel suspends at
++// that entry the way it does on a semaphore acquire: the GPU thread runs other channels and queued
++// work, and the entry is parsed again once the copy's tick is done. Its own entries keep their
++// order. Read once.
++static bool ListAsync() {
++    static const bool enabled = Common::PeSwitch("EDEN_NX2_LIST_ASYNC");
++    return enabled;
++}
++
++bool DmaPusher::CanResumeAcquire() {
++    if (pending_list_tick) {
++        return rasterizer == nullptr || rasterizer->IsGpuTickDone(*pending_list_tick);
++    }
++    return puller.CanResumeAcquire(*this);
++}
++
+ void DmaPusher::DispatchCalls() {
+     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
+     dma_state.is_last_call = true;
+@@ -254,6 +275,23 @@ bool DmaPusher::Step() {
+     }
+     // Reading and parsing the lists; the methods they call open zones of their own.
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::CommandLists};
++    // EDEN_NX2_LIST_ASYNC: waiting for the GPU's copy of the command list this channel reads next
++    // (ReadGpuWrittenCommands). Never set with the switch off.
++    if (pending_list_tick) {
++        if (rasterizer != nullptr && !rasterizer->IsGpuTickDone(*pending_list_tick)) {
++            return false;
++        }
++        pending_list_tick.reset();
++        resumed_list_read = true;
++    }
++    // The entry that suspended already ran its start-of-entry work (split-method parking, submit
++    // hash check, macro dirty check) before it suspended: not twice.
++    const bool resumed_entry = resumed_list_read;
++    // Only for that entry: an acquire, the safe-read path or a stopped split must not leave it set
++    // for a later list (which would then skip its writer wait).
++    SCOPE_EXIT {
++        resumed_list_read = false;
++    };
+     const u64 suspensions_before = suspensions.load(std::memory_order_relaxed);
+     if (!puller.ResumeAcquire(*this)) {
+         return false;
+@@ -309,7 +347,7 @@ bool DmaPusher::Step() {
+     }
+ 
+     if (header.size > 0) {
+-        if (subchannels[dma_state.subchannel] && dma_state.method_count) {
++        if (!resumed_entry && subchannels[dma_state.subchannel] && dma_state.method_count) {
+             const auto engine = subchannel_type[dma_state.subchannel];
+             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
+             const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
+@@ -327,7 +365,7 @@ bool DmaPusher::Step() {
+                 }
+             }
+         }
+-        if (command_resume_offset == 0) {
++        if (command_resume_offset == 0 && !resumed_entry) {
+             // A method's data continues across GP entries, whatever their level: title 4 ends a
+             // main entry after a macro's first word and supplies the remaining parameters in a
+             // 5-word subroutine entry. EDEN_NX2_PARK_SPLIT_METHODS restores the old guess (an
+@@ -453,8 +491,15 @@ bool DmaPusher::Step() {
+             RecordParsedEntry(header, commands);
+             command_resume_offset +=
+                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+-        } else if (!ListDrainFull() &&
+-                   ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
++        } else if (bool list_pending = false;
++                   !ListDrainFull() &&
++                   (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size),
++                                           ListAsync() ? &list_pending : nullptr) ||
++                    list_pending)) {
++            if (list_pending) {
++                // Parsed again once the GPU copied the list; other channels run meanwhile.
++                return false;
++            }
+             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+             entry_trace.source = 2;
+             RecordParsedEntry(header, commands);
+@@ -1007,7 +1052,7 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
+     return false;
+ }
+ 
+-bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
++bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending) {
+     // The pages are marked as command list pages: from the next write on, the buffer cache copies
+     // them to host memory right after the dispatch or copy that writes them and submits. The
+     // front then waits only for the back to run that work and for the GPU to finish the copy, not
+@@ -1031,9 +1076,20 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
+     if (!written) {
+         return false;
+     }
+-    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    // EDEN_NX2_LIST_ASYNC, resuming after the copy's tick: the back ran the list's writer before
++    // the suspension (this wait ran then), and waiting again would also wait for the other
++    // channels' work queued meanwhile. Always false with the switch off.
++    const bool resumed = std::exchange(resumed_list_read, false);
++    if (split.Active() && !resumed) {
+         split.WaitForWriters();
+     }
++    // Suspending needs the split's back running: only it submits a deferred copy, and
++    // IsGpuTickDone answers done without it (the same test, or a stopping split would suspend
++    // and resume this entry forever).
++    u64 copy_tick = 0;
++    u64* const pending_tick =
++        pending != nullptr && split.Active() && split.BackRunning() ? &copy_tick : nullptr;
+     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
+     command_headers.resize_destructive(count);
+     u8* const out = reinterpret_cast<u8*>(command_headers.data());
+@@ -1047,7 +1103,14 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
+         }
+         GpuWrittenList where = GpuWrittenList::Synced;
+         if (Tegra::Nx2IsGpuWritten(*device)) {
+-            where = rasterizer->ReadGpuWrittenCommandList(*device, part);
++            where = rasterizer->ReadGpuWrittenCommandList(*device, part, pending_tick);
++        }
++        if (where == GpuWrittenList::Pending) {
++            // The copy is still on the GPU: the channel waits for it without blocking the others
++            // (Step parses this entry again once IsGpuTickDone).
++            pending_list_tick = copy_tick;
++            *pending = true;
++            return false;
+         }
+         if (where == GpuWrittenList::Unknown) {
+             return false;
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index ed4cd7d..518c238 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -179,12 +179,16 @@ public:
+ 
+     void DispatchCalls();
+ 
+-    /// Switch 2: true while the channel is suspended on a semaphore acquire.
++    /// Switch 2: true while the channel is suspended on a semaphore acquire, or
++    /// (EDEN_NX2_LIST_ASYNC) on the GPU's copy of a command list it reads next.
+     [[nodiscard]] bool HasPendingAcquire() const {
+-        return puller.HasPendingAcquire();
++        return puller.HasPendingAcquire() || pending_list_tick.has_value();
+     }
+-    [[nodiscard]] bool CanResumeAcquire() {
+-        return puller.CanResumeAcquire(*this);
++    [[nodiscard]] bool CanResumeAcquire();
++    /// Suspended on a semaphore acquire only, not on a list copy (GPU::HasSuspendedChannels: the
++    /// present wait gives up on a channel that may wait for its thread, which a copy never does).
++    [[nodiscard]] bool HasPendingSemaphore() const {
++        return puller.HasPendingAcquire();
+     }
+ 
+     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
+@@ -243,8 +247,9 @@ public:
+     /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
+     /// buffer cache made after the work that wrote them or from guest memory for pages flushed
+     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
+-    /// flushes and reads guest memory.
+-    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
++    /// flushes and reads guest memory. With `pending` (EDEN_NX2_LIST_ASYNC), a copy the GPU has
++    /// not finished sets `*pending` and pending_list_tick instead of waiting (the result is false).
++    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
+     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
+     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+ 
+@@ -365,6 +370,10 @@ public:
+     std::condition_variable sync_cv;
+ 
+     VideoCore::RasterizerInterface* rasterizer = nullptr;
++    /// EDEN_NX2_LIST_ASYNC: host GPU tick of the command list copy this channel waits for.
++    std::optional<u64> pending_list_tick;
++    /// The entry parsed next was suspended on pending_list_tick, which is done now.
++    bool resumed_list_read{};
+ 
+     const bool ib_enable : 1 = true; ///< IB mode enabled
+     bool dma_increment_once : 1 = false;
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 52c6edb..23e0f70 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -108,12 +108,24 @@ public:
+         Unknown, ///< Neither: the caller drains, flushes the page and notes it synced
+         Copied,  ///< `out` (within one 4 KiB page) is filled from the copy made after its writer
+         Synced,  ///< Guest memory holds the page: no GPU work wrote it since it was flushed
++        /// Only with `pending_tick`: the copy is not done yet, `*pending_tick` is the host GPU
++        /// tick that completes it. Ask again once IsGpuTickDone(*pending_tick).
++        Pending,
+     };
++    /// With `pending_tick` (EDEN_NX2_LIST_ASYNC), a copy the GPU is still making returns Pending
++    /// instead of waiting.
+     virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
+-                                                     [[maybe_unused]] std::span<u8> out) {
++                                                     [[maybe_unused]] std::span<u8> out,
++                                                     [[maybe_unused]] u64* pending_tick = nullptr) {
+         return GpuWrittenList::Unknown;
+     }
+ 
++    /// Whether the host GPU passed `tick`, without waiting. Asks the split's back to submit
++    /// deferred work when the tick is not submitted yet, so it completes.
++    virtual bool IsGpuTickDone([[maybe_unused]] u64 tick) {
++        return true;
++    }
++
+     /// Switch 2: the front flushed this command list page with the split drained.
+     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 11e711e..36efd04 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1725,18 +1725,38 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
+ }
+ 
+ VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenCommandList(
+-    DAddr addr, std::span<u8> out) {
++    DAddr addr, std::span<u8> out, u64* pending_tick) {
+     // No cache lock: the front only reads the copies, under their own lock.
+-    switch (buffer_cache.Nx2ReadListCopy(addr, out)) {
++    switch (buffer_cache.Nx2ReadListCopy(addr, out, pending_tick)) {
+     case BufferCache::Nx2ListRead::Copied:
+         return GpuWrittenList::Copied;
+     case BufferCache::Nx2ListRead::Synced:
+         return GpuWrittenList::Synced;
++    case BufferCache::Nx2ListRead::Pending:
++        return GpuWrittenList::Pending;
+     default:
+         return GpuWrittenList::Unknown;
+     }
+ }
+ 
++bool RasterizerVulkan::IsGpuTickDone(u64 tick) {
++    if (scheduler.IsFree(tick)) {
++        return true;
++    }
++    auto& split = VideoCommon::GpuSplit::Get();
++    // Only the split's back makes a deferred submission (Scheduler::DeferFlush). With the back
++    // stopped nothing will: answer done, and the read again takes the waiting path (no pending
++    // tick without the split), which submits it itself (BufferCacheRuntime::WaitSubmittedTick).
++    if (!split.Active() || !split.BackRunning()) {
++        return true;
++    }
++    if (!scheduler.IsSubmitted(tick)) {
++        split.RequestIdleHook();
++    }
++    scheduler.GetMasterSemaphore().Refresh();
++    return scheduler.IsFree(tick);
++}
++
+ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
+     buffer_cache.Nx2NoteListSynced(page);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 5aecc2a..a107920 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -101,7 +101,9 @@ public:
+     void FlushAll() override;
+     void FlushRegion(DAddr addr, u64 size,
+                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+-    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out) override;
++    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
++                                             u64* pending_tick = nullptr) override;
++    bool IsGpuTickDone(u64 tick) override;
+     void NoteGpuWrittenCommandListSynced(DAddr page) override;
+     bool MustFlushRegion(DAddr addr, u64 size,
+                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;

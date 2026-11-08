@@ -1,0 +1,44 @@
+From 47af7b0e94e48ed7789d9a99ca8206e57bf7fa79 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:02:46 +0100
+Subject: [PATCH] up: texture-budget-cap
+
+Source: 5d5fba1ca1
+Switch: EDEN_UP_TC_BUDGET_CAP
+Device budget cap is not a PS5 shared-pool availability probe; effect requires threshold overrides.
+---
+ src/video_core/texture_cache/texture_cache.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index d2231c2..9759be9 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -361,6 +361,9 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
+     // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
+     // MaxCriticalMemory on rather than near the card's budget.
++    static const bool budget_cap = Common::PeSwitch("EDEN_UP_TC_BUDGET_CAP");
++    const u64 budget_critical = critical_memory;
++    const u64 budget_expected = expected_memory;
+     critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
+     expected_memory =
+         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+@@ -371,8 +374,14 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+                                        std::pair{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory}}) {
+         if (const char* value = std::getenv(name)) {
+             *target = std::strtoull(value, nullptr, 10) << 20;
++            if (budget_cap) {
++                *target = (std::min)(*target, target == &expected_memory ? budget_expected : budget_critical);
++            }
+         }
+     }
++    if (budget_cap) {
++        expected_memory = (std::min)(expected_memory, critical_memory);
++    }
+     if (log) {
+         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
+                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
+-- 
+2.54.0
+

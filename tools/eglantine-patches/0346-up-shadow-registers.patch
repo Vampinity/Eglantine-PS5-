@@ -1,0 +1,67 @@
+From 2ed5c407a646c7669c64603a0fd95d26dc45e70b Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:03:52 +0100
+Subject: [PATCH] up: shadow-registers
+
+Source: 900ab5a825
+Switch: EDEN_UP_SHADOW_REGISTERS
+Review fix: with the switch unset the four new opcodes now take the old default path
+(invalid, lowering refuses the program) instead of a valid shadow form with no operands.
+---
+ .../frontend/ampere/lower_to_maxwell.h        | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 341df1b..f13f8c6 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -4,6 +4,7 @@
+ // Encoding reference: Mesa NAK sm70_encode.rs (MIT), Copyright 2022 Collabora, Ltd.
+ #pragma once
+ 
++#include "common/pe_switch.h"
+ #include "common/settings.h"
+ #include <fmt/format.h>
+ #include <cstdlib>
+@@ -80,12 +81,23 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     case 0x802: case 0xa02: case 0xb08: case 0xd08: operand(16); break;
+     case 0x804: case 0x80c: operand(24); break;
+     case 0x805: operand(16, 2); break;
++    case 0x306: {
++        // EDEN_UP_SHADOW_REGISTERS unset: as before, no shadow form (the default case below).
++        static const bool enabled = Common::PeSwitch("EDEN_UP_SHADOW_REGISTERS");
++        if (!enabled) { result.valid = false; return result; }
++        operand(16); operand(32); break;
++    }
+     case 0x308: operand(16); operand(32); break;
+     case 0x433: case 0x633: operand(16); operand(24); break;
+     case 0x220: case 0x221: operand(16); operand(24); operand(32); break;
+     case 0x421: case 0x817: case 0x820: operand(16); operand(24); break;
+     case 0x81a: operand(16); operand(24); break;
+     case 0x919: operand(16); break;
++    case 0x20b: {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_SHADOW_REGISTERS");
++        if (!enabled) { result.valid = false; return result; }
++        operand(24); operand(32); break;
++    }
+     case 0x20c: operand(24); operand(32); break;
+     case 0x208: operand(16); operand(24); operand(32); break;
+     case 0x823: operand(16); operand(24); operand(64); break;
+@@ -112,6 +124,14 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+         operand(16); operand(24); operand(32); operand(64); break;
+     case 0x819: case 0xa11:
+         operand(16); operand(24); operand(64); break;
++    case 0x219: case 0xc10: {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_SHADOW_REGISTERS");
++        if (!enabled) { result.valid = false; return result; }
++        operand(16); operand(24);
++        if (opcode == 0x219) operand(32);
++        operand(64);
++        break;
++    }
+     case 0x225: case 0x625: case 0x825:
+         operand(16, 2); operand(24);
+         if (opcode == 0x225) { operand(32); operand(64, 2); }
+-- 
+2.54.0
+

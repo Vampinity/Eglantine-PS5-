@@ -1,0 +1,57 @@
+From 2996b81bafdc4c05da309c85e6cf267bcfc0cec4 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:03:59 +0100
+Subject: [PATCH] up: swapchain-recreate
+
+Source: d039880df9
+Switch: EDEN_UP_SWAPCHAIN_RECREATE
+Main relevance is swapchain recreation; fixed-size PS5 presentation may not trigger it.
+---
+ src/video_core/renderer_vulkan/vk_swapchain.cpp | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_swapchain.cpp b/src/video_core/renderer_vulkan/vk_swapchain.cpp
+index a0ed5a4..355d593 100644
+--- a/src/video_core/renderer_vulkan/vk_swapchain.cpp
++++ b/src/video_core/renderer_vulkan/vk_swapchain.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/pe_switch.h"
+ #include <algorithm>
+ #include <array>
+ #include <limits>
+@@ -149,6 +150,17 @@ void Swapchain::Create(
+         return;
+     }
+ 
++    // Submitted work may still wait on the old acquire/present semaphores; destroying them under
++    // it loses the device on MoltenVK (window moved to a display with a different scale).
++    static const bool safe_recreate = Common::PeSwitch("EDEN_UP_SWAPCHAIN_RECREATE");
++    if (safe_recreate && swapchain) {
++        std::scoped_lock lock{scheduler.submit_mutex};
++        const VkResult result = device.GetLogical().WaitIdle();
++        if (result == VK_ERROR_DEVICE_LOST) {
++            device.ReportLoss();
++        }
++        vk::Check(result);
++    }
+     Destroy();
+ 
+     CreateSwapchain(capabilities);
+@@ -211,7 +223,10 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
+ 
+     resource_ticks[image_index] = scheduler.CurrentTick();
+ 
+-    return is_suboptimal || is_outdated;
++    // A suboptimal acquire still acquired an image and signals its semaphore: present it, and let
++    // NeedsRecreation() recreate at the next frame. Out of date acquired nothing.
++    static const bool safe_recreate = Common::PeSwitch("EDEN_UP_SWAPCHAIN_RECREATE");
++    return safe_recreate ? is_outdated : is_suboptimal || is_outdated;
+ }
+ 
+ void Swapchain::Present(VkSemaphore render_semaphore) {
+-- 
+2.54.0
+

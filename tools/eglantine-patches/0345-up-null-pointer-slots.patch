@@ -1,0 +1,260 @@
+From 31ae34bc6a8bff8fa4ddafe91944d58e64fc2f7c Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:03:34 +0100
+Subject: [PATCH] up: null-pointer-slots
+
+Source: 688c6fa7d8
+Switch: EDEN_UP_NULL_POINTER_SLOTS
+T61 legacy EDEN_NX2_NULL_SLOTS remains available. New path seeds earlier pointers, serializes rebuilt environments and chooses disk records with more bindings. Retired pipelines retained for in-flight users.
+---
+ .../renderer_vulkan/vk_compute_pipeline.h     |  7 ++
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 74 ++++++++++++++++++-
+ .../renderer_vulkan/vk_pipeline_cache.h       |  6 +-
+ src/video_core/shader_environment.cpp         | 39 ++++++++++
+ src/video_core/shader_environment.h           | 10 +++
+ 5 files changed, 132 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index 82b3910..c682b27 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <condition_variable>
+ #include <mutex>
++#include <vector>
+ 
+ #include "common/common_types.h"
+ #include "common/thread_worker.h"
+@@ -66,6 +67,12 @@ public:
+         return is_built.load(std::memory_order::acquire) && IsBound();
+     }
+ 
++    /// Native constant buffer pointer slots taken as storage buffers, and the ones left out
++    /// because they held null when this pipeline was built (rebuilt once one is filled).
++    std::vector<u64> pointer_slots;
++    std::vector<u64> null_pointer_slots;
++    u32 pointer_rebuilds{};
++
+ private:
+     const Device& device;
+     vk::PipelineCache& pipeline_cache;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 54d99eb..127d449 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1286,10 +1286,31 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
+     };
+     const auto [pair, is_new]{compute_cache.try_emplace(key)};
+     auto& pipeline{pair->second};
+-    if (!is_new && NullSlotsMode() != 0 && pipeline) {
++    static const bool up_null_slots = Common::PeSwitch("EDEN_UP_NULL_POINTER_SLOTS");
++    if (!is_new && !up_null_slots && NullSlotsMode() != 0 && pipeline) {
+         RecheckNullPointerSlots(key, shader, pipeline);
+     }
+     if (!is_new) {
++        // A native program translated while one of its pointer slots was null (a buffer the game
++        // hadn't allocated yet) has no binding for it, and the disk cache keeps that version for
++        // later sessions: Ocarina of Time's bush leaves never appeared in Castle Town. Rebuild it
++        // once the slot holds a buffer.
++        if (up_null_slots && pipeline && !pipeline->null_pointer_slots.empty() && pipeline->pointer_rebuilds < 4 &&
++            NullPointerSlotFilled(*pipeline)) {
++            auto rebuilt{CreateComputePipeline(key, shader, pipeline.get())};
++            if (rebuilt) {
++                LOG_INFO(Render_Vulkan,
++                         "Compute pipeline {:016x} rebuilt: a pointer slot null at its translation "
++                         "now holds a buffer ({} pointer slots, {} still null)",
++                         key.unique_hash, rebuilt->pointer_slots.size(),
++                         rebuilt->null_pointer_slots.size());
++                retired_compute_pipelines.push_back(std::move(pipeline));
++                pipeline = std::move(rebuilt);
++            } else {
++                pipeline->null_pointer_slots.clear();
++            }
++        }
++
+         return pipeline.get();
+     }
+     pipeline = CreateComputePipeline(key, shader);
+@@ -1360,6 +1381,28 @@ void PipelineCache::RecheckNullPointerSlots(const ComputePipelineCacheKey& key,
+     pipeline = std::move(rebuilt);
+ }
+ 
++bool PipelineCache::NullPointerSlotFilled(const ComputePipeline& pipeline) const {
++    const auto& qmd{kepler_compute->launch_description};
++    for (const u64 slot : pipeline.null_pointer_slots) {
++        const u32 index = static_cast<u32>(slot >> 32);
++        const u32 offset = static_cast<u32>(slot);
++        if (index >= qmd.const_buffer_config.size() ||
++            ((qmd.const_buffer_enable_mask.Value() >> index) & 1) == 0) {
++            continue;
++        }
++        const auto& cbuf{qmd.const_buffer_config[index]};
++        if (offset + sizeof(u64) > cbuf.size) {
++            continue;
++        }
++        const GPUVAddr address = gpu_memory->Read<u64>(cbuf.Address() + offset);
++        if (address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
++            gpu_memory->IsFullyMappedRange(address, 1)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                       const VideoCore::DiskResourceLoadCallback& callback) {
+     visual_workaround_title = title_id;
+@@ -1412,9 +1455,23 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
+             ShaderPools pools;
+             auto pipeline{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
++            if (pipeline) {
++                static const bool up_collect = Common::PeSwitch("EDEN_UP_NULL_POINTER_SLOTS");
++                if (up_collect) env_.StoragePointerSlots(pipeline->pointer_slots, pipeline->null_pointer_slots);
++            }
+             std::scoped_lock lock{state.mutex};
+             if (pipeline) {
+-                compute_cache.emplace(key, std::move(pipeline));
++                // A program rebuilt for a filled pointer slot has a second record: keep the one
++                // that binds more pointers.
++                static const bool up_keep_best = Common::PeSwitch("EDEN_UP_NULL_POINTER_SLOTS");
++                if (!up_keep_best) {
++                    compute_cache.emplace(key, std::move(pipeline));
++                } else {
++                auto& slot{compute_cache[key]};
++                if (!slot || slot->pointer_slots.size() < pipeline->pointer_slots.size()) {
++                    slot = std::move(pipeline);
++                }
++                }
+             }
+             ++state.built;
+             if (state.has_loaded) {
+@@ -2065,7 +2122,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+ }
+ 
+ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+-    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
++    const ComputePipelineCacheKey& key, const ShaderInfo* shader,
++    const ComputePipeline* previous) {
+     Common::HangSite site{"building a compute pipeline"};
+     const auto begin = std::chrono::steady_clock::now();
+     SCOPE_EXIT {
+@@ -2076,9 +2134,19 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
+                            shader->lowered_native};
+     env.SetCachedSize(shader->size_bytes);
++    if (previous) {
++        // Keep the buffers the previous build bound, so a slot that empties again later doesn't
++        // drop them and start another rebuild.
++        env.SeedStoragePointers(previous->pointer_slots);
++    }
+ 
+     main_pools.ReleaseContents();
+     auto pipeline{CreateComputePipeline(main_pools, key, env, nullptr, true)};
++    if (pipeline) {
++        static const bool up_collect = Common::PeSwitch("EDEN_UP_NULL_POINTER_SLOTS");
++        if (up_collect) env.StoragePointerSlots(pipeline->pointer_slots, pipeline->null_pointer_slots);
++        pipeline->pointer_rebuilds = previous ? previous->pointer_rebuilds + 1 : 0;
++    }
+     if (!pipeline || pipeline_cache_filename.empty()) {
+         return pipeline;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 8c0cd53..170ac03 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -191,7 +191,11 @@ private:
+         bool build_in_parallel);
+ 
+     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineCacheKey& key,
+-                                                           const ShaderInfo* shader);
++                                                           const ShaderInfo* shader,
++                                                           const ComputePipeline* previous = nullptr);
++
++    /// Whether a pointer slot the pipeline left out because it was null now holds a mapped address.
++    bool NullPointerSlotFilled(const ComputePipeline& pipeline) const;
+ 
+     std::unique_ptr<ComputePipeline> CreateComputePipeline(ShaderPools& pools,
+                                                            const ComputePipelineCacheKey& key,
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index bd058c7..f6de9cc 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -223,6 +223,45 @@ std::vector<std::pair<u32, u32>> GenericEnvironment::NullStoragePointerSlots() c
+     return FindNullStoragePointerSlots(cbuf_values, storage_pointer_types);
+ }
+ 
++static void CollectStoragePointerSlots(const ::Common::unordered_map<u64, u8>& types,
++                                       const ::Common::unordered_map<u64, u32>& values,
++                                       std::vector<u64>& pointers, std::vector<u64>& null_slots) {
++    for (const auto& [key, type] : types) {
++        if ((key >> 63) != 0) {
++            continue; // pointer-table entries
++        }
++        if (type != 0) {
++            pointers.push_back(key);
++            continue;
++        }
++        const u32 index = static_cast<u32>(key >> 32);
++        const u32 offset = static_cast<u32>(key);
++        const auto low = values.find(MakeCbufKey(index, offset));
++        const auto high = values.find(MakeCbufKey(index, offset + 4));
++        if (low != values.end() && high != values.end() && low->second == 0 &&
++            high->second == 0) {
++            null_slots.push_back(key);
++        }
++    }
++}
++
++void GenericEnvironment::StoragePointerSlots(std::vector<u64>& pointers,
++                                             std::vector<u64>& null_slots) const {
++    CollectStoragePointerSlots(storage_pointer_types, cbuf_values, pointers, null_slots);
++}
++
++void GenericEnvironment::SeedStoragePointers(std::span<const u64> slots) {
++    for (const u64 key : slots) {
++        storage_pointer_types.emplace(key, u8{1});
++    }
++}
++
++void FileEnvironment::StoragePointerSlots(std::vector<u64>& pointers,
++                                          std::vector<u64>& null_slots) const {
++    CollectStoragePointerSlots(storage_pointer_types, cbuf_values, pointers, null_slots);
++}
++
++
+ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+     const u64 key = MakeIndirectCbufKey(index, offset, indirect);
+     if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+index 8fd70ab..938d1c3 100644
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -103,6 +103,13 @@ public:
+     /// programs (only the mesh pipeline file carries them).
+     void Serialize(std::ofstream& file, bool with_mesh_state = false) const;
+ 
++    /// Native programs: the constant buffer slots (index << 32 | offset) storage tracking took as
++    /// pointers, and the ones it left out because they held null when the program was translated.
++    void StoragePointerSlots(std::vector<u64>& pointers, std::vector<u64>& null_slots) const;
++
++    /// Takes these slots as pointers without reading them: a rebuild keeps its earlier buffers.
++    void SeedStoragePointers(std::span<const u64> slots);
++
+     bool HasHLEMacroState() const override {
+         return has_hle_engine_state;
+     }
+@@ -221,6 +228,9 @@ public:
+ 
+     void Deserialize(std::ifstream& file, bool with_mesh_state = false);
+ 
++    /// See GenericEnvironment::StoragePointerSlots.
++    void StoragePointerSlots(std::vector<u64>& pointers, std::vector<u64>& null_slots) const;
++
+     [[nodiscard]] u64 ReadInstruction(u32 address) override;
+ 
+     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+-- 
+2.54.0
+
