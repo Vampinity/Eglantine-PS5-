@@ -1,0 +1,106 @@
+From a51b99145824e11ab7af8f48ae02953813bf0f20 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:53 +0100
+Subject: [PATCH] pe: astc-busy-async
+
+---
+ src/video_core/astc_policy.h                  | 32 +++++++++++++++++++
+ .../renderer_vulkan/vk_rasterizer.cpp         |  3 ++
+ src/video_core/texture_cache/texture_cache.h  |  7 +++-
+ 3 files changed, 41 insertions(+), 1 deletion(-)
+ create mode 100644 src/video_core/astc_policy.h
+
+diff --git a/src/video_core/astc_policy.h b/src/video_core/astc_policy.h
+new file mode 100644
+index 0000000..f49fc0d
+--- /dev/null
++++ b/src/video_core/astc_policy.h
+@@ -0,0 +1,32 @@
++// Eden PS5 port: where an ASTC texture that is kept as BC3 gets converted.
++//
++// The console's GPU has no ASTC, and above 1x such a texture is kept as BC3 (headless/main.cpp):
++// decoded and compressed on the CPU. In place, inside the draw that first uses it, that held a
++// frame of a large open-world game for 130 to 290 ms whenever new scenery came in. On another
++// thread (Eden's asynchronous mode) no frame waits, but the texture is drawn before it is ready:
++// in play that is a far texture a moment late, on a loading screen it is the picture itself, and
++// wrong.
++//
++// So the frame decides. A frame with many draws is the game in play: its new textures are
++// converted in the background. A frame with few is a loading screen, a menu or a title screen,
++// where nothing moves that a wait would spoil: there the texture is converted in place and is
++// right the first time it shows. The count is of the frame being made or the one before it,
++// whichever is larger, so the first frames of play after a light screen are already "busy".
++#pragma once
++
++namespace Eden::AstcPolicy {
++// GPU thread only.
++inline unsigned draws_now = 0, draws_before = 0;
++// From this many draws a frame is the game in play (a large open-world game: 2,000 to 4,500
++// in play, 300 to 750 on its loading screen).
++inline constexpr unsigned kBusyFrame = 1000;
++
++inline void Draw() noexcept { ++draws_now; }
++inline void Frame() noexcept {
++    draws_before = draws_now;
++    draws_now = 0;
++}
++inline bool InBackground() noexcept {
++    return (draws_now > draws_before ? draws_now : draws_before) >= kBusyFrame;
++}
++} // namespace Eden::AstcPolicy
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index f3ab65c..ae59291 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "common/pe_switch.h"
+ #include "video_core/image_pages.h"
++#include "video_core/astc_policy.h"
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -640,6 +641,8 @@ private:
+ 
+ template <typename Func>
+ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
++    static const bool pe_busy = Common::PeSwitch("EDEN_PE_ASTC_BUSY_ASYNC");
++    if (pe_busy) Eden::AstcPolicy::Draw();
+ 
+     SCOPE_EXIT {
+         gpu.TickWork();
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 2746af7..9ae54b6 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -8,6 +8,7 @@
+ 
+ #include "common/pe_switch.h"
+ #include "video_core/image_pages.h"
++#include "video_core/astc_policy.h"
+ #include <algorithm>
+ #include <array>
+ #include <numeric>
+@@ -558,6 +559,8 @@ void TextureCache<P>::ReleaseFinished() {
+ 
+ template <class P>
+ void TextureCache<P>::TickFrame() {
++    static const bool pe_busy = Common::PeSwitch("EDEN_PE_ASTC_BUSY_ASYNC");
++    if (pe_busy) Eden::AstcPolicy::Frame();
+     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
+     // rather than kept for the rest of the session.
+     // EDEN_TC_SCRATCH_KEEP_MIB=<0..64>: keep less of each between frames. A frame that needs more
+@@ -2150,7 +2153,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         runtime.TransitionImageLayout(image);
+         return;
+     }
+-    if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
++    static const bool busy_only = Common::PeSwitch("EDEN_PE_ASTC_BUSY_ASYNC");
++    if (True(image.flags & ImageFlagBits::AsynchronousDecode) &&
++        (!busy_only || Eden::AstcPolicy::InBackground())) {
+         try {
+             QueueAsyncDecode(image, image_id);
+         } catch (const std::bad_alloc&) {
+-- 
+2.54.0
+

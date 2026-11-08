@@ -1,0 +1,115 @@
+From 71722fd680c429e966edafe11d470bf62e407fe8 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:46 +0100
+Subject: [PATCH] pe: pipeline-cache-write-safety
+
+---
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 84 ++++++++++---------
+ 1 file changed, 44 insertions(+), 40 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index e9a9499..a09e3f6 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -815,6 +815,7 @@ bool DropMeshDrawsBeforeBuild() {
+ }
+ 
+ PipelineCache::~PipelineCache() {
++    serialization_thread.WaitForRequests();
+     SaveUsedPipelines();
+     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+@@ -2093,47 +2094,50 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+ 
+ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+                                                  const vk::PipelineCache& pipeline_cache,
+-                                                 u32 cache_version) try {
+-    // Written beside the cache and renamed over it: the emulator stopped mid-write left the cache
+-    // empty, and every later boot failed to read it.
+-    auto temporary = filename;
+-    temporary += ".tmp";
+-    std::ofstream file(temporary, std::ios::binary);
+-    file.exceptions(std::ifstream::failbit);
+-    if (!file.is_open()) {
+-        LOG_ERROR(Common_Filesystem, "Failed to open Vulkan driver pipeline cache file {}",
+-                  Common::FS::PathToUTF8String(filename));
+-        return;
+-    }
+-    file.write(VULKAN_CACHE_MAGIC_NUMBER.data(), VULKAN_CACHE_MAGIC_NUMBER.size())
+-        .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+-
+-    size_t cache_size = 0;
+-    std::vector<char> cache_data;
+-    if (pipeline_cache) {
+-        pipeline_cache.Read(&cache_size, nullptr);
+-        cache_data.resize(cache_size);
+-        pipeline_cache.Read(&cache_size, cache_data.data());
+-    }
+-    file.write(cache_data.data(), cache_size);
+-    file.close();
++                                                 u32 cache_version) {
++    // Written whole beside the cache, then renamed over it: until the rename the previous cache
++    // stays as it was, and a write that fails or is cut short leaves it alone.
++    auto partial = filename;
++    partial += ".part";
+     std::error_code error;
+-    std::filesystem::rename(temporary, filename, error);
+-    if (error) {
+-        LOG_ERROR(Common_Filesystem, "Failed to replace Vulkan driver pipeline cache file {}: {}",
+-                  Common::FS::PathToUTF8String(filename), error.message());
+-        std::filesystem::remove(temporary, error);
+-        return;
+-    }
+-
+-    LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
+-             Common::FS::PathToUTF8String(filename));
+-
+-} catch (const std::ios_base::failure& e) {
+-    LOG_ERROR(Common_Filesystem, "{}", e.what());
+-    if (!Common::FS::RemoveFile(filename)) {
+-        LOG_ERROR(Common_Filesystem, "Failed to delete Vulkan driver pipeline cache file {}",
+-                  Common::FS::PathToUTF8String(filename));
++    try {
++        size_t cache_size = 0;
++        std::vector<char> cache_data;
++        if (pipeline_cache) {
++            pipeline_cache.Read(&cache_size, nullptr);
++            cache_data.resize(cache_size);
++            pipeline_cache.Read(&cache_size, cache_data.data());
++        }
++        {
++            std::ofstream file(partial, std::ios::binary | std::ios::trunc);
++            if (!file.is_open()) {
++                LOG_ERROR(Common_Filesystem, "Failed to open Vulkan driver pipeline cache file {}",
++                          Common::FS::PathToUTF8String(partial));
++                return;
++            }
++            file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
++            file.write(VULKAN_CACHE_MAGIC_NUMBER.data(), VULKAN_CACHE_MAGIC_NUMBER.size())
++                .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version))
++                .write(cache_data.data(), static_cast<std::streamsize>(cache_size));
++            file.flush();
++            file.close();
++        }
++        std::filesystem::rename(partial, filename, error);
++        if (error) {
++            LOG_ERROR(Common_Filesystem, "Failed to replace Vulkan driver pipeline cache file {}: {}",
++                      Common::FS::PathToUTF8String(filename), error.message());
++            std::filesystem::remove(partial, error);
++            return;
++        }
++        LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
++                 Common::FS::PathToUTF8String(filename));
++    } catch (const std::ios_base::failure& e) {
++        LOG_ERROR(Common_Filesystem, "{}", e.what());
++        std::filesystem::remove(partial, error);
++    } catch (const std::bad_alloc&) {
++        // A copy of a large cache did not fit in memory: keep the one on disk.
++        LOG_ERROR(Render_Vulkan, "No memory to copy the Vulkan driver pipeline cache; kept the previous file");
++        std::filesystem::remove(partial, error);
+     }
+ }
+ 
+-- 
+2.54.0
+

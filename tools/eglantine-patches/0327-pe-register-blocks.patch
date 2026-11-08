@@ -1,0 +1,246 @@
+From 3bcef6ce712f4ba48fb0debda500e96f6802d6a4 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:01:27 +0100
+Subject: [PATCH] pe: register-blocks
+
+---
+ src/video_core/engines/maxwell_3d.cpp | 19 +++++++++-
+ src/video_core/engines/maxwell_3d.h   |  3 ++
+ src/video_core/gpu_split.cpp          | 25 +++++++++++++
+ src/video_core/gpu_split.h            | 54 +++++++++++++++++++++++++++
+ 4 files changed, 100 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 5a98a1c..bf38194 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -940,6 +940,18 @@ void Maxwell3D::ProcessCBData(u32 value) {
+     ProcessCBMultiData(&value, 1);
+ }
+ 
++void Maxwell3D::ProcessCBDataBlock(const u64* words, u32 count) {
++    std::array<u32, 64> data;
++    ASSERT(count <= data.size());
++    for (u32 i = 0; i < count; ++i) {
++        const u32 method = static_cast<u32>(words[i]);
++        const u32 value = ProcessShadowRam(method, static_cast<u32>(words[i] >> 32));
++        ProcessDirtyRegisters(method, value);
++        data[i] = value;
++    }
++    ProcessCBMultiData(data.data(), count);
++}
++
+ void Maxwell3D::ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount) {
+     if (amount == 0) {
+         return;
+@@ -1222,7 +1234,12 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+     if (FrontMemoryNotesEnabled() && FrontWritesGuestMemory(method)) {
+         FrontNoteMemoryWrite(split, fs, method, &value, 1);
+     }
+-    if (from_macro && (execution_mask[method] || !FrontMacroSink())) {
++    constexpr u32 cb_data_first = MAXWELL3D_REG_INDEX(const_buffer.buffer);
++    if (!execution_mask[method] && split.RegBlocks()) {
++        split.PlainWrite(this, method, argument);
++    } else if (method >= cb_data_first && method < cb_data_first + 16 && split.RegBlocks()) {
++        split.CbDataWrite(this, method, argument);
++    } else if (from_macro && (execution_mask[method] || !FrontMacroSink())) {
+         split.MacroWrite(this, method, argument);
+     } else {
+         split.Method(this, method, argument, is_last_call, nullptr);
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 37a887a..7d80901 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3276,6 +3276,9 @@ public:
+ 
+     /// Handles a write to the CB_DATA[i] register.
+     void ProcessCBData(u32 value);
++    /// A run of CB_DATA writes from the split GPU thread's front (GpuSplit::CbDataWrite): words
++    /// hold method (low 32 bits) and argument (high 32); as CallMethod for each, one memory write.
++    void ProcessCBDataBlock(const u64* words, u32 count);
+     void ProcessCBMultiData(const u32* start_base, u32 amount);
+ 
+     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index f374fce..3ca5319 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -25,6 +25,7 @@
+ #include "core/core.h"
+ #include "video_core/engines/engine_interface.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/engines/maxwell_3d.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_profile.h"
+@@ -117,6 +118,8 @@ void GpuSplit::CheckOwner(const char* where) {
+ GpuSplit GpuSplit::instance;
+ 
+ void GpuSplit::MaybeStart(Core::System& system_) {
++    static const bool blocks = Common::PeSwitch("EDEN_PE_REG_BLOCKS");
++    reg_blocks = blocks;
+     Nx2Profile::ReadSwitch();
+     static const char mode = [] {
+         const char* value = std::getenv("EDEN_NX2_SPLIT");
+@@ -174,6 +177,8 @@ void GpuSplit::Stop() {
+     // wrap at a time and never reached the old write position (the next game's first GPU work
+     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
+     ring.reset();
++    regs_entry = nullptr;
++    regs_count = 0;
+     write_position = 0;
+     last_writer_position = 0;
+     published_local = 0;
+@@ -225,6 +230,7 @@ void GpuSplit::WaitForSpace(size_t words) {
+ }
+ 
+ void GpuSplit::Publish() {
++    CloseRegs();
+     if (published_local == write_position) {
+         return;
+     }
+@@ -322,6 +328,7 @@ bool GpuSplit::WritePending(u64 key) {
+ 
+ void GpuSplit::Drain() {
+     sync_pending = false;
++    CloseRegs();
+     consumed_cache = consumed.load(std::memory_order_acquire);
+     if (consumed_cache == write_position && BackQuiet()) {
+         return;
+@@ -641,6 +648,24 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
+                                 amount, static_cast<u32>(entry[1]));
+         return data + (amount + 1) / 2;
+     }
++    case Kind::Regs: {
++        const u32 count = static_cast<u32>((head >> 8) & 0xff);
++        auto* const engine = back_engine;
++        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
++        for (u32 i = 0; i < count; ++i) {
++            engine->method_sink.emplace_back(static_cast<u32>(entry[1 + i]), static_cast<u32>(entry[1 + i] >> 32));
++        }
++        engine->ConsumeSink(*system);
++        return 1 + count;
++    }
++    case Kind::CbData: {
++        const u32 count = static_cast<u32>((head >> 8) & 0xff);
++        auto* const engine = back_engine;
++        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
++        engine->ConsumeSink(*system);
++        static_cast<Tegra::Engines::Maxwell3D*>(engine)->ProcessCBDataBlock(entry + 1, count);
++        return 1 + count;
++    }
+     case Kind::Call: {
+         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
+         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index f4c4114..bda1007 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -131,6 +131,22 @@ public:
+     }
+     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
+                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
++    /// Whether plain register writes travel in blocks (PlainWrite); EDEN_PE_REG_BLOCKS=1 enables it.
++    [[nodiscard]] bool RegBlocks() const {
++        return reg_blocks;
++    }
++    /// A state register write with no side effect (not in the engine's execution_mask): gathered
++    /// with the ones around it into one Regs entry, which the back applies through the engine's
++    /// method sink (ProcessShadowRam, same-value skip, dirty flags) before anything sent after it.
++    void PlainWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
++        BlockWrite(Kind::Regs, engine, method, argument);
++    }
++    /// A 3D constant-buffer data write (CB_DATA): gathered with the ones next to it into one
++    /// CbData entry, which the back runs as that many writes of the register (shadow RAM, dirty
++    /// flags) and one guest-memory write (Maxwell3D::ProcessCBDataBlock).
++    void CbDataWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
++        BlockWrite(Kind::CbData, engine, method, argument);
++    }
+     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
+     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+         SelectEngine(engine);
+@@ -183,6 +199,7 @@ public:
+     }
+     static bool TrackReleases() { return PendingReleases() || DmaReadAhead(); }
+     void DrainTo(u64 position) {
++        CloseRegs();
+         WaitFor((std::min)(position, write_position), DrainSite::Acquire);
+     }
+     /// Front: a semaphore release just sent to the back; `key`: address space and GPU address.
+@@ -253,6 +270,7 @@ public:
+ 
+     /// Compute or copy work was just sent: what can write GPU-written command lists.
+     void NoteWriter() {
++        CloseRegs();
+         last_writer_position = write_position;
+     }
+     /// Waits until the back executed the compute and copy work sent so far (not what came after).
+@@ -332,6 +350,8 @@ private:
+         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
+         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
+         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
++        Regs,   ///< Bits 8-15 count; then per word method (low 32 bits) and argument (high 32)
++        CbData, ///< As Regs, all constant-buffer data writes of the 3D engine
+     };
+     static constexpr u64 IsLast = 1 << 4;
+     static constexpr u64 HasSegment = 1 << 5;
+@@ -347,8 +367,37 @@ private:
+         (*reinterpret_cast<const Func*>(payload))();
+     }
+ 
++    static constexpr u32 MaxRegs = 64;
++    void BlockWrite(Kind kind, Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
++        SelectEngine(engine);
++        if (regs_entry != nullptr && regs_kind != kind) {
++            CloseRegs();
++        }
++        if (regs_entry == nullptr) {
++            regs_entry = Reserve(1 + MaxRegs);
++            regs_kind = kind;
++        }
++        regs_entry[1 + regs_count] = (u64{argument} << 32) | method;
++        if (++regs_count == MaxRegs) {
++            CloseRegs();
++        }
++    }
++    /// Commits the open Regs entry: before any other entry, a publish and a drain.
++    void CloseRegs() {
++        if (regs_entry == nullptr) {
++            return;
++        }
++        regs_entry[0] = static_cast<u64>(regs_kind) | (u64{regs_count} << 8);
++        regs_entry = nullptr;
++        const u32 count = regs_count;
++        regs_count = 0;
++        Commit(1 + count);
++    }
+     /// Room for an entry of `words` at the write position (never across the ring's end).
+     u64* Reserve(size_t words) {
++        if (regs_entry != nullptr) [[unlikely]] {
++            CloseRegs();
++        }
+         const size_t index = write_position & RingMask;
+         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
+             [[likely]] {
+@@ -386,6 +435,7 @@ private:
+     Core::System* system{};
+     bool active{};
+     bool front_macros{};
++    bool reg_blocks{};
+     u64 session_generation{};
+     std::unique_ptr<u64[]> ring;
+ 
+@@ -408,6 +458,10 @@ private:
+     /// Words between publishes: small right after a drain, while the back has nothing to do.
+     size_t publish_every{PublishEvery};
+     Tegra::Engines::EngineInterface* front_engine{};
++    /// The open Regs entry (reserved, not committed) and the writes in it.
++    u64* regs_entry{};
++    u32 regs_count{};
++    Kind regs_kind{Kind::Regs};
+     struct FrontRelease {
+         u32 value;
+         u64 position; ///< write_position after the release: run once consumed reaches it
+-- 
+2.54.0
+

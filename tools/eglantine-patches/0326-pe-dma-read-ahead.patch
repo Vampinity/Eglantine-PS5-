@@ -1,0 +1,322 @@
+From c42bdffc1707c1101f7cf8d786d1c81df76492ec Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:01:20 +0100
+Subject: [PATCH] pe: dma-read-ahead
+
+---
+ src/video_core/engines/kepler_compute.cpp |  2 +-
+ src/video_core/engines/maxwell_3d.cpp     | 60 +++++++++++++++++++++--
+ src/video_core/engines/puller.cpp         |  1 +
+ src/video_core/gpu_split.cpp              | 20 ++++++--
+ src/video_core/gpu_split.h                | 42 +++++++++++++---
+ 5 files changed, 112 insertions(+), 13 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index af5c6ad..e8e1e4c 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -1795,7 +1795,7 @@ NativeQmdScheduler& FrontQmdScheduler(const VideoCommon::GpuSplit& split) {
+ // waits). Called after the method is sent. As ProcessNativeMethod's 0x107 (inline QMD) and
+ // 0xae-0xb0 (QMD control).
+ void KeplerCompute::FrontQmd(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u32 argument) {
+-    if (!split.PendingReleases()) return;
++    if (!split.TrackReleases()) return;
+     if (method != 0x107 && method != 0xae && method != 0xaf && method != 0xb0) {
+         return;
+     }
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index f4aacbf..5a98a1c 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/pe_switch.h"
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -992,6 +993,7 @@ struct Maxwell3D::FrontState {
+     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
+     /// then can it have a deferred instanced draw to issue at the end of a macro.
+     bool draw_pending{true};
++    std::unordered_map<u64, s32> read_trust;
+     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+     /// EDEN_NX2_DMA_SNAPSHOT: the current inline upload (LAUNCH_DMA), for the write notes.
+     bool upload_known{};
+@@ -1140,6 +1142,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+     u32 value = argument;
+     bool shadow_kept = true;
+     bool payload_release = false;
++    bool report_write = false;
+     if (fs.control == Regs::ShadowRamControl::Track ||
+         fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+         shadow_kept = fs.shadow[method] == argument;
+@@ -1192,11 +1195,16 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+         case MAXWELL3D_REG_INDEX(falcon[4]):
+             fs.regs[MAXWELL3D_REG_INDEX(shadow_scratch)] = 1;
+             break;
++        case MAXWELL3D_REG_INDEX(wait_for_idle):
++            split.NoteSync();
++            break;
+         case MAXWELL3D_REG_INDEX(report_semaphore.query): {
+             // A payload release the back will write (ProcessQueryGet): noted below once sent, an
+             // acquire it meets needs no drain (GpuSplit::NoteRelease, the puller's acquires).
+             Regs::ReportSemaphore report;
+             std::memcpy(&report, &fs.regs[MAXWELL3D_REG_INDEX(report_semaphore)], sizeof(report));
++            report_write = report.query.operation == Regs::ReportSemaphore::Operation::Release ||
++                           report.query.operation == Regs::ReportSemaphore::Operation::ReportOnly;
+             payload_release = report.query.operation == Regs::ReportSemaphore::Operation::Release &&
+                               static_cast<VideoCommon::QueryType>(report.query.report.Value()) ==
+                                   VideoCommon::QueryType::Payload;
+@@ -1219,10 +1227,15 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+     } else {
+         split.Method(this, method, argument, is_last_call, nullptr);
+     }
+-    if (payload_release) [[unlikely]] {
++    if (report_write) [[unlikely]] {
+         Regs::ReportSemaphore report;
+         std::memcpy(&report, &fs.regs[MAXWELL3D_REG_INDEX(report_semaphore)], sizeof(report));
+-        split.NoteRelease((u64{memory_manager.GetID()} << 48) | report.Address(), report.payload);
++        const u64 key = (u64{memory_manager.GetID()} << 48) | report.Address();
++        // For the MME's DMA reads that run ahead of the back (FrontDmaRead).
++        split.NoteReport(key, report.query.short_query ? 4 : 16);
++        if (payload_release) {
++            split.NoteRelease(key, report.payload);
++        }
+     }
+ }
+ 
+@@ -1570,16 +1583,57 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+             ++report_reads;
+         }
+     }
+-    split.Defer([this, memory = &memory_manager, macro, method, source, read_bytes] {
++    const bool checkable = split.DmaReadAhead() && words <= 64;
++    const bool sync = split.SyncPending();
++    bool pending = false;
++    const u64 space = u64{memory_manager.GetID()} << 48;
++    for (u32 i = 0; checkable && i < words; ++i) {
++        const u64 key = space | (source + u64{i} * sizeof(u32));
++        if (split.WritePending(key) || split.EverReported(key)) {
++            pending = true;
++            break;
++        }
++    }
++    bool drain = !checkable || sync || pending;
++    static const bool trust_sources = Common::PeSwitch("EDEN_PE_DMA_READ_TRUST");
++    s32* trust = nullptr;
++    std::array<u32, 64> early{};
++    if (trust_sources && checkable && sync && !pending) {
++        if (fs.read_trust.size() > 65536) fs.read_trust.clear();
++        trust = &fs.read_trust[space | source];
++        if (*trust >= 16) {
++            trust = nullptr;
++            drain = false;
++        }
++    }
++    if (trust && *trust >= 0) {
++        for (u32 i = 0; i < words; ++i) {
++            early[i] = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
++        }
++    }
++    bool dirty = false;
++    if (drain) {
++    split.Defer([this, memory = &memory_manager, macro, method, source, read_bytes,
++                 dirty_ptr = &dirty] {
+         // EDEN_NX2_QUERY_DMA_TRACE / EDEN_NX2_QUERY_DMA_SYNC: below High accuracy, counter reports
+         // reach guest memory when a later fence pops, and nothing here waits for them.
+         VideoCommon::QueryDma::BeforeRead(*memory, *rasterizer, macro, method, source, read_bytes);
++        *dirty_ptr = memory->IsMemoryDirty(source, read_bytes,
++            VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache);
+         if (memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+         }
+         VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+     });
+     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++    }
++    if (trust && *trust >= 0) {
++        bool changed = dirty;
++        for (u32 i = 0; i < words && !changed; ++i) {
++            changed = early[i] != memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
++        }
++        *trust = changed ? -1 : *trust + 1;
++    }
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+         if (method == 0x158) {
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index fd2e45e..5b528ce 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -611,6 +611,7 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+         break;
+     case BufferMethods::WaitForIdle:
+         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
++        VideoCommon::GpuSplit::Get().NoteSync();
+         break;
+     case BufferMethods::SemaphoreOperation: {
+         ProcessSemaphoreTriggerMethod(dma_pusher);
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index e78309c..f374fce 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -185,6 +185,9 @@ void GpuSplit::Stop() {
+     front_pending.clear();
+     front_lower_bounds.clear();
+     front_adds.clear();
++    front_reports.clear();
++    reported_words.clear();
++    sync_pending = false;
+     back_engine_now.store(nullptr, std::memory_order_relaxed);
+     hang_reports = 0;
+     hang_dumped_position = ~u64{0};
+@@ -237,7 +240,7 @@ void GpuSplit::Publish() {
+ }
+ 
+ std::optional<u32> GpuSplit::PendingLowerBound(u64 key, u32 memory) {
+-    if (!PendingReleases()) return std::nullopt;
++    if (!TrackReleases()) return std::nullopt;
+     const u64 done = consumed.load(std::memory_order_acquire);
+     std::optional<u64> bound;
+     if (const auto it = front_adds.find(key); it != front_adds.end()) {
+@@ -270,7 +273,7 @@ std::optional<u32> GpuSplit::PendingLowerBound(u64 key, u32 memory) {
+ }
+ 
+ std::optional<u64> GpuSplit::PendingPosition(u64 key) {
+-    if (!PendingReleases()) return std::nullopt;
++    if (!TrackReleases()) return std::nullopt;
+     const u64 done = consumed.load(std::memory_order_acquire);
+     if (front_pending.size() > 4096) {
+         std::erase_if(front_pending, [done](const auto& entry) { return done >= entry.second; });
+@@ -287,7 +290,7 @@ std::optional<u64> GpuSplit::PendingPosition(u64 key) {
+ }
+ 
+ std::optional<u32> GpuSplit::PendingRelease(u64 key) {
+-    if (!PendingReleases()) return std::nullopt;
++    if (!TrackReleases()) return std::nullopt;
+     const u64 done = consumed.load(std::memory_order_acquire);
+     if (front_releases.size() > 4096) {
+         std::erase_if(front_releases, [done](const auto& entry) { return done >= entry.second.position; });
+@@ -304,10 +307,21 @@ std::optional<u32> GpuSplit::PendingRelease(u64 key) {
+ }
+ 
+ bool GpuSplit::WritePending(u64 key) {
++    const u64 done = consumed.load(std::memory_order_acquire);
++    if (front_reports.size() > 4096) {
++        std::erase_if(front_reports, [done](const auto& entry) { return done >= entry.second; });
++    }
++    if (const auto it = front_reports.find(key); it != front_reports.end()) {
++        if (done < it->second) {
++            return true;
++        }
++        front_reports.erase(it);
++    }
+     return PendingRelease(key) || PendingPosition(key) || PendingLowerBound(key, 0);
+ }
+ 
+ void GpuSplit::Drain() {
++    sync_pending = false;
+     consumed_cache = consumed.load(std::memory_order_acquire);
+     if (consumed_cache == write_position && BackQuiet()) {
+         return;
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 095b34c..f4c4114 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -14,6 +14,7 @@
+ #include <thread>
+ #include <type_traits>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -176,23 +177,28 @@ public:
+         static const bool enabled = Common::PeSwitch("EDEN_PE_PENDING_RELEASES");
+         return enabled;
+     }
++    static bool DmaReadAhead() {
++        static const bool enabled = Common::PeSwitch("EDEN_PE_DMA_READ_AHEAD");
++        return enabled;
++    }
++    static bool TrackReleases() { return PendingReleases() || DmaReadAhead(); }
+     void DrainTo(u64 position) {
+         WaitFor((std::min)(position, write_position), DrainSite::Acquire);
+     }
+     /// Front: a semaphore release just sent to the back; `key`: address space and GPU address.
+     void NoteRelease(u64 key, u32 value) {
+-        if (!PendingReleases()) return;
++        if (!TrackReleases()) return;
+         front_releases[key] = {value, write_position};
+     }
+     /// Front: a QMD release that leaves at least `value` at `key` (a "max" release), as the
+     /// front's copy of the QMD scheduling read it.
+     void NoteLowerBound(u64 key, u32 value) {
+-        if (!PendingReleases()) return;
++        if (!TrackReleases()) return;
+         front_lower_bounds[key] = {value, write_position};
+     }
+     /// Front: a QMD release that adds `value` to the word at `key`.
+     void NoteAdd(u64 key, u32 value) {
+-        if (!PendingReleases()) return;
++        if (!TrackReleases()) return;
+         front_adds[key].push_back({value, write_position});
+     }
+     /// Front: a lower bound of the word at `key` once the back has run everything sent so far,
+@@ -203,7 +209,7 @@ public:
+     /// Front: a release to `key` whose value the front cannot know (a QMD's, read when it runs)
+     /// was just sent to the back.
+     void NotePending(u64 key) {
+-        if (!PendingReleases()) return;
++        if (!TrackReleases()) return;
+         front_pending[key] = write_position;
+     }
+     /// Front: where the back will have run the last such release to `key`, while it has not
+@@ -213,9 +219,30 @@ public:
+     /// An acquire that value meets needs no Drain: the back runs the release before anything the
+     /// front sends after the acquire. Empty once the back ran it (memory then tells).
+     std::optional<u32> PendingRelease(u64 key);
+-    /// Front: whether the back has yet to run a release noted above (exact, QMD, "add" or "max")
+-    /// to the word at `key`.
++    /// Front: a report the back will write, `bytes` at `key` (address space and GPU address).
++    void NoteReport(u64 key, u32 bytes) {
++        if (!DmaReadAhead()) return;
++        for (u32 offset = 0; offset < bytes; offset += sizeof(u32)) {
++            front_reports[key + offset] = write_position;
++            reported_words.insert(key + offset);
++        }
++    }
++    /// Front: whether a report was ever sent to the word at `key`. The back's query cache can hold
++    /// its result after running it, until a fence writes it (MME DMA reads flush it).
++    [[nodiscard]] bool EverReported(u64 key) const {
++        return reported_words.contains(key);
++    }
++    /// Front: whether the back has yet to run a write the front sent to the word at `key`: a
++    /// report, or a release noted above (exact, QMD, "add" or "max").
+     [[nodiscard]] bool WritePending(u64 key);
++    /// Front: a wait for idle (3D or puller) was sent: reads that run ahead of the back (the MME's
++    /// DMA reads) wait for it until the next Drain.
++    void NoteSync() {
++        sync_pending = true;
++    }
++    [[nodiscard]] bool SyncPending() const {
++        return sync_pending;
++    }
+ 
+     /// Makes what was sent visible to the back.
+     void Publish();
+@@ -389,6 +416,9 @@ private:
+     std::unordered_map<u64, u64> front_pending; ///< key -> write_position after the release
+     std::unordered_map<u64, FrontRelease> front_lower_bounds;
+     std::unordered_map<u64, std::vector<FrontRelease>> front_adds;
++    std::unordered_map<u64, u64> front_reports; ///< key of each word -> write_position after it
++    std::unordered_set<u64> reported_words;     ///< every word a report was sent to
++    bool sync_pending{};
+     /// EDEN_NX2_SPLIT_WAITS=1: nanoseconds, waits and longest wait per site since the last report.
+     std::array<u64, static_cast<size_t>(DrainSite::Count)> wait_ns{};
+     std::array<u64, static_cast<size_t>(DrainSite::Count)> wait_count{};
+-- 
+2.54.0
+

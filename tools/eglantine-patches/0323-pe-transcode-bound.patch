@@ -1,0 +1,71 @@
+From 11cca48bb10ecde127ad729f5450e1baaa76e314 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:58 +0100
+Subject: [PATCH] pe: transcode-bound
+
+---
+ .../renderer_vulkan/vk_texture_cache.cpp      | 41 +++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index c3df0ed..674bc8f 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include "common/pe_switch.h"
+ #include <algorithm>
+ #include <atomic>
+ #include <limits>
+@@ -4970,6 +4971,46 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+         upload_refused = true;
+         return;
+     }
++    static const bool bounded = Common::PeSwitch("EDEN_PE_TRANSCODE_BOUND");
++    if (bounded) {
++        const auto bytes = [](const PendingTranscode& t) {
++            u64 result{};
++            for (u32 level = 0; level < t.levels; ++level) {
++                result += u64{(std::max)(t.width >> level, 1U)} *
++                          (std::max)(t.height >> level, 1U) * 4 * t.layers;
++            }
++            return result;
++        };
++        u64 incoming{};
++        for (u32 level = 0; level < levels; ++level) {
++            incoming += u64{(std::max)(width >> level, 1U)} *
++                        (std::max)(height >> level, 1U) * 4 * layers;
++        }
++        static const u64 limit = [] {
++            const char* value = std::getenv("EDEN_PS5_TRANSCODE_PENDING_MIB");
++            return value ? std::strtoull(value, nullptr, 10) << 20 : u64{256} << 20;
++        }();
++        while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
++            pending_transcodes.pop_front();
++        }
++        u64 held{}, recorded{};
++        for (const auto& t : pending_transcodes) {
++            held += bytes(t);
++            if (t.tick >= scheduler.CurrentTick()) {
++                recorded += bytes(t);
++            }
++        }
++        if (recorded >= (u64{32} << 20)) {
++            scheduler.Flush();
++        }
++        while (!pending_transcodes.empty() && (incoming > limit || held > limit - incoming)) {
++            scheduler.Wait(pending_transcodes.front().tick);
++            while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
++                held -= bytes(pending_transcodes.front());
++                pending_transcodes.pop_front();
++            }
++        }
++    }
+     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
+     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
+     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
+-- 
+2.54.0
+

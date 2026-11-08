@@ -1,0 +1,50 @@
+From e7d951141fc9c6f0a2a2dfbee92fc207286f9d11 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:53 +0100
+Subject: [PATCH] pe: decode-handoff
+
+---
+ src/video_core/texture_cache/texture_cache.h | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 0ff76a2..2746af7 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3088,11 +3088,15 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+             async_decode->failed = true;
+         }
+ 
+-        // TODO: Do we need this lock?
+-        std::unique_lock lock{async_decode->mutex};
++        static const bool lock_free = Common::PeSwitch("EDEN_PE_DECODE_HANDOFF");
++        std::unique_lock lock{async_decode->mutex, std::defer_lock};
++        if (!lock_free) {
++            lock.lock();
++        }
+         async_decode->decoded = std::chrono::steady_clock::now();
+         async_decode->copies = std::move(copies);
+-        async_decode->complete = true;
++        // Last access by the worker; GPU thread may destroy the context after this store.
++        async_decode->complete.store(true, std::memory_order_release);
+     };
+     texture_decode_worker.QueueWork(std::move(func));
+ }
+@@ -3121,8 +3125,12 @@ void TextureCache<P>::TickAsyncDecode() {
+         {
+             // Release the lock before the context is erased below: unlocking it afterwards wrote
+             // into freed memory (heap corruption, crashes minutes into title 1).
+-            std::unique_lock lock{async_decode->mutex};
+-            if (!async_decode->complete) {
++            static const bool lock_free = Common::PeSwitch("EDEN_PE_DECODE_HANDOFF");
++            std::unique_lock lock{async_decode->mutex, std::defer_lock};
++            if (!lock_free) {
++                lock.lock();
++            }
++            if (!async_decode->complete.load(std::memory_order_acquire)) {
+                 ++i;
+                 continue;
+             }
+-- 
+2.54.0
+

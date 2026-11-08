@@ -1,0 +1,50 @@
+From 331ad3c5a1fcf73c2a0c18e4bb6bc1ed890ed8ce Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:46 +0100
+Subject: [PATCH] pe: cpu-read-skip
+
+---
+ .../renderer_vulkan/vk_rasterizer.cpp         | 27 ++++++++++++++++---
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index b1552d7..a6953d9 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1810,10 +1810,29 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+     static const bool pages = Common::PeSwitch("EDEN_PE_IMAGE_PAGES");
+     if (!pages || !Eden::ImagePages::NeverHeld(addr, size)) {
+-        std::scoped_lock lock{texture_cache.mutex};
+-        auto area = texture_cache.GetFlushArea(addr, size);
+-        if (area) {
+-            return *area;
++        static const bool skip = Common::PeSwitch("EDEN_PE_CPU_READ_SKIP");
++        std::unique_lock lock{texture_cache.mutex, std::defer_lock};
++        if (!skip) {
++            lock.lock();
++        } else {
++            lock.try_lock();
++        }
++        if (lock.owns_lock()) {
++            auto area = texture_cache.GetFlushArea(addr, size);
++            if (area) {
++                return *area;
++            }
++        } else {
++            // An empty area is not remembered: the next read retries the texture cache.
++            // Keep the buffer-cache question below even when the texture lock is skipped.
++            if (!buffer_cache.FlushesOnCpuRead()) {
++                return {.start_address = addr, .end_address = addr, .preemtive = true};
++            }
++            std::scoped_lock buffer_lock{buffer_cache.mutex};
++            if (auto area = buffer_cache.GetFlushArea(addr, size)) {
++                return *area;
++            }
++            return {.start_address = addr, .end_address = addr, .preemtive = true};
+         }
+     }
+     if (buffer_cache.FlushesOnCpuRead()) {
+-- 
+2.54.0
+

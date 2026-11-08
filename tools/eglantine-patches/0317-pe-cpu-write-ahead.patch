@@ -1,0 +1,35 @@
+From 7ec17376c90ded4b0aec4a3cdaef3d6273f91e5e Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:46 +0100
+Subject: [PATCH] pe: cpu-write-ahead
+
+---
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index a6953d9..e5f9a02 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1923,6 +1923,18 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+         if (buffer_cache.OnCPUWrite(addr, size)) {
+             return true;
+         }
++        static const bool ahead = Common::PeSwitch("EDEN_PE_CPU_WRITE_AHEAD");
++        if (ahead && size != 0 && addr <= ~DAddr{0} - size) {
++            DAddr page = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
++            for (unsigned marked = 0; marked < 64 && page != 0 &&
++                 page <= ~DAddr{0} - Core::DEVICE_PAGESIZE;
++                 ++marked, page += Core::DEVICE_PAGESIZE) {
++                if (!buffer_cache.IsRegionRegistered(page, Core::DEVICE_PAGESIZE) ||
++                    buffer_cache.OnCPUWrite(page, Core::DEVICE_PAGESIZE)) {
++                    break;
++                }
++            }
++        }
+     }
+     {
+         std::scoped_lock lock{texture_cache.mutex};
+-- 
+2.54.0
+

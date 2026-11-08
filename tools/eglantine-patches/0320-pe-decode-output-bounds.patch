@@ -1,0 +1,37 @@
+From c6eb0ab631a431277aa065a4a9d71c86b825ed96 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:53 +0100
+Subject: [PATCH] pe: decode-output-bounds
+
+---
+ src/video_core/texture_cache/texture_cache.h | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 4719e17..0ff76a2 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3026,7 +3026,11 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+     auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
+     DropTrimmedLevels(image.host_level_offset, copies);
+-    const size_t out_size = MapSizeBytes(image);
++    auto converted_layout = copies;
++    ConvertedLayout(image.info, converted_layout);
++    const size_t out_size = converted_layout.empty() ? MapSizeBytes(image) :
++        (std::max<size_t>)(MapSizeBytes(image), converted_layout.back().buffer_offset +
++                                             converted_layout.back().buffer_size);
+     if (False(image.flags & ImageFlagBits::ZeroFilled)) {
+         // Until the decode lands (a second or more while title 1 streams ~40 textures a second)
+         // a new image showed whatever its memory last held, often other textures. Zero blocks
+@@ -3158,6 +3162,7 @@ void TextureCache<P>::TickAsyncDecode() {
+         if (async_decode->decoded_data.size() > MapSizeBytes(image)) {
+             LOG_ERROR(HW_GPU, "Async decode of {} bytes for a {}-byte image at {:#x}, dropped",
+                       async_decode->decoded_data.size(), MapSizeBytes(image), image.gpu_addr);
++            image.flags &= ~ImageFlagBits::IsDecoding;
+             i = async_decodes.erase(i);
+             continue;
+         }
+-- 
+2.54.0
+

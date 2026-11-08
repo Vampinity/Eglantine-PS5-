@@ -1,0 +1,81 @@
+From 1cba11db5e9d15b88f88267b43b6b2ac6550f95a Mon Sep 17 00:00:00 2001
+From: Port <port@local>
+Date: Sun, 8 Nov 2026 05:00:40 +0100
+Subject: [PATCH] pe: gc-evictions
+
+---
+ src/common/pe_switch.h                       | 11 +++++++++++
+ src/video_core/texture_cache/texture_cache.h | 15 ++++++++++++---
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+ create mode 100644 src/common/pe_switch.h
+
+diff --git a/src/common/pe_switch.h b/src/common/pe_switch.h
+new file mode 100644
+index 0000000..b3a6612
+--- /dev/null
++++ b/src/common/pe_switch.h
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <cstdlib>
++
++namespace Common {
++// Callers cache this at first use; only an exact "1" enables an experimental PE port.
++inline bool PeSwitch(const char* name) noexcept {
++    const char* value = std::getenv(name);
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++}
++} // namespace Common
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index a9f0cc9..162ff6a 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include "common/pe_switch.h"
+ #include <algorithm>
+ #include <array>
+ #include <numeric>
+@@ -193,6 +194,8 @@ void TextureCache<P>::RunGarbageCollector() {
+     bool evict_old_costly = false;
+     u64 ticks_to_destroy = 0;
+     size_t num_iterations = 0;
++    size_t num_scanned = 0;
++    static const bool count_evictions = Common::PeSwitch("EDEN_PE_GC_EVICTIONS");
+     const auto Configure = [&](bool allow_aggressive) {
+         high_priority_mode = total_used_memory >= expected_memory;
+         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
+@@ -205,12 +208,15 @@ void TextureCache<P>::RunGarbageCollector() {
+         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
+         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+     };
+-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
++    const auto Cleanup = [this, &num_iterations, &num_scanned, &high_priority_mode, &aggressive_mode,
+                           &evict_old_costly](ImageId image_id) {
+-        if (num_iterations == 0) {
++        if (num_iterations == 0 || (count_evictions && num_scanned >= 8192)) {
+             return true;
+         }
+-        --num_iterations;
++        if (count_evictions) ++num_scanned;
++        if (!count_evictions) {
++            --num_iterations;
++        }
+         auto& image = slot_images[image_id];
+         if (True(image.flags & ImageFlagBits::IsDecoding)) {
+             return false;
+@@ -251,6 +257,9 @@ void TextureCache<P>::RunGarbageCollector() {
+         if (True(image.flags & ImageFlagBits::Tracked)) {
+             UntrackImage(image, image_id);
+         }
++        if (count_evictions) {
++            --num_iterations;
++        }
+         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+         UnregisterImage(image_id);
+         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+-- 
+2.54.0
+

@@ -1,0 +1,46 @@
+From e3aaf1183120ee0de387ff803010e195382ed51e Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:46 +0100
+Subject: [PATCH] pe: gc-block-order
+
+---
+ src/video_core/texture_cache/texture_cache.h | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 162ff6a..b449b6a 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -281,7 +281,8 @@ void TextureCache<P>::RunGarbageCollector() {
+     const auto Collect = [&] {
+         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
+             std::vector<ImageId> candidates;
+-            const size_t limit = num_iterations * 8;
++            static const bool wider = Common::PeSwitch("EDEN_PE_GC_BLOCK_ORDER");
++            const size_t limit = wider ? 1024 : num_iterations * 8;
+             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
+                 candidates.push_back(image_id);
+                 return candidates.size() >= limit;
+@@ -316,9 +317,18 @@ void TextureCache<P>::RunGarbageCollector() {
+                              [](const auto& a, const auto& b) { return a.first < b.first; });
+             for (const auto& [fill, image_id] : ordered) {
+                 if (Cleanup(image_id)) {
+-                    break;
++                    return;
+                 }
+             }
++            if (wider && candidates.size() == limit) {
++                // Continue in age order, excluding ids already visited (some were deleted).
++                lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId id) {
++                    if (std::find(candidates.begin(), candidates.end(), id) != candidates.end()) {
++                        return false;
++                    }
++                    return Cleanup(id);
++                });
++            }
+         } else {
+             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+         }
+-- 
+2.54.0
+

@@ -1,0 +1,117 @@
+From b64ceeb9320d3b1e827f324eb80f3da10d05c9d6 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:01:37 +0100
+Subject: [PATCH] pe: idle-cache-tick
+
+---
+ src/video_core/gpu.cpp                        |  1 +
+ src/video_core/rasterizer_interface.h         |  3 ++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 35 +++++++++++++++++++
+ .../renderer_vulkan/vk_rasterizer.h           |  4 +++
+ 4 files changed, 43 insertions(+)
+
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index f04d56e..051eaff 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -198,6 +198,7 @@ struct GPU::Impl {
+     /// Signal the ending of command list.
+     void OnCommandListEnd() {
+         renderer->ReadRasterizer()->ReleaseFences(false);
++        renderer->ReadRasterizer()->TickWithoutPresent();
+         Settings::UpdateGPUAccuracy();
+     }
+ 
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 28c59c1..52c6edb 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -208,6 +208,9 @@ public:
+     /// Notify rasterizer that a frame is about to finish
+     virtual void TickFrame() = 0;
+ 
++    /// End of a command list: lets caches age while the game renders without presenting.
++    virtual void TickWithoutPresent() {}
++
+     virtual bool AccelerateConditionalRendering() {
+         return false;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index ae59291..5c527ba 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2110,7 +2110,42 @@ void RasterizerVulkan::FlushCommands() {
+     }
+ }
+ 
++void RasterizerVulkan::TickWithoutPresent() {
++    // The texture and buffer caches age, and collect garbage, by presented frames. A game can
++    // render for minutes without presenting (Mario Kart World loads ~7 GiB of textures first),
++    // so after 250 ms without a present they age by time, once the GPU has finished what was
++    // submitted (images retired by an age tick are destroyed a few ticks later). Never wait for
++    // it here: GPU work can wait on guest work that this thread has yet to process.
++    // EDEN_PE_IDLE_CACHE_TICK=1 opts into aging without presentation.
++    static const bool enabled = Common::PeSwitch("EDEN_PE_IDLE_CACHE_TICK");
++    if (!enabled) {
++        return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now - last_cache_tick < std::chrono::milliseconds{250}) {
++        return;
++    }
++    if (idle_tick_gpu == 0) {
++        scheduler.Flush();
++        idle_tick_gpu = scheduler.CurrentTick() - 1;
++    }
++    if (!scheduler.IsFree(idle_tick_gpu)) {
++        return;
++    }
++    idle_tick_gpu = 0;
++    last_cache_tick = now;
++    {
++        std::scoped_lock lock{texture_cache.mutex};
++        texture_cache.TickFrame();
++    }
++    {
++        std::scoped_lock lock{buffer_cache.mutex};
++        buffer_cache.TickFrame();
++    }
++}
++
+ void RasterizerVulkan::TickFrame() {
++    last_cache_tick = std::chrono::steady_clock::now();
+     draw_counter = 0;
+     pipeline_cache.TickFrame();
+     guest_descriptor_queue.TickFrame();
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 1b3d02d..5aecc2a 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <chrono>
+ 
+ #include <boost/container/static_vector.hpp>
+ 
+@@ -132,6 +133,7 @@ public:
+     void TiledCacheBarrier() override;
+     void FlushCommands() override;
+     void TickFrame() override;
++    void TickWithoutPresent() override;
+     bool AccelerateConditionalRendering() override;
+     bool HasDrawTransformFeedback() override;
+     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
+@@ -266,6 +268,8 @@ private:
+     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
+ 
+     u32 draw_counter = 0;
++    std::chrono::steady_clock::time_point last_cache_tick = std::chrono::steady_clock::now();
++    u64 idle_tick_gpu{}; ///< GPU tick that must complete before the next idle cache tick
+     u64 pe_recorded_tick{};
+     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+     /// EDEN_NX2_OOT_SKIP_AA (oot_network.h): the tonemapped image and whether the output pass of
+-- 
+2.54.0
+

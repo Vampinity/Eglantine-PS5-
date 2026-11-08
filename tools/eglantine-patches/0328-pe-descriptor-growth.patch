@@ -1,0 +1,34 @@
+From 4ea2784192ada10c33026c98091b9fcf5e58e742 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:01:27 +0100
+Subject: [PATCH] pe: descriptor-growth
+
+---
+ src/video_core/texture_cache/descriptor_table.h | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index d9e65c8..5df7855 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include "common/pe_switch.h"
+ #include <algorithm>
+ #include <bit>
+ #include <cstdlib>
+@@ -78,7 +79,8 @@ public:
+         // some large limits, and such a table never shrinks.
+         static const bool tight = [] {
+             const char* const value = std::getenv("EDEN_NX2_TIGHT_DESCRIPTOR_TABLES");
+-            return value != nullptr && value[0] == '1';
++            return Common::PeSwitch("EDEN_PE_DESCRIPTOR_GROWTH") ||
++                   (value != nullptr && value[0] == '1');
+         }();
+         const size_t old_rounding = ((limit + 0x80000) & (~0x7ffff)) + 1;
+         const size_t num_descriptors =
+-- 
+2.54.0
+

@@ -1,0 +1,35 @@
+From 6b2b70a6d12214f447cba0d21f8c3575156ecd88 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:00:46 +0100
+Subject: [PATCH] pe: pipeline-cache-exit
+
+---
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index a09e3f6..51031a8 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/pe_switch.h"
+ #include <algorithm>
+ #include <chrono>
+ #include <cstddef>
+@@ -817,7 +818,9 @@ bool DropMeshDrawsBeforeBuild() {
+ PipelineCache::~PipelineCache() {
+     serialization_thread.WaitForRequests();
+     SaveUsedPipelines();
+-    if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
++    static const bool skip_unchanged = Common::PeSwitch("EDEN_PE_PIPELINE_CACHE_EXIT");
++    if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty() &&
++        (!skip_unchanged || last_flush.time_since_epoch().count() == 0 || pipelines_since_flush != 0)) {
+         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                      CACHE_VERSION);
+     }
+-- 
+2.54.0
+
