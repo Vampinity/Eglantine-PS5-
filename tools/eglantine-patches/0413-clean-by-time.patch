@@ -940,7 +940,7 @@ index bb495c6..eec341a 100644
      [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
  
 diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
-index fbd6208..669b0f8 100644
+index fbd6208..3a60217 100644
 --- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
 +++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
 @@ -251,6 +251,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
@@ -951,20 +951,6 @@ index fbd6208..669b0f8 100644
          // Still out of device memory: a real image in host memory (slow, but valid) beats one
          // with nothing bound, which AMD's drivers do not survive being sampled.
          VmaAllocationCreateInfo host = alloc_ci;
-@@ -424,7 +425,12 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
-     VkMemoryPropertyFlags property_flags{};
- 
-     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
--        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
-+        const VkResult result =
-+            vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
-+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-+            refusal_events.fetch_add(1, std::memory_order_relaxed);
-+        }
-+        vk::Check(result);
-     }
-     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
- 
 diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.h b/src/video_core/vulkan_common/vulkan_memory_allocator.h
 index d1df008..5f8b876 100644
 --- a/src/video_core/vulkan_common/vulkan_memory_allocator.h
