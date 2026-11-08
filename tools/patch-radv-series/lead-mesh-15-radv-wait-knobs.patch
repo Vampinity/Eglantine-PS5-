@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:00:00 +0100
+Subject: [PATCH] radv/ps5: radv wait knobs
+
+Port only PlayTendoh 0009's wait spin/sleep environment knobs.
+Unset retains 1500 us spin and 1000 us sleep; each existing numeric
+variable opts into its own override. Clamp as upstream and log at winsys
+creation, outside submit_lock. No realtime-deadline changes: lead-mesh-13
+owns those. The duplicate fence-status fast path is in lead-mesh-17.
+
+Credit: PlayTendoh patches/mesa; source reference 80a816a05c in
+playtendoh-prosperoeden-2026-11-07.md. The supplied mail patches carry
+zero commit IDs; individual upstream commit IDs were not supplied.
+---
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -17,6 +17,7 @@
+ #include "util/os_time.h"
+ #include "util/u_atomic.h"
+ #include "util/u_math.h"
++#include "util/u_debug.h"
+ #include "ac_linux_drm.h"
+ #include "sid.h"
+ #if defined(__PROSPERO__)
+@@ -91,7 +92,21 @@
+ #define RADV_PS5_STALL_NS (UINT64_C(10) * 1000000000)
+ /* Before sleeping, the marker is checked in a loop for this long: most waits
+  * end well inside a millisecond (PS5_Vulkan R36). */
+-#define RADV_PS5_SPIN_NS UINT64_C(1500000)
++static uint64_t radv_ps5_wait_spin_ns = UINT64_C(1500000);
++static unsigned radv_ps5_wait_sleep_us = 1000;
++static once_flag radv_ps5_wait_once = ONCE_FLAG_INIT;
++
++static void
++radv_ps5_wait_configure(void)
++{
++   const int64_t spin_us = debug_get_num_option("RADV_PS5_WAIT_SPIN_US", 1500);
++   const int64_t sleep_us = debug_get_num_option("RADV_PS5_WAIT_SLEEP_US", 1000);
++   radv_ps5_wait_spin_ns = (uint64_t)CLAMP(spin_us, 0, 100000) * 1000;
++   radv_ps5_wait_sleep_us = (unsigned)CLAMP(sleep_us, 50, 10000);
++   if (getenv("RADV_PS5_WAIT_SPIN_US") || getenv("RADV_PS5_WAIT_SLEEP_US"))
++      fprintf(stderr, "radv/ps5: a wait for the GPU spins %" PRIu64 " us, then sleeps %u us between looks\n",
++              radv_ps5_wait_spin_ns / 1000, radv_ps5_wait_sleep_us);
++}
+ 
+ /* ProsperoEden (tools/patch-radv-submission-dump.py): the 32-bit value at a GPU address, as the
+  * CPU reads it now. A buffer's GPU address is its CPU address (radv_ps5_bo.c), but the address may
+@@ -978,7 +993,7 @@
+    if (completed >= seq)
+       return true;
+    uint64_t now = os_time_get_nano();
+-   const uint64_t spin_until = now + RADV_PS5_SPIN_NS;
++   const uint64_t spin_until = now + radv_ps5_wait_spin_ns;
+    uint64_t progress_at = now;
+    uint64_t last = completed;
+    for (;;) {
+@@ -1002,7 +1017,7 @@
+       if (now < spin_until)
+          __builtin_ia32_pause();
+       else
+-         radv_ps5_sleep_us(1000);
++         radv_ps5_sleep_us(radv_ps5_wait_sleep_us);
+    }
+ }
+ 
+@@ -1485,6 +1500,7 @@
+ radv_ps5_winsys_create(const struct radeon_info *info, uint64_t debug_flags, uint64_t perftest_flags,
+                        struct radeon_winsys **winsys)
+ {
++   call_once(&radv_ps5_wait_once, radv_ps5_wait_configure);
+    struct radv_ps5_queue *const queue = radv_ps5_queue_get();
+    if (!queue)
+       return VK_ERROR_INITIALIZATION_FAILED;

@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:00:00 +0100
+Subject: [PATCH] radv/ps5: radv fence status fast
+
+Port PlayTendoh 0003's zero-timeout status optimization behind
+EDEN_NX2_RADV_FENCE_STATUS_FAST=1, default off. Check readiness before
+returning VK_TIMEOUT without a clock read. Its fixed 200 us sleep is
+superseded by lead-mesh-15's independent RADV_PS5_WAIT_SLEEP_US knob.
+Leave the realtime-deadline fix to the existing lead-mesh-13.
+
+Credit: PlayTendoh patches/mesa; source reference 80a816a05c in
+playtendoh-prosperoeden-2026-11-07.md. The supplied mail patches carry
+zero commit IDs; individual upstream commit IDs were not supplied.
+---
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c b/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
+@@ -7,7 +7,22 @@
+ #include "radv_ps5_winsys.h"
+ 
+ #include "util/os_time.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include "vk_sync.h"
++
++static bool radv_ps5_fence_status_fast;
++static once_flag radv_ps5_fence_status_once = ONCE_FLAG_INIT;
++
++static void
++radv_ps5_fence_status_configure(void)
++{
++   const char *value = getenv("EDEN_NX2_RADV_FENCE_STATUS_FAST");
++   radv_ps5_fence_status_fast = value && !strcmp(value, "1");
++   if (radv_ps5_fence_status_fast)
++      fprintf(stderr, "radv/ps5: zero-timeout fence status without clock (EDEN_NX2_RADV_FENCE_STATUS_FAST)\n");
++}
+ 
+ /* A binary sync object on the console's one queue. It is signalled by the
+  * submission that carries it -- the GPU has run it once the queue's marker
+@@ -119,6 +134,7 @@
+    (void)device;
+    struct radv_ps5_queue *const queue = radv_ps5_sync_queue();
+    const bool any = flags & VK_SYNC_WAIT_ANY;
++   call_once(&radv_ps5_fence_status_once, radv_ps5_fence_status_configure);
+ 
+    mtx_lock(&queue->sync_lock);
+    for (;;) {
+@@ -144,6 +160,12 @@
+          mtx_unlock(&queue->sync_lock);
+          return VK_SUCCESS;
+       }
++      /* Preserve the ready test first, including WAIT_ANY/PENDING and zero
++       * waits. Only an unsatisfied status query skips the clock. */
++      if (radv_ps5_fence_status_fast && abs_timeout_ns == 0) {
++         mtx_unlock(&queue->sync_lock);
++         return VK_TIMEOUT;
++      }
+       const uint64_t now = os_time_get_nano();
+       if (now >= abs_timeout_ns) {
+          mtx_unlock(&queue->sync_lock);

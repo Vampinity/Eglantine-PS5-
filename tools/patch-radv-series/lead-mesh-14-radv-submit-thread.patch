@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:00:00 +0100
+Subject: [PATCH] radv/ps5: radv submit thread
+
+Port PlayTendoh 0008 (source reference commit 80a816a05c).
+RADV_PS5_SUBMIT_THREAD=1 opts in; otherwise submit synchronously.
+Keep FIFO sequencing, ring retirement and our submission dump metadata.
+Drain before clock packets and AGC state changes. Propagate async failure
+through CPU waits. Serialize platform totals at their ten-second snapshot
+because platform.c is absent from the supplied inputs. Preserve the
+lead-mesh-12 print-after-unlock fix, absent from the supplied cs snapshot.
+The worker and queue live until process exit; no driver unload support.
+
+Credit: PlayTendoh patches/mesa; source reference 80a816a05c in
+playtendoh-prosperoeden-2026-11-07.md. The supplied mail patches carry
+zero commit IDs; individual upstream commit IDs were not supplied.
+---
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+@@ -14,6 +14,8 @@
+ #include "util/os_time.h"
+ #include "util/u_atomic.h"
+ #include "util/u_math.h"
++#include "util/u_debug.h"
++#include "util/u_thread.h"
+ #include "sid.h"
+ 
+ /* Command streams. The console faults a PM4 INDIRECT_BUFFER into title memory
+@@ -312,6 +314,204 @@
+ 
+ /* ------------------------------------------------------------- submission */
+ 
++/* Submissions handed to a thread of their own (RADV_PS5_SUBMIT_THREAD=1).
++ *
++ * sceAgcDriverSubmitDcb keeps the submitting thread in the console's kernel
++ * for a while: Cemu's GPU thread, which records Breath of the Wild's 3,000 to
++ * 4,000 draws a frame and submits every 300, spent 14% of its time in it at
++ * 4K (agc_ms, 2026-10-13), most of it blocked rather than running. With the
++ * variable set, a submission is planned, numbered, given ring space and copied
++ * into the ring where it is made, as before; the thread then flushes its words
++ * and hands them to AGC, in the order they were made. Nothing else changes: a
++ * sync object is signalled by the sequence number, which the GPU reaches only
++ * once the thread has submitted it, and ring space comes back as the marker
++ * passes it, as before. RADV_PS5_SUBMIT_SPIN_US (2000 by default) is how long
++ * the thread looks for the next submission before it sleeps: while a game
++ * draws, the next comes within a millisecond or two, and a sleeping thread
++ * costs the submitter a system call to wake and the GPU the wake-up's delay. */
++#define RADV_PS5_SUBMITTER_JOBS 256u
++
++struct radv_ps5_submit_job {
++   uint32_t *words;
++   uint32_t count;
++   volatile uint32_t *marker;
++   uint32_t marker_value;
++};
++
++static struct {
++   bool enabled;
++   /* PAUSEs the thread spins for before it sleeps: about 20 ns each on the
++    * console's CPU. */
++   uint32_t spins;
++   struct radv_ps5_submit_job jobs[RADV_PS5_SUBMITTER_JOBS];
++   /* The next job the thread submits (only the thread writes it), and the
++    * next free slot (written under the queue's submit lock). */
++   uint32_t head;
++   uint32_t tail;
++   /* The thread sleeps, or is about to, on wanted. */
++   uint32_t sleeping;
++   /* Submitters waiting on done: for room, or for the thread to catch up. */
++   uint32_t waiting;
++   /* The first result AGC refused a submission with; the device is lost from
++    * then on. */
++   int32_t error;
++   mtx_t lock;
++   cnd_t wanted;
++   cnd_t done;
++} radv_ps5_submitter;
++static simple_mtx_t radv_ps5_submit_api_lock = SIMPLE_MTX_INITIALIZER;
++static once_flag radv_ps5_submitter_once = ONCE_FLAG_INIT;
++
++static int
++radv_ps5_submitter_body(void *unused)
++{
++   (void)unused;
++   u_thread_setname("radv_submit");
++   uint32_t head = 0;
++   for (;;) {
++      for (uint32_t spin = radv_ps5_submitter.spins; spin && head == p_atomic_read(&radv_ps5_submitter.tail); spin--)
++         __builtin_ia32_pause();
++      if (head == p_atomic_read(&radv_ps5_submitter.tail)) {
++         mtx_lock(&radv_ps5_submitter.lock);
++         p_atomic_set(&radv_ps5_submitter.sleeping, 1);
++         /* The flag before the look at the tail: a submitter stores the tail,
++          * then looks at the flag, so one of the two sees the other's store. */
++         __sync_synchronize();
++         while (head == p_atomic_read(&radv_ps5_submitter.tail))
++            cnd_wait(&radv_ps5_submitter.wanted, &radv_ps5_submitter.lock);
++         p_atomic_set(&radv_ps5_submitter.sleeping, 0);
++         mtx_unlock(&radv_ps5_submitter.lock);
++      }
++      const struct radv_ps5_submit_job job = radv_ps5_submitter.jobs[head % RADV_PS5_SUBMITTER_JOBS];
++      int failure = 0;
++      if (!p_atomic_read(&radv_ps5_submitter.error)) {
++         /* The platform's flush/agc totals use plain +=. Serialize with the
++          * ten-second snapshot without putting AGC back on the caller's path. */
++         simple_mtx_lock(&radv_ps5_submit_api_lock);
++         const int result = radv_ps5_submit(job.words, job.count, job.marker, job.marker_value);
++         simple_mtx_unlock(&radv_ps5_submit_api_lock);
++         if (result != 0) {
++            p_atomic_set(&radv_ps5_submitter.error, result);
++            failure = result;
++         }
++      }
++      head++;
++      p_atomic_set(&radv_ps5_submitter.head, head);
++      /* The head before the look at the waiters, as above. */
++      __sync_synchronize();
++      if (p_atomic_read(&radv_ps5_submitter.waiting)) {
++         mtx_lock(&radv_ps5_submitter.lock);
++         cnd_broadcast(&radv_ps5_submitter.done);
++         mtx_unlock(&radv_ps5_submitter.lock);
++      }
++      if (failure)
++         fprintf(stderr, "radv/ps5: sceAgcDriverSubmitDcb failed: 0x%08x (on the submit thread)\n",
++                 (unsigned)failure);
++   }
++   return 0;
++}
++
++static void
++radv_ps5_submitter_start(void)
++{
++   if (!debug_get_bool_option("RADV_PS5_SUBMIT_THREAD", false))
++      return;
++   const int64_t spin_us = debug_get_num_option("RADV_PS5_SUBMIT_SPIN_US", 2000);
++   radv_ps5_submitter.spins = (uint32_t)CLAMP(spin_us, 0, 100000) * 50;
++   if (mtx_init(&radv_ps5_submitter.lock, mtx_plain) != thrd_success)
++      goto failed_lock;
++   if (cnd_init(&radv_ps5_submitter.wanted) != thrd_success) {
++      mtx_destroy(&radv_ps5_submitter.lock);
++      goto failed_lock;
++   }
++   if (cnd_init(&radv_ps5_submitter.done) != thrd_success) {
++      cnd_destroy(&radv_ps5_submitter.wanted);
++      mtx_destroy(&radv_ps5_submitter.lock);
++      goto failed_lock;
++   }
++   thrd_t thread;
++   if (thrd_create(&thread, radv_ps5_submitter_body, NULL) != thrd_success) {
++      cnd_destroy(&radv_ps5_submitter.done);
++      cnd_destroy(&radv_ps5_submitter.wanted);
++      mtx_destroy(&radv_ps5_submitter.lock);
++      fprintf(stderr, "radv/ps5: submissions stay on the submitting thread: the submit thread was refused\n");
++      return;
++   }
++   thrd_detach(thread);
++   radv_ps5_submitter.enabled = true;
++   fprintf(stderr, "radv/ps5: submissions on a thread of their own (RADV_PS5_SUBMIT_THREAD), which looks for the next "
++                   "one for %" PRId64 " us before it sleeps\n",
++           (int64_t)CLAMP(spin_us, 0, 100000));
++   return;
++failed_lock:
++   fprintf(stderr, "radv/ps5: submissions stay on the submitting thread: the submit thread's lock was refused\n");
++}
++
++/* Waits until the submit thread has submitted every job a submitter waits
++ * for: up to (not including) until. */
++static void
++radv_ps5_submitter_wait(uint32_t until)
++{
++   if ((int32_t)(until - p_atomic_read(&radv_ps5_submitter.head)) <= 0)
++      return;
++   mtx_lock(&radv_ps5_submitter.lock);
++   p_atomic_inc(&radv_ps5_submitter.waiting);
++   /* The count before the look at the head; the thread stores the head, then
++    * looks at the count. */
++   __sync_synchronize();
++   while ((int32_t)(until - p_atomic_read(&radv_ps5_submitter.head)) > 0)
++      cnd_wait(&radv_ps5_submitter.done, &radv_ps5_submitter.lock);
++   p_atomic_dec(&radv_ps5_submitter.waiting);
++   mtx_unlock(&radv_ps5_submitter.lock);
++}
++
++/* Every job submitted to AGC: before anything else reaches AGC, or an AGC
++ * setting changes for the next submissions. Called with the submit lock held,
++ * so no job is added meanwhile. */
++static void
++radv_ps5_submitter_drain(void)
++{
++   if (radv_ps5_submitter.enabled)
++      radv_ps5_submitter_wait(p_atomic_read(&radv_ps5_submitter.tail));
++}
++
++/* Hands count words to the submit thread, after the jobs before them. Called
++ * with the submit lock held. Returns what AGC refused an earlier one with, or
++ * 0. */
++static int
++radv_ps5_submitter_push(uint32_t *words, uint32_t count, volatile uint32_t *marker, uint32_t marker_value)
++{
++   if (p_atomic_read(&radv_ps5_submitter.error))
++      return p_atomic_read(&radv_ps5_submitter.error);
++   const uint32_t tail = p_atomic_read(&radv_ps5_submitter.tail);
++   /* All the slots in use: the thread is RADV_PS5_SUBMITTER_JOBS submissions
++    * behind, so it is running, not asleep. */
++   radv_ps5_submitter_wait(tail - RADV_PS5_SUBMITTER_JOBS + 1);
++   radv_ps5_submitter.jobs[tail % RADV_PS5_SUBMITTER_JOBS] = (struct radv_ps5_submit_job){
++      .words = words,
++      .count = count,
++      .marker = marker,
++      .marker_value = marker_value,
++   };
++   /* The job before the tail (a release store), and the tail before the look
++    * at the thread's flag. */
++   p_atomic_set(&radv_ps5_submitter.tail, tail + 1);
++   __sync_synchronize();
++   if (p_atomic_read(&radv_ps5_submitter.sleeping)) {
++      mtx_lock(&radv_ps5_submitter.lock);
++      cnd_signal(&radv_ps5_submitter.wanted);
++      mtx_unlock(&radv_ps5_submitter.lock);
++   }
++   return p_atomic_read(&radv_ps5_submitter.error);
++}
++
++/* Atomic even before configuration; error remains zero with the switch off. */
++bool
++radv_ps5_submission_failed(void)
++{
++   return p_atomic_read(&radv_ps5_submitter.error) != 0;
++}
++
+ /* The completion packet: one RELEASE_MEM of CACHE_FLUSH_AND_INV_TS_EVENT
+  * (event 20, index 5) that flushes the colour and depth caches, writes back and
+  * invalidates L2 and the vector caches (the GCR actions 0x30c), and only then
+@@ -357,7 +557,13 @@
+    volatile uint64_t *const value = (volatile uint64_t *)(page + RADV_PS5_CLOCK_VALUE_OFFSET);
+    const uint64_t va = (uint64_t)(uintptr_t)value;
+ 
++   call_once(&radv_ps5_submitter_once, radv_ps5_submitter_start);
+    simple_mtx_lock(&queue->submit_lock);
++   radv_ps5_submitter_drain();
++   if (radv_ps5_submission_failed()) {
++      simple_mtx_unlock(&queue->submit_lock);
++      return 0;
++   }
+    *value = UINT64_MAX;
+    radv_ps5_cpu_flush((const void *)value, sizeof(*value));
+    words[0] = PKT3(PKT3_RELEASE_MEM, 6, 0);
+@@ -502,13 +708,17 @@
+ }
+ 
+ /* Where the submissions' time goes: a line on stderr every 10 s of a queue
+- * that submits (held with the submit lock). */
++ * that submits. Snapshot under submit_lock; print after unlocking (lead-mesh-12). */
+ static struct {
+    uint64_t window_start, count, words, claim_ns, copy_ns;
+ } radv_ps5_submit_window;
+ 
+-static void
+-radv_ps5_note_submission(uint32_t words, uint64_t claim_ns, uint64_t copy_ns)
++struct radv_ps5_submit_line {
++   uint64_t count, words, claim_ns, copy_ns, times[3];
++};
++
++static bool
++radv_ps5_note_submission(uint32_t words, uint64_t claim_ns, uint64_t copy_ns, struct radv_ps5_submit_line *line)
+ {
+    const uint64_t now = os_time_get_nano();
+    if (!radv_ps5_submit_window.window_start)
+@@ -518,16 +728,29 @@
+    radv_ps5_submit_window.claim_ns += claim_ns;
+    radv_ps5_submit_window.copy_ns += copy_ns;
+    if (now - radv_ps5_submit_window.window_start < 10ull * 1000 * 1000 * 1000)
+-      return;
+-   uint64_t times[3];
+-   radv_ps5_submit_times(times);
++      return false;
++   if (radv_ps5_submitter.enabled)
++      simple_mtx_lock(&radv_ps5_submit_api_lock);
++   radv_ps5_submit_times(line->times);
++   if (radv_ps5_submitter.enabled)
++      simple_mtx_unlock(&radv_ps5_submit_api_lock);
++   line->count = radv_ps5_submit_window.count;
++   line->words = radv_ps5_submit_window.words;
++   line->claim_ns = radv_ps5_submit_window.claim_ns;
++   line->copy_ns = radv_ps5_submit_window.copy_ns;
++   memset(&radv_ps5_submit_window, 0, sizeof(radv_ps5_submit_window));
++   radv_ps5_submit_window.window_start = now;
++   return true;
++}
++
++static void
++radv_ps5_print_submit_line(const struct radv_ps5_submit_line *line)
++{
+    fprintf(stderr,
+            "radv/ps5 submissions: window count=%" PRIu64 " kwords=%" PRIu64 " claim_ms=%.1f copy_ms=%.1f flush_ms=%.1f"
+            " agc_ms=%.1f suspend_ms=%.1f\n",
+-           radv_ps5_submit_window.count, radv_ps5_submit_window.words / 1024, radv_ps5_submit_window.claim_ns / 1e6,
+-           radv_ps5_submit_window.copy_ns / 1e6, times[0] / 1e6, times[1] / 1e6, times[2] / 1e6);
+-   memset(&radv_ps5_submit_window, 0, sizeof(radv_ps5_submit_window));
+-   radv_ps5_submit_window.window_start = now;
++           line->count, line->words / 1024, line->claim_ns / 1e6,
++           line->copy_ns / 1e6, line->times[0] / 1e6, line->times[1] / 1e6, line->times[2] / 1e6);
+ }
+ 
+ static VkResult
+@@ -544,6 +767,10 @@
+          return radv_ps5_cs(submit->cs_array[i])->status;
+    }
+ 
++   call_once(&radv_ps5_submitter_once, radv_ps5_submitter_start);
++   if (radv_ps5_submission_failed())
++      return VK_ERROR_DEVICE_LOST;
++
+    /* Waits need only their signals submitted: this queue runs in order. */
+    uint64_t depends = 0;
+    VkResult result = radv_ps5_sync_wait_submitted(wait_count, waits, &depends);
+@@ -551,11 +778,19 @@
+       return result;
+ 
+    simple_mtx_lock(&queue->submit_lock);
++   if (radv_ps5_submission_failed()) {
++      simple_mtx_unlock(&queue->submit_lock);
++      return VK_ERROR_DEVICE_LOST;
++   }
+    /* AGC owns the tessellation factor ring's registers: the ring is handed to
+     * it, after the GPU has finished with the one it held. */
+    if (ctx->tess_factor_ring_va && (ctx->tess_factor_ring_va != queue->tess_factor_ring_va ||
+                                     ctx->tess_factor_ring_size != queue->tess_factor_ring_size)) {
+-      radv_ps5_queue_wait_seq(queue, queue->submitted_seq, OS_TIMEOUT_INFINITE);
++      radv_ps5_submitter_drain();
++      if (!radv_ps5_queue_wait_seq(queue, queue->submitted_seq, OS_TIMEOUT_INFINITE)) {
++         simple_mtx_unlock(&queue->submit_lock);
++         return VK_ERROR_DEVICE_LOST;
++      }
+       const int set = radv_ps5_set_tess_factor_ring(ctx->tess_factor_ring_va, ctx->tess_factor_ring_size);
+       if (set != 0)
+          fprintf(stderr, "radv/ps5: sceAgcDriverSetTFRing(0x%llx, %u) failed: 0x%08x\n",
+@@ -566,6 +801,11 @@
+    /* The off-chip ring RADV allocated holds as many workgroups as its
+     * OFFCHIP_BUFFERING names; AGC starts with its own. */
+    if (ctx->tess_factor_ring_va && !queue->hs_offchip_param_set) {
++      radv_ps5_submitter_drain();
++      if (radv_ps5_submission_failed()) {
++         simple_mtx_unlock(&queue->submit_lock);
++         return VK_ERROR_DEVICE_LOST;
++      }
+       const uint32_t param = ctx->ws->info.hs_offchip_param;
+       const int set = radv_ps5_set_hs_offchip_param(G_03093C_OFFCHIP_GRANULARITY_GFX103(param),
+                                                     G_03093C_OFFCHIP_BUFFERING_GFX103(param));
+@@ -667,14 +907,22 @@
+    for (unsigned i = 0; i < parts && submitted == 0; i++) {
+       const uint32_t start = *util_dynarray_element(&starts, uint32_t, i);
+       const uint32_t end = i + 1 < parts ? *util_dynarray_element(&starts, uint32_t, i + 1) : count;
+-      submitted = radv_ps5_submit(words + start, end - start, queue->marker, (uint32_t)seq);
++      if (radv_ps5_submitter.enabled)
++         submitted = radv_ps5_submitter_push(words + start, end - start, queue->marker, (uint32_t)seq);
++      else
++         submitted = radv_ps5_submit(words + start, end - start, queue->marker, (uint32_t)seq);
+    }
+    util_dynarray_fini(&starts);
+    radv_ps5_record_submission(queue, count, parts, wait_count, signal_count, submit->queue_index, depends);
+-   radv_ps5_note_submission(count, copy_start - claim_start, copy_end - copy_start);
++   struct radv_ps5_submit_line submit_line;
++   const bool submit_line_due =
++      radv_ps5_note_submission(count, copy_start - claim_start, copy_end - copy_start, &submit_line);
+    simple_mtx_unlock(&queue->submit_lock);
++   if (submit_line_due)
++      radv_ps5_print_submit_line(&submit_line);
+    if (submitted != 0) {
+-      fprintf(stderr, "radv/ps5: sceAgcDriverSubmitDcb failed: 0x%08x\n", (unsigned)submitted);
++      if (!radv_ps5_submitter.enabled)
++         fprintf(stderr, "radv/ps5: sceAgcDriverSubmitDcb failed: 0x%08x\n", (unsigned)submitted);
+       return VK_ERROR_DEVICE_LOST;
+    }
+    ctx->queue_used[submit->ip_type][submit->queue_index] = true;
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c b/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_sync.c
+@@ -122,6 +122,10 @@
+ 
+    mtx_lock(&queue->sync_lock);
+    for (;;) {
++      if (radv_ps5_submission_failed()) {
++         mtx_unlock(&queue->sync_lock);
++         return VK_ERROR_DEVICE_LOST;
++      }
+       uint32_t ready = 0;
+       /* The sequence the slowest ready-but-running wait still needs. */
+       uint64_t need = 0;
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -982,6 +982,8 @@
+    uint64_t progress_at = now;
+    uint64_t last = completed;
+    for (;;) {
++      if (radv_ps5_submission_failed())
++         return false;
+       completed = radv_ps5_queue_poll(queue);
+       if (completed >= seq)
+          return true;
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h
+@@ -173,6 +173,9 @@
+    uint32_t tess_factor_ring_size;
+ };
+ 
++/* The async submitter's first AGC failure; never true with the option off. */
++bool radv_ps5_submission_failed(void);
++
+ /* Completion: the sequence the GPU has run up to, read from the marker. */
+ uint64_t radv_ps5_queue_poll(struct radv_ps5_queue *queue);
+ /* Waits until the GPU has run seq, or until abs_timeout_ns (os_time_get_nano's

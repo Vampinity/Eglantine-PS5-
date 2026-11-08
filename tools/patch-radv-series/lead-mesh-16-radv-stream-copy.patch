@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 12:00:00 +0100
+Subject: [PATCH] radv/ps5: radv stream copy
+
+Port PlayTendoh 0002's streaming copy behind
+EDEN_NX2_RADV_STREAM_COPY=1. Off by default; non-SSE2 builds use memcpy.
+All preambles, chunks and completion words use the same copy mode.
+SFENCE on the producer before publishing work to lead-mesh-14's worker.
+The platform API/source is absent here: retain its cache flush, so this
+is a conservative partial port, not the upstream flush-bypass speedup.
+Potential CPU cache/RFO savings require console measurement.
+
+Credit: PlayTendoh patches/mesa; source reference 80a816a05c in
+playtendoh-prosperoeden-2026-11-07.md. The supplied mail patches carry
+zero commit IDs; individual upstream commit IDs were not supplied.
+---
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+@@ -17,6 +17,10 @@
+ #include "util/u_debug.h"
+ #include "util/u_thread.h"
+ #include "sid.h"
++
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
+ 
+ /* Command streams. The console faults a PM4 INDIRECT_BUFFER into title memory
+  * (PS5_Vulkan B8), so nothing is chained: a stream's words stay in CPU memory,
+@@ -683,6 +687,59 @@
+                                 }));
+ }
+ 
++/* PlayTendoh 0002's non-temporal copy. Keep the existing platform flush:
++ * platform.c is not supplied, so this port does not bypass cache eviction. */
++static bool radv_ps5_stream_copy;
++static once_flag radv_ps5_stream_once = ONCE_FLAG_INIT;
++
++static void
++radv_ps5_stream_configure(void)
++{
++#if defined(__SSE2__)
++   const char *value = getenv("EDEN_NX2_RADV_STREAM_COPY");
++   radv_ps5_stream_copy = value && !strcmp(value, "1");
++   if (radv_ps5_stream_copy)
++      fprintf(stderr, "radv/ps5: streamed ring copy (EDEN_NX2_RADV_STREAM_COPY), platform flush retained\n");
++#endif
++}
++
++#if defined(__SSE2__)
++
++static uint32_t *
++radv_ps5_stream_words(uint32_t *restrict to, const uint32_t *restrict from, uint32_t count)
++{
++   if (!radv_ps5_stream_copy) {
++      memcpy(to, from, (size_t)count * sizeof(uint32_t));
++      return to + count;
++   }
++   for (; count && ((uintptr_t)to & 15); count--)
++      _mm_stream_si32((int *)to++, (int)*from++);
++   for (; count >= 16; count -= 16, to += 16, from += 16) {
++      const __m128i a = _mm_loadu_si128((const __m128i *)from);
++      const __m128i b = _mm_loadu_si128((const __m128i *)from + 1);
++      const __m128i c = _mm_loadu_si128((const __m128i *)from + 2);
++      const __m128i d = _mm_loadu_si128((const __m128i *)from + 3);
++      _mm_stream_si128((__m128i *)to, a);
++      _mm_stream_si128((__m128i *)to + 1, b);
++      _mm_stream_si128((__m128i *)to + 2, c);
++      _mm_stream_si128((__m128i *)to + 3, d);
++   }
++   for (; count >= 4; count -= 4, to += 4, from += 4)
++      _mm_stream_si128((__m128i *)to, _mm_loadu_si128((const __m128i *)from));
++   for (; count; count--)
++      _mm_stream_si32((int *)to++, (int)*from++);
++   return to;
++}
++#else
++
++static uint32_t *
++radv_ps5_stream_words(uint32_t *restrict to, const uint32_t *restrict from, uint32_t count)
++{
++   memcpy(to, from, (size_t)count * sizeof(uint32_t));
++   return to + count;
++}
++#endif
++
+ static uint32_t
+ radv_ps5_count_streams(struct ac_cmdbuf **streams, unsigned count)
+ {
+@@ -697,12 +754,9 @@
+ {
+    for (unsigned i = 0; i < count; i++) {
+       const struct radv_ps5_cs *const cs = radv_ps5_cs(streams[i]);
+-      util_dynarray_foreach (&cs->chunks, struct radv_ps5_cs_chunk, chunk) {
+-         memcpy(at, chunk->words, (size_t)chunk->cdw * sizeof(uint32_t));
+-         at += chunk->cdw;
+-      }
+-      memcpy(at, cs->base.buf, (size_t)cs->base.cdw * sizeof(uint32_t));
+-      at += cs->base.cdw;
++      util_dynarray_foreach (&cs->chunks, struct radv_ps5_cs_chunk, chunk)
++         at = radv_ps5_stream_words(at, chunk->words, chunk->cdw);
++      at = radv_ps5_stream_words(at, cs->base.buf, cs->base.cdw);
+    }
+    return at;
+ }
+@@ -767,6 +821,7 @@
+          return radv_ps5_cs(submit->cs_array[i])->status;
+    }
+ 
++   call_once(&radv_ps5_stream_once, radv_ps5_stream_configure);
+    call_once(&radv_ps5_submitter_once, radv_ps5_submitter_start);
+    if (radv_ps5_submission_failed())
+       return VK_ERROR_DEVICE_LOST;
+@@ -890,12 +945,18 @@
+                                               : util_dynarray_num_elements(&pieces, struct radv_ps5_cs_chunk);
+       for (unsigned p = unit->first_piece; p < end; p++) {
+          const struct radv_ps5_cs_chunk *const piece = util_dynarray_element(&pieces, struct radv_ps5_cs_chunk, p);
+-         memcpy(at, piece->words, (size_t)piece->cdw * sizeof(uint32_t));
+-         at += piece->cdw;
++         at = radv_ps5_stream_words(at, piece->words, piece->cdw);
+       }
+    }
+-   radv_ps5_completion_words(at, (uint64_t)(uintptr_t)queue->marker, (uint32_t)seq);
+-   at += RADV_PS5_COMPLETION_WORDS;
++   uint32_t completion[RADV_PS5_COMPLETION_WORDS];
++   radv_ps5_completion_words(completion, (uint64_t)(uintptr_t)queue->marker, (uint32_t)seq);
++   at = radv_ps5_stream_words(at, completion, RADV_PS5_COMPLETION_WORDS);
++#if defined(__SSE2__)
++   /* Drain this producer's WC buffers before publishing jobs to another CPU.
++    * A fence in the worker would not order the producer's streaming stores. */
++   if (radv_ps5_stream_copy)
++      _mm_sfence();
++#endif
+    assert((uint32_t)(at - words) == count);
+    util_dynarray_fini(&pieces);
+    util_dynarray_fini(&units);
