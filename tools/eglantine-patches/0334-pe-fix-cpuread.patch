@@ -1,0 +1,40 @@
+Subject: [PATCH] review fix for the ProsperoEden port (cpuread), 8 Nov
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 5c527ba..11e711e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1817,25 +1817,15 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
+         std::unique_lock lock{texture_cache.mutex, std::defer_lock};
+         if (!skip) {
+             lock.lock();
+-        } else {
+-            lock.try_lock();
++        } else if (!lock.try_lock()) {
++            // Contended: still ask the texture cache. Only it flushes a GPU-written image on these
++            // pages, and an answer without it would hand back stale bytes (and the core remembers
++            // a non-empty area). ImagePages above is the lock-free skip for pages with no image.
++            lock.lock();
+         }
+-        if (lock.owns_lock()) {
+-            auto area = texture_cache.GetFlushArea(addr, size);
+-            if (area) {
+-                return *area;
+-            }
+-        } else {
+-            // An empty area is not remembered: the next read retries the texture cache.
+-            // Keep the buffer-cache question below even when the texture lock is skipped.
+-            if (!buffer_cache.FlushesOnCpuRead()) {
+-                return {.start_address = addr, .end_address = addr, .preemtive = true};
+-            }
+-            std::scoped_lock buffer_lock{buffer_cache.mutex};
+-            if (auto area = buffer_cache.GetFlushArea(addr, size)) {
+-                return *area;
+-            }
+-            return {.start_address = addr, .end_address = addr, .preemtive = true};
++        auto area = texture_cache.GetFlushArea(addr, size);
++        if (area) {
++            return *area;
+         }
+     }
+     if (buffer_cache.FlushesOnCpuRead()) {

@@ -1,0 +1,92 @@
+Subject: [PATCH] review fix for the ProsperoEden port (astc), 8 Nov
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index f6f6667..5060b27 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -200,6 +200,26 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref, bool completed) {
+     it->deferred = false;
+ }
+ 
++void StagingBufferPool::CarryTick(u64 old_tick, u64 new_tick) {
++    if (old_tick == new_tick) {
++        return;
++    }
++    for (u64& tick : sync_ticks) {
++        if (tick == old_tick) {
++            tick = new_tick;
++        }
++    }
++    for (StagingBuffersCache* const cache : {&upload_cache, &device_local_cache, &download_cache}) {
++        for (StagingBuffers& level : *cache) {
++            for (StagingBuffer& entry : level.entries) {
++                if (!entry.deferred && entry.tick == old_tick) {
++                    entry.tick = new_tick;
++                }
++            }
++        }
++    }
++}
++
+ void StagingBufferPool::TickFrame() {
+     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 5ee05a5..e27d637 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -69,6 +69,10 @@ public:
+ 
+     void TickFrame();
+ 
++    /// The command buffer of old_tick ended while work recorded after it still reads what was
++    /// handed out in old_tick. Everything stamped old_tick stays busy until new_tick is done.
++    void CarryTick(u64 old_tick, u64 new_tick);
++
+ private:
+     struct StreamBufferCommit {
+         size_t upper_bound;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 674bc8f..567e264 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -5000,6 +5000,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+                 recorded += bytes(t);
+             }
+         }
++        // The upload's input (map) and what the current draw took were handed out in this tick,
++        // and are read only after the flush or wait below, in a later tick.
++        const u64 old_tick = scheduler.CurrentTick();
+         if (recorded >= (u64{32} << 20)) {
+             scheduler.Flush();
+         }
+@@ -5010,6 +5013,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+                 pending_transcodes.pop_front();
+             }
+         }
++        staging_buffer_pool.CarryTick(old_tick, scheduler.CurrentTick());
+     }
+     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
+     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 9ae54b6..cbd8861 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2154,8 +2154,16 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         return;
+     }
+     static const bool busy_only = Common::PeSwitch("EDEN_PE_ASTC_BUSY_ASYNC");
++    // A decode still pending for this image lands after anything uploaded now, so while one is,
++    // the next goes the same way and lands after it. IsDecoding is not enough: the first of two
++    // queued decodes clears it when it lands.
++    const auto decode_pending = [&] {
++        return std::ranges::any_of(async_decodes, [image_id](const auto& decode) {
++            return decode->image_id == image_id && !decode->cancelled;
++        });
++    };
+     if (True(image.flags & ImageFlagBits::AsynchronousDecode) &&
+-        (!busy_only || Eden::AstcPolicy::InBackground())) {
++        (!busy_only || Eden::AstcPolicy::InBackground() || decode_pending())) {
+         try {
+             QueueAsyncDecode(image, image_id);
+         } catch (const std::bad_alloc&) {

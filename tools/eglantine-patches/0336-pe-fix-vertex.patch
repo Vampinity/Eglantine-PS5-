@@ -1,0 +1,67 @@
+Subject: [PATCH] review fix for the ProsperoEden port (vertex), 8 Nov
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 4b1e567..364f3f7 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -875,6 +875,13 @@ namespace {
+ using EdenVertexIdentity = std::array<u64, 2>;
+ bool EdenAttributeless(EdenVertexIdentity vertex_hash);
+ extern std::atomic<u32> eden_attributeless_generation;
++// EDEN_PE_STATIC_VERTEX_INPUT=1 (default off): PE 0324. Draws whose vertex shader reads no
++// attribute take a static vertex input pipeline on devices with dynamic vertex input. Off, keys,
++// dirty flags, the clean watch list and the disk cache rule are T61's.
++bool StaticVertexInputEnabled() {
++    static const bool on = Common::PeSwitch("EDEN_PE_STATIC_VERTEX_INPUT");
++    return on;
++}
+ // EDEN_NX2_PIPELINE_CLEAN=1 (default off): see CurrentGraphicsPipelineClean. From Frizti/Lichii
+ // 13a51aeca3 (Dr. Sergio, Lichii PR 166). The watch list matches this tree's Refresh: it differs
+ // from that base only in how alpha_test_ref is rounded, and the register is watched either way.
+@@ -932,7 +939,7 @@ void PipelineCache::BuildCleanWatch() {
+     // Dirty::VertexInput (both branches) and the static vertex repack:
+     watch(regs.vertex_attrib_format);
+     const bool repack = !features.has_dynamic_vertex_input && features.has_static_vertex_repack;
+-    {
++    if (!features.has_dynamic_vertex_input || StaticVertexInputEnabled()) {
+         watch(regs.vertex_stream_instances);
+         for (const auto& stream : regs.vertex_streams) {
+             watch(stream.frequency);
+@@ -1093,7 +1100,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean() {
+         !dynamic_features.has_extended_dynamic_state_3_blend && flags[Dirty::Blending];
+     if (clean.pipeline != nullptr && clean.pipeline == current_pipeline &&
+         clean.maxwell3d == maxwell3d &&
+-        pe_attributeless_generation == eden_attributeless_generation.load(std::memory_order_acquire) &&
++        (!StaticVertexInputEnabled() ||
++         pe_attributeless_generation == eden_attributeless_generation.load(std::memory_order_acquire)) &&
+         !flags[Dirty::VertexInput] &&
+         !flags[Dirty::ViewportSwizzles] && !blending_dirty &&
+         clean.hashes == graphics_key.unique_hashes &&
+@@ -1187,6 +1195,9 @@ bool EdenAttributelessStaticKey(const FixedPipelineState& state) {
+ } // Anonymous namespace
+ 
+ void PipelineCache::ApplyAttributelessVertexInput() {
++    if (!StaticVertexInputEnabled()) {
++        return;
++    }
+     const u32 generation = eden_attributeless_generation.load(std::memory_order_acquire);
+     const bool static_vertex_input = graphics_key.state.dynamic_vertex_input != 0 &&
+                                      EdenAttributeless({graphics_key.unique_hashes[0], graphics_key.unique_hashes[1]});
+@@ -1431,7 +1442,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+                 dynamic_features.has_color_write_enable ||
+             ((key.state.dynamic_vertex_input != 0) !=
+                  dynamic_features.has_dynamic_vertex_input &&
+-             !(dynamic_features.has_dynamic_vertex_input &&
++             !(StaticVertexInputEnabled() && dynamic_features.has_dynamic_vertex_input &&
+                EdenAttributelessStaticKey(key.state)))) {
+             return;
+         }
+@@ -1819,7 +1830,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+             }
+         }
+     }
+-    if (uses_vertex_b) {
++    if (uses_vertex_b && StaticVertexInputEnabled()) {
+         EdenRecordAttributeless({key.unique_hashes[0], key.unique_hashes[1]}, programs[1].info);
+     }
+     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};

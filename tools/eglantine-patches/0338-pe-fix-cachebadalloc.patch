@@ -1,0 +1,87 @@
+Subject: [PATCH] review fix for the ProsperoEden port (cachebadalloc), 8 Nov
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 4b1e567..7cb4cba 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -822,8 +822,19 @@ PipelineCache::~PipelineCache() {
+     serialization_thread.WaitForRequests();
+     SaveUsedPipelines();
+     static const bool skip_unchanged = Common::PeSwitch("EDEN_PE_PIPELINE_CACHE_EXIT");
+-    if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty() &&
+-        (!skip_unchanged || last_flush.time_since_epoch().count() == 0 || pipelines_since_flush != 0)) {
++    bool unchanged = false;
++    if (skip_unchanged && vulkan_pipeline_cache) {
++        // Unchanged only if a write succeeded, every pipeline counted since was in a write that
++        // succeeded, and the driver cache is still the size that write saved (builds that ended
++        // after it grew it).
++        size_t size = 0;
++        const size_t written = written_cache_size.load(std::memory_order_acquire);
++        unchanged = written != NO_CACHE_WRITTEN &&
++                    pipelines_saved.load(std::memory_order_acquire) ==
++                        pipelines_counted.load(std::memory_order_acquire) &&
++                    vulkan_pipeline_cache.Read(&size, nullptr) == VK_SUCCESS && size == written;
++    }
++    if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty() && !unchanged) {
+         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                      CACHE_VERSION);
+     }
+@@ -1517,6 +1528,7 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
+     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+         return;
+     }
++    pipelines_counted.fetch_add(1, std::memory_order_acq_rel);
+     if (++pipelines_since_flush < VULKAN_CACHE_FLUSH_PIPELINES) {
+         return;
+     }
+@@ -2193,6 +2205,8 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
+     auto partial = filename;
+     partial += ".part";
+     std::error_code error;
++    // Pipelines counted before the copy below: a write that succeeds marks them saved.
++    const size_t counted = pipelines_counted.load(std::memory_order_acquire);
+     try {
+         size_t cache_size = 0;
+         std::vector<char> cache_data;
+@@ -2222,6 +2236,11 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
+             std::filesystem::remove(partial, error);
+             return;
+         }
++        size_t saved = pipelines_saved.load(std::memory_order_acquire);
++        while (saved < counted &&
++               !pipelines_saved.compare_exchange_weak(saved, counted, std::memory_order_acq_rel)) {
++        }
++        written_cache_size.store(cache_size, std::memory_order_release);
+         LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
+                  Common::FS::PathToUTF8String(filename));
+     } catch (const std::ios_base::failure& e) {
+@@ -2229,8 +2248,11 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
+         std::filesystem::remove(partial, error);
+     } catch (const std::bad_alloc&) {
+         // A copy of a large cache did not fit in memory: keep the one on disk.
+-        LOG_ERROR(Render_Vulkan, "No memory to copy the Vulkan driver pipeline cache; kept the previous file");
+         std::filesystem::remove(partial, error);
++        if (BadAllocEnds()) {
++            throw; // EDEN_NX2_BAD_ALLOC_ENDS=1: to the caller, as before this write was made safe
++        }
++        LOG_ERROR(Render_Vulkan, "No memory to copy the Vulkan driver pipeline cache; kept the previous file");
+     }
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index f1c1b31..8c0cd53 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -275,6 +275,12 @@ private:
+     std::chrono::steady_clock::time_point last_flush{};
+     std::atomic<size_t> last_cache_size{};
+     std::atomic_bool flush_in_flight{};
++    // EDEN_PE_PIPELINE_CACHE_EXIT: pipelines counted for the driver cache, how many of them the
++    // last successful write held, and the size it saved (NO_CACHE_WRITTEN until one succeeds).
++    static constexpr size_t NO_CACHE_WRITTEN = ~size_t{0};
++    std::atomic<size_t> pipelines_counted{};
++    std::atomic<size_t> pipelines_saved{};
++    std::atomic<size_t> written_cache_size{NO_CACHE_WRITTEN};
+ 
+     Common::ThreadWorker workers;
+     Common::ThreadWorker serialization_thread;

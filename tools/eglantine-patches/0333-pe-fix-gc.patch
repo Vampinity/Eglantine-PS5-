@@ -1,0 +1,27 @@
+Subject: [PATCH] review fix for the ProsperoEden port (gc), 8 Nov
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 9ae54b6..36bac47 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -209,6 +209,8 @@ void TextureCache<P>::RunGarbageCollector() {
+         }();
+         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
+         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
++        // Each pass gets its own scan budget, so the aggressive pass is not starved by earlier ones.
++        num_scanned = 0;
+     };
+     const auto Cleanup = [this, &num_iterations, &num_scanned, &high_priority_mode, &aggressive_mode,
+                           &evict_old_costly](ImageId image_id) {
+@@ -324,8 +326,10 @@ void TextureCache<P>::RunGarbageCollector() {
+             }
+             if (wider && candidates.size() == limit) {
+                 // Continue in age order, excluding ids already visited (some were deleted).
++                // Sorted once so each LRU item costs a binary search, not a linear scan.
++                std::sort(candidates.begin(), candidates.end());
+                 lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId id) {
+-                    if (std::find(candidates.begin(), candidates.end(), id) != candidates.end()) {
++                    if (std::binary_search(candidates.begin(), candidates.end(), id)) {
+                         return false;
+                     }
+                     return Cleanup(id);

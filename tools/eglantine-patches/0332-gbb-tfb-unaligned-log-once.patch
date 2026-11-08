@@ -1,0 +1,33 @@
+From: GrowingBlackBeans (gist e3676cf2, core-9995), ported by EglantinePS5
+Subject: [PATCH] transform feedback: log each unaligned TFB attribute once (rupee pickup freeze)
+
+diff --git a/src/video_core/transform_feedback.cpp b/src/video_core/transform_feedback.cpp
+index 53d29c08e2..63b560eaea 100644
+--- a/src/video_core/transform_feedback.cpp
++++ b/src/video_core/transform_feedback.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <vector>
+ 
+ #include "common/alignment.h"
+@@ -98,7 +99,16 @@ std::pair<std::array<Shader::TransformFeedbackVarying, 256>, u32> MakeTransformF
+             const u32 base_offset = offset;
+             const auto attribute{get_attribute(offset)};
+             if (std::ranges::find(VECTORS, Common::AlignDown(attribute, 4)) != VECTORS.end()) {
+-                UNIMPLEMENTED_IF_MSG(attribute % 4 != 0, "Unaligned TFB {}", attribute);
++                // Once per attribute: a pipeline with unaligned varyings logged this ~670 times a
++                // second at Critical level (each line flushed to storage) when Ocarina of Time
++                // first showed a rupee pickup, and the stalled GPU thread froze the game.
++                if (attribute % 4 != 0) {
++                    static std::array<std::atomic<bool>, 256> reported{};
++                    if (attribute < reported.size() &&
++                        !reported[attribute].exchange(true, std::memory_order_relaxed)) {
++                        LOG_WARNING(Render, "Unaligned TFB {} (logged once)", attribute);
++                    }
++                }
+ 
+                 const auto base_index = attribute / 4;
+                 while (offset + 1 < varying_count && base_index == get_attribute(offset + 1) / 4) {
