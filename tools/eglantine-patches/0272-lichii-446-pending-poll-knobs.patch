@@ -1,14 +1,73 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: EglantinePS5 <noreply@eglantineps5.local>
-Date: Sun, 8 Nov 2026 00:45:00 +0100
+Date: Sun, 8 Nov 2026 04:10:00 +0100
 Subject: [PATCH] EDEN_NX2_PENDING_POLL_US / _SPIN_US: env knobs for the pending-channel poll
 
-Off unless set: unset keeps the 500 us yield and the 250 us poll exactly. Port of the idea in
-zortos293/Lichii PR 446 (50 us poll while a channel waits on a CPU-released semaphore, 1 ms after
-2 s). Ours already wakes on new commands and polls every 250 us (0041), so Lichii's 1 ms -> 50 us
-gain mostly does not apply; this makes 50 testable. A poll below 250 us returns to 250 us once a
-channel has waited 2 s. The Linux prctl timer slack hunk is left out (not our kernel).
+Off unless set: with none of the three switches set the 500 us yield and the 250 us poll run
+exactly as before. Port of the idea in zortos293/Lichii PR 446 (50 us poll while a channel waits
+on a CPU-released semaphore, 1 ms after 2 s). Ours already wakes on new commands and polls every
+250 us (0041), so Lichii's 1 ms -> 50 us gain mostly does not apply; this makes 50 testable. A
+poll below 250 us returns to 250 us once a channel has made no progress for 2 s. The Linux prctl
+timer slack hunk is left out (not our kernel).
+
+v2 adds the fix from zortos293/Lichii PR 621 (head f8bd5af94a): last_progress moved only when a
+command was popped, before it ran, so every semaphore acquire after the first in a list skipped
+the yield window. Scheduler::ResumePending now returns whether a channel moved; last_progress
+moves on that and after the command is dispatched; the pending sleep is skipped once no channel
+is pending. On with EDEN_NX2_PENDING_PROGRESS=1, or whenever SPIN_US or POLL_US is set
+(EDEN_NX2_PENDING_PROGRESS=0 forces it off). #621's Windows SleepForOneTick hunk is left out.
 ---
+diff --git a/src/video_core/control/scheduler.cpp b/src/video_core/control/scheduler.cpp
+--- a/src/video_core/control/scheduler.cpp
++++ b/src/video_core/control/scheduler.cpp
+@@ -58,7 +58,8 @@
+     }
+ }
+ 
+-void Scheduler::ResumePending(GPU& gpu) {
++bool Scheduler::ResumePending(GPU& gpu) {
++    bool any_progress = false;
+     // Running one channel can release the semaphore another waits for: retry until none moves.
+     for (bool progress = true; progress;) {
+         progress = false;
+@@ -68,7 +69,7 @@
+             // pending: resuming it again counted as progress forever and the GPU thread never
+             // reached its stop request (closing the game hung).
+             if (!dma_pusher.system.IsPoweredOn()) {
+-                return;
++                return any_progress;
+             }
+             if (!dma_pusher.HasPendingAcquire() || !dma_pusher.CanResumeAcquire()) {
+                 continue;
+@@ -76,12 +77,14 @@
+             BindChannel(gpu, state->bind_id);
+             dma_pusher.DispatchCalls();
+             progress = true;
++            any_progress = true;
+         }
+     }
+     std::erase_if(pending_channels, [](const auto& state) {
+         return !state->payload->dma_pusher.HasPendingAcquire();
+     });
+     any_pending.store(!pending_channels.empty(), std::memory_order_release);
++    return any_progress;
+ }
+ 
+ void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {
+diff --git a/src/video_core/control/scheduler.h b/src/video_core/control/scheduler.h
+--- a/src/video_core/control/scheduler.h
++++ b/src/video_core/control/scheduler.h
+@@ -26,8 +26,8 @@
+ public:
+     void Push(GPU& gpu, s32 channel, CommandList&& entries);
+ 
+-    /// Runs channels whose pending semaphore acquire is now met.
+-    void ResumePending(GPU& gpu);
++    /// Runs channels whose pending semaphore acquire is now met; true if any channel moved.
++    bool ResumePending(GPU& gpu);
+     [[nodiscard]] bool HasPendingChannels() const {
+         return !pending_channels.empty();
+     }
 diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
 --- a/src/video_core/gpu_thread.cpp
 +++ b/src/video_core/gpu_thread.cpp
@@ -20,7 +79,7 @@ diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
  #include <chrono>
  #include <cstdlib>
  #include <thread>
-@@ -26,6 +27,27 @@
+@@ -26,6 +27,48 @@
  namespace VideoCommon::GPUThread {
  
  namespace {
@@ -28,11 +87,32 @@ diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
 +// EDEN_NX2_PENDING_SPIN_US / EDEN_NX2_PENDING_POLL_US (Lichii #446): how long the GPU thread yields
 +// after the last command arrived, then how often it polls the channel's semaphores while it
 +// sleeps for new commands. Unset: 500 and 250, the values below have always been. Lichii polls every
-+// 50 us. A poll shorter than 250 us goes back to 250 us once 2 s pass with no new command
-+// (last_progress only moves when a command arrives, so a title that still submits every frame
-+// stays on the short poll), as Lichii goes back to 1 ms; at 250 or more nothing changes then.
++// 50 us. A poll shorter than 250 us goes back to 250 us once 2 s pass with no progress (no new
++// command, and with the fix below no resumed channel either), as Lichii goes back to 1 ms; at 250
++// or more nothing changes then.
 +// Values outside min..100000 or not a plain number keep the default (a 0 poll would spin on
 +// ResumePending). Read once.
++//
++// Lichii #621 fixes a bug #446 shipped with, and this port too: last_progress moved only when a
++// command was popped, before the list ran. A list with several semaphore acquires (Ocarina) then
++// used up the yield window on the first one, and every later acquire in it went straight to the
++// sleep. With the fix, last_progress also moves when ResumePending runs a channel and after a
++// command has been dispatched, and the sleep is skipped once no channel is pending any more.
++// EDEN_NX2_PENDING_PROGRESS=1 turns the fix on, =0 off; unset, it is on whenever
++// EDEN_NX2_PENDING_SPIN_US or EDEN_NX2_PENDING_POLL_US is set, so the knobs are tested with it and
++// a run with neither set behaves exactly as before.
++bool PendingProgressFix() {
++    const char* const value = std::getenv("EDEN_NX2_PENDING_PROGRESS");
++    if (value != nullptr && value[0] != '\0') {
++        return value[0] == '1' && value[1] == '\0';
++    }
++    const auto set = [](const char* name) {
++        const char* const knob = std::getenv(name);
++        return knob != nullptr && knob[0] != '\0';
++    };
++    return set("EDEN_NX2_PENDING_SPIN_US") || set("EDEN_NX2_PENDING_POLL_US");
++}
++
 +std::chrono::microseconds PendingKnob(const char* name, long long fallback, long long min) {
 +    const char* const value = std::getenv(name);
 +    if (value == nullptr || value[0] == '\0') {
@@ -48,7 +128,7 @@ diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
  
  // Tells a CPU thread waiting in PushCommand that its command ran.
  void SignalCommand(SynchState& state, u64 fence, bool block) {
-@@ -63,6 +85,10 @@
+@@ -63,29 +106,43 @@
          auto last_progress = std::chrono::steady_clock::now();
          namespace Profile = VideoCommon::Nx2Profile;
          auto& split = VideoCommon::GpuSplit::Get();
@@ -56,10 +136,26 @@ diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
 +        static const auto pending_poll = PendingKnob("EDEN_NX2_PENDING_POLL_US", 250, 1);
 +        static const auto pending_poll_long =
 +            (std::max)(pending_poll, std::chrono::microseconds{250});
++        static const bool progress_fix = PendingProgressFix();
          while (!stop_token.stop_requested()) {
              Profile::Report();
              split.MaybeStart(system);
-@@ -77,15 +103,17 @@
+             if (scheduler.HasPendingChannels()) {
+                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
++                bool resumed = false;
+                 {
+                     Profile::Scope scope{Profile::Zone::ResumePending};
+-                    scheduler.ResumePending(system.GPU());
++                    resumed = scheduler.ResumePending(system.GPU());
+                 }
++                if (progress_fix && resumed) {
++                    last_progress = std::chrono::steady_clock::now();
++                }
+                 if (!state.queue.TryPop(next)) {
++                    if (progress_fix && !scheduler.HasPendingChannels()) {
++                        continue; // the last pending channel just finished: wait in PopWait
++                    }
+                     // The CPU usually releases the semaphore soon after: poll for half a
                      // millisecond before sleeping, or every wait also waits out a host sleep
                      // (title 1 waits ~25 times a second).
                      Profile::Scope scope{Profile::Zone::PendingSleep};
@@ -80,3 +176,35 @@ diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
                          continue;
                      }
                  }
+@@ -96,7 +153,9 @@
+             if (stop_token.stop_requested()) {
+                 break;
+             }
+-            last_progress = std::chrono::steady_clock::now();
++            if (!progress_fix) {
++                last_progress = std::chrono::steady_clock::now();
++            }
+             if (split.Active()) {
+                 // Only command lists are parsed here; everything else runs on the back thread
+                 // in order, and so does the signal that the command ran.
+@@ -133,6 +192,10 @@
+                     SignalCommand(*state_ptr, fence, block);
+                 });
+                 split.Publish();
++                if (progress_fix) {
++                    // After the list ran: its own run time does not use up the yield window.
++                    last_progress = std::chrono::steady_clock::now();
++                }
+                 continue;
+             }
+             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+@@ -155,6 +218,9 @@
+                 ASSERT(false);
+             }
+             SignalCommand(state, next.fence, next.block);
++            if (progress_fix) {
++                last_progress = std::chrono::steady_clock::now();
++            }
+         }
+     });
+ }
