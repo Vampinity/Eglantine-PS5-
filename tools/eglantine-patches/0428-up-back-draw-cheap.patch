@@ -1,0 +1,173 @@
+Subject: [PATCH] EDEN_UP_BACK_DRAW_CHEAP: part of Lichii #858 (c7e807d617): skip alias sync when no aliased image changed, drop empty direct draws before pipeline work; off by default
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 7302c76..f1b1699 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1079,6 +1079,22 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+                      regs.blend.enable[0], seen.size());
+         }
+     }
++    // EDEN_UP_BACK_DRAW_CHEAP (Lichii PR 858): a direct draw with no vertices, or no instances
++    // outside task/mesh pipelines, records nothing. Skip it before the pipeline, buffer and
++    // descriptor work: dirty state, deferred clears and query counter toggles stay pending for the
++    // next recorded draw, clear or render pass end, which apply them before anything can observe
++    // them. With transform feedback on the draw goes through, since its counters are begun and
++    // closed around draws.
++    if (VideoCommon::UpBackDrawCheap() && maxwell3d->regs.transform_feedback_enabled == 0 &&
++        (MakeDrawParams(maxwell3d->draw_manager.draw_state, instance_count, is_indexed)
++                 .num_vertices == 0 ||
++         (instance_count == 0 && [this] {
++             const GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
++             return pipeline != nullptr && !pipeline->IsMeshPipeline();
++         }()))) {
++        gpu.TickWork();
++        return;
++    }
+     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+         const auto& draw_state = maxwell3d->draw_manager.draw_state;
+         const u32 num_instances{instance_count};
+diff --git a/src/video_core/texture_cache/image_base.cpp b/src/video_core/texture_cache/image_base.cpp
+index 3185dd8..ebed5cf 100644
+--- a/src/video_core/texture_cache/image_base.cpp
++++ b/src/video_core/texture_cache/image_base.cpp
+@@ -253,6 +253,10 @@ bool AddImageAlias(ImageBase& lhs, ImageBase& rhs, ImageId lhs_id, ImageId rhs_i
+     }
+     lhs.aliased_images.push_back(std::move(lhs_alias));
+     rhs.aliased_images.push_back(std::move(rhs_alias));
++    if (UpBackDrawCheap()) {
++        lhs.newest_alias_tick = (std::max)(lhs.newest_alias_tick, rhs.modification_tick);
++        rhs.newest_alias_tick = (std::max)(rhs.newest_alias_tick, lhs.modification_tick);
++    }
+     lhs.flags &= ~ImageFlagBits::IsRescalable;
+     rhs.flags &= ~ImageFlagBits::IsRescalable;
+     return true;
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index 878c229..0f79c54 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <array>
+ #include <optional>
+ #include <vector>
+@@ -13,6 +14,7 @@
+ 
+ #include "common/common_funcs.h"
+ #include "common/common_types.h"
++#include "common/pe_switch.h"
+ #include "video_core/texture_cache/image_info.h"
+ #include "video_core/texture_cache/image_view_info.h"
+ #include "video_core/texture_cache/types.h"
+@@ -126,7 +128,12 @@ struct ImageBase {
+     VAddr cpu_addr = 0;
+     VAddr cpu_addr_end = 0;
+ 
++    /// Set through SetModificationTick.
+     u64 modification_tick = 0;
++    /// EDEN_UP_BACK_DRAW_CHEAP: at least the newest modification_tick among aliased_images
++    /// (raised when an alias's tick is set or an alias is added): SynchronizeAliases has nothing
++    /// to do while it is not newer. Never read with the switch off.
++    u64 newest_alias_tick = 0;
+     size_t lru_index = SIZE_MAX;
+ 
+     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
+@@ -170,4 +177,26 @@ struct ImageAllocBase {
+ 
+ bool AddImageAlias(ImageBase& lhs, ImageBase& rhs, ImageId lhs_id, ImageId rhs_id);
+ 
++/// EDEN_UP_BACK_DRAW_CHEAP=1, from Lichii PR 858 (zortos293/Lichii c7e807d617): skip texture
++/// alias sync when no alias changed, and skip empty direct draws before any pipeline, buffer or
++/// descriptor work. Read once.
++inline bool UpBackDrawCheap() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_BACK_DRAW_CHEAP");
++    return enabled;
++}
++
++/// Sets an image's modification tick; with EDEN_UP_BACK_DRAW_CHEAP also raises its aliases'
++/// newest_alias_tick to it.
++template <typename Images>
++void SetModificationTick(Images& images, ImageBase& image, u64 tick) {
++    image.modification_tick = tick;
++    if (!UpBackDrawCheap()) {
++        return;
++    }
++    for (const AliasedImage& alias : image.aliased_images) {
++        u64& newest = images[alias.id].newest_alias_tick;
++        newest = (std::max)(newest, tick);
++    }
++}
++
+ } // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index dc955b3..b304b94 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -4296,7 +4296,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+                 continue;
+             }
+             CopyImage(new_image_id, aliased->id, aliased->copies);
+-            new_image.modification_tick = overlap.modification_tick;
++            SetModificationTick(slot_images, new_image, overlap.modification_tick);
+             continue;
+         }
+         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
+@@ -4311,7 +4311,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             } else {
+                 runtime.CopyImage(new_image, overlap, copies);
+             }
+-            new_image.modification_tick = overlap.modification_tick;
++            SetModificationTick(slot_images, new_image, overlap.modification_tick);
+         }
+         if (True(overlap.flags & ImageFlagBits::Tracked)) {
+             UntrackImage(overlap, copy_object.id);
+@@ -5090,13 +5090,22 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
+ template <class P>
+ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+     image.flags |= ImageFlagBits::GpuModified;
+-    image.modification_tick = ++modification_tick;
++    SetModificationTick(slot_images, image, ++modification_tick);
+ }
+ 
+ template <class P>
+ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
+     Image& image = slot_images[image_id];
++    const bool cheap = UpBackDrawCheap();
++    // EDEN_UP_BACK_DRAW_CHEAP: nothing aliased was modified after this image, skip walking its
++    // (possibly long) alias list for every draw that samples it.
++    if (cheap && image.newest_alias_tick <= image.modification_tick) {
++        DEBUG_ASSERT(std::ranges::none_of(image.aliased_images, [&](const AliasedImage& alias) {
++            return slot_images[alias.id].modification_tick > image.modification_tick;
++        }));
++        return;
++    }
+     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
+     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
+     u64 most_recent_tick = image.modification_tick;
+@@ -5110,6 +5119,10 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+         }
+     }
+     if (aliased_images.empty()) {
++        if (cheap) {
++            // Newer aliases were deleted since: skip the walk until one is modified again.
++            image.newest_alias_tick = image.modification_tick;
++        }
+         return;
+     }
+     const bool can_rescale = ImageCanRescale(image);
+@@ -5120,7 +5133,10 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+             ScaleDown(image);
+         }
+     }
+-    image.modification_tick = most_recent_tick;
++    SetModificationTick(slot_images, image, most_recent_tick);
++    if (cheap) {
++        image.newest_alias_tick = most_recent_tick;
++    }
+     if (any_modified) {
+         image.flags |= ImageFlagBits::GpuModified;
+     }

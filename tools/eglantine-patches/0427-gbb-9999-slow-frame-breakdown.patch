@@ -1,0 +1,205 @@
+Subject: [PATCH] GBB 9999 slow-frame breakdown on T71 (EDEN_NX2_SLOW_FRAME_MS, plus EDEN_NX2_FRAME_BREAKDOWN_EVERY=<n>), both need EDEN_NX2_GPU_PROFILE=1; off when unset
+
+diff --git a/src/video_core/nx2_profile.h b/src/video_core/nx2_profile.h
+index e75f772..3456202 100644
+--- a/src/video_core/nx2_profile.h
++++ b/src/video_core/nx2_profile.h
+@@ -11,6 +11,7 @@
+ #include <cstring>
+ #include <string>
+ #include <unordered_set>
++#include <utility>
+ 
+ #include "common/common_types.h"
+ #include "common/logging.h"
+@@ -91,12 +92,21 @@ inline u64 Now() {
+     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+ }
+ 
++/// The current frame's exclusive time and calls per zone (FrameMark), and when it began.
++struct FrameData {
++    std::array<u64, static_cast<size_t>(Zone::Count)> ns{};
++    std::array<u64, static_cast<size_t>(Zone::Count)> count{};
++    u64 start{};
++    u64 seq{}; ///< g_frame_seq at this thread's last frame mark
++};
++
+ struct ThreadData {
+     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
+     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
+     std::array<u64, 9> counters{}; ///< See Counter
+     u64 child_ns{};    ///< Time of the zones nested in the current one
+     u64 window_start{};
++    FrameData frame{}; ///< Kept across Report's 10 s reset
+ };
+ 
+ inline thread_local ThreadData t_data;
+@@ -136,6 +146,8 @@ public:
+         const auto index = static_cast<size_t>(zone);
+         data.exclusive_ns[index] += elapsed - data.child_ns;
+         ++data.count[index];
++        data.frame.ns[index] += elapsed - data.child_ns;
++        ++data.frame.count[index];
+         data.child_ns = parent_child_ns + elapsed;
+         if (t_place != nullptr) {
+             t_place->zone.store(parent_zone, std::memory_order_relaxed);
+@@ -179,6 +191,124 @@ inline void Add(Counter counter, u64 amount) {
+     }
+ }
+ 
++// Per-frame breakdown (with EDEN_NX2_GPU_PROFILE; both unset: nothing changes).
++// EDEN_NX2_SLOW_FRAME_MS=<ms>: a frame of that wall time or more (0 or empty: 150) logs its
++//   biggest zones, at most 300 lines a session per thread.
++// EDEN_NX2_FRAME_BREAKDOWN_EVERY=<n>: every n-th frame logs its zones whatever its length, at
++//   most 3000 lines a session per thread.
++// The rasterizer's thread marks frames in TickFrame (FrameMark); the other GPU thread (the
++// split's front) closes its own frame at its next loop turn after that (Report), under the same
++// frame number: the same stretch of time on both halves (the front is usually parsing the next
++// frame's commands by then). Zones still open at a mark count in the frame they close in.
++struct FrameSwitches {
++    u64 slow_ns{}; ///< 0: no slow-frame lines
++    u64 every{};   ///< 0: no sampled lines
++};
++
++// Read at the first frame, after the frontend has set its variables.
++inline const FrameSwitches& FrameLog() {
++    static const FrameSwitches switches = [] {
++        FrameSwitches result{};
++        if (const char* value = std::getenv("EDEN_NX2_SLOW_FRAME_MS"); value != nullptr) {
++            const unsigned long ms = std::strtoul(value, nullptr, 10);
++            result.slow_ns = static_cast<u64>(ms != 0 ? ms : 150) * 1'000'000ULL;
++        }
++        if (const char* value = std::getenv("EDEN_NX2_FRAME_BREAKDOWN_EVERY"); value != nullptr) {
++            result.every = std::strtoull(value, nullptr, 10);
++        }
++        return result;
++    }();
++    return switches;
++}
++
++inline bool FrameLogOn() {
++    const FrameSwitches& switches = FrameLog();
++    return switches.slow_ns != 0 || switches.every != 0;
++}
++
++inline std::atomic<u64> g_frame_seq{0};      ///< Frames marked by the rasterizer's thread
++inline thread_local bool t_marks_frames = false; ///< This thread runs TickFrame
++
++/// Ends the calling thread's current frame (frame number `seq`) and logs it when it is slow or
++/// sampled.
++inline void EndFrame(const char* thread_name, u64 seq) {
++    auto& frame = t_data.frame;
++    const u64 now = Now();
++    if (frame.start != 0) {
++        const FrameSwitches& switches = FrameLog();
++        const u64 wall = now - frame.start;
++        const bool slow = switches.slow_ns != 0 && wall >= switches.slow_ns;
++        // Crossed a multiple of n (the front may see two frames at once).
++        const bool sampled =
++            switches.every != 0 && seq / switches.every != frame.seq / switches.every;
++        // Caps per thread.
++        static thread_local u32 slow_lines{0};
++        static thread_local u32 sampled_lines{0};
++        const char* kind = nullptr;
++        size_t max_zones{};
++        u64 min_ns{};
++        if (slow && slow_lines < 300) {
++            ++slow_lines;
++            kind = "Slow frame";
++            max_zones = 8;
++            min_ns = 1'000'000ULL;
++        } else if (sampled && sampled_lines < 3000) {
++            ++sampled_lines;
++            kind = "Frame breakdown";
++            max_zones = 12;
++            min_ns = 500'000ULL;
++        }
++        if (kind != nullptr) {
++            u64 zoned{};
++            std::array<std::pair<u64, size_t>, static_cast<size_t>(Zone::Count)> order{};
++            for (size_t i = 0; i < order.size(); ++i) {
++                if (i != 0) {
++                    zoned += frame.ns[i];
++                }
++                order[i] = {frame.ns[i], i};
++            }
++            order[0].first = wall > zoned ? wall - zoned : 0; // in no zone
++            std::sort(order.begin(), order.end(),
++                      [](const auto& a, const auto& b) { return a.first > b.first; });
++            std::string line;
++            for (size_t k = 0; k < max_zones && order[k].first >= min_ns; ++k) {
++                const size_t i = order[k].second;
++                line += fmt::format(" | {} {:.1f} ms ({})", zone_names[i],
++                                    static_cast<double>(order[k].first) / 1e6, frame.count[i]);
++            }
++            const u64 frames = seq - frame.seq;
++            LOG_INFO(HW_GPU, "{} on {}: {:.1f} ms (frame {}{}){}", kind, thread_name,
++                     static_cast<double>(wall) / 1e6, seq,
++                     frames > 1 ? fmt::format(", {} frames", frames) : std::string{}, line);
++        }
++    }
++    frame = {};
++    frame.start = now;
++    frame.seq = seq;
++}
++
++/// Called by the thread that runs the rasterizer once per guest frame (RasterizerVulkan::
++/// TickFrame). Does nothing unless EDEN_NX2_SLOW_FRAME_MS or EDEN_NX2_FRAME_BREAKDOWN_EVERY is
++/// set.
++inline void FrameMark() {
++    if (!FrameLogOn()) {
++        return;
++    }
++    if (!Enabled()) {
++        static std::atomic<bool> warned{false};
++        if (!warned.exchange(true, std::memory_order_relaxed)) {
++            LOG_WARNING(HW_GPU, "EDEN_NX2_SLOW_FRAME_MS and EDEN_NX2_FRAME_BREAKDOWN_EVERY need "
++                                "EDEN_NX2_GPU_PROFILE=1: no frame breakdown");
++        }
++        return;
++    }
++    t_marks_frames = true;
++    const u64 seq = g_frame_seq.fetch_add(1, std::memory_order_relaxed) + 1;
++    const char* const name =
++        t_place != nullptr ? t_place->name.load(std::memory_order_relaxed) : nullptr;
++    EndFrame(name != nullptr ? name : "rasterizer thread", seq);
++}
++
+ /// Called by the GPU thread (and the split's back thread) between commands: logs and resets
+ /// the totals every 10 s.
+ inline void Report(const char* thread_name = "GPU thread") {
+@@ -211,6 +341,12 @@ inline void Report(const char* thread_name = "GPU thread") {
+     if (t_place != nullptr) {
+         t_place->beat.store(now, std::memory_order_relaxed);
+     }
++    if (!t_marks_frames && FrameLogOn()) {
++        // The other GPU thread: a frame ended on the rasterizer's thread since this one's last.
++        if (const u64 seq = g_frame_seq.load(std::memory_order_relaxed); seq != data.frame.seq) {
++            EndFrame(thread_name, seq);
++        }
++    }
+     if (data.window_start == 0) {
+         data.window_start = now;
+         data.child_ns = 0;
+@@ -250,7 +386,9 @@ inline void Report(const char* thread_name = "GPU thread") {
+                         static_cast<double>(data.counters[7]) * 1e9 / window,
+                         static_cast<double>(data.counters[8]) * 1e9 / window);
+     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
++    const FrameData frame = data.frame;
+     data = {};
++    data.frame = frame;
+     data.window_start = now;
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 7302c76..ef36a00 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2281,6 +2281,7 @@ void RasterizerVulkan::TickWithoutPresent() {
+ }
+ 
+ void RasterizerVulkan::TickFrame() {
++    VideoCommon::Nx2Profile::FrameMark();
+     last_cache_tick = std::chrono::steady_clock::now();
+     draw_counter = 0;
+     pipeline_cache.TickFrame();
