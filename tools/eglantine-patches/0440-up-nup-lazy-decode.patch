@@ -1,0 +1,509 @@
+Subject: [PATCH] EDEN_UP_NUP_LAZY_DECODE: Lichii #885 (b49273aba8): NUP zstd members are decoded only as far as reads reach (128 KiB steps, one decoder per member, shared prefix for readers), beside the old reader; off by default
+
+diff --git a/src/core/file_sys/nup_container.cpp b/src/core/file_sys/nup_container.cpp
+index de7ee81..9eb043f 100644
+--- a/src/core/file_sys/nup_container.cpp
++++ b/src/core/file_sys/nup_container.cpp
+@@ -4,21 +4,28 @@
+ #include "core/file_sys/nup_container.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <condition_variable>
+ #include <cstddef>
+ #include <cstdlib>
+ #include <cstring>
+ #include <list>
+ #include <map>
++#include <memory>
++#include <mutex>
+ #include <random>
+ #include <span>
+ #include <unordered_map>
+ 
+ #include <fmt/format.h>
+ #include <openssl/evp.h>
++// ZSTD_d_stableOutBuffer, for EDEN_UP_NUP_LAZY_DECODE (zstd is linked statically).
++#define ZSTD_STATIC_LINKING_ONLY
+ #include <zstd.h>
+ 
+ #include "common/fs/path_util.h"
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "common/swap.h"
+ #include "core/file_sys/content_archive.h"
+ #include "core/file_sys/romfs.h"
+@@ -343,6 +350,416 @@ private:
+     bool cache_enabled;
+ };
+ 
++// EDEN_UP_NUP_LAZY_DECODE=1 (Lichii b49273aba8, #885): a zstd member is decoded from its start only
++// as far as reads reach, instead of whole on the first read that touches it. Ocarina's title movie
++// fell ~4 s behind its sound at boot: every first read of a member unpacked all of it on the one
++// fsp-srv host thread the boot loader also uses. Unset, NupVfsFile above serves every zstd file.
++
++/// Bytes read from the extent per decode step; a read decodes at most one step past its end.
++constexpr std::size_t LazyDecodeInputChunk = 128 * 1024;
++/// How far past the decoded prefix a read may end and still decode only up to its end.
++constexpr u64 LazyNearDecode = 1024 * 1024;
++/// What a zstd decoder holds while a member is partly decoded (Lichii measured about 221 KiB).
++constexpr std::size_t LazyDecoderCharge = 256 * 1024;
++/// Partly decoded spilled members that keep their decoder, and with it a window of up to
++/// 128 MiB; another one restarts from its first frame when read past its prefix again.
++constexpr std::size_t LazyMaxSpillDecoders = 2;
++
++bool LazyDecodeEnabled() {
++    static const bool enabled = [] {
++        const bool on = Common::PeSwitch("EDEN_UP_NUP_LAZY_DECODE");
++        if (on) {
++            LOG_INFO(Loader,
++                     "EDEN_UP_NUP_LAZY_DECODE: zstd members are decoded only as far as reads reach");
++        }
++        return on;
++    }();
++    return enabled;
++}
++
++} // namespace
++
++/// The decoded prefix of one zstd member, grown as reads need more of it. Reads below `decoded`
++/// never wait on decoding.
++struct NupLazyMember {
++    ~NupLazyMember() {
++        file.Close();
++        if (!path.empty()) {
++            std::error_code ec;
++            std::filesystem::remove(path, ec);
++        }
++    }
++
++    std::atomic<u64> decoded{};
++
++    // Whoever sets decoding owns the decoder state below until it clears it again.
++    std::mutex mutex;
++    std::condition_variable progress;
++    bool decoding{};
++    bool failed{};
++
++    std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{nullptr, &ZSTD_freeDCtx};
++    u64 consumed{};
++    u64 produced{};
++    std::size_t last_result{};
++    bool started{};
++
++    // A member up to half the cache cap, decoded in place.
++    std::unique_ptr<u8[]> data;
++
++    // A larger member, decoded into a temporary file.
++    std::mutex file_mutex;
++    std::filesystem::path path;
++    Common::FS::IOFile file;
++};
++
++/// Members of one container on the partial-decode path, shared by all files opened from it.
++/// In-memory members are charged their full size, plus LazyDecoderCharge while partly decoded,
++/// against `cap` and evicted least recently used first; spilled members last as long as the
++/// container. `cap` and `spill_dir` are the container's (EDEN_NUP_CACHE_MIB included).
++struct NupLazyCache {
++    struct Entry {
++        std::size_t file_index;
++        std::size_t charge;
++        std::shared_ptr<NupLazyMember> member;
++    };
++
++    std::mutex mutex;
++    std::list<Entry> lru;
++    std::unordered_map<std::size_t, std::list<Entry>::iterator> index;
++    std::unordered_map<std::size_t, std::shared_ptr<NupLazyMember>> spills;
++    // Spilled members holding a decoder, newest first.
++    std::list<NupLazyMember*> spill_decoders;
++    std::size_t bytes{};
++    std::size_t cap{};
++    std::filesystem::path spill_dir;
++    // Members dropped so far, their charge, and the most held, for the log (as NupDecompressCache).
++    std::size_t evicted{};
++    std::size_t evicted_bytes{};
++    std::size_t reported{};
++    std::size_t reported_evicted{};
++
++    bool Spills(u64 size) const {
++        return size > cap / 2;
++    }
++
++    std::shared_ptr<NupLazyMember> Get(std::size_t file_index, u64 size) {
++        std::scoped_lock lock{mutex};
++        if (Spills(size)) {
++            auto& member = spills[file_index];
++            if (!member) {
++                member = std::make_shared<NupLazyMember>();
++            }
++            return member;
++        }
++        if (const auto it = index.find(file_index); it != index.end()) {
++            lru.splice(lru.begin(), lru, it->second);
++            return it->second->member;
++        }
++        const std::size_t charge = static_cast<std::size_t>(size) + LazyDecoderCharge;
++        while (bytes + charge > cap && !lru.empty()) {
++            bytes -= lru.back().charge;
++            evicted_bytes += lru.back().charge;
++            index.erase(lru.back().file_index);
++            lru.pop_back();
++            ++evicted;
++        }
++        bytes += charge;
++        lru.push_front({file_index, charge, std::make_shared<NupLazyMember>()});
++        index.emplace(file_index, lru.begin());
++        if (bytes >= reported + NupDecompressCache::ReportStep ||
++            evicted >= reported_evicted + NupDecompressCache::ReportEvicted) {
++            reported = (std::max)(reported, bytes);
++            reported_evicted = evicted;
++            LOG_INFO(Loader,
++                     "EDEN_NUP_CACHE (lazy) holds {} MiB in {} files of {} MiB, {} files of {} MiB "
++                     "dropped so far",
++                     bytes >> 20, lru.size(), cap >> 20, evicted, evicted_bytes >> 20);
++        }
++        return lru.front().member;
++    }
++
++    /// Registers the new decoder of a spilled member the caller decodes, and frees the decoders of
++    /// idle spilled members beyond LazyMaxSpillDecoders.
++    void AddSpillDecoder(NupLazyMember& member) {
++        std::scoped_lock lock{mutex};
++        spill_decoders.push_front(&member);
++        auto it = spill_decoders.end();
++        while (spill_decoders.size() > LazyMaxSpillDecoders &&
++               it != std::next(spill_decoders.begin())) {
++            --it;
++            NupLazyMember& other = **it;
++            std::unique_lock other_lock{other.mutex, std::try_to_lock};
++            if (!other_lock || other.decoding) {
++                continue;
++            }
++            other.dctx.reset();
++            it = spill_decoders.erase(it);
++        }
++    }
++
++    void RemoveSpillDecoder(NupLazyMember& member) {
++        std::scoped_lock lock{mutex};
++        spill_decoders.remove(&member);
++    }
++
++    /// Stops charging a member's decoder once it is freed.
++    void ReleaseDecoder(std::size_t file_index, const NupLazyMember& member) {
++        std::scoped_lock lock{mutex};
++        const auto it = index.find(file_index);
++        if (it == index.end() || it->second->member.get() != &member ||
++            it->second->charge < LazyDecoderCharge) {
++            return;
++        }
++        it->second->charge -= LazyDecoderCharge;
++        bytes -= LazyDecoderCharge;
++    }
++};
++
++namespace {
++
++/// A zstd member file on the EDEN_UP_NUP_LAZY_DECODE path: decoded from its start as reads need
++/// it and shared through the container's NupLazyCache, so concurrent readers share one decode.
++class NupLazyVfsFile final : public VfsFile {
++public:
++    NupLazyVfsFile(VirtualFile backing_, u64 extent_offset_, u64 extent_size_,
++                   u64 uncompressed_size_, std::string name_, std::shared_ptr<NupLazyCache> cache_,
++                   std::size_t cache_index_)
++        : backing(std::move(backing_)), extent_offset(extent_offset_), extent_size(extent_size_),
++          uncompressed_size(uncompressed_size_), name(std::move(name_)), cache(std::move(cache_)),
++          cache_index(cache_index_), spilled(cache->Spills(uncompressed_size)) {}
++
++    std::string GetName() const override {
++        return name;
++    }
++
++    std::size_t GetSize() const override {
++        return static_cast<std::size_t>(uncompressed_size);
++    }
++
++    bool Resize(std::size_t) override {
++        return false;
++    }
++
++    VirtualDir GetContainingDirectory() const override {
++        return nullptr;
++    }
++
++    bool IsWritable() const override {
++        return false;
++    }
++
++    bool IsReadable() const override {
++        return true;
++    }
++
++    std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
++        if (length == 0 || offset >= uncompressed_size) {
++            return 0;
++        }
++        length = std::min(length, static_cast<std::size_t>(uncompressed_size) - offset);
++        const u64 end = static_cast<u64>(offset) + length;
++
++        const auto member = cache->Get(cache_index, uncompressed_size);
++        if (const u64 decoded = member->decoded.load(std::memory_order_acquire); decoded < end) {
++            // A read just past the decoded prefix, like the next chunk of a stream or the start of
++            // a file, decodes only that far. A read further in decodes the whole member, as the
++            // old reader did, so a random reader stalls once per member rather than repeatedly.
++            const u64 target = end - decoded <= LazyNearDecode ? end : uncompressed_size;
++            if (!DecodeTo(*member, end, target)) {
++                return 0;
++            }
++        }
++        if (!spilled) {
++            std::memcpy(data, member->data.get() + offset, length);
++            return length;
++        }
++        std::scoped_lock lock{member->file_mutex};
++        if (!member->file.Seek(static_cast<s64>(offset))) {
++            return 0;
++        }
++        return member->file.ReadSpan(std::span{data, length});
++    }
++
++    std::size_t Write(const u8*, std::size_t, std::size_t) override {
++        return 0;
++    }
++
++    bool Rename(std::string_view new_name) override {
++        name = std::string(new_name);
++        return true;
++    }
++
++private:
++    /// Input and output staging of one DecodeTo call, allocated at its first step. Lichii keeps
++    /// them thread_local; here they are freed when the call returns, so no host thread keeps
++    /// 256 KiB after its last decode.
++    struct Buffers {
++        std::unique_ptr<u8[]> input;
++        std::unique_ptr<u8[]> output;
++        std::size_t output_size{};
++    };
++
++    /// Decodes the member up to `target` bytes one step at a time, waiting while another thread
++    /// holds the decoder. False if fewer than `end` bytes can be decoded.
++    bool DecodeTo(NupLazyMember& member, u64 end, u64 target) const {
++        Buffers buffers;
++        std::unique_lock lock{member.mutex};
++        while (member.decoded.load(std::memory_order_acquire) < target) {
++            if (member.failed) {
++                return member.decoded.load(std::memory_order_acquire) >= end;
++            }
++            if (member.decoding) {
++                member.progress.wait(lock);
++                continue;
++            }
++            member.decoding = true;
++            lock.unlock();
++            const bool ok = DecodeStep(member, buffers);
++            lock.lock();
++            member.decoding = false;
++            member.failed = !ok;
++            member.progress.notify_all();
++        }
++        return true;
++    }
++
++    /// Decodes the next input chunk; the caller owns the member's decoder. The last byte is
++    /// published only once the extent has ended exactly at the file size. False on failure.
++    bool DecodeStep(NupLazyMember& member, Buffers& buffers) const {
++        u64 decoded = member.decoded.load(std::memory_order_relaxed);
++        const auto finish = [&] {
++            member.dctx.reset();
++            if (spilled) {
++                cache->RemoveSpillDecoder(member);
++            } else {
++                cache->ReleaseDecoder(cache_index, member);
++            }
++        };
++        const auto fail = [&](const char* reason) {
++            LOG_ERROR(Loader, "NUP zstd decompression of {} failed at byte {}: {}", name,
++                      member.produced, reason);
++            finish();
++            return false;
++        };
++        if (!member.dctx) {
++            if (!member.started) {
++                member.started = true;
++                if (extent_size > backing->GetSize() ||
++                    extent_offset > backing->GetSize() - extent_size) {
++                    return fail("extent out of range");
++                }
++                if (spilled) {
++                    std::random_device random;
++                    std::error_code ec;
++                    std::filesystem::create_directories(cache->spill_dir, ec);
++                    member.path = cache->spill_dir / fmt::format("{:08x}{:08x}-{}.tmp", random(),
++                                                                 random(), cache_index);
++                    member.file.Open(member.path, Common::FS::FileAccessMode::Write);
++                    member.file.Close();
++                    member.file.Open(member.path, Common::FS::FileAccessMode::ReadWrite);
++                    if (!member.file.IsOpen()) {
++                        return fail("cannot create the temporary file");
++                    }
++                } else {
++                    member.data = std::make_unique_for_overwrite<u8[]>(
++                        static_cast<std::size_t>(uncompressed_size));
++                }
++            }
++            // A spilled member whose decoder was freed starts over; output already in its
++            // temporary file is decoded again but not rewritten.
++            member.dctx.reset(ZSTD_createDCtx());
++            if (!member.dctx) {
++                return fail("cannot create a decoder");
++            }
++            member.consumed = 0;
++            member.produced = 0;
++            if (spilled) {
++                cache->AddSpillDecoder(member);
++            } else {
++                // Decoding straight into the member skips zstd's window buffer and its copy.
++                ZSTD_DCtx_setParameter(member.dctx.get(), ZSTD_d_stableOutBuffer, 1);
++                ZSTD_DCtx_setParameter(member.dctx.get(), ZSTD_d_windowLogMax, ZSTD_WINDOWLOG_MAX);
++            }
++        }
++
++        if (!buffers.input) {
++            buffers.input = std::make_unique_for_overwrite<u8[]>(LazyDecodeInputChunk);
++        }
++        if (spilled && !buffers.output) {
++            buffers.output_size = ZSTD_DStreamOutSize();
++            buffers.output = std::make_unique_for_overwrite<u8[]>(buffers.output_size);
++        }
++        const auto chunk = static_cast<std::size_t>(
++            std::min<u64>(LazyDecodeInputChunk, extent_size - member.consumed));
++        if (backing->Read(buffers.input.get(), chunk,
++                          static_cast<std::size_t>(extent_offset + member.consumed)) != chunk) {
++            return fail("short read of the compressed data");
++        }
++        member.consumed += chunk;
++        ZSTD_inBuffer in{buffers.input.get(), chunk, 0};
++        bool flush = false;
++        while (in.pos < in.size || flush) {
++            ZSTD_outBuffer out =
++                spilled
++                    ? ZSTD_outBuffer{buffers.output.get(), buffers.output_size, 0}
++                    : ZSTD_outBuffer{member.data.get(), static_cast<std::size_t>(uncompressed_size),
++                                     static_cast<std::size_t>(member.produced)};
++            const std::size_t in_before = in.pos;
++            const std::size_t out_before = out.pos;
++            member.last_result = ZSTD_decompressStream(member.dctx.get(), &out, &in);
++            if (ZSTD_isError(member.last_result)) {
++                return fail(ZSTD_getErrorName(member.last_result));
++            }
++            const u64 produced = out.pos - out_before;
++            if (produced > uncompressed_size - member.produced) {
++                return fail("more data than the file size");
++            }
++            const u64 from = (std::max)(member.produced, decoded);
++            if (spilled && member.produced + produced > from) {
++                const auto count = static_cast<std::size_t>(member.produced + produced - from);
++                std::scoped_lock file_lock{member.file_mutex};
++                if (!member.file.Seek(static_cast<s64>(from)) ||
++                    member.file.WriteSpan(std::span<const u8>{
++                        buffers.output.get() + (from - member.produced), count}) != count) {
++                    return fail("cannot write the temporary file");
++                }
++            }
++            if (produced == 0 && in.pos == in_before) {
++                if (in.pos < in.size) {
++                    return fail("more data than the file size");
++                }
++                break;
++            }
++            member.produced += produced;
++            if (const u64 visible = (std::min)(member.produced, uncompressed_size - 1);
++                visible > decoded) {
++                decoded = visible;
++                member.decoded.store(decoded, std::memory_order_release);
++            }
++            flush = spilled && out.pos == out.size && member.last_result != 0;
++        }
++        if (member.consumed < extent_size) {
++            return true;
++        }
++        if (member.produced != uncompressed_size || member.last_result != 0) {
++            return fail("the data does not end at the file size");
++        }
++        member.decoded.store(uncompressed_size, std::memory_order_release);
++        finish();
++        return true;
++    }
++
++    VirtualFile backing;
++    u64 extent_offset;
++    u64 extent_size;
++    u64 uncompressed_size;
++    std::string name;
++    std::shared_ptr<NupLazyCache> cache;
++    std::size_t cache_index;
++    bool spilled;
++};
++
+ } // namespace
+ 
+ NupSpillFile::~NupSpillFile() {
+@@ -410,6 +827,11 @@ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
+     if (cache->cap != memory_cache_cap) {
+         RemoveOldSpills(cache->spill_dir);
+     }
++    if (LazyDecodeEnabled()) {
++        cache->lazy = std::make_shared<NupLazyCache>();
++        cache->lazy->cap = cache->cap;
++        cache->lazy->spill_dir = cache->spill_dir;
++    }
+     if (file == nullptr) {
+         return;
+     }
+@@ -758,6 +1180,10 @@ VirtualFile NupContainer::OpenFile(std::size_t file_index) {
+             file, static_cast<std::size_t>(node.extent_size),
+             static_cast<std::size_t>(node.extent_offset), node.name);
+     }
++    if (cache->lazy) {
++        return std::make_shared<NupLazyVfsFile>(file, node.extent_offset, node.extent_size,
++                                                node.size, node.name, cache->lazy, file_index);
++    }
+     return std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size, node.size,
+                                         node.name, cache, file_index);
+ }
+@@ -881,6 +1307,10 @@ Loader::ResultStatus NupContainer::VerifyIntegrity(
+             content = ReadExtentRaw(node);
+         } else if (node.codec == CodecRaw) {
+             content = ReadExtentRaw(node);
++        } else if (cache->lazy) {
++            NupLazyVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
++                                cache->lazy, i);
++            content = view.ReadAllBytes();
+         } else {
+             NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
+                             cache, i);
+diff --git a/src/core/file_sys/nup_container.h b/src/core/file_sys/nup_container.h
+index 8df5d02..3fb2e30 100644
+--- a/src/core/file_sys/nup_container.h
++++ b/src/core/file_sys/nup_container.h
+@@ -25,6 +25,8 @@
+ 
+ namespace FileSys {
+ 
++struct NupLazyCache;
++
+ /// A zstd member too large for the in-memory cache, decompressed once into a temporary file.
+ struct NupSpillFile {
+     ~NupSpillFile();
+@@ -55,6 +57,9 @@ struct NupDecompressCache {
+     std::size_t reported_evicted{};
+     std::filesystem::path spill_dir;
+     std::unordered_map<std::size_t, std::shared_ptr<NupSpillFile>> spills;
++    /// EDEN_UP_NUP_LAZY_DECODE=1: the members of the partial-decode reader (nup_container.cpp),
++    /// which then serves every zstd file instead of the LRU above. Null when unset.
++    std::shared_ptr<NupLazyCache> lazy;
+ 
+     std::vector<u8>* Find(std::size_t file_index) {
+         const auto it = index.find(file_index);
