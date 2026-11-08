@@ -147,9 +147,10 @@ void RasterizerVulkan::DispatchCompute() {"""),
     ('VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {',
      'VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {\n    ::Eden::Performance::Timer guest_read_timer(::Eden::Performance::guest_cpu_read);'),
     # ... and wait for those locks spinning briefly before sleeping (performance.h GuestCacheLock).
-    ('        std::scoped_lock lock{texture_cache.mutex};\n        auto area = texture_cache.GetFlushArea(addr, size);',
-     '        ::Eden::Performance::GuestCacheLock(texture_cache.mutex);\n'
-     '        std::lock_guard lock{texture_cache.mutex, std::adopt_lock};\n        auto area = texture_cache.GetFlushArea(addr, size);'),
+    # 0316 (EDEN_PE_CPU_READ_SKIP) turned this lock into a deferred unique_lock; its blocking path keeps the spin.
+    ('        if (!skip) {\n            lock.lock();\n',
+     '        if (!skip) {\n            ::Eden::Performance::GuestCacheLock(texture_cache.mutex);\n'
+     '            lock = std::unique_lock{texture_cache.mutex, std::adopt_lock};\n'),
     ('        std::scoped_lock lock{buffer_cache.mutex};\n        if (buffer_cache.OnCPUWrite(addr, size)) {',
      '        ::Eden::Performance::GuestCacheLock(buffer_cache.mutex);\n'
      '        std::lock_guard lock{buffer_cache.mutex, std::adopt_lock};\n        if (buffer_cache.OnCPUWrite(addr, size)) {'),
