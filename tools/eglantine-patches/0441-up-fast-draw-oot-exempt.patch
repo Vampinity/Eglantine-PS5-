@@ -1,0 +1,232 @@
+Subject: [PATCH] EDEN_UP_FAST_DRAW_OOT_EXEMPT: fast draw ignores register writes nothing on the delta path reads (vertex_id_base, viewports, scissor, blend_color, surface_clip, register_count, render_enable, strides when outside the key) and the clear_report_value / render_enable.mode methods; 64-range delta; only with EDEN_UP_FAST_DRAW=1
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 2d3d563..f8115c0 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -389,7 +389,7 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
+         return true;
+     default:
+         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
+-               IsFastDrawVertexBuffer(method);
++               IsFastDrawVertexBuffer(method) || IsFastDrawExempt(method);
+     }
+ }
+ 
+@@ -424,9 +424,64 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
+     }
+ }
+ 
++// EDEN_UP_FAST_DRAW_OOT_EXEMPT (nx2_fast_draw.h). What reads these is either run again by every
++// draw, delta draws too (dynamic state, ConfigureDelta's buffers, render targets and render area,
++// the query cache), or nothing on the Vulkan path; never the pipeline key (BuildCleanWatch lists
++// what it reads), the texture handles, or the image views and samplers a delta draw keeps:
++// - vertex_id_base: the native draw macros write it before each draw; only HLE macros, which
++//   assign it, name it.
++// - viewports[] (the Vulkan path reads viewport_transform), scissor_test[], blend_color and
++//   surface_clip: dynamic state, render targets and the render area.
++// - pipelines[].register_count: read by nothing (the program address words still end reuse).
++// - vertex_streams[] stride and enable: buffer bindings and dynamic strides, while strides stay
++//   out of the pipeline key (g_strides_outside_key).
++// - clear_report_value and render_enable: ProcessCounterReset and ProcessQueryCondition, which
++//   act on the query cache only. A render pass that ends there changes the recording epoch, a
++//   submit the tick, and TakeReusableDraw checks both. report_semaphore (query results written
++//   to guest memory) still ends reuse.
++bool Maxwell3D::IsFastDrawExempt(u32 method) {
++    namespace FastDraw = VideoCommon::Nx2FastDraw;
++    if (!FastDraw::OotExemptEnabled()) {
++        return false;
++    }
++    const auto in_block = [method](u32 first, size_t bytes) {
++        return method >= first && method < first + bytes / sizeof(u32);
++    };
++    if (IsFastDrawExemptMethod(method) || method == MAXWELL3D_REG_INDEX(vertex_id_base) ||
++        method == MAXWELL3D_REG_INDEX(render_enable.address_high) ||
++        method == MAXWELL3D_REG_INDEX(render_enable.address_low) ||
++        in_block(MAXWELL3D_REG_INDEX(viewports), sizeof(Regs::viewports)) ||
++        in_block(MAXWELL3D_REG_INDEX(scissor_test), sizeof(Regs::scissor_test)) ||
++        in_block(MAXWELL3D_REG_INDEX(blend_color), sizeof(Regs::blend_color)) ||
++        in_block(MAXWELL3D_REG_INDEX(surface_clip), sizeof(Regs::surface_clip))) {
++        return true;
++    }
++    constexpr u32 pipeline_words = sizeof(Regs::Pipeline) / sizeof(u32);
++    constexpr u32 register_counts = static_cast<u32>(
++        MAXWELL3D_REG_INDEX(pipelines) + offsetof(Regs::Pipeline, register_count) / sizeof(u32));
++    if (method >= register_counts &&
++        method < register_counts + Regs::MaxShaderProgram * pipeline_words &&
++        (method - register_counts) % pipeline_words == 0) {
++        return true;
++    }
++    constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
++    constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
++    if (method >= streams && method < streams + Regs::NumVertexArrays * stream_words &&
++        (method - streams) % stream_words == 0) { // stride and enable
++        return FastDraw::g_strides_outside_key.load(std::memory_order_relaxed);
++    }
++    return false;
++}
++
++bool Maxwell3D::IsFastDrawExemptMethod(u32 method) {
++    return VideoCommon::Nx2FastDraw::OotExemptEnabled() &&
++           (method == MAXWELL3D_REG_INDEX(clear_report_value) ||
++            method == MAXWELL3D_REG_INDEX(render_enable.mode));
++}
++
+ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
+     if (VideoCommon::Nx2FastDraw::Enabled() && !DrawManager::IsInstanceLoopMethod(method) &&
+-        !IsFastDrawDeltaMethod(method)) {
++        !IsFastDrawDeltaMethod(method) && !IsFastDrawExemptMethod(method)) {
+         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
+     }
+     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 725e115..79726b9 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3289,6 +3289,10 @@ public:
+     static bool IsFastDrawDeltaMethod(u32 method);
+     /// A vertex stream's address, size or limit (not its stride or enable).
+     static bool IsFastDrawVertexBuffer(u32 method);
++    /// EDEN_UP_FAST_DRAW_OOT_EXEMPT: state that nothing a delta draw keeps depends on...
++    static bool IsFastDrawExempt(u32 method);
++    /// ...and the methods among it whose side effects stay in the query cache.
++    static bool IsFastDrawExemptMethod(u32 method);
+     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
+ 
+     /// Handles a write to the CB_DATA[i] register.
+diff --git a/src/video_core/nx2_fast_draw.h b/src/video_core/nx2_fast_draw.h
+index 9dbc66c..72c7abf 100644
+--- a/src/video_core/nx2_fast_draw.h
++++ b/src/video_core/nx2_fast_draw.h
+@@ -39,6 +39,14 @@ class MemoryManager;
+ /// last full resolve read them from (TextureCache::ResolveMemoizedTextures).
+ /// EDEN_UP_FAST_DRAW_VERIFY=1 (with EDEN_UP_FAST_DRAW=1) resolves delta and memo draws in full and
+ /// counts where the pipeline, views, samplers or kept buffer bindings differ.
++/// EDEN_UP_FAST_DRAW_OOT_EXEMPT=1 (with EDEN_UP_FAST_DRAW=1) adds the 3D state that nothing a delta
++/// draw keeps depends on (Maxwell3D::IsFastDrawExempt): the vertex id base, viewport clips,
++/// scissors, blend constants, the surface clip, shader register counts, vertex stream strides
++/// while they stay out of pipeline keys, and the occlusion counter reset and render condition,
++/// whose effects stay in the query cache (a render pass they end or a submit is caught by the
++/// recording epoch and tick checks). It also collects up to 64 inline constant buffer ranges
++/// between two draws instead of 16. In Ocarina of Time's Kokiri walk ~69% of the state changes
++/// were the vertex id base, which its draw macro writes before every draw.
+ namespace VideoCommon::Nx2FastDraw {
+ 
+ enum class Reason : u8 {
+@@ -79,6 +87,17 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
+     return verify;
+ }
+ 
++/// EDEN_UP_FAST_DRAW_OOT_EXEMPT=1 (exact "1") with EDEN_UP_FAST_DRAW=1, read once.
++[[nodiscard]] inline bool OotExemptEnabled() {
++    static const bool exempt = Enabled() && Common::PeSwitch("EDEN_UP_FAST_DRAW_OOT_EXEMPT");
++    return exempt;
++}
++
++/// Whether vertex stream strides (and enables) stay out of graphics pipeline keys, set once by the
++/// Vulkan rasterizer (PipelineCache::StridesOutsideKey). Until then, and on other renderers, a
++/// stride change ends reuse with EDEN_UP_FAST_DRAW_OOT_EXEMPT too.
++inline std::atomic<bool> g_strides_outside_key{false};
++
+ inline std::atomic<u64> g_serial{1};
+ /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
+ inline std::atomic<u32> g_last_break{};
+@@ -117,7 +136,10 @@ private:
+ /// Light changes since the last draw that can reach texture handles. Written and read on the
+ /// thread that runs the 3D engine and the rasterizer (the split's back).
+ struct Delta {
+-    static constexpr size_t MaxWrites = 16;
++    /// Ranges a delta can hold: WriteLimit() of them are used, 16, or 64 with
++    /// EDEN_UP_FAST_DRAW_OOT_EXEMPT=1.
++    static constexpr size_t MaxWrites = 64;
++    static constexpr size_t BaseWrites = 16;
+ 
+     std::array<u32, 5> binds{}; ///< Constant buffer slots bound per stage
+     /// Constant buffer data written, by GPU address (unmapped addresses included)...
+@@ -133,6 +155,13 @@ struct Delta {
+         return num_writes == 0 && (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
+     }
+ 
++    /// Empties it (the ranges past the counts are never read).
++    void Clear() {
++        binds = {};
++        num_writes = 0;
++        num_device_writes = 0;
++    }
++
+     /// Whether data written reaches [address, address + size), whose device memory is spans: at
+     /// one of its GPU addresses, or through any GPU address that maps its device memory.
+     [[nodiscard]] bool Reaches(GPUVAddr address, u64 size, const DeviceSpans& spans) const {
+@@ -152,6 +181,13 @@ struct Delta {
+ 
+ inline Delta g_delta;
+ 
++/// How many ranges a delta collects before one more ends reuse (Reason::DeltaOverflow).
++[[nodiscard]] inline u32 WriteLimit() {
++    static const u32 limit =
++        static_cast<u32>(OotExemptEnabled() ? Delta::MaxWrites : Delta::BaseWrites);
++    return limit;
++}
++
+ /// Appends [begin, end) to a delta's range list, or extends its last range when that ends at
+ /// begin. False when the list is full.
+ inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
+@@ -160,7 +196,7 @@ inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
+         ends[count - 1] = end;
+         return true;
+     }
+-    if (count == Delta::MaxWrites) {
++    if (count >= WriteLimit()) {
+         return false;
+     }
+     begins[count] = begin;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 8aa2ee4..62ca8e8 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -143,6 +143,14 @@ public:
+         return last_compute_hash;
+     }
+ 
++    /// Whether vertex stream strides (and enables) stay out of graphics pipeline keys: extended
++    /// dynamic state and no static vertex repack, as BuildCleanWatch decides (EDEN_UP_FAST_DRAW).
++    [[nodiscard]] bool StridesOutsideKey() const noexcept {
++        return dynamic_features.has_extended_dynamic_state &&
++               (dynamic_features.has_dynamic_vertex_input ||
++                !dynamic_features.has_static_vertex_repack);
++    }
++
+     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                            const VideoCore::DiskResourceLoadCallback& callback);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 1b2c705..471ac0c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -260,6 +260,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
+       wfi_event(device.GetLogical().CreateEvent()) {
+     scheduler.SetQueryCache(query_cache);
++    VideoCommon::Nx2FastDraw::g_strides_outside_key.store(pipeline_cache.StridesOutsideKey(),
++                                                          std::memory_order_relaxed);
++    if (VideoCommon::Nx2FastDraw::OotExemptEnabled()) {
++        LOG_INFO(Render_Vulkan, "EDEN_UP_FAST_DRAW_OOT_EXEMPT: on, vertex stream strides {}",
++                 pipeline_cache.StridesOutsideKey() ? "exempt" : "still end reuse");
++    }
+     buffer_cache_runtime.SetReleaseHook(
+         [](void* context) { static_cast<RasterizerVulkan*>(context)->ReleaseFinishedMemory(); },
+         this);
+@@ -295,7 +301,12 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
+                                                      u64 serial) {
+     namespace FastDraw = VideoCommon::Nx2FastDraw;
+     const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
+-    const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
++    // Read in place and emptied on the way out: the delta holds 64 ranges now
++    // (EDEN_UP_FAST_DRAW_OOT_EXEMPT), and copying them for every draw cost more than reading.
++    FastDraw::Delta& delta = FastDraw::g_delta;
++    SCOPE_EXIT {
++        delta.Clear();
++    };
+     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
+         ++fast_draw_stats.full[static_cast<size_t>(reason)];
+         return nullptr;
