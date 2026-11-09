@@ -1,0 +1,563 @@
+Subject: [PATCH] EDEN_UP_OOT_FSR_SPATIAL: skip Ocarina's gameplay upscale network and draw FSR 1 EASU+RCAS instead (sharpness EDEN_UP_OOT_FSR_SHARPNESS, default 0.25); off by default
+
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -310,6 +310,9 @@
+     std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
+     bool UpscaleInsteadOfNativeProgram();
+     void RememberNativeUpscaleInput();
++    /// EDEN_UP_OOT_FSR_SPATIAL=1: true when this dispatch was Ocarina of Time's gameplay network
++    /// and FSR 1 (EASU + RCAS) drew its output instead.
++    bool OotFsrSpatial();
+ 
+     /// This frame's DLSS evaluation (Fortune's Weave): whether its passes all ran, and whether
+     /// the game's own network output is shown instead of the replacement upscale.
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -18,6 +18,7 @@
+ #include <unordered_set>
+ #include "common/assert.h"
+ #include "common/logging.h"
++#include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "shader_recompiler/exception.h"
+ #include "core/core.h"
+@@ -763,6 +764,12 @@
+         if (skipping) {
+             return true;
+         }
++    }
++    // EDEN_UP_OOT_FSR_SPATIAL=1: Ocarina of Time's gameplay network is not dispatched; FSR 1 draws
++    // its output (OotFsrSpatial). Unset: one static bool.
++    static const bool fsr_spatial = Common::PeSwitch("EDEN_UP_OOT_FSR_SPATIAL");
++    if (fsr_spatial && !dlss_chain.active && OotFsrSpatial()) {
++        return true;
+     }
+ 
+     bool dispatched = true;
+@@ -1893,6 +1900,168 @@
+     return done;
+ }
+ 
++// EDEN_UP_OOT_FSR_SPATIAL=1, after exploitizm's spatial stand-in (exploitizm/Eglantine 0c419316e9,
++// "Replace Ocarina neural upscale with captured spatial paths"), itself on ProphetWild's and
++// Lichii's network bypasses. Ocarina of Time's gameplay network is the program whose own handles
++// read the drawn frame (E5B9G9R9, square roots of the light) through cbuf0+0xc0 and store one
++// B10G11R11 image through +0xd0, and which multiplies matrices (first HMMA at 0xc00 with Max
++// Resolution, where it is 1:1; at 0xad0 without). It is not dispatched: FSR 1 draws its output
++// instead, EASU to the output's size and RCAS in the frame's own square-root space (the gamma-2
++// space FSR expects), then the square the network applies. exploitizm's version blits bilinear
++// and sharpens; EASU is FSR 1's own upscale. EDEN_UP_OOT_FSR_SHARPNESS=<stops> sets RCAS (0 is
++// the strongest, 2 mild; unset: the FSR sharpness setting). The rest of the frame's passes run
++// as before. When the images don't fit, the network runs; when FSR 1 can't start, the same
++// blit draws without it (the EDEN_NX2_UPSCALE_SQUARE stand-in) and the network takes over again.
++bool KeplerCompute::OotFsrSpatial() {
++    static bool given_up = false;
++    if (given_up || Settings::GetCurrentProgramID() != VideoCommon::OotNetwork::ProgramId ||
++        !(launch_description.const_buffer_enable_mask & 1)) {
++        return false;
++    }
++    constexpr u32 input_slot = 0xc0;
++    constexpr u32 output_slot = 0xd0;
++    constexpr u32 no_matrix_multiply = ~0U;
++    const GPUVAddr program = regs.code_loc.Address();
++    // Per program: the byte offset of its first HMMA when its handles are the network's.
++    static std::unordered_map<GPUVAddr, u32> first_hmma;
++    auto known = first_hmma.find(program);
++    if (known == first_hmma.end()) {
++        const auto [reads, stores] = NativeImageHandles(program);
++        u32 found = no_matrix_multiply;
++        if (std::find(reads.begin(), reads.end(), input_slot) != reads.end() &&
++            stores.size() == 1 && stores.front() == output_slot) {
++            std::array<u32, 0x400> block{};
++            bool exited = false;
++            for (u64 offset = 0; offset < 0x40000 && !exited && found == no_matrix_multiply;
++                 offset += sizeof(block)) {
++                if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) break;
++                memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
++                for (size_t word = 0; word < block.size() && !exited; word += 4) {
++                    const u32 opcode = block[word] & 0xfff;
++                    if (opcode == 0x23c) { // HMMA
++                        found = static_cast<u32>(offset + word * sizeof(u32));
++                        break;
++                    }
++                    // EXIT, unconditional when guarded by PT
++                    exited = opcode == 0x94d && ((block[word] >> 12) & 0xf) == 7;
++                }
++            }
++        }
++        known = first_hmma.emplace(program, found).first;
++        if (found != no_matrix_multiply) {
++            LOG_INFO(HW_GPU, "EDEN_UP_OOT_FSR_SPATIAL: gameplay network {:#x}, first HMMA at {:#x}",
++                     program, found);
++        }
++    }
++    if (known->second == no_matrix_multiply) {
++        return false;
++    }
++    const auto input = ConstBuffer0Image(input_slot);
++    const auto output = ConstBuffer0Image(output_slot);
++    if (!input || !output || input->format != Texture::TextureFormat::E5B9G9R9 ||
++        output->format != Texture::TextureFormat::B10G11R11 || input->Address() == 0 ||
++        output->Address() == 0 || input->Address() == output->Address() ||
++        !input->IsBlockLinear() || !output->IsBlockLinear()) {
++        return false;
++    }
++    // 1:1 to 4x with the aspect kept (without Max Resolution the frame follows the game's dynamic
++    // resolution: exploitizm captured 854x480 to 2560x1440).
++    const u64 in_width = input->Width(), in_height = input->Height();
++    const u64 out_width = output->Width(), out_height = output->Height();
++    const u64 cross_a = out_width * in_height, cross_b = out_height * in_width;
++    if (in_width < 64 || in_height < 64 || out_width < in_width || out_height < in_height ||
++        out_width > in_width * 4 || out_height > in_height * 4 ||
++        (cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a) * 32 > cross_a) {
++        return false;
++    }
++    const auto surface = [](const Texture::TICEntry& tic) {
++        Fermi2D::Surface result{};
++        // E5B9G9R9 has no 2D surface format: the input is read as one through
++        // g_blit_source_format below, like the upscale stand-in's.
++        result.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
++        result.linear = Fermi2D::MemoryLayout::BlockLinear;
++        result.block_width.Assign(tic.block_width);
++        result.block_height.Assign(tic.block_height);
++        result.block_depth.Assign(tic.block_depth);
++        result.depth = 1;
++        result.width = tic.Width();
++        result.height = tic.Height();
++        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
++        result.addr_lower = static_cast<u32>(tic.Address());
++        return result;
++    };
++    const Fermi2D::Config config{
++        .operation = Fermi2D::Operation::SrcCopySquare,
++        .filter = Fermi2D::Filter::Bilinear,
++        .must_accelerate = true,
++        .dst_x0 = 0,
++        .dst_y0 = 0,
++        .dst_x1 = static_cast<s32>(out_width),
++        .dst_y1 = static_cast<s32>(out_height),
++        .src_x0 = 0,
++        .src_y0 = 0,
++        .src_x1 = static_cast<s32>(in_width),
++        .src_y1 = static_cast<s32>(in_height),
++    };
++    static const std::optional<f32> sharpness_override = []() -> std::optional<f32> {
++        const char* const value = std::getenv("EDEN_UP_OOT_FSR_SHARPNESS");
++        if (value == nullptr || value[0] == '\0') {
++            return std::nullopt;
++        }
++        return static_cast<f32>(std::strtod(value, nullptr));
++    }();
++    const f32 sharpness = sharpness_override.value_or(
++        static_cast<f32>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f);
++    // As RasterizerVulkan::DispatchCompute would have before the network.
++    memory_manager.FlushCaching();
++    bool applied = false;
++    const bool done = [&] {
++        VideoCommon::g_blit_source_format = VideoCore::Surface::PixelFormat::E5B9G9R9_FLOAT;
++        VideoCommon::g_blit_spatial_upscale =
++            VideoCommon::BlitSpatialUpscale{.sharpness = sharpness};
++        SCOPE_EXIT {
++            applied = VideoCommon::g_blit_spatial_upscale->applied;
++            VideoCommon::g_blit_spatial_upscale.reset();
++            VideoCommon::g_blit_source_format.reset();
++        };
++        return rasterizer->AccelerateSurfaceCopy(surface(*input), surface(*output), config);
++    }();
++    if (done && !applied) {
++        given_up = true;
++        LOG_WARNING(HW_GPU, "EDEN_UP_OOT_FSR_SPATIAL: FSR 1 did not draw; the network runs from "
++                            "the next frame");
++    }
++    static u32 logged = 0;
++    static std::pair<u64, u64> last_size{};
++    if (logged < 64 && (logged < 4 || last_size != std::pair{in_width, in_height})) {
++        ++logged;
++        last_size = {in_width, in_height};
++        // The network's own size words (Mac check: +0x30 1/source size, +0x60 scale and offset,
++        // +0x70 output size), to see whether a dynamic-resolution frame fills its whole image.
++        const auto& cbuf = launch_description.const_buffer_config[0];
++        const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
++        const auto word = [&](u32 offset) -> std::string {
++            if (cbuf.size.Value() < offset + 4 ||
++                !memory_manager.IsFullyMappedRange(cbuf_address + offset, 4)) {
++                return "-";
++            }
++            const u32 value = memory_manager.Read<u32>(cbuf_address + offset);
++            return fmt::format("{:08x}({:g})", value, std::bit_cast<f32>(value));
++        };
++        LOG_INFO(HW_GPU,
++                 "EDEN_UP_OOT_FSR_SPATIAL: network {:#x} {}: {:#x} {}x{} -> {:#x} {}x{}, RCAS "
++                 "{} stops; cbuf0 +0x30 {} {} +0x60 {} {} {} {} +0x70 {} {}",
++                 program,
++                 !done      ? "kept (2D blit refused)"
++                 : applied ? "replaced by FSR 1"
++                           : "replaced by a plain blit",
++                 input->Address(), in_width, in_height, output->Address(), out_width,
++                 out_height, sharpness, word(0x30), word(0x34), word(0x60), word(0x64),
++                 word(0x68), word(0x6c), word(0x70), word(0x74));
++    }
++    return done;
++}
++
+ void KeplerCompute::ProcessLaunch() {
+     const GPUVAddr launch_desc_loc = regs.launch_desc_loc.Address();
+     memory_manager.ReadBlockUnsafe(launch_desc_loc, &launch_description,
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -64,6 +64,15 @@
+ /// 2D engine has no surface format for, e.g. E5B9G9R9 by the NX2 upscale stand-in). GPU thread only.
+ inline thread_local std::optional<VideoCore::Surface::PixelFormat> g_blit_source_format;
+ 
++/// EDEN_UP_OOT_FSR_SPATIAL: set around a 2D blit to draw it through FSR 1 (EASU, then RCAS with
++/// `sharpness` in stops, 0 the strongest) before the blit's own operation. The Vulkan runtime sets
++/// `applied` when it did. GPU thread only.
++struct BlitSpatialUpscale {
++    float sharpness{};
++    bool applied{};
++};
++inline thread_local std::optional<BlitSpatialUpscale> g_blit_spatial_upscale;
++
+ using Tegra::Texture::TICEntry;
+ using Tegra::Texture::TSCEntry;
+ using VideoCore::Surface::PixelFormat;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -46,6 +46,7 @@
+ class Image;
+ class ImageView;
+ class Framebuffer;
++class OotSpatialUpscale;
+ class RenderPassCache;
+ class StagingBufferPool;
+ class Scheduler;
+@@ -262,6 +263,15 @@
+     /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
+     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
+                             VkSampler sampler);
++
++    /// EDEN_UP_OOT_FSR_SPATIAL (VideoCommon::g_blit_spatial_upscale): FSR 1 (EASU, then RCAS of
++    /// `sharpness` stops) from src to dst_region's size, then `operation` into dst. False when it
++    /// can't (the blit then draws as usual).
++    bool SpatialUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
++                        const Region2D& dst_region, const Region2D& src_region,
++                        Tegra::Engines::Fermi2D::Operation operation, f32 sharpness);
++    std::shared_ptr<OotSpatialUpscale> spatial_upscale; ///< created on first use
++    bool spatial_upscale_failed{};
+ #ifdef EGLANTINE_STREAMLINE
+     /// NVIDIA's DLSS (through NVIDIA Streamline) in place of the game's,
+     /// before FSR 3.1, when the setting is on. Returns false to fall back to FSR 3.1.
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include "video_core/engines/fermi_2d.h"
+ #include "video_core/renderer_vulkan/blit_image.h"
++#include "video_core/renderer_vulkan/present/fsr.h"
+ #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_compute_pass.h"
+ #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+@@ -1907,7 +1908,197 @@
+         };
+         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
++    });
++}
++
++// EDEN_UP_OOT_FSR_SPATIAL's FSR 1 passes (present/fsr.h: the window filter's EASU and RCAS) at the
++// output's size. FSR::Draw rewrites an image set's descriptors as it records, so the two sets are
++// used in turn and each is reused only once the GPU is past its last use.
++class OotSpatialUpscale {
++public:
++    static constexpr size_t Sets = 2;
++
++    explicit OotSpatialUpscale(const Device& device, MemoryAllocator& memory_allocator,
++                               VkExtent2D extent_)
++        : fsr{device, memory_allocator, Sets, extent_},
++          sampler{device.GetLogical().CreateSampler(VkSamplerCreateInfo{
++              .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
++              .pNext = nullptr,
++              .flags = 0,
++              .magFilter = VK_FILTER_NEAREST,
++              .minFilter = VK_FILTER_NEAREST,
++              .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
++              .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++              .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++              .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++              .mipLodBias = 0.0f,
++              .anisotropyEnable = VK_FALSE,
++              .maxAnisotropy = 0.0f,
++              .compareEnable = VK_FALSE,
++              .compareOp = VK_COMPARE_OP_NEVER,
++              .minLod = 0.0f,
++              .maxLod = 0.0f,
++              .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
++              .unnormalizedCoordinates = VK_FALSE,
++          })},
++          extent{extent_} {}
++
++    FSR fsr;
++    vk::Sampler sampler; ///< reads the RCAS result 1:1
++    VkExtent2D extent;
++    std::array<u64, Sets> ticks{}; ///< each set's last use
++    size_t next{};
++};
++
++bool TextureCacheRuntime::SpatialUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
++                                         ImageView& src, const Region2D& dst_region,
++                                         const Region2D& src_region,
++                                         Tegra::Engines::Fermi2D::Operation operation,
++                                         f32 sharpness) {
++    const s32 dst_width = dst_region.end.x - dst_region.start.x;
++    const s32 dst_height = dst_region.end.y - dst_region.start.y;
++    // A rescaled source has its region scaled but not its view size (crop below): not handled.
++    if (spatial_upscale_failed || src.IsRescaled() || dst_width <= 0 || dst_height <= 0 ||
++        src_region.end.x <= src_region.start.x || src_region.end.y <= src_region.start.y ||
++        src.size.width == 0 || src.size.height == 0) {
++        return false;
++    }
++    const VkExtent2D extent{static_cast<u32>(dst_width), static_cast<u32>(dst_height)};
++    if (!spatial_upscale || spatial_upscale->extent.width != extent.width ||
++        spatial_upscale->extent.height != extent.height) {
++        if (spatial_upscale) {
++            scheduler.Finish(); // the old images may still be in use
++            spatial_upscale.reset();
++        }
++        // Out of device memory, the allocator places images in host memory or leaves them
++        // unbacked (black when sampled) rather than throwing: either counts as a failed start.
++        const u32 refusals = memory_allocator.MemoryRefusalEvents();
++        try {
++            spatial_upscale = std::make_shared<OotSpatialUpscale>(device, memory_allocator, extent);
++        } catch (const vk::Exception& exception) {
++            LOG_ERROR(Render_Vulkan, "EDEN_UP_OOT_FSR_SPATIAL: FSR 1 failed to start ({})",
++                      exception.what());
++            spatial_upscale_failed = true;
++            return false;
++        }
++        if (memory_allocator.MemoryRefusalEvents() != refusals) {
++            LOG_ERROR(Render_Vulkan,
++                      "EDEN_UP_OOT_FSR_SPATIAL: no device memory for FSR 1's images, not used");
++            spatial_upscale.reset();
++            spatial_upscale_failed = true;
++            return false;
++        }
++        LOG_INFO(Render_Vulkan, "EDEN_UP_OOT_FSR_SPATIAL: FSR 1 into {}x{}", extent.width,
++                 extent.height);
++    }
++    OotSpatialUpscale& spatial = *spatial_upscale;
++    const size_t index = spatial.next;
++    spatial.next = (index + 1) % OotSpatialUpscale::Sets;
++    if (spatial.ticks[index] != 0) {
++        scheduler.Wait(spatial.ticks[index]); // the set's last use, normally long done
++    }
++    // What the game drew into the source is visible to EASU (FSR::Draw's own transition covers
++    // colour attachment writes only). Texture cache images stay in the GENERAL layout.
++    const VkImage src_image = src.ImageHandle();
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([src_image](vk::CommandBuffer cmdbuf) {
++        const VkImageMemoryBarrier barrier{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                             VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = src_image,
++            .subresourceRange{
++                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                .baseMipLevel = 0,
++                .levelCount = VK_REMAINING_MIP_LEVELS,
++                .baseArrayLayer = 0,
++                .layerCount = VK_REMAINING_ARRAY_LAYERS,
++            },
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, barrier);
++    });
++    const f32 src_width = static_cast<f32>(src.size.width);
++    const f32 src_height = static_cast<f32>(src.size.height);
++    const Common::Rectangle<f32> crop{static_cast<f32>(src_region.start.x) / src_width,
++                                      static_cast<f32>(src_region.start.y) / src_height,
++                                      static_cast<f32>(src_region.end.x) / src_width,
++                                      static_cast<f32>(src_region.end.y) / src_height};
++    const VkImageView upscaled =
++        spatial.fsr.Draw(device, scheduler, index, src_image,
++                         src.Handle(Shader::TextureType::Color2D),
++                         VkExtent2D{src.size.width, src.size.height}, crop, sharpness);
++    const VkImage upscaled_image = spatial.fsr.OutputImage(index);
++    const Region2D whole{
++        .start = {0, 0},
++        .end = {dst_width, dst_height},
++    };
++    // The blit's own operation (EDEN_UP_OOT_FSR_SPATIAL: the square) on the way into dst.
++    blit_image_helper.BlitColor(dst_framebuffer, upscaled, upscaled_image, *spatial.sampler,
++                                dst_region, whole, {extent.width, extent.height, 1}, operation);
++    // The blit left the RCAS image in SHADER_READ_ONLY_OPTIMAL; FSR::Draw expects GENERAL. Its
++    // own render pass records no end-of-pass barrier, so the output's colour writes are made
++    // visible to the passes after it (the game samples it, blends the HUD onto it) here.
++    const VkImage dst_image = dst.ImageHandle();
++    const u32 dst_level = static_cast<u32>(dst.range.base.level);
++    const u32 dst_layer = static_cast<u32>(dst.range.base.layer);
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([upscaled_image, dst_image, dst_level, dst_layer](vk::CommandBuffer cmdbuf) {
++        const std::array barriers{
++            VkImageMemoryBarrier{
++                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
++                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++                .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .image = upscaled_image,
++                .subresourceRange{
++                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                    .baseMipLevel = 0,
++                    .levelCount = 1,
++                    .baseArrayLayer = 0,
++                    .layerCount = 1,
++                },
++            },
++            VkImageMemoryBarrier{
++                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                .image = dst_image,
++                .subresourceRange{
++                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                    .baseMipLevel = dst_level,
++                    .levelCount = 1,
++                    .baseArrayLayer = dst_layer,
++                    .layerCount = 1,
++                },
++            },
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, {}, {}, barriers);
+     });
++    spatial.ticks[index] = scheduler.CurrentTick();
++    // FSR's passes bound their own pipelines and descriptor sets.
++    scheduler.InvalidateState();
++    return true;
+ }
+ 
+ #ifdef EGLANTINE_STREAMLINE
+@@ -2191,6 +2382,13 @@
+         return;
+     }
+     if (aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT && !is_src_msaa && !is_dst_msaa) {
++        // EDEN_UP_OOT_FSR_SPATIAL (KeplerCompute::OotFsrSpatial): FSR 1 draws this blit.
++        if (auto& spatial = VideoCommon::g_blit_spatial_upscale;
++            spatial && SpatialUpscale(dst_framebuffer, dst, src, dst_region, src_region,
++                                      operation, spatial->sharpness)) {
++            spatial->applied = true;
++            return;
++        }
+         blit_image_helper.BlitColor(dst_framebuffer, src, dst_region, src_region, filter,
+                                     operation);
+         return;
+diff --git a/src/video_core/renderer_vulkan/present/fsr.h b/src/video_core/renderer_vulkan/present/fsr.h
+--- a/src/video_core/renderer_vulkan/present/fsr.h
++++ b/src/video_core/renderer_vulkan/present/fsr.h
+@@ -6,6 +6,8 @@
+ 
+ #pragma once
+ 
++#include <optional>
++
+ #include "common/math_util.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -18,10 +20,18 @@
+ class FSR {
+ public:
+     explicit FSR(const Device& device, MemoryAllocator& memory_allocator, size_t image_count, VkExtent2D extent);
++    /// sharpening: RCAS stops as FsrRcasCon takes them (0 is the strongest); unset, the FSR
++    /// sharpness setting (EDEN_UP_OOT_FSR_SPATIAL passes its own).
+     VkImageView Draw(const Device& device, Scheduler& scheduler, size_t image_index, VkImage source_image,
+                      VkImageView source_image_view, VkExtent2D input_image_extent,
+-                     const Common::Rectangle<f32>& crop_rect);
++                     const Common::Rectangle<f32>& crop_rect,
++                     std::optional<f32> sharpening = std::nullopt);
+ 
++    /// The image Draw returns a view of (the RCAS result), in the GENERAL layout.
++    [[nodiscard]] VkImage OutputImage(size_t image_index) const {
++        return *m_dynamic_images[image_index].images[Rcas];
++    }
++
+ private:
+     void CreateImages(const Device& device);
+     void CreateRenderPasses(const Device& device);
+diff --git a/src/video_core/renderer_vulkan/present/fsr.cpp b/src/video_core/renderer_vulkan/present/fsr.cpp
+--- a/src/video_core/renderer_vulkan/present/fsr.cpp
++++ b/src/video_core/renderer_vulkan/present/fsr.cpp
+@@ -144,7 +144,7 @@
+ 
+ VkImageView FSR::Draw(const Device& device, Scheduler& scheduler, size_t image_index, VkImage source_image,
+                       VkImageView source_image_view, VkExtent2D input_image_extent,
+-                      const Common::Rectangle<f32>& crop_rect) {
++                      const Common::Rectangle<f32>& crop_rect, std::optional<f32> sharpening_stops) {
+     Images& images = m_dynamic_images[image_index];
+ 
+     VkImage easu_image = *images.images[Easu];
+@@ -175,8 +175,8 @@
+                      input_image_height, output_image_width, output_image_height, viewport_x,
+                      viewport_y);
+ 
+-    const float sharpening =
+-        static_cast<float>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f;
++    const float sharpening = sharpening_stops.value_or(
++        static_cast<float>(Settings::values.fsr_sharpening_slider.GetValue()) / 100.0f);
+     FsrRcasCon(rcas_con.data(), sharpening);
+ 
+     UploadImages(device, scheduler);
+diff --git a/src/video_core/renderer_vulkan/blit_image.h b/src/video_core/renderer_vulkan/blit_image.h
+--- a/src/video_core/renderer_vulkan/blit_image.h
++++ b/src/video_core/renderer_vulkan/blit_image.h
+@@ -80,7 +80,9 @@
+ 
+     void BlitColor(const Framebuffer* dst_framebuffer, VkImageView src_image_view,
+                    VkImage src_image, VkSampler src_sampler, const Region2D& dst_region,
+-                   const Region2D& src_region, const Extent3D& src_size);
++                   const Region2D& src_region, const Extent3D& src_size,
++                   Tegra::Engines::Fermi2D::Operation operation =
++                       Tegra::Engines::Fermi2D::Operation::SrcCopy);
+ 
+     /// Temporal upscale (temporal_upscale.frag) into dst_framebuffer: the jittered input colour,
+     /// accumulated with the history image reprojected along the motion vectors. The result is also
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -778,10 +778,11 @@
+ void BlitImageHelper::BlitColor(const Framebuffer* dst_framebuffer, VkImageView src_image_view,
+                                 VkImage src_image, VkSampler src_sampler,
+                                 const Region2D& dst_region, const Region2D& src_region,
+-                                const Extent3D& src_size) {
++                                const Extent3D& src_size,
++                                Tegra::Engines::Fermi2D::Operation operation) {
+     const BlitImagePipelineKey key{
+         .renderpass = dst_framebuffer->RenderPass(),
+-        .operation = Tegra::Engines::Fermi2D::Operation::SrcCopy,
++        .operation = operation,
+     };
+     const VkPipelineLayout layout = *one_texture_pipeline_layout;
+     const VkPipeline pipeline = FindOrEmplaceColorPipeline(key);

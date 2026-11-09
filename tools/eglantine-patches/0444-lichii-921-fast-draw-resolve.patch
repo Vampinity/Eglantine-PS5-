@@ -1,0 +1,277 @@
+Subject: [PATCH] Lichii #921 (1c25fbdfb4) for 0435: fast draw delta draws and texture memo hits fall back to a full resolve when a texture changed in a way the delta path cannot see; only active with EDEN_UP_FAST_DRAW=1
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index ef204a5..0034cb6 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -240,6 +240,13 @@ public:
+         return delta_mismatch;
+     }
+ 
++    /// EDEN_UP_FAST_DRAW (Lichii #921): whether an image the kept views sample has an upload
++    /// pending or a newer alias to copy in. ConfigureDelta prepares none, Configure does.
++    [[nodiscard]] bool DeltaImagesChange() const noexcept {
++        return texture_cache.SampledViewsChange(
++            std::span<const VideoCommon::ImageViewInOut>{delta_views.data(), delta_views.size()});
++    }
++
+     template <typename Spec>
+     static auto MakeConfigureSpecFunc() {
+         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 471ac0c..e1d6c28 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -368,11 +368,38 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
+             }
+         }
+     }
++    taken_draw = draw;
+     return draw.pipeline;
+ }
+ 
++bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
++    // Lichii #921 (1c25fbdfb4): TakeReusableDraw ran before the caches were locked, while other
++    // threads could still write, unmap or delete what the delta draw keeps.
++    const auto full = [&](FullDraw reason) {
++        ++fast_draw_stats.full[static_cast<size_t>(reason)];
++        return false;
++    };
++    const ReusableDraw& draw = taken_draw;
++    if (draw.serial != serial || draw.map_serial != map_serial) {
++        return full(FullDraw::ChangedBeforeLock);
++    }
++    if (draw.tick != scheduler.CurrentTick()) {
++        return full(FullDraw::Submitted);
++    }
++    if (draw.recording_epoch != scheduler.RecordingEpoch() || !scheduler.IsRenderPassActive() ||
++        scheduler.BoundGraphicsPipeline() != draw.pipeline) {
++        return full(FullDraw::RenderPass);
++    }
++    // A delta draw prepares none of the images it samples: one with an upload pending or a newer
++    // alias to copy in (a render target aliasing it, written by the draw before) needs Configure.
++    if (draw.pipeline->DeltaImagesChange()) {
++        return full(FullDraw::SampledImages);
++    }
++    return true;
++}
++
+ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed,
+-                                        bool is_indirect, u64 serial) {
++                                        bool is_indirect, u64 serial, u64 map_serial) {
+     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+     const auto topology = draw_state.topology;
+     const auto ineligible = [&]() -> std::optional<Ineligible> {
+@@ -407,7 +434,7 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
+         .maxwell3d = maxwell3d,
+         .memory = gpu_memory,
+         .serial = serial,
+-        .map_serial = gpu_memory->MapSerial(),
++        .map_serial = map_serial,
+         .tick = scheduler.CurrentTick(),
+         .recording_epoch = scheduler.RecordingEpoch(),
+         .topology = topology,
+@@ -439,12 +466,14 @@ void RasterizerVulkan::ReportFastDraws() {
+              "Fast draw per second: {:.0f} delta | full: {:.0f} after an ineligible draw, {:.0f} "
+              "different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} render pass or "
+              "pipeline changed, {:.0f} pipeline takes no delta draws, {:.0f} handle buffer bound, "
+-             "{:.0f} handle data written",
++             "{:.0f} handle data written, {:.0f} changed before the lock, {:.0f} sampled image to "
++             "prepare",
+              static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
+              per_second(FullDraw::Kind), per_second(FullDraw::StateChanged),
+              per_second(FullDraw::Submitted), per_second(FullDraw::RenderPass),
+              per_second(FullDraw::DeltaPipeline), per_second(FullDraw::HandleBind),
+-             per_second(FullDraw::HandleData));
++             per_second(FullDraw::HandleData), per_second(FullDraw::ChangedBeforeLock),
++             per_second(FullDraw::SampledImages));
+     static constexpr std::array<const char*, static_cast<size_t>(Ineligible::Count)>
+         ineligible_names{"indirect",       "mesh",           "not built",
+                          "writes images",  "transform feedback", "inline index",
+@@ -926,8 +955,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     // Everything else below runs as for any draw. With EDEN_UP_FAST_DRAW_VERIFY such draws are
+     // resolved in full and compared with what the delta path keeps.
+     const bool fast_draw_verify = fast_draw_on && FastDraw::VerifyEnabled();
+-    // Read once, before TakeReusableDraw: what this draw resolves or keeps is good for the next
+-    // draw only while nothing ends reuse until NoteResolvedDraw, breaks during the draw included.
++    // Read once, before TakeReusableDraw; DeltaStillHolds checks the draw again once the caches
++    // are locked (Lichii #921).
+     const u64 fast_draw_serial = fast_draw_on ? FastDraw::Serial() : 0;
+     GraphicsPipeline* const delta_pipeline =
+         fast_draw_on ? TakeReusableDraw(is_indexed, fast_draw_indirect, fast_draw_serial)
+@@ -1024,6 +1053,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
++    // EDEN_UP_FAST_DRAW (Lichii #921): what the next draw's TakeReusableDraw compares with, read
++    // once the caches are locked: a break from here on, this draw's own resolve included, ends the
++    // chain (NoteResolvedDraw). A taken delta draw is checked again here, and takes the full path
++    // when an image it samples needs preparing.
++    const u64 draw_serial = fast_draw_on ? FastDraw::Serial() : 0;
++    const u64 draw_map_serial = fast_draw_on ? gpu_memory->MapSerial() : 0;
++    const bool delta_holds =
++        (delta_path || verify_views) && DeltaStillHolds(draw_serial, draw_map_serial);
++    const bool delta_draw = delta_path && delta_holds;
++    const bool verify_draw = verify_views && delta_holds;
++    if (verify_views && !delta_holds) {
++        --fast_draw_stats.verified; // counted under its full draw reason instead, not compared
++    }
+     mesh_runs_as_compute = mesh_draw && pipeline->RunsMeshAsCompute();
+     if (mesh_runs_as_compute) {
+         // The draw's vertex count is its task (or mesh) workgroup count.
+@@ -1043,19 +1085,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     }
+     // What a delta draw would have kept: the texture buffer bindings (EDEN_UP_FAST_DRAW_VERIFY).
+     const u64 kept_bindings =
+-        verify_views ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
+-    if (delta_path) {
++        verify_draw ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
++    if (delta_draw) {
+         pipeline->ConfigureNextAsDelta();
+     } else if (fast_draw_on) {
+-        pipeline->CaptureNextDelta(verify_views);
++        pipeline->CaptureNextDelta(verify_draw);
+     }
+     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+         report_failure("configure failed");
+         return;
+     }
+-    if (delta_path) {
++    if (delta_draw) {
+         ++fast_draw_stats.delta;
+-    } else if (verify_views) {
++    } else if (verify_draw) {
+         if (pipeline->DeltaMismatch()) {
+             ++fast_draw_stats.view_mismatches;
+         }
+@@ -1080,8 +1122,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     }
+     submitted = true;
+     if (fast_draw_on) {
+-        NoteResolvedDraw(pipeline, is_indexed, fast_draw_indirect, fast_draw_serial);
+-        const size_t index = static_cast<size_t>(delta_path ? DrawPath::Delta : DrawPath::Full);
++        NoteResolvedDraw(pipeline, is_indexed, fast_draw_indirect, draw_serial, draw_map_serial);
++        const size_t index = static_cast<size_t>(delta_draw ? DrawPath::Delta : DrawPath::Full);
+         fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
+         ++fast_draw_stats.prepare_draws[index];
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 990ea8b..219e909 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -311,6 +311,8 @@ private:
+         DeltaPipeline,
+         HandleBind,
+         HandleData,
++        ChangedBeforeLock,
++        SampledImages,
+         Count,
+     };
+     /// Why a recorded draw can't be followed by a delta draw.
+@@ -352,13 +354,18 @@ private:
+     };
+     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
+     /// the remembered draw either way: only a recorded draw remembers one again. `serial` is
+-    /// Nx2FastDraw::Serial() as the draw began: NoteResolvedDraw remembers nothing when it
+-    /// changed by the end of the draw.
++    /// Nx2FastDraw::Serial() as the draw began.
+     GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect, u64 serial);
++    /// Lichii #921: whether the draw TakeReusableDraw took still holds once the caches are locked
++    /// (`serial` and `map_serial` as read then), and the images it samples need no preparing.
++    bool DeltaStillHolds(u64 serial, u64 map_serial);
++    /// `serial` and `map_serial` as read once the caches were locked: NoteResolvedDraw remembers
++    /// nothing when the serial changed by the end of the draw.
+     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect,
+-                          u64 serial);
++                          u64 serial, u64 map_serial);
+     void ReportFastDraws();
+     ReusableDraw reusable_draw;
++    ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
+     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
+                Maxwell::MaxShaderStage>
+diff --git a/src/video_core/texture_cache/sampled_views.h b/src/video_core/texture_cache/sampled_views.h
+new file mode 100644
+index 0000000..364459b
+--- /dev/null
++++ b/src/video_core/texture_cache/sampled_views.h
+@@ -0,0 +1,53 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++
++#include "common/common_funcs.h"
++#include "video_core/texture_cache/image_base.h"
++#include "video_core/texture_cache/image_view_base.h"
++#include "video_core/texture_cache/types.h"
++
++namespace VideoCommon {
++
++/// Lichii #921 (1c25fbdfb4) for EDEN_UP_FAST_DRAW: whether TextureCache::PrepareImageView
++/// prepares the view's image. Neither an invalid id, nor the null view (0438), nor a buffer view.
++template <typename ImageViews>
++[[nodiscard]] bool PreparesImage(const ImageViews& image_views, ImageViewId id) noexcept {
++    return id && id != NULL_IMAGE_VIEW_ID && !image_views[id].IsBuffer();
++}
++
++/// Whether TextureCache::PrepareImage would change a sampled image: upload it from guest memory
++/// (RefreshContents) or copy a newer alias into it (SynchronizeAliases). newest_alias_tick is
++/// only kept with EDEN_UP_BACK_DRAW_CHEAP; without it the aliases are walked as
++/// SynchronizeAliases does.
++template <typename Images>
++[[nodiscard]] bool SamplingChangesImage(const Images& images, const ImageBase& image) noexcept {
++    if (True(image.flags & ImageFlagBits::CpuModified)) {
++        return true;
++    }
++    if (image.aliased_images.empty()) {
++        return false;
++    }
++    if (UpBackDrawCheap() && image.newest_alias_tick <= image.modification_tick) {
++        return false;
++    }
++    return std::ranges::any_of(image.aliased_images, [&](const AliasedImage& alias) {
++        return images[alias.id].modification_tick > image.modification_tick;
++    });
++}
++
++/// Whether sampling any of the views now needs a resolve that prepares their images (fast draw
++/// delta draws keep the previous resolve's views and prepare none).
++template <typename Views, typename ImageViews, typename Images>
++[[nodiscard]] bool SampledViewsChange(const Views& views, const ImageViews& image_views,
++                                      const Images& images) noexcept {
++    return std::ranges::any_of(views, [&](const auto& view) {
++        return PreparesImage(image_views, view.id) &&
++               SamplingChangesImage(images, images[image_views[view.id].image_id]);
++    });
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index adf4e54..c59520a 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -48,6 +48,7 @@
+ #include "video_core/texture_cache/image_info.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/render_targets.h"
++#include "video_core/texture_cache/sampled_views.h"
+ #include "video_core/texture_cache/stale_pages.h"
+ #include "video_core/texture_cache/types.h"
+ #include "video_core/textures/texture.h"
+@@ -402,6 +403,13 @@ public:
+         return feedback_view_copies;
+     }
+ 
++    /// EDEN_UP_FAST_DRAW (Lichii #921): whether sampling the views now needs PrepareImageView, an
++    /// image with an upload pending or a newer alias to copy in (delta draws keep their views and
++    /// prepare none). Called with the caches locked.
++    [[nodiscard]] bool SampledViewsChange(std::span<const ImageViewInOut> views) const noexcept {
++        return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
++    }
++
+     /// Get the sampler from the graphics/compute descriptor table in the specified index
+     Sampler* GetSampler(u32 index, bool compute);
+ 

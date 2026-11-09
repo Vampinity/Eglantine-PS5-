@@ -1,0 +1,44 @@
+Subject: [PATCH] EDEN_UP_BLIT_EDGE_CLAMP: linear 2D blits clamp to the source edge texels instead of an opaque white border (the title movie's light 1-pixel frame); off by default
+
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -11,6 +11,7 @@
+ #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+ 
+ #include "common/div_ceil.h"
++#include "common/pe_switch.h"
+ #include "common/settings.h"
+ #include "video_core/host_shaders/blit_color_float_frag_spv.h"
+ #include "video_core/host_shaders/blit_color_square_frag_spv.h"
+@@ -354,6 +355,21 @@
+     .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+     .unnormalizedCoordinates = VK_TRUE,
+ };
++
++// EDEN_UP_BLIT_EDGE_CLAMP=1: linear blits read their source's edge texels past its borders instead
++// of opaque white. A scaling blit's outermost output pixels otherwise take up to half a source
++// texel of white: Ocarina of Time's movie stand-in (1920x1080 to 2560x1440) mixed 12.5% white
++// into all four edges of the title movie and its menus, a light frame plainest on dark fades.
++// Unset: the white border as before.
++VkSamplerCreateInfo LinearSamplerCreateInfo() {
++    VkSamplerCreateInfo info = SAMPLER_CREATE_INFO<VK_FILTER_LINEAR>;
++    if (Common::PeSwitch("EDEN_UP_BLIT_EDGE_CLAMP")) {
++        info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++        info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++        info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    }
++    return info;
++}
+ 
+ constexpr VkPipelineLayoutCreateInfo PipelineLayoutCreateInfo(
+     const VkDescriptorSetLayout* set_layout, vk::Span<VkPushConstantRange> push_constants) {
+@@ -752,7 +768,7 @@
+           device.IsExtShaderStencilExportSupported()
+               ? BuildShader(device, CONVERT_NON_MSAA_TO_MSAA_DEPTH_STENCIL_FRAG_SPV)
+               : vk::ShaderModule{}),
+-      linear_sampler(device.GetLogical().CreateSampler(SAMPLER_CREATE_INFO<VK_FILTER_LINEAR>)),
++      linear_sampler(device.GetLogical().CreateSampler(LinearSamplerCreateInfo())),
+       nearest_sampler(device.GetLogical().CreateSampler(SAMPLER_CREATE_INFO<VK_FILTER_NEAREST>)) {}
+ 
+ BlitImageHelper::~BlitImageHelper() = default;
