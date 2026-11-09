@@ -1,0 +1,1140 @@
+Subject: [PATCH] EDEN_UP_OOT_NATIVE_ZSTD, EDEN_UP_OOT_FAST_LOOKUP, EDEN_UP_OOT_POLL_BACKOFF: the three game-side CPU patches of Lichii PR 717 (stephenjayakar) as built-in patches with their SVC handlers; EDEN_UP_ZPASS_QUERY_BANKS: the Z pass query bound of Lichii PR 718; all off by default
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ff9f27..94cdb62 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -373,6 +373,10 @@ add_library(core STATIC
+     hle/kernel/svc/svc_light_ipc.cpp
+     hle/kernel/svc/svc_lock.cpp
+     hle/kernel/svc/svc_memory.cpp
++    hle/kernel/svc/svc_nx2_oot_poll.cpp
++    hle/kernel/svc/svc_nx2_oot_poll.h
++    hle/kernel/svc/svc_nx2_zstd.cpp
++    hle/kernel/svc/svc_nx2_zstd.h
+     hle/kernel/svc/svc_physical_memory.cpp
+     hle/kernel/svc/svc_port.cpp
+     hle/kernel/svc/svc_power_management.cpp
+diff --git a/src/core/file_sys/patch_manager.cpp b/src/core/file_sys/patch_manager.cpp
+index 2914ca2..1192fd8 100644
+--- a/src/core/file_sys/patch_manager.cpp
++++ b/src/core/file_sys/patch_manager.cpp
+@@ -10,6 +10,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <optional>
++#include <span>
+ #include <string_view>
+ 
+ #include "common/assert.h"
+@@ -118,6 +119,223 @@ constexpr std::array BUILTIN_PATCHES{
+     return enabled;
+ }
+ 
++// Built-in patches of several sites, or of more than one instruction, applied all or none.
++// The table shape and the three patches below are from Lichii PR 717 (stephenjayakar,
++// zortos293/Lichii eb3553bcb8). There each is on by default; here each has its own switch
++// (exact "1") and is off unless set.
++struct BuiltinPatchRecord {
++    size_t module_offset;
++    std::span<const u8> bytes;
++    std::span<const u8> original;
++};
++
++struct BuiltinGroupPatch {
++    std::string_view name;
++    u64 title_id;
++    std::string_view module;
++    std::string_view build_id;
++    std::span<const BuiltinPatchRecord> records;
++    bool (*enabled)(); ///< The switch that applies it
++};
++
++[[nodiscard]] bool UpSwitch(const char* name) {
++    const char* const value = std::getenv(name);
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++}
++
++// EDEN_UP_OOT_NATIVE_ZSTD=1: the game's three calls of ZSTD_decompressMultiFrame (main+0xEB380,
++// its asset streaming jobs) become svc 0xF0-0xF2, and the host's libzstd decompresses instead of
++// the game's own zstd under the JIT (core/hle/kernel/svc/svc_nx2_zstd.cpp, which needs exactly
++// these sites and runs the game's function when it cannot give the same bytes).
++[[nodiscard]] bool NativeZstdEnabled() {
++    static const bool enabled = UpSwitch("EDEN_UP_OOT_NATIVE_ZSTD");
++    return enabled;
++}
++constexpr std::array<u8, 4> OOT_ZSTD_CALL_1{0x28, 0xD0, 0xD3, 0x97}; // bl 0xeb380
++constexpr std::array<u8, 4> OOT_ZSTD_CALL_2{0x87, 0x6C, 0xC6, 0x97}; // bl 0xeb380
++constexpr std::array<u8, 4> OOT_ZSTD_CALL_3{0x9D, 0x08, 0x00, 0x94}; // bl 0xeb380
++constexpr std::array<u8, 4> OOT_ZSTD_SVC_F0{0x01, 0x1E, 0x00, 0xD4}; // svc #0xf0
++constexpr std::array<u8, 4> OOT_ZSTD_SVC_F1{0x21, 0x1E, 0x00, 0xD4}; // svc #0xf1
++constexpr std::array<u8, 4> OOT_ZSTD_SVC_F2{0x41, 0x1E, 0x00, 0xD4}; // svc #0xf2
++constexpr std::array OOT_NATIVE_ZSTD_RECORDS{
++    BuiltinPatchRecord{0xBF72E0, OOT_ZSTD_SVC_F0, OOT_ZSTD_CALL_1},
++    BuiltinPatchRecord{0xF50164, OOT_ZSTD_SVC_F1, OOT_ZSTD_CALL_2},
++    BuiltinPatchRecord{0xE910C, OOT_ZSTD_SVC_F2, OOT_ZSTD_CALL_3},
++};
++
++// EDEN_UP_OOT_FAST_LOOKUP=1: the string-keyed sorted-index lookup at main+0x58EEA0 binary-searches
++// with an inlined strcmp (8-way unrolled, two branches per byte). Both hot copies (lower bound
++// main+0x58FC64, upper bound main+0x591E24) are rewritten in place as an 8-bytes-per-iteration
++// compare with the same result sign, the same 32 MiB limit and no loads that cross into a page
++// the original would not read. The bytes are the PR's, taken over unchanged.
++[[nodiscard]] bool FastLookupEnabled() {
++    static const bool enabled = UpSwitch("EDEN_UP_OOT_FAST_LOOKUP");
++    return enabled;
++}
++constexpr std::array<u8, 240> OOT_FAST_LOOKUP_A{
++    0xEA, 0x03, 0x08, 0xAA, 0x4C, 0x15, 0x40, 0x38, 0x2D, 0x15, 0x40, 0x38, 0x9F, 0x01, 0x0D, 0x6B,
++    0xE8, 0x97, 0x9F, 0x1A, 0x08, 0x21, 0x9F, 0x5A, 0x9F, 0x01, 0x00, 0x71, 0x80, 0x11, 0x4D, 0x7A,
++    0xE1, 0xF9, 0xFF, 0x54, 0xEB, 0x63, 0x40, 0xB2, 0x7F, 0x21, 0x00, 0xF1, 0x48, 0x21, 0x7D, 0x92,
++    0x08, 0x21, 0x7D, 0xD2, 0x04, 0x29, 0x40, 0xFA, 0x28, 0x21, 0x7D, 0x92, 0x08, 0x21, 0x7D, 0xD2,
++    0x04, 0x19, 0x40, 0xFA, 0xC0, 0x03, 0x00, 0x54, 0x4C, 0x85, 0x40, 0xF8, 0x2D, 0x85, 0x40, 0xF8,
++    0xE8, 0xC3, 0x00, 0xB2, 0x88, 0x01, 0x08, 0xCB, 0x08, 0x01, 0x2C, 0x8A, 0x08, 0xC1, 0x01, 0x92,
++    0x8E, 0x01, 0x0D, 0xCA, 0xCE, 0x01, 0x08, 0xAA, 0x6B, 0x21, 0x00, 0xD1, 0x7F, 0x21, 0x00, 0xF1,
++    0xC0, 0x29, 0x40, 0xFA, 0x48, 0x21, 0x7D, 0x92, 0x08, 0x21, 0x7D, 0xD2, 0x04, 0x09, 0x40, 0xFA,
++    0x28, 0x21, 0x7D, 0x92, 0x08, 0x21, 0x7D, 0xD2, 0x04, 0x19, 0x40, 0xFA, 0xE1, 0xFD, 0xFF, 0x54,
++    0xC8, 0x0D, 0xC0, 0xDA, 0x08, 0x11, 0xC0, 0xDA, 0x08, 0x09, 0x7D, 0x92, 0x8C, 0x25, 0xC8, 0x9A,
++    0xAD, 0x25, 0xC8, 0x9A, 0x8C, 0x1D, 0x00, 0x12, 0xAD, 0x1D, 0x00, 0x12, 0x9F, 0x01, 0x0D, 0x6B,
++    0xE8, 0x97, 0x9F, 0x1A, 0x08, 0x21, 0x9F, 0x5A, 0x2E, 0xF5, 0xFF, 0xB5, 0x6B, 0x01, 0x00, 0xB4,
++    0x4C, 0x15, 0x40, 0x38, 0x2D, 0x15, 0x40, 0x38, 0x6B, 0x05, 0x00, 0xD1, 0x9F, 0x01, 0x0D, 0x6B,
++    0xE8, 0x97, 0x9F, 0x1A, 0x08, 0x21, 0x9F, 0x5A, 0x9F, 0x01, 0x00, 0x71, 0x80, 0x11, 0x4D, 0x7A,
++    0x40, 0xFA, 0xFF, 0x54, 0x9E, 0xFF, 0xFF, 0x17, 0xE8, 0x03, 0x1F, 0x2A, 0x9C, 0xFF, 0xFF, 0x17,
++};
++constexpr std::array<u8, 240> OOT_FAST_LOOKUP_A_ORIGINAL{
++    0x29, 0x0D, 0x00, 0x91, 0x0A, 0x0D, 0x00, 0x91, 0x0B, 0x08, 0xA0, 0x52, 0x4C, 0xD1, 0x5F, 0x38,
++    0xAC, 0x0D, 0x00, 0x34, 0x2D, 0xD1, 0x5F, 0x38, 0x9F, 0x01, 0x0D, 0x6B, 0x6E, 0x37, 0x9B, 0x5A,
++    0x08, 0x01, 0x8E, 0x1A, 0x9F, 0x01, 0x00, 0x71, 0x80, 0x11, 0x4D, 0x7A, 0x81, 0xF9, 0xFF, 0x54,
++    0x4C, 0xE1, 0x5F, 0x38, 0x8C, 0x10, 0x00, 0x34, 0x2D, 0xE1, 0x5F, 0x38, 0x9F, 0x01, 0x0D, 0x6B,
++    0x6E, 0x37, 0x9B, 0x5A, 0x08, 0x01, 0x8E, 0x1A, 0xAC, 0xF8, 0xFF, 0x34, 0x9F, 0x01, 0x0D, 0x6B,
++    0x61, 0xF8, 0xFF, 0x54, 0x4C, 0xF1, 0x5F, 0x38, 0xAC, 0x0F, 0x00, 0x34, 0x2D, 0xF1, 0x5F, 0x38,
++    0x9F, 0x01, 0x0D, 0x6B, 0x6E, 0x37, 0x9B, 0x5A, 0x08, 0x01, 0x8E, 0x1A, 0x8C, 0xF7, 0xFF, 0x34,
++    0x9F, 0x01, 0x0D, 0x6B, 0x41, 0xF7, 0xFF, 0x54, 0x4C, 0x01, 0x40, 0x39, 0xCC, 0x0E, 0x00, 0x34,
++    0x2D, 0x01, 0x40, 0x39, 0x9F, 0x01, 0x0D, 0x6B, 0x6E, 0x37, 0x9B, 0x5A, 0x08, 0x01, 0x8E, 0x1A,
++    0x6C, 0xF6, 0xFF, 0x34, 0x9F, 0x01, 0x0D, 0x6B, 0x21, 0xF6, 0xFF, 0x54, 0x4C, 0x05, 0x40, 0x39,
++    0xEC, 0x0D, 0x00, 0x34, 0x2D, 0x05, 0x40, 0x39, 0x9F, 0x01, 0x0D, 0x6B, 0x6E, 0x37, 0x9B, 0x5A,
++    0x08, 0x01, 0x8E, 0x1A, 0x4C, 0xF5, 0xFF, 0x34, 0x9F, 0x01, 0x0D, 0x6B, 0x01, 0xF5, 0xFF, 0x54,
++    0x4C, 0x09, 0x40, 0x39, 0x0C, 0x0D, 0x00, 0x34, 0x2D, 0x09, 0x40, 0x39, 0x9F, 0x01, 0x0D, 0x6B,
++    0x6E, 0x37, 0x9B, 0x5A, 0x08, 0x01, 0x8E, 0x1A, 0x2C, 0xF4, 0xFF, 0x34, 0x9F, 0x01, 0x0D, 0x6B,
++    0xE1, 0xF3, 0xFF, 0x54, 0x4C, 0x0D, 0x40, 0x39, 0x2C, 0x0C, 0x00, 0x34, 0x2D, 0x0D, 0x40, 0x39,
++};
++constexpr std::array<u8, 244> OOT_FAST_LOOKUP_B{
++    0xEA, 0x03, 0x08, 0xAA, 0x4C, 0x15, 0x40, 0x38, 0x2D, 0x15, 0x40, 0x38, 0x9F, 0x01, 0x0D, 0x6B,
++    0xE8, 0x97, 0x9F, 0x1A, 0x08, 0x21, 0x9F, 0x5A, 0x9F, 0x01, 0x00, 0x71, 0x80, 0x11, 0x4D, 0x7A,
++    0x01, 0x09, 0x00, 0x54, 0xEB, 0x63, 0x40, 0xB2, 0x7F, 0x21, 0x00, 0xF1, 0x48, 0x21, 0x7D, 0x92,
++    0x08, 0x21, 0x7D, 0xD2, 0x04, 0x29, 0x40, 0xFA, 0x28, 0x21, 0x7D, 0x92, 0x08, 0x21, 0x7D, 0xD2,
++    0x04, 0x19, 0x40, 0xFA, 0xC0, 0x03, 0x00, 0x54, 0x4C, 0x85, 0x40, 0xF8, 0x2D, 0x85, 0x40, 0xF8,
++    0xE8, 0xC3, 0x00, 0xB2, 0x88, 0x01, 0x08, 0xCB, 0x08, 0x01, 0x2C, 0x8A, 0x08, 0xC1, 0x01, 0x92,
++    0x8E, 0x01, 0x0D, 0xCA, 0xCE, 0x01, 0x08, 0xAA, 0x6B, 0x21, 0x00, 0xD1, 0x7F, 0x21, 0x00, 0xF1,
++    0xC0, 0x29, 0x40, 0xFA, 0x48, 0x21, 0x7D, 0x92, 0x08, 0x21, 0x7D, 0xD2, 0x04, 0x09, 0x40, 0xFA,
++    0x28, 0x21, 0x7D, 0x92, 0x08, 0x21, 0x7D, 0xD2, 0x04, 0x19, 0x40, 0xFA, 0xE1, 0xFD, 0xFF, 0x54,
++    0xC8, 0x0D, 0xC0, 0xDA, 0x08, 0x11, 0xC0, 0xDA, 0x08, 0x09, 0x7D, 0x92, 0x8C, 0x25, 0xC8, 0x9A,
++    0xAD, 0x25, 0xC8, 0x9A, 0x8C, 0x1D, 0x00, 0x12, 0xAD, 0x1D, 0x00, 0x12, 0x9F, 0x01, 0x0D, 0x6B,
++    0xE8, 0x97, 0x9F, 0x1A, 0x08, 0x21, 0x9F, 0x5A, 0x4E, 0x04, 0x00, 0xB5, 0x6B, 0x01, 0x00, 0xB4,
++    0x4C, 0x15, 0x40, 0x38, 0x2D, 0x15, 0x40, 0x38, 0x6B, 0x05, 0x00, 0xD1, 0x9F, 0x01, 0x0D, 0x6B,
++    0xE8, 0x97, 0x9F, 0x1A, 0x08, 0x21, 0x9F, 0x5A, 0x9F, 0x01, 0x00, 0x71, 0x80, 0x11, 0x4D, 0x7A,
++    0x40, 0xFA, 0xFF, 0x54, 0x17, 0x00, 0x00, 0x14, 0x08, 0x40, 0xA0, 0xD2, 0x48, 0x01, 0x08, 0xCB,
++    0x9B, 0xFF, 0xFF, 0x17,
++};
++constexpr std::array<u8, 244> OOT_FAST_LOOKUP_B_ORIGINAL{
++    0x29, 0x0D, 0x00, 0x91, 0x0A, 0x0D, 0x00, 0x91, 0x0B, 0x08, 0xA0, 0x52, 0x4C, 0xD1, 0x5F, 0x38,
++    0x2C, 0x0E, 0x00, 0x34, 0x2D, 0xD1, 0x5F, 0x38, 0x9F, 0x01, 0x0D, 0x6B, 0xCE, 0x36, 0x96, 0x5A,
++    0x08, 0x01, 0x8E, 0x1A, 0x9F, 0x01, 0x00, 0x71, 0x80, 0x11, 0x4D, 0x7A, 0xA1, 0x08, 0x00, 0x54,
++    0x4C, 0xE1, 0x5F, 0x38, 0x4C, 0x0D, 0x00, 0x34, 0x2D, 0xE1, 0x5F, 0x38, 0x9F, 0x01, 0x0D, 0x6B,
++    0xCE, 0x36, 0x96, 0x5A, 0x08, 0x01, 0x8E, 0x1A, 0xCC, 0x07, 0x00, 0x34, 0x9F, 0x01, 0x0D, 0x6B,
++    0x81, 0x07, 0x00, 0x54, 0x4C, 0xF1, 0x5F, 0x38, 0x6C, 0x0C, 0x00, 0x34, 0x2D, 0xF1, 0x5F, 0x38,
++    0x9F, 0x01, 0x0D, 0x6B, 0xCE, 0x36, 0x96, 0x5A, 0x08, 0x01, 0x8E, 0x1A, 0xAC, 0x06, 0x00, 0x34,
++    0x9F, 0x01, 0x0D, 0x6B, 0x61, 0x06, 0x00, 0x54, 0x4C, 0x01, 0x40, 0x39, 0x8C, 0x0B, 0x00, 0x34,
++    0x2D, 0x01, 0x40, 0x39, 0x9F, 0x01, 0x0D, 0x6B, 0xCE, 0x36, 0x96, 0x5A, 0x08, 0x01, 0x8E, 0x1A,
++    0x8C, 0x05, 0x00, 0x34, 0x9F, 0x01, 0x0D, 0x6B, 0x41, 0x05, 0x00, 0x54, 0x4C, 0x05, 0x40, 0x39,
++    0xAC, 0x0A, 0x00, 0x34, 0x2D, 0x05, 0x40, 0x39, 0x9F, 0x01, 0x0D, 0x6B, 0xCE, 0x36, 0x96, 0x5A,
++    0x08, 0x01, 0x8E, 0x1A, 0x6C, 0x04, 0x00, 0x34, 0x9F, 0x01, 0x0D, 0x6B, 0x21, 0x04, 0x00, 0x54,
++    0x4C, 0x09, 0x40, 0x39, 0xCC, 0x09, 0x00, 0x34, 0x2D, 0x09, 0x40, 0x39, 0x9F, 0x01, 0x0D, 0x6B,
++    0xCE, 0x36, 0x96, 0x5A, 0x08, 0x01, 0x8E, 0x1A, 0x4C, 0x03, 0x00, 0x34, 0x9F, 0x01, 0x0D, 0x6B,
++    0x01, 0x03, 0x00, 0x54, 0x4C, 0x0D, 0x40, 0x39, 0xEC, 0x08, 0x00, 0x34, 0x2D, 0x0D, 0x40, 0x39,
++    0x9F, 0x01, 0x0D, 0x6B,
++};
++constexpr std::array OOT_FAST_LOOKUP_RECORDS{
++    BuiltinPatchRecord{0x58FC64, OOT_FAST_LOOKUP_A, OOT_FAST_LOOKUP_A_ORIGINAL},
++    BuiltinPatchRecord{0x591E24, OOT_FAST_LOOKUP_B, OOT_FAST_LOOKUP_B_ORIGINAL},
++};
++
++// EDEN_UP_OOT_POLL_BACKOFF=1: the resource request thread (main+0xF7A0) rescans its pending
++// requests at once when one is not ready (`tbz w8, #0, loop` at main+0x14ABC, w8 = "all done").
++// That branch now goes through the padding at main+0x17088: `svc #0xf3` and `b loop`. The SVC
++// (core/hle/kernel/svc/svc_nx2_oot_poll.cpp) sleeps in proportion to the walk only if the walk was
++// a pure re-check; otherwise it returns at once.
++[[nodiscard]] bool PollBackoffEnabled() {
++    static const bool enabled = UpSwitch("EDEN_UP_OOT_POLL_BACKOFF");
++    return enabled;
++}
++constexpr std::array<u8, 4> OOT_POLL_RESCAN_ORIGINAL{0x28, 0x70, 0x05, 0x36}; // tbz w8, #0, 0xf8c0
++constexpr std::array<u8, 4> OOT_POLL_RESCAN_BRANCH{0x68, 0x2E, 0x01, 0x36};   // tbz w8, #0, 0x17088
++constexpr std::array<u8, 8> OOT_POLL_PADDING_ORIGINAL{};
++constexpr std::array<u8, 8> OOT_POLL_BACKOFF_CAVE{
++    0x61, 0x1E, 0x00, 0xD4, // svc #0xf3
++    0x0D, 0xE2, 0xFF, 0x17, // b 0xf8c0
++};
++constexpr std::array OOT_POLL_BACKOFF_RECORDS{
++    BuiltinPatchRecord{0x14ABC, OOT_POLL_RESCAN_BRANCH, OOT_POLL_RESCAN_ORIGINAL},
++    BuiltinPatchRecord{0x17088, OOT_POLL_BACKOFF_CAVE, OOT_POLL_PADDING_ORIGINAL},
++};
++
++constexpr std::array BUILTIN_GROUP_PATCHES{
++    BuiltinGroupPatch{"Native zstd (built-in)", 0x0400486024DEC000, "main",
++                      "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", OOT_NATIVE_ZSTD_RECORDS,
++                      NativeZstdEnabled},
++    BuiltinGroupPatch{"Fast lookup strcmp (built-in)", 0x0400486024DEC000, "main",
++                      "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", OOT_FAST_LOOKUP_RECORDS,
++                      FastLookupEnabled},
++    BuiltinGroupPatch{"Resource poll backoff (built-in)", 0x0400486024DEC000, "main",
++                      "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", OOT_POLL_BACKOFF_RECORDS,
++                      PollBackoffEnabled},
++};
++
++// `nso` is the module as loaded, `out` the same with the user's mods applied. A patch is applied
++// only when every one of its records fits the module, finds its original bytes in `nso`, and no
++// user mod changed those bytes.
++void ApplyBuiltinGroupPatches(std::vector<u8>& out, const std::vector<u8>& nso,
++                              std::string_view name, std::string_view build_id, u64 title_id) {
++    const auto fits = [](const std::vector<u8>& data, size_t offset, size_t size) {
++        return data.size() >= sizeof(Loader::NSOHeader) &&
++               offset <= data.size() - sizeof(Loader::NSOHeader) &&
++               size <= data.size() - sizeof(Loader::NSOHeader) - offset;
++    };
++    for (const auto& patch : BUILTIN_GROUP_PATCHES) {
++        if (!patch.enabled() || patch.title_id != title_id || patch.module != name) {
++            continue;
++        }
++        if (patch.build_id != build_id) {
++            LOG_INFO(Loader, "    - Skipping \"{}\": build id {} is not {}", patch.name, build_id,
++                     patch.build_id);
++            continue;
++        }
++        bool apply = true;
++        for (const auto& record : patch.records) {
++            if (record.bytes.size() != record.original.size() ||
++                !fits(nso, record.module_offset, record.bytes.size()) ||
++                !fits(out, record.module_offset, record.bytes.size())) {
++                LOG_WARNING(Loader, "    - Skipping \"{}\": {}+{:#x} is past the module's end",
++                            patch.name, name, record.module_offset);
++                apply = false;
++                break;
++            }
++            const size_t offset = sizeof(Loader::NSOHeader) + record.module_offset;
++            if (!std::equal(record.original.begin(), record.original.end(), nso.begin() + offset)) {
++                LOG_WARNING(Loader, "    - Skipping \"{}\": unexpected original bytes at {}+{:#x}",
++                            patch.name, name, record.module_offset);
++                apply = false;
++                break;
++            }
++            if (!std::equal(nso.begin() + offset, nso.begin() + offset + record.bytes.size(),
++                            out.begin() + offset)) {
++                LOG_INFO(Loader, "    - Skipping \"{}\": a user mod already patched {}+{:#x}",
++                         patch.name, name, record.module_offset);
++                apply = false;
++                break;
++            }
++        }
++        if (!apply) {
++            continue;
++        }
++        for (const auto& record : patch.records) {
++            std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
++                        record.bytes.data(), record.bytes.size());
++        }
++        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} sites in {})", patch.name,
++                 patch.records.size(), name);
++    }
++}
++
+ // EDEN_NX2_OOT_MAX_RESOLUTION=1 applies the table. Lichii has it on by default; here it is opt-in,
+ // because the bigger render targets come out of the same memory pool that ends a session.
+ [[nodiscard]] bool BuiltinPatchesEnabled() {
+@@ -167,6 +385,7 @@ void ApplyBuiltinPatches(std::vector<u8>& out, const std::vector<u8>& nso, std::
+         LOG_INFO(Loader, "    - Applying built-in patch \"{}\" at {}+{:#x}", patch.name, name,
+                  patch.module_offset);
+     }
++    ApplyBuiltinGroupPatches(out, nso, name, build_id, title_id);
+ }
+ 
+ enum class TitleVersionFormat : u8 {
+@@ -608,6 +827,11 @@ bool PatchManager::HasNSOPatch(const BuildID& build_id_, std::string_view name)
+         })) {
+         return true;
+     }
++    if (std::ranges::any_of(BUILTIN_GROUP_PATCHES, [&](const BuiltinGroupPatch& patch) {
++            return patch.enabled() && patch.title_id == title_id && patch.module == name;
++        })) {
++        return true;
++    }
+ 
+     const auto load_dir = GetModificationLoadRoot();
+     if (load_dir == nullptr) {
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index fbcd40c..e7f7754 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -14,6 +14,8 @@
+ #include "core/core.h"
+ #include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/svc.h"
++#include "core/hle/kernel/svc/svc_nx2_oot_poll.h"
++#include "core/hle/kernel/svc/svc_nx2_zstd.h"
+ #include "core/hle/kernel/k_readable_event.h"
+ #include "core/hle/service/kernel_helpers.h"
+ 
+@@ -2541,7 +2543,13 @@ void Call(Core::System& system, u32 imm) {
+             LOG_INFO(Kernel_SVC, "svc 0x18 t{} waits on{}", GetCurrentThread(kernel).GetThreadId(), list);
+         }
+     }
+-    if (imm == 0x80) {
++    if (CallNx2OotZstd(system, imm, args)) {
++        // EDEN_UP_OOT_NATIVE_ZSTD: Ocarina of Time native zstd (svc 0xF0-0xF2, svc_nx2_zstd.cpp).
++        // Only the built-in patch of that switch puts these SVCs into the game.
++    } else if (CallNx2OotPollBackoff(system, imm)) {
++        // EDEN_UP_OOT_POLL_BACKOFF: Ocarina of Time resource poll backoff (svc 0xF3,
++        // svc_nx2_oot_poll.cpp).
++    } else if (imm == 0x80) {
+         // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
+         // nn::gs native memory set the new "GPU accessible" attribute (0x20) before registering
+         // memory with the GPU and clear it on destruction; NVN can see it through QueryMemory.
+diff --git a/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp b/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp
+new file mode 100644
+index 0000000..74578a3
+--- /dev/null
++++ b/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp
+@@ -0,0 +1,320 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdlib>
++#include <mutex>
++
++#include "common/logging.h"
++#include "core/arm/arm_interface.h"
++#include "core/core.h"
++#include "core/hle/kernel/k_process.h"
++#include "core/hle/kernel/k_thread.h"
++#include "core/hle/kernel/kernel.h"
++#include "core/hle/kernel/svc.h"
++#include "core/hle/kernel/svc/svc_nx2_oot_poll.h"
++#include "core/hle/kernel/svc_types.h"
++#include "core/memory.h"
++
++namespace Kernel::Svc {
++namespace {
++
++// From Lichii PR 717 (stephenjayakar, zortos293/Lichii eb3553bcb8), unchanged but for the switch
++// names. Here the game patch that reaches this code is off unless EDEN_UP_OOT_POLL_BACKOFF=1
++// (core/file_sys/patch_manager.cpp).
++//
++// Ocarina of Time (main build E0F3CCFA...): the resource request thread (main+0xF7A0, state 3)
++// walks every entry of its pending-request ring. Per entry it locks the manager mutex, looks the
++// name up twice through the query engine (main+0x58EEA0, via 0x167B0 and 0xF630), checks the
++// states of the entry's sub-resources and unlocks. If any entry is not ready ("all done" flag
++// [sp+0x110] cleared), the walk starts again at once (main+0x14ABC, patched to reach this SVC).
++//
++// The walks are long: hundreds of entries, about 1-2 ms each in an OoT profile (the query engine
++// is 455 ms/s while this SVC ran fewer than about 700 times a second). A fixed 500 us sleep per
++// walk therefore cut the poll's duty cycle by only a third. The sleep is now proportional to the
++// walk that just ended, so the thread spends at most about 1/(1+kWalkFactor) of its time
++// re-checking a list where nothing changed.
++//
++// What may never be delayed (the SVC returns at once, exactly like the original branch):
++//  - a walk that issued new loads ([sp+0x108], incremented on the load-issue paths 0x14B8C and
++//    0x14DE4 before 0x149F8): the request chain is making progress;
++//  - a request list that changed during the walk (count [x19+0x1E0] differs from the walk's
++//    snapshot [sp+0x128], or the ring head/count moved since the walk started);
++//  - a state other than 3 ([x19+0x2C]: another thread asked for a flush, cancel or stop);
++//  - the loop top's exit request ([[main+0x4C7E178]]+0x1F8 != 0, 0xF8C0..0xF8D4).
++// The manager mutex (x19+0x50) is not held at the SVC (it is released at 0x141B8 before both exits
++// to 0x14AB8), so a sleep never blocks the threads that add or complete requests.
++constexpr u64 kOotProgramId = 0x0400486024DEC000ULL;
++constexpr u32 kPollSvc = 0xF3;
++
++// main offsets, used to check that the SVC came from the patched code.
++constexpr u64 kSvcReturnOffset = 0x1708C; // instruction after `svc #0xf3` in the cave
++constexpr u64 kSvcOffset = 0x17088;
++constexpr u32 kSvcInstruction = 0xD4001E61;      // svc #0xf3
++constexpr u64 kRescanBranchOffset = 0x14ABC;
++constexpr u32 kRescanBranch = 0x36012E68;        // tbz w8, #0, 0x17088
++constexpr u64 kExitGotOffset = 0x4C7E178;        // adrp/ldr at the loop top 0xF8C0
++constexpr u64 kExitFlagOffset = 0x1F8;
++
++// Request manager (x19).
++constexpr u64 kStateOffset = 0x2C;
++constexpr u32 kStateWalking = 3;
++constexpr u64 kHeadOffset = 0x1DC;
++constexpr u64 kCountOffset = 0x1E0;
++
++// The walk's stack frame (sp is fixed after the prologue's `sub sp, sp, #0xa30`).
++constexpr u64 kIssuedOffset = 0x108;    // w: loads issued by this walk (reset at 0x130E8)
++constexpr u64 kAllDoneOffset = 0x110;   // w: bit 0 = every entry was ready
++constexpr u64 kWalkCountOffset = 0x128; // w: entries this walk visits (snapshot at 0x130E0)
++
++constexpr s64 kMinSleepNs = 500'000;
++constexpr s64 kDefaultMaxSleepNs = 4'000'000;
++constexpr s64 kLimitMaxSleepNs = 16'000'000; // the game's own idle sleep in this loop
++constexpr s64 kWalkFactor = 4;
++// A gap longer than this since the last return from the SVC is not one walk (the thread idled in
++// the 16 ms sleep or was preempted for long); such a walk gets the minimum sleep.
++constexpr s64 kStaleWalkNs = 20'000'000;
++constexpr s64 kLogIntervalNs = 10'000'000'000;
++
++// EDEN_UP_OOT_POLL_BACKOFF_US=<us>: the longest sleep in us (above 1, at most 16000; "500" is the
++// PR's first, fixed sleep). Unset or anything else: 4000 us. Without EDEN_UP_OOT_POLL_BACKOFF=1
++// main is not patched (patch_manager.cpp) and this SVC never runs.
++s64 MaxSleepNs() {
++    static const s64 ns = [] {
++        const char* value = std::getenv("EDEN_UP_OOT_POLL_BACKOFF_US");
++        s64 us = kDefaultMaxSleepNs / 1000;
++        if (value != nullptr && value[0] != 0) {
++            const long long parsed = std::strtoll(value, nullptr, 10);
++            if (parsed > 1) {
++                us = parsed < kLimitMaxSleepNs / 1000 ? parsed : kLimitMaxSleepNs / 1000;
++            }
++        }
++        return us * 1000;
++    }();
++    return ns;
++}
++
++s64 NowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++enum class Outcome : u8 {
++    Sleep,
++    Progress,    // the walk issued loads
++    ListChanged, // requests added or removed during the walk
++    State,       // state is no longer 3
++    Exit,        // the loop top will stop the thread
++    Frame,       // not the expected code or frame; behave as the original branch
++    Count,
++};
++
++struct WalkView {
++    Outcome outcome{Outcome::Frame};
++    u64 manager{};
++    u32 head{};
++    u32 count{};
++};
++
++bool Valid(Core::Memory::Memory& memory, u64 address, u64 size) {
++    return address != 0 && memory.IsValidVirtualAddressRange(address, size);
++}
++
++bool ExitPending(Core::Memory::Memory& memory, u64 main_base) {
++    const u64 got = main_base + kExitGotOffset;
++    if (!Valid(memory, got, 8)) {
++        return false;
++    }
++    const u64 global = memory.Read64(got);
++    if (!Valid(memory, global, 8)) {
++        return false;
++    }
++    const u64 object = memory.Read64(global);
++    if (object == 0 || !Valid(memory, object + kExitFlagOffset, 8)) {
++        return false;
++    }
++    return memory.Read64(object + kExitFlagOffset) != 0;
++}
++
++WalkView ReadWalk(Core::Memory::Memory& memory, const ThreadContext& ctx) {
++    WalkView view{};
++    const u64 main_base = ctx.pc - kSvcReturnOffset;
++    if (!Valid(memory, main_base + kRescanBranchOffset, 4) ||
++        memory.Read32(main_base + kRescanBranchOffset) != kRescanBranch ||
++        !Valid(memory, main_base + kSvcOffset, 4) ||
++        memory.Read32(main_base + kSvcOffset) != kSvcInstruction) {
++        return view;
++    }
++    const u64 manager = ctx.r[19];
++    const u64 sp = ctx.sp;
++    if (!Valid(memory, manager, kCountOffset + 4) || !Valid(memory, sp + kIssuedOffset, 0x24)) {
++        return view;
++    }
++    // Only reached through `tbz w8, #0` with w8 = [sp+0x110]; anything else is not this frame.
++    if ((memory.Read32(sp + kAllDoneOffset) & 1) != 0) {
++        return view;
++    }
++    view.manager = manager;
++    view.head = memory.Read32(manager + kHeadOffset);
++    view.count = memory.Read32(manager + kCountOffset);
++    if (memory.Read32(manager + kStateOffset) != kStateWalking) {
++        view.outcome = Outcome::State;
++    } else if (memory.Read32(sp + kIssuedOffset) != 0) {
++        view.outcome = Outcome::Progress;
++    } else if (view.count != memory.Read32(sp + kWalkCountOffset)) {
++        view.outcome = Outcome::ListChanged;
++    } else if (ExitPending(memory, main_base)) {
++        view.outcome = Outcome::Exit;
++    } else {
++        view.outcome = Outcome::Sleep;
++    }
++    return view;
++}
++
++// One per request manager (the game has one poller thread per manager).
++struct Slot {
++    u64 manager{};
++    s64 resume_ns{}; // when the thread last returned from this SVC (start of the next walk)
++    u32 head{};
++    u32 count{};
++};
++
++struct Stats {
++    u64 calls{};
++    u64 slept{};
++    u64 measured{};
++    s64 walk_ns{};
++    s64 sleep_ns{};
++    std::array<u64, static_cast<size_t>(Outcome::Count)> outcomes{};
++};
++
++std::mutex g_mutex;
++std::array<Slot, 8> g_slots{};
++Stats g_stats{};
++u64 g_total_calls{};
++s64 g_interval_start_ns{};
++
++// Under g_mutex.
++Slot& FindSlot(u64 manager) {
++    Slot* oldest = &g_slots[0];
++    for (Slot& slot : g_slots) {
++        if (slot.manager == manager) {
++            return slot;
++        }
++        if (slot.resume_ns < oldest->resume_ns) {
++            oldest = &slot;
++        }
++    }
++    *oldest = Slot{.manager = manager};
++    return *oldest;
++}
++
++void LogStats(const Stats& stats, s64 interval_ns) {
++    const double secs = static_cast<double>(interval_ns) / 1e9;
++    const auto n = [&](Outcome o) { return stats.outcomes[static_cast<size_t>(o)]; };
++    LOG_INFO(Kernel_SVC,
++             "OoT resource poll backoff: {} walks in {:.1f} s ({:.0f}/s), {} slept (avg walk {} "
++             "us, avg sleep {} us); at once: {} issued loads, {} list changed, {} state, {} exit, "
++             "{} frame",
++             stats.calls, secs, secs > 0 ? static_cast<double>(stats.calls) / secs : 0.0,
++             stats.slept, stats.measured ? stats.walk_ns / static_cast<s64>(stats.measured) / 1000 : 0,
++             stats.slept ? stats.sleep_ns / static_cast<s64>(stats.slept) / 1000 : 0,
++             n(Outcome::Progress), n(Outcome::ListChanged), n(Outcome::State), n(Outcome::Exit),
++             n(Outcome::Frame));
++}
++
++} // Anonymous namespace
++
++bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
++    if (imm != kPollSvc) {
++        return false;
++    }
++    auto& kernel = system.Kernel();
++    auto& process = GetCurrentProcess(kernel);
++    if (!process.Is64Bit() || process.GetProgramId() != kOotProgramId) {
++        return false;
++    }
++    auto& memory = process.GetMemory();
++
++    // Read the walk's registers before sleeping: afterwards the thread may run on another core.
++    WalkView view{};
++    if (auto* const arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex())) {
++        ThreadContext ctx{};
++        arm->GetContext(ctx);
++        view = ReadWalk(memory, ctx);
++    }
++
++    const s64 now = NowNs();
++    const s64 max_sleep = MaxSleepNs();
++    const s64 min_sleep = std::min(kMinSleepNs, max_sleep);
++    s64 sleep_ns = 0;
++    bool first = false;
++    bool do_log = false;
++    Stats snapshot{};
++    s64 interval_ns = 0;
++    {
++        std::scoped_lock lock{g_mutex};
++        if (view.outcome != Outcome::Frame) {
++            Slot& slot = FindSlot(view.manager);
++            const s64 walk = slot.resume_ns != 0 ? now - slot.resume_ns : 0;
++            // The ring moved under the walk (an entry completed and another came in).
++            if (view.outcome == Outcome::Sleep && slot.resume_ns != 0 &&
++                (slot.head != view.head || slot.count != view.count)) {
++                view.outcome = Outcome::ListChanged;
++            }
++            if (view.outcome == Outcome::Sleep) {
++                sleep_ns = min_sleep;
++                if (walk > 0 && walk <= kStaleWalkNs) {
++                    sleep_ns = std::clamp(walk * kWalkFactor, min_sleep, max_sleep);
++                    ++g_stats.measured;
++                    g_stats.walk_ns += walk;
++                }
++                ++g_stats.slept;
++                g_stats.sleep_ns += sleep_ns;
++            }
++        }
++        ++g_stats.outcomes[static_cast<size_t>(view.outcome)];
++        ++g_stats.calls;
++        first = g_total_calls++ == 0;
++        if (first) {
++            g_interval_start_ns = now;
++        } else if (now - g_interval_start_ns >= kLogIntervalNs) {
++            do_log = true;
++            snapshot = g_stats;
++            interval_ns = now - g_interval_start_ns;
++            g_stats = Stats{};
++            g_interval_start_ns = now;
++        }
++    }
++    if (first) {
++        LOG_INFO(Kernel_SVC,
++                 "OoT resource poll backoff: active; a walk that issued nothing and saw no "
++                 "change sleeps {}x its length, {}-{} us",
++                 kWalkFactor, min_sleep / 1000, max_sleep / 1000);
++    }
++    if (do_log) {
++        LogStats(snapshot, interval_ns);
++    }
++
++    if (sleep_ns > 0) {
++        SleepThread(system, sleep_ns);
++    }
++
++    // The next walk starts now: remember when, and the ring it starts from.
++    if (view.outcome != Outcome::Frame) {
++        const u32 head = memory.Read32(view.manager + kHeadOffset);
++        const u32 count = memory.Read32(view.manager + kCountOffset);
++        const s64 resume = NowNs();
++        std::scoped_lock lock{g_mutex};
++        Slot& slot = FindSlot(view.manager);
++        slot.resume_ns = resume;
++        slot.head = head;
++        slot.count = count;
++    }
++    return true;
++}
++
++} // namespace Kernel::Svc
+diff --git a/src/core/hle/kernel/svc/svc_nx2_oot_poll.h b/src/core/hle/kernel/svc/svc_nx2_oot_poll.h
+new file mode 100644
+index 0000000..cf8b966
+--- /dev/null
++++ b/src/core/hle/kernel/svc/svc_nx2_oot_poll.h
+@@ -0,0 +1,24 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include "common/common_types.h"
++
++namespace Core {
++class System;
++}
++
++namespace Kernel::Svc {
++
++/// EDEN_UP_OOT_POLL_BACKOFF=1 (from Lichii PR 717, stephenjayakar).
++/// Ocarina of Time: svc 0xF3, placed by the built-in patch "Resource poll backoff" on the path where
++/// the game's resource request loop (main+0xF7A0) would walk its pending requests again at once
++/// because one of them was not ready. If the walk that just ended was a pure re-check (it issued no
++/// load, the request list and the loop state did not change, no exit is pending), it sleeps the
++/// calling thread for a time proportional to the walk's own length; otherwise it returns at once,
++/// as the original branch would. Leaves every register as it was. Returns false (and does nothing)
++/// for any other SVC.
++bool CallNx2OotPollBackoff(Core::System& system, u32 imm);
++
++} // namespace Kernel::Svc
+diff --git a/src/core/hle/kernel/svc/svc_nx2_zstd.cpp b/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
+new file mode 100644
+index 0000000..7de0366
+--- /dev/null
++++ b/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
+@@ -0,0 +1,424 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++#define ZSTD_STATIC_LINKING_ONLY
++#include <zstd.h>
++
++#include "common/logging.h"
++#include "common/scratch_buffer.h"
++#include "core/arm/arm_interface.h"
++#include "core/core.h"
++#include "core/hle/kernel/k_process.h"
++#include "core/hle/kernel/k_thread.h"
++#include "core/hle/kernel/kernel.h"
++#include "core/hle/kernel/svc/svc_nx2_zstd.h"
++#include "core/hle/kernel/svc_types.h"
++#include "core/memory.h"
++
++namespace Kernel::Svc {
++namespace {
++
++// From Lichii PR 717 (stephenjayakar, zortos293/Lichii eb3553bcb8), unchanged but for the switch
++// names. Here the game patch that reaches this code is off unless EDEN_UP_OOT_NATIVE_ZSTD=1
++// (core/file_sys/patch_manager.cpp).
++//
++// Ocarina of Time (main build E0F3CCFA...): the asset streaming jobs decompress with
++// ZSTD_decompressMultiFrame(dctx, dst, dstCapacity, src, srcSize, dict, dictSize, ddict) at
++// main+0xEB380. Each of its three callers re-initialises a static DCtx (default parameters, format
++// zstd1) right before the call and only uses the return value, so a default host DCtx decodes the
++// same bytes. svc 0xF0 + i replaces the bl at kCallSites[i].
++constexpr u64 kOotProgramId = 0x0400486024DEC000ULL;
++constexpr u64 kMultiFrameOffset = 0xEB380;
++constexpr std::array<u64, 3> kCallSites{0xBF72E0, 0xF50164, 0xE910C};
++constexpr u32 kFirstSvc = 0xF0;
++constexpr size_t kMaxSize = size_t{512} << 20;
++
++// The guest ZSTD_DDict (0x6860 bytes, from ZSTD_createDDict_advanced at main+0x348B740 and
++// ZSTD_initDDict_internal at main+0x348B850):
++//   +0x0000 dictBuffer, +0x0008 dictContent, +0x0010 dictSize, +0x0018 entropy tables
++//   (LL +0x18, OF +0x1020, ML +0x1828, HUF +0x2830, rep[3] +0x6834), +0x6840 dictID,
++//   +0x6844 entropyPresent, +0x6848 customMem.
++// ZSTD_decompressBegin_usingDDict (main+0x348B610) reads exactly these fields. The game creates
++// its dictionaries (Pack/ZsDic.pack) with ZSTD_dlm_byRef and ZSTD_dct_auto (main+0x3B91638) and
++// picks the ddict by the frame header's dictID (main+0xE8FB4 -> main+0x348C540).
++constexpr u64 kDDictContent = 0x8;
++constexpr u64 kDDictSize = 0x10;
++constexpr u64 kDDictId = 0x6840;
++constexpr u64 kDDictEntropyPresent = 0x6844;
++constexpr u64 kDDictReadEnd = 0x6848;
++constexpr u64 kMaxDictSize = u64{64} << 20;
++constexpr size_t kMaxDictEntries = 16;
++constexpr size_t kEdgeBytes = 64;
++constexpr s64 kRevalidateNs = 1'000'000'000;
++constexpr s64 kLogIntervalNs = 1'000'000'000;
++
++// EDEN_UP_OOT_ZSTD_DICT: "0" sends calls with a ddict to the game's decoder again (only calls
++// without a dictionary use host libzstd then). Default on.
++bool DictEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_UP_OOT_ZSTD_DICT");
++        return value == nullptr || value[0] == 0 || value[0] != '0';
++    }();
++    return enabled;
++}
++
++s64 NowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++struct DCtxDeleter {
++    void operator()(ZSTD_DCtx* dctx) const {
++        ZSTD_freeDCtx(dctx);
++    }
++};
++
++struct DDictDeleter {
++    void operator()(ZSTD_DDict* ddict) const {
++        ZSTD_freeDDict(ddict);
++    }
++};
++
++struct Stats {
++    std::atomic<u64> calls{};
++    std::atomic<u64> ddict_calls{};
++    std::atomic<u64> fallbacks{};
++    std::atomic<u64> bytes{};
++    std::atomic<u64> dict_hits{};
++    std::atomic<u64> dict_builds{};
++};
++Stats g_stats;
++
++// The guest ddict fields that decide how a frame decodes.
++struct GuestDDict {
++    u64 address{};
++    u64 content{};
++    u64 size{};
++    u32 dict_id{};
++    u32 entropy_present{};
++
++    bool operator==(const GuestDDict&) const = default;
++};
++
++// A host copy of one guest dictionary. The host DDict references `content` (byRef), so it is
++// declared after it and destroyed first. A null `ddict` means the game's decoder handles it.
++struct DictEntry {
++    GuestDDict key;
++    std::vector<u8> content;
++    std::unique_ptr<ZSTD_DDict, DDictDeleter> ddict;
++    std::atomic<s64> validated_ns{};
++    std::atomic<s64> last_use_ns{};
++};
++
++struct DictCache {
++    std::mutex mutex;
++    std::vector<std::shared_ptr<DictEntry>> entries;
++};
++
++DictCache& Cache() {
++    static DictCache cache;
++    return cache;
++}
++
++bool ReadGuestDDict(Core::Memory::Memory& memory, u64 address, GuestDDict& out) {
++    if (!memory.IsValidVirtualAddressRange(address, kDDictReadEnd)) {
++        return false;
++    }
++    out.address = address;
++    out.content = memory.Read64(address + kDDictContent);
++    out.size = memory.Read64(address + kDDictSize);
++    out.dict_id = memory.Read32(address + kDDictId);
++    out.entropy_present = memory.Read32(address + kDDictEntropyPresent);
++    return out.content != 0 && out.size != 0 && out.size <= kMaxDictSize &&
++           memory.IsValidVirtualAddressRange(out.content, out.size);
++}
++
++// Cheap per-call check: the first and last bytes of the guest dictionary still match the copy.
++bool EdgesMatch(Core::Memory::Memory& memory, const DictEntry& entry) {
++    const size_t size = entry.content.size();
++    const size_t n = std::min(size, kEdgeBytes);
++    std::array<u8, kEdgeBytes> buffer;
++    if (!memory.ReadBlock(entry.key.content, buffer.data(), n) ||
++        std::memcmp(buffer.data(), entry.content.data(), n) != 0) {
++        return false;
++    }
++    if (size > n) {
++        if (!memory.ReadBlock(entry.key.content + size - n, buffer.data(), n) ||
++            std::memcmp(buffer.data(), entry.content.data() + size - n, n) != 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Full check, at most once a second per dictionary: the whole guest dictionary matches the copy.
++bool ContentMatches(Core::Memory::Memory& memory, const DictEntry& entry) {
++    thread_local Common::ScratchBuffer<u8> scratch;
++    const size_t size = entry.content.size();
++    scratch.resize_destructive(size);
++    return memory.ReadBlock(entry.key.content, scratch.data(), size) &&
++           std::memcmp(scratch.data(), entry.content.data(), size) == 0;
++}
++
++// Copies the guest dictionary and loads it the way the guest did: ZSTD_dct_auto with byRef gives
++// entropyPresent = 1 and dictID from the header for a zstd dictionary (magic 0xEC30A437), and
++// entropyPresent = 0, dictID = 0 for raw content. The host DDict gets the matching explicit type,
++// and its dictID must equal the guest's. Null when the dictionary could not be read.
++std::shared_ptr<DictEntry> BuildEntry(Core::Memory::Memory& memory, const GuestDDict& key,
++                                      s64 now) {
++    auto entry = std::make_shared<DictEntry>();
++    entry->key = key;
++    entry->content.resize(key.size);
++    if (!memory.ReadBlock(key.content, entry->content.data(), key.size)) {
++        return nullptr;
++    }
++    entry->validated_ns.store(now, std::memory_order_relaxed);
++    entry->last_use_ns.store(now, std::memory_order_relaxed);
++    const char* type_name = "unusual";
++    if (key.entropy_present == 1 || (key.entropy_present == 0 && key.dict_id == 0)) {
++        const bool full = key.entropy_present == 1;
++        type_name = full ? "zstd dictionary" : "raw content";
++        entry->ddict.reset(ZSTD_createDDict_advanced(
++            entry->content.data(), entry->content.size(), ZSTD_dlm_byRef,
++            full ? ZSTD_dct_fullDict : ZSTD_dct_rawContent, ZSTD_defaultCMem));
++        if (entry->ddict && ZSTD_getDictID_fromDDict(entry->ddict.get()) != key.dict_id) {
++            entry->ddict.reset();
++        }
++    }
++    static std::atomic<u32> logged{};
++    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
++        LOG_INFO(Kernel_SVC,
++                 "Native zstd: ddict {:#x} (content {:#x}, {} bytes, dictID {:#x}, {}): {}",
++                 key.address, key.content, key.size, key.dict_id, type_name,
++                 entry->ddict ? "decoding on the host" : "left to the game's decoder");
++    }
++    return entry;
++}
++
++// The host dictionary for a guest ddict, rebuilt when the guest ddict or its content changes.
++// Null when the dictionary could not be read (not cached).
++std::shared_ptr<DictEntry> GetDict(Core::Memory::Memory& memory, const GuestDDict& key, s64 now) {
++    auto& cache = Cache();
++    std::shared_ptr<DictEntry> entry;
++    {
++        std::scoped_lock lock{cache.mutex};
++        for (const auto& candidate : cache.entries) {
++            if (candidate->key == key) {
++                entry = candidate;
++                break;
++            }
++        }
++    }
++    if (entry) {
++        bool valid = EdgesMatch(memory, *entry);
++        if (valid && now - entry->validated_ns.load(std::memory_order_relaxed) >= kRevalidateNs) {
++            valid = ContentMatches(memory, *entry);
++            if (valid) {
++                entry->validated_ns.store(now, std::memory_order_relaxed);
++            }
++        }
++        if (valid) {
++            entry->last_use_ns.store(now, std::memory_order_relaxed);
++            return entry;
++        }
++    }
++    auto fresh = BuildEntry(memory, key, now);
++    if (!fresh) {
++        return nullptr;
++    }
++    g_stats.dict_builds.fetch_add(1, std::memory_order_relaxed);
++    std::scoped_lock lock{cache.mutex};
++    std::erase_if(cache.entries, [&](const std::shared_ptr<DictEntry>& old) {
++        return old->key.address == key.address || old->key == key;
++    });
++    if (cache.entries.size() >= kMaxDictEntries) {
++        const auto oldest = std::min_element(
++            cache.entries.begin(), cache.entries.end(), [](const auto& a, const auto& b) {
++                return a->last_use_ns.load(std::memory_order_relaxed) <
++                       b->last_use_ns.load(std::memory_order_relaxed);
++            });
++        cache.entries.erase(oldest);
++    }
++    cache.entries.push_back(fresh);
++    return fresh;
++}
++
++// Only zstd1 and skippable frames, each complete: anything else (legacy formats the host library
++// would accept, truncated input, trailing bytes) goes to the game's decoder.
++bool OnlyStandardFrames(const u8* src, size_t size) {
++    if (size == 0) {
++        return false;
++    }
++    while (size != 0) {
++        if (size < 4) {
++            return false;
++        }
++        u32 magic;
++        std::memcpy(&magic, src, sizeof(magic));
++        if (magic != ZSTD_MAGICNUMBER &&
++            (magic & ZSTD_MAGIC_SKIPPABLE_MASK) != ZSTD_MAGIC_SKIPPABLE_START) {
++            return false;
++        }
++        const size_t frame_size = ZSTD_findFrameCompressedSize(src, size);
++        if (ZSTD_isError(frame_size) || frame_size == 0 || frame_size > size) {
++            return false;
++        }
++        src += frame_size;
++        size -= frame_size;
++    }
++    return true;
++}
++
++// Decompresses on the host. Returns nullptr on success (args[0] then holds the decompressed size,
++// as the function returns), or the reason the game's own function must run instead; then nothing
++// was written to guest memory.
++const char* HostDecompress(Core::Memory::Memory& memory, std::span<uint64_t, 8> args, s64 now) {
++    const u64 dst = args[1];
++    const u64 capacity = args[2];
++    const u64 src = args[3];
++    const u64 src_size = args[4];
++    const u64 ddict_address = args[7];
++    if (args[5] != 0 || args[6] != 0) {
++        return "raw dict argument";
++    }
++    if (src_size == 0 || src_size > kMaxSize || !memory.IsValidVirtualAddressRange(src, src_size)) {
++        return "source size or range";
++    }
++    // With a ddict, ZSTD_decompressMultiFrame is ZSTD_decompress_usingDDict: the same function
++    // with the same ddict fields gives the same bytes and the same return value.
++    std::shared_ptr<DictEntry> dict;
++    if (ddict_address != 0) {
++        if (!DictEnabled()) {
++            return "ddict (EDEN_UP_OOT_ZSTD_DICT=0)";
++        }
++        GuestDDict key;
++        if (!ReadGuestDDict(memory, ddict_address, key)) {
++            return "unreadable or unusual ddict";
++        }
++        dict = GetDict(memory, key, now);
++        if (!dict) {
++            return "dictionary content unreadable";
++        }
++        if (!dict->ddict) {
++            return "dictionary type or dictID the host does not reproduce";
++        }
++    }
++    thread_local Common::ScratchBuffer<u8> input;
++    thread_local Common::ScratchBuffer<u8> output;
++    thread_local std::unique_ptr<ZSTD_DCtx, DCtxDeleter> dctx{ZSTD_createDCtx()};
++    if (!dctx) {
++        return "no host DCtx";
++    }
++    input.resize_destructive(src_size);
++    if (!memory.ReadBlock(src, input.data(), src_size)) {
++        return "source unreadable";
++    }
++    if (!OnlyStandardFrames(input.data(), src_size)) {
++        return "not only complete zstd1/skippable frames";
++    }
++    // Same result for any capacity >= the output, and a capacity below it fails either way.
++    const unsigned long long bound = ZSTD_decompressBound(input.data(), src_size);
++    if (bound == ZSTD_CONTENTSIZE_ERROR) {
++        return "no decompression bound";
++    }
++    const u64 out_capacity = std::min<u64>(capacity, bound);
++    if (out_capacity > kMaxSize) {
++        return "output too large";
++    }
++    output.resize_destructive(std::max<size_t>(out_capacity, 1));
++    const size_t result =
++        dict ? ZSTD_decompress_usingDDict(dctx.get(), output.data(), out_capacity, input.data(),
++                                          src_size, dict->ddict.get())
++             : ZSTD_decompressDCtx(dctx.get(), output.data(), out_capacity, input.data(),
++                                   src_size);
++    if (ZSTD_isError(result)) {
++        return ZSTD_getErrorName(result);
++    }
++    if (result != 0) {
++        if (!memory.IsValidVirtualAddressRange(dst, result)) {
++            return "destination range";
++        }
++        memory.WriteBlock(dst, output.data(), result);
++    }
++    if (dict) {
++        g_stats.dict_hits.fetch_add(1, std::memory_order_relaxed);
++    }
++    args[0] = result;
++    return nullptr;
++}
++
++// Runs the game's function as the replaced bl would have: lr = the instruction after the svc.
++void RunGuestFunction(Core::System& system, KProcess& process, u32 imm) {
++    auto* const arm = process.GetArmInterface(system.Kernel().CurrentPhysicalCoreIndex());
++    ThreadContext ctx{};
++    arm->GetContext(ctx);
++    const u64 return_address = ctx.pc;
++    ctx.lr = return_address;
++    ctx.pc = return_address - 4 - kCallSites[imm - kFirstSvc] + kMultiFrameOffset;
++    arm->SetContext(ctx);
++}
++
++// At most one counters line a second (the first call logs at once).
++void MaybeLogCounters(s64 now) {
++    static std::atomic<s64> next_log_ns{0};
++    s64 next = next_log_ns.load(std::memory_order_relaxed);
++    if (now < next ||
++        !next_log_ns.compare_exchange_strong(next, now + kLogIntervalNs,
++                                             std::memory_order_relaxed)) {
++        return;
++    }
++    LOG_INFO(Kernel_SVC,
++             "Native zstd: {} calls ({} with a ddict), {} MiB decompressed on the host, {} "
++             "dictionary hits, {} dictionaries built, {} by the game",
++             g_stats.calls.load(std::memory_order_relaxed),
++             g_stats.ddict_calls.load(std::memory_order_relaxed),
++             g_stats.bytes.load(std::memory_order_relaxed) >> 20,
++             g_stats.dict_hits.load(std::memory_order_relaxed),
++             g_stats.dict_builds.load(std::memory_order_relaxed),
++             g_stats.fallbacks.load(std::memory_order_relaxed));
++}
++
++} // Anonymous namespace
++
++bool CallNx2OotZstd(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
++    if (imm < kFirstSvc || imm >= kFirstSvc + kCallSites.size()) {
++        return false;
++    }
++    auto& process = GetCurrentProcess(system.Kernel());
++    if (!process.Is64Bit() || process.GetProgramId() != kOotProgramId) {
++        return false;
++    }
++    const s64 now = NowNs();
++    g_stats.calls.fetch_add(1, std::memory_order_relaxed);
++    if (args[7] != 0) {
++        g_stats.ddict_calls.fetch_add(1, std::memory_order_relaxed);
++    }
++    const char* const reason = HostDecompress(process.GetMemory(), args, now);
++    if (reason == nullptr) {
++        g_stats.bytes.fetch_add(args[0], std::memory_order_relaxed);
++    } else {
++        if (g_stats.fallbacks.fetch_add(1, std::memory_order_relaxed) < 16) {
++            LOG_WARNING(Kernel_SVC,
++                        "Native zstd (svc {:#x}): src={:#x} size={:#x} dst={:#x} cap={:#x} "
++                        "dict={:#x}/{:#x} ddict={:#x}: {}; running the game's decoder",
++                        imm, args[3], args[4], args[1], args[2], args[5], args[6], args[7],
++                        reason);
++        }
++        RunGuestFunction(system, process, imm);
++    }
++    MaybeLogCounters(now);
++    return true;
++}
++
++} // namespace Kernel::Svc
+diff --git a/src/core/hle/kernel/svc/svc_nx2_zstd.h b/src/core/hle/kernel/svc/svc_nx2_zstd.h
+new file mode 100644
+index 0000000..f1e6869
+--- /dev/null
++++ b/src/core/hle/kernel/svc/svc_nx2_zstd.h
+@@ -0,0 +1,23 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <cstdint>
++#include <span>
++
++#include "common/common_types.h"
++
++namespace Core {
++class System;
++}
++
++namespace Kernel::Svc {
++
++/// EDEN_UP_OOT_NATIVE_ZSTD=1 (from Lichii PR 717, stephenjayakar).
++/// Ocarina of Time: svc 0xF0-0xF2 placed by the built-in patch "Native zstd" over the game's calls
++/// to ZSTD_decompressMultiFrame (with or without a ZSTD_DDict). Returns false (and does nothing)
++/// for any other SVC.
++bool CallNx2OotZstd(Core::System& system, u32 imm, std::span<uint64_t, 8> args);
++
++} // namespace Kernel::Svc
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index c0a875b..708dbdc 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -243,7 +243,18 @@ public:
+         // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
+         // Time's title screen and file select reached 16,384 slots over 64 banks (its gameplay
+         // windows span at most 36 slots). Past a bank, drop the count as a reset would.
+-        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE) {
++        // EDEN_UP_ZPASS_QUERY_BANKS=<1 to 4> (Lichii PR 718, 88783d558d, which made it 4): the
++        // bound in banks of 256 slots. Lichii measured gameplay windows of up to 346 slots across
++        // two banks (Hyrule Field, Kakariko Village, the Shooting Gallery); a window cut here
++        // restarts its count, which reads as "visible" for the object the cut falls in. Unset or
++        // anything else: 1 bank, as before.
++        static const size_t max_running_slots = [] {
++            const char* const value = std::getenv("EDEN_UP_ZPASS_QUERY_BANKS");
++            const long banks = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
++            return static_cast<size_t>(banks >= 1 && banks <= 4 ? banks : 1) *
++                   SamplesQueryBank::BANK_SIZE;
++        }();
++        if (current_query && current_query->size_slots > max_running_slots) {
+             ResetCounter();
+         }
+     }
