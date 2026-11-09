@@ -1,0 +1,1066 @@
+Subject: [PATCH] fritchii2-writemark: a native compute dispatch marks a written storage binding GPU-written only as
+
+fritchii2-writemark: a native compute dispatch marks a written storage binding GPU-written only as
+far as the program's stores can reach, not the whole binding of up to 8 MiB. Switch
+EDEN_UP_FRITCHII_WRITEMARK=1, off unless exactly "1"; behaviour unchanged unset (the analysis does
+not run, no extent is stored, every mark is the old call).
+
+Upstream: Frizti/Fritchii ca82af4712 (store reach bound in GlobalMemoryToStorageBufferPass, new
+storage_write_extent.h, taken whole) and b4204230c9 (BindComputeStorageBuffer marks
+min(binding, pad + extent), BindMultiRangeStorage spreads the mark over the segments; Fritchii's
+"Native compute write mark" setting, default Auto, is this switch; 1624f65e38's EXP1=1 whole-mark
+A/B is the switch unset). From zortos293/Lichii#415 (open), co-authored by Claude Fable 5.1.
+Fritchii's numbers: ~130 Ocarina skinning dispatches a frame write 17-45 KB each but marked 8 MiB
+each; on an RX 6600 XT Kokiri/Deku Tree went from 24-25 to 44-47 fps (PC, with fence downloads).
+
+How: the pass bounds each store's low address minus the buffer's pointer word as an affine upper
+bound in gl_LocalInvocationID/gl_WorkGroupID with constant non-negative strides (adds, constant
+multiplies and shifts, masks, bit-field extracts, selects, non-loop phis; IMAD's 16-bit halves under
+a guard checked per dispatch). Anything else (a loaded value, another constant buffer word, a
+loop-carried index) leaves it unknown. BindComputeStorageBuffer resolves it with the QMD's block and
+grid (an indirect dispatch's group terms: unknown) and BindHostComputeStorageBuffers marks
+min(binding, pad + extent). Unknown extents, Maxwell programs, read-only bindings, table pointers
+and DLSS dispatches keep the whole binding.
+
+Port changes against upstream:
+1. Extents live in a separate Info::storage_write_extents vector (FindStorageWriteExtent), not in
+   StorageBufferDescriptor: Info holds up to 64 descriptors inline (static_vector), and the 60-byte
+   extent would have grown every Info by ~3.8 KiB and every graphics pipeline by ~19 KiB, switch
+   or not. Unset, Info grows by one empty std::vector.
+2. Any write left global drops every extent of the program (counted over the IR, not through
+   CollectStorageBuffers' returns, which differ here: paired pointers, full bindings). Upstream
+   dropped only a multi-candidate access's candidates, but a native program's global accesses pick
+   their buffer at run time among all bound buffers (spirv_emit_context.cpp, native_global_bounds).
+3. Analysis hardening, each closing an under-mark upstream's rules allow (the host test's "hole"
+   cases pass here and fail with upstream's rules put back):
+   - A value that can go below zero (and wrap to 2^32 and up) is tracked (neg); masks, shifts,
+     minimums, bit-field extracts and guards take only values that never do. Upstream checked
+     c >= 0 only: (BFE(x, 0, 8) - 4) >> 12 was bounded at 8 bytes and reaches 4 MiB.
+   - x - k takes only an exact constant k (upstream subtracted a mask's largest value).
+   - Exactness does not survive a multiplication by a bound (x * (y & 0xff)).
+   - A store whose offset can go 2^31 or more below the pointer is unknown, and only bindings under
+     2 GiB are narrowed, so a wrapped offset always lands outside the binding.
+   - Every product is range-checked before it is formed.
+   - (review fix) A multiplication by a factor that is only a bound (a mask, a minimum, a
+     select) needs a value whose bound never goes below zero, and a factor that can itself be
+     below zero is no bound: (c0 & 0xff) * -5 + 2000 was bounded at 729 bytes and reaches 2004
+     (upstream has the same hole). Host test case HoleNegativeTimesBound.
+4. A log line every power of two: "EDEN_UP_FRITCHII_WRITEMARK: N native written bindings marked as
+   far as their stores reach, M MiB fewer bytes marked; last X of Y bytes".
+
+Not ported: Fritchii's settings plumbing (settings.h/enums, Qt translation), the GL compute
+pipeline call (the default argument keeps it whole), the EDEN_NX2_WRITTEN_SSBO_MARK_KIB cap our
+tree does not have, and the 251-line Catch2 test (fritchii2-writemark_test.cpp is a host version
+of its cases plus the hardening cases).
+
+Here: our StorageBufferBinding takes the qword after a direct native pointer as a size when it
+looks like one (native_pointer is only DLSS/table pointers), so not every binding is 8 MiB; the log
+line tells how much is cut. Fence downloads are off for us, so the PC gain is not expected. What
+the over-mark costs here: the CPU's later writes to those pages wait for the next fence (stale
+per-object data, Fritchii's white leaves), the pages' GPU-written bits are set for good (command
+lists and semaphores there take the slow paths), and the back books 130 x 8 MiB of marks a frame.
+Risk: an extent too small leaves stale data; the bits never clear, so start the switch from boot.
+Files: shader_recompiler CMakeLists.txt, storage_write_extent.h (new), shader_info.h,
+ir_opt/global_memory_to_storage_buffer_pass.cpp, frontend/maxwell/translate_program.cpp;
+video_core buffer_cache.h, buffer_cache_base.h, renderer_vulkan/vk_compute_pipeline.cpp (the
+generated vk_compute_pipeline_cost.cpp carries the change, no anchor touched).
+
+T83: rebased onto the T83 stack (context only: fritchii-churn and fritchii2-lastaddr changed neighbouring lines).
+
+diff --git a/src/shader_recompiler/CMakeLists.txt b/src/shader_recompiler/CMakeLists.txt
+index 13c0c06..cb92bba 100644
+--- a/src/shader_recompiler/CMakeLists.txt
++++ b/src/shader_recompiler/CMakeLists.txt
+@@ -205,6 +205,7 @@ add_library(shader_recompiler STATIC
+     program_header.h
+     runtime_info.h
+     shader_info.h
++    storage_write_extent.h
+     varying_state.h)
+ 
+ if (ENABLE_OPENGL)
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index f750573..9d38571 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -99,6 +99,11 @@ void AddNVNStorageBuffers(IR::Program& program) {
+     if (!program.info.uses_global_memory) {
+         return;
+     }
++    if (program.info.stores_global_memory) {
++        // EDEN_UP_FRITCHII_WRITEMARK (Fritchii ca82af4712): a global store may land anywhere in
++        // any of the program's buffers (GlobalMemoryToStorageBufferPass proved none then anyway)
++        program.info.storage_write_extents.clear();
++    }
+     const u32 driver_cbuf{0};
+     const u32 descriptor_size{0x10};
+     const u32 num_buffers{16};
+diff --git a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+index 1851933..117ba0c 100644
+--- a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
++++ b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+@@ -30,6 +30,7 @@
+ #include "shader_recompiler/frontend/ir/value.h"
+ #include "shader_recompiler/host_translate_info.h"
+ #include "shader_recompiler/ir_opt/passes.h"
++#include "shader_recompiler/storage_write_extent.h"
+ 
+ namespace Shader::Optimization {
+ namespace {
+@@ -1582,6 +1583,542 @@ size_t PendingNvnBindings(const IR::Program& program, const StorageBufferSet& se
+     return pending;
+ }
+ 
++// EDEN_UP_FRITCHII_WRITEMARK=1 (Frizti/Fritchii ca82af4712, zortos293/Lichii#415): for native
++// compute programs, bound how far the stores reach into each storage buffer, so a dispatch marks
++// only that much of its binding GPU-written (BufferCache::BindComputeStorageBuffer) instead of
++// the whole binding of up to 8 MiB. Off unless exactly "1"; read once.
++bool WriteMarkSwitch() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_WRITEMARK");
++    return enabled;
++}
++
++/// Bytes a global store or atomic writes
++u32 StoreSize(IR::Opcode opcode) {
++    switch (opcode) {
++    case IR::Opcode::WriteGlobalS8:
++    case IR::Opcode::WriteGlobalU8:
++        return 1;
++    case IR::Opcode::WriteGlobalS16:
++    case IR::Opcode::WriteGlobalU16:
++        return 2;
++    case IR::Opcode::WriteGlobal64:
++    case IR::Opcode::GlobalAtomicIAdd64:
++    case IR::Opcode::GlobalAtomicSMin64:
++    case IR::Opcode::GlobalAtomicUMin64:
++    case IR::Opcode::GlobalAtomicSMax64:
++    case IR::Opcode::GlobalAtomicUMax64:
++    case IR::Opcode::GlobalAtomicAnd64:
++    case IR::Opcode::GlobalAtomicOr64:
++    case IR::Opcode::GlobalAtomicXor64:
++    case IR::Opcode::GlobalAtomicExchange64:
++    case IR::Opcode::GlobalAtomicIAdd32x2:
++    case IR::Opcode::GlobalAtomicSMin32x2:
++    case IR::Opcode::GlobalAtomicUMin32x2:
++    case IR::Opcode::GlobalAtomicSMax32x2:
++    case IR::Opcode::GlobalAtomicUMax32x2:
++    case IR::Opcode::GlobalAtomicAnd32x2:
++    case IR::Opcode::GlobalAtomicOr32x2:
++    case IR::Opcode::GlobalAtomicXor32x2:
++    case IR::Opcode::GlobalAtomicExchange32x2:
++    case IR::Opcode::GlobalAtomicAddF32x2:
++    case IR::Opcode::GlobalAtomicMinF32x2:
++    case IR::Opcode::GlobalAtomicMaxF32x2:
++        return 8;
++    case IR::Opcode::WriteGlobal128:
++        return 16;
++    default:
++        return 4;
++    }
++}
++
++/// A bound of an unsigned 32-bit value for every invocation of a dispatch:
++/// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
++/// plus `base` times the storage buffer's pointer word. All coefficients are non-negative.
++/// Port hardening (not upstream): the value is congruent mod 2^32 to an integer I with
++/// -neg <= I <= the bound. A value whose I can be negative (neg != 0) wrapped to 2^32 and above,
++/// so the bound holds for it only through additions and constant multiplications; masks, shifts,
++/// minimums and the like take only values with neg == 0. `exact`: I is the sum itself (an
++/// immediate, an id, the pointer, and sums and exact multiples of those), whose least value is c.
++struct IdBound {
++    s64 c{};
++    std::array<u64, 6> coef{};
++    u32 base{};
++    u64 neg{};
++    bool exact{true};
++
++    bool IsConstant() const {
++        return base == 0 && std::ranges::all_of(coef, [](u64 value) { return value == 0; });
++    }
++    bool HasGroupTerms() const {
++        return coef[3] != 0 || coef[4] != 0 || coef[5] != 0;
++    }
++    /// A value masks, shifts and minimums may take: never below zero, no pointer term
++    bool NonNegative() const {
++        return base == 0 && c >= 0 && neg == 0;
++    }
++};
++
++/// Proves where a program's stores to one storage buffer can land relative to its pointer word.
++/// Anything not provably affine in the invocation and workgroup ids with constant non-negative
++/// strides (a value loaded from memory or read from another constant buffer word, a loop-carried
++/// index, a signed or 64-bit computation) leaves the extent unknown.
++class StoreExtentAnalysis {
++public:
++    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_)
++        : buffer{buffer_}, workgroup{workgroup_} {}
++
++    /// Extent of one store, merged into `extent`
++    void AddStore(IR::Inst& inst, StorageWriteExtent& extent) {
++        const std::optional<StorageWriteExtent> store{StoreExtent(inst)};
++        if (!store) {
++            extent = StorageWriteExtent{};
++            return;
++        }
++        MergeStorageWriteExtent(extent, *store);
++    }
++
++private:
++    static constexpr s64 CONST_LIMIT = s64{1} << 40;
++    static constexpr u64 COEF_LIMIT = u64{1} << 32;
++    static constexpr u64 NEG_LIMIT = u64{1} << 40;
++    /// A store whose offset can go this far below the pointer is left unknown: past it, the
++    /// wrapped offset (2^32 and above, less this) could land back inside a binding.
++    static constexpr u64 WRAP_LIMIT = u64{1} << 31;
++    static constexpr u32 MAX_DEPTH = 256;
++
++    std::optional<StorageWriteExtent> StoreExtent(IR::Inst& inst) {
++        const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
++        if (!addr) {
++            return std::nullopt;
++        }
++        const std::optional<IdBound> low{Evaluate(addr->value, 0)};
++        if (!low || low->base != 1 || guard_failed) {
++            return std::nullopt;
++        }
++        const u64 below{low->neg + (addr->imm_offset < 0 ? static_cast<u64>(-s64{addr->imm_offset})
++                                                         : u64{0})};
++        if (below >= WRAP_LIMIT) {
++            return std::nullopt;
++        }
++        const s64 end{low->c + addr->imm_offset + StoreSize(inst.GetOpcode())};
++        if (end > s64{0xffffffff}) {
++            return std::nullopt;
++        }
++        StorageWriteExtent result{
++            .bounded = true,
++            .const_end = static_cast<u32>((std::max)(end, s64{0})),
++        };
++        for (size_t i = 0; i < 3; ++i) {
++            if (low->coef[i] >= COEF_LIMIT || low->coef[i + 3] >= COEF_LIMIT) {
++                return std::nullopt;
++            }
++            result.local_stride[i] = static_cast<u32>(low->coef[i]);
++            result.group_stride[i] = static_cast<u32>(low->coef[i + 3]);
++        }
++        if (guard) {
++            if (guard->c > s64{0xffff}) {
++                return std::nullopt;
++            }
++            result.guarded = true;
++            result.guard_const = static_cast<u32>((std::max)(guard->c, s64{0}));
++            for (size_t i = 0; i < 3; ++i) {
++                if (guard->coef[i] > 0xffff || guard->coef[i + 3] > 0xffff) {
++                    return std::nullopt;
++                }
++                result.guard_local_stride[i] = static_cast<u32>(guard->coef[i]);
++                result.guard_group_stride[i] = static_cast<u32>(guard->coef[i + 3]);
++            }
++        }
++        return result;
++    }
++
++    static std::optional<IdBound> Checked(IdBound value) {
++        if (value.c > CONST_LIMIT || value.c < -CONST_LIMIT || value.base > 1 ||
++            value.neg > NEG_LIMIT) {
++            return std::nullopt;
++        }
++        for (const u64 coef : value.coef) {
++            if (coef >= COEF_LIMIT) {
++                return std::nullopt;
++            }
++        }
++        return value;
++    }
++
++    /// An exact constant (an immediate, or a field that is exactly that value)
++    static std::optional<IdBound> Constant(s64 value) {
++        return IdBound{.c = value, .neg = value < 0 ? static_cast<u64>(-value) : u64{0}};
++    }
++
++    /// A bound that is no longer the value itself (a mask, a minimum, a field's largest value)
++    static std::optional<IdBound> Loose(std::optional<IdBound> value) {
++        if (value) {
++            value->exact = false;
++        }
++        return value;
++    }
++
++    static std::optional<IdBound> Sum(const IdBound& lhs, const IdBound& rhs) {
++        IdBound result{.c = lhs.c + rhs.c, .base = lhs.base + rhs.base,
++                       .exact = lhs.exact && rhs.exact};
++        for (size_t i = 0; i < result.coef.size(); ++i) {
++            result.coef[i] = lhs.coef[i] + rhs.coef[i];
++        }
++        // An exact sum is least at the ids' zero: c. Otherwise the two least values add up.
++        result.neg = result.exact ? (result.c < 0 ? static_cast<u64>(-result.c) : u64{0})
++                                  : lhs.neg + rhs.neg;
++        return Checked(result);
++    }
++
++    /// Component-wise maximum: a bound of either value (ids are non-negative)
++    static std::optional<IdBound> Max(const IdBound& lhs, const IdBound& rhs) {
++        if (lhs.base != rhs.base) {
++            return std::nullopt;
++        }
++        IdBound result{.c = (std::max)(lhs.c, rhs.c), .base = lhs.base,
++                       .neg = (std::max)(lhs.neg, rhs.neg), .exact = false};
++        for (size_t i = 0; i < result.coef.size(); ++i) {
++            result.coef[i] = (std::max)(lhs.coef[i], rhs.coef[i]);
++        }
++        return result;
++    }
++
++    /// value * factor, `factor_exact` when the factor is the value's multiplier itself rather than
++    /// a bound of it
++    static std::optional<IdBound> Scale(const IdBound& value, u64 factor, bool factor_exact) {
++        if (value.base != 0 || factor >= COEF_LIMIT) {
++            return std::nullopt;
++        }
++        // A factor that is only a bound can be anything from 0 up to it, so the product is at
++        // most max(0, value) * factor: (c + strides) * factor only bounds that while the value's
++        // bound never goes below zero, c >= 0 (review fix: (y & 0xff) * -5 + 2000 reaches 2004
++        // bytes, and was bounded at 729).
++        if (!factor_exact && value.c < 0) {
++            return std::nullopt;
++        }
++        // Every product is range-checked before it is formed (upstream formed c first).
++        if (value.neg != 0 && factor > NEG_LIMIT / value.neg) {
++            return std::nullopt;
++        }
++        if (value.c > 0 && factor > static_cast<u64>(CONST_LIMIT / value.c)) {
++            return std::nullopt;
++        }
++        if (value.c < 0 && factor > static_cast<u64>(CONST_LIMIT / -value.c)) {
++            return std::nullopt;
++        }
++        IdBound result{.c = value.c * static_cast<s64>(factor), .neg = value.neg * factor,
++                       .exact = value.exact && factor_exact};
++        for (size_t i = 0; i < result.coef.size(); ++i) {
++            if (value.coef[i] != 0 && factor > (COEF_LIMIT - 1) / value.coef[i]) {
++                return std::nullopt;
++            }
++            result.coef[i] = value.coef[i] * factor;
++        }
++        return Checked(result);
++    }
++
++    /// value >> shift, rounded up term by term (the sum of the rounded terms bounds the shifted sum)
++    static std::optional<IdBound> ShiftDown(const IdBound& value, u32 shift) {
++        if (!value.NonNegative() || shift >= 32) {
++            return std::nullopt;
++        }
++        const auto up = [shift](u64 x) { return (x + (u64{1} << shift) - 1) >> shift; };
++        IdBound result{.c = static_cast<s64>(up(static_cast<u64>(value.c))), .exact = false};
++        for (size_t i = 0; i < result.coef.size(); ++i) {
++            result.coef[i] = up(value.coef[i]);
++        }
++        return result;
++    }
++
++    /// The value's bound when only its local-id terms vary (the workgroup size is fixed), or
++    /// nullopt when it has workgroup terms or the pointer
++    std::optional<u64> StaticMax(const IdBound& value) const {
++        if (!value.NonNegative() || value.HasGroupTerms()) {
++            return std::nullopt;
++        }
++        u64 total{static_cast<u64>(value.c)};
++        for (size_t i = 0; i < 3; ++i) {
++            if (workgroup[i] == 0) {
++                return std::nullopt;
++            }
++            total += value.coef[i] * (workgroup[i] - 1);
++        }
++        return total;
++    }
++
++    /// Requires a value to stay below 2^16 for the bound to hold
++    void Guard(const IdBound& value) {
++        if (!value.NonNegative()) {
++            guard_failed = true;
++            return;
++        }
++        if (!guard) {
++            guard = value;
++            return;
++        }
++        const std::optional<IdBound> merged{Max(*guard, value)};
++        if (!merged) {
++            guard_failed = true;
++            return;
++        }
++        guard = *merged;
++    }
++
++    std::optional<IdBound> BitFieldExtract(const IR::Inst& inst, u32 depth) {
++        if (!inst.Arg(1).IsImmediate() || !inst.Arg(2).IsImmediate()) {
++            return std::nullopt;
++        }
++        const u32 offset{inst.Arg(1).U32()};
++        const u32 count{inst.Arg(2).U32()};
++        if (offset >= 32 || count == 0 || count > 32) {
++            return std::nullopt;
++        }
++        if (inst.Arg(0).IsImmediate()) {
++            const u64 field{(u64{inst.Arg(0).U32()} >> offset) & ((u64{1} << count) - 1)};
++            return Constant(static_cast<s64>(field));
++        }
++        const std::optional<IdBound> source{Evaluate(inst.Arg(0), depth + 1)};
++        const std::optional<IdBound> field_max{
++            count <= 24 ? Loose(Constant((s64{1} << count) - 1)) : std::nullopt};
++        if (!source || !source->NonNegative()) {
++            return field_max;
++        }
++        if (const std::optional<u64> static_max{StaticMax(*source)}) {
++            if ((*static_max >> offset) == 0) {
++                return Constant(0);
++            }
++        }
++        if (offset == 0) {
++            // A low field is at most the whole value
++            return Loose(source);
++        }
++        if (offset >= 16) {
++            // The high half of a lowered 32-bit multiplication's operand: zero while the operand
++            // stays below 2^16, which the dispatch checks
++            Guard(*source);
++            return Constant(0);
++        }
++        return ShiftDown(*source, offset);
++    }
++
++    std::optional<IdBound> Evaluate(const IR::Value& value, u32 depth) {
++        if (value.IsImmediate()) {
++            if (value.Type() != IR::Type::U32) {
++                return std::nullopt;
++            }
++            return Constant(static_cast<s64>(static_cast<s32>(value.U32())));
++        }
++        if (depth > MAX_DEPTH) {
++            return std::nullopt;
++        }
++        const IR::Inst* const inst{value.InstRecursive()};
++        if (const auto it{memo.find(inst)}; it != memo.end()) {
++            return it->second;
++        }
++        if (!active.insert(inst).second) {
++            // A cycle: a loop-carried value
++            return std::nullopt;
++        }
++        const std::optional<IdBound> result{EvaluateInst(*inst, depth)};
++        active.erase(inst);
++        memo.emplace(inst, result);
++        return result;
++    }
++
++    std::optional<IdBound> EvaluateInst(const IR::Inst& inst, u32 depth) {
++        if (const std::optional<StorageBufferAddr> word{CbufWord(&inst)}) {
++            if (*word == buffer) {
++                return IdBound{.base = 1};
++            }
++            return std::nullopt;
++        }
++        const auto arg{[&](size_t index) { return Evaluate(inst.Arg(index), depth + 1); }};
++        switch (inst.GetOpcode()) {
++        case IR::Opcode::CompositeExtractU32x3: {
++            if (inst.Arg(0).IsImmediate() || !inst.Arg(1).IsImmediate() || inst.Arg(1).U32() > 2) {
++                return std::nullopt;
++            }
++            const IR::Opcode vector{inst.Arg(0).InstRecursive()->GetOpcode()};
++            const u32 element{inst.Arg(1).U32()};
++            IdBound result;
++            if (vector == IR::Opcode::LocalInvocationId) {
++                result.coef[element] = 1;
++            } else if (vector == IR::Opcode::WorkgroupId) {
++                result.coef[3 + element] = 1;
++            } else {
++                return std::nullopt;
++            }
++            return result;
++        }
++        case IR::Opcode::IAdd32: {
++            const auto lhs{arg(0)};
++            const auto rhs{lhs ? arg(1) : std::nullopt};
++            return lhs && rhs ? Sum(*lhs, *rhs) : std::nullopt;
++        }
++        case IR::Opcode::ISub32: {
++            // x - k for an exact constant k only (a bound of k is no bound of x - k)
++            const auto lhs{arg(0)};
++            const auto rhs{lhs ? arg(1) : std::nullopt};
++            if (!lhs || !rhs || !rhs->IsConstant() || !rhs->exact) {
++                return std::nullopt;
++            }
++            return Sum(*lhs, *Constant(-rhs->c));
++        }
++        case IR::Opcode::IMul32: {
++            const auto lhs{arg(0)};
++            const auto rhs{lhs ? arg(1) : std::nullopt};
++            if (!lhs || !rhs) {
++                return std::nullopt;
++            }
++            // The factor must never be below zero: a select of 5 and -3 has c = 5 but can wrap
++            // the product to 2^32 and up (review fix; NonNegative, not just c >= 0).
++            if (rhs->IsConstant() && rhs->NonNegative()) {
++                return Scale(*lhs, static_cast<u64>(rhs->c), rhs->exact);
++            }
++            if (lhs->IsConstant() && lhs->NonNegative()) {
++                return Scale(*rhs, static_cast<u64>(lhs->c), lhs->exact);
++            }
++            return std::nullopt;
++        }
++        case IR::Opcode::ShiftLeftLogical32: {
++            if (!inst.Arg(1).IsImmediate() || inst.Arg(1).U32() >= 32) {
++                return std::nullopt;
++            }
++            const auto lhs{arg(0)};
++            return lhs ? Scale(*lhs, u64{1} << inst.Arg(1).U32(), true) : std::nullopt;
++        }
++        case IR::Opcode::ShiftRightLogical32: {
++            if (!inst.Arg(1).IsImmediate()) {
++                return std::nullopt;
++            }
++            const auto lhs{arg(0)};
++            return lhs ? ShiftDown(*lhs, inst.Arg(1).U32()) : std::nullopt;
++        }
++        case IR::Opcode::BitwiseAnd32: {
++            // x & y <= min(x, y) for unsigned values
++            const auto lhs{arg(0)};
++            const auto rhs{arg(1)};
++            const auto usable{[](const std::optional<IdBound>& bound) {
++                return bound && bound->NonNegative();
++            }};
++            for (const auto* side : {&rhs, &lhs}) {
++                if (usable(*side) && (*side)->IsConstant() && (*side)->c <= 0xffffff) {
++                    return Loose(*side);
++                }
++            }
++            for (const auto* side : {&lhs, &rhs}) {
++                if (usable(*side)) {
++                    return Loose(*side);
++                }
++            }
++            return std::nullopt;
++        }
++        case IR::Opcode::BitwiseOr32:
++        case IR::Opcode::BitwiseXor32:
++        case IR::Opcode::UMax32: {
++            // x | y, x ^ y and max(x, y) are at most x + y for unsigned values
++            const auto lhs{arg(0)};
++            const auto rhs{lhs ? arg(1) : std::nullopt};
++            if (!lhs || !rhs || !lhs->NonNegative() || !rhs->NonNegative()) {
++                return std::nullopt;
++            }
++            return Loose(Sum(*lhs, *rhs));
++        }
++        case IR::Opcode::UMin32: {
++            const auto lhs{arg(0)};
++            const auto rhs{arg(1)};
++            for (const auto* side : {&rhs, &lhs}) {
++                if (*side && (*side)->NonNegative()) {
++                    return Loose(*side);
++                }
++            }
++            return std::nullopt;
++        }
++        case IR::Opcode::BitFieldUExtract:
++            return BitFieldExtract(inst, depth);
++        case IR::Opcode::BitFieldInsert: {
++            // (base & ~mask) | ((insert << offset) & mask) <= base + (insert << offset)
++            if (!inst.Arg(2).IsImmediate() || !inst.Arg(3).IsImmediate() ||
++                inst.Arg(2).U32() >= 32) {
++                return std::nullopt;
++            }
++            const auto base_value{arg(0)};
++            const auto insert{base_value ? arg(1) : std::nullopt};
++            if (!base_value || !insert || !base_value->NonNegative() || !insert->NonNegative()) {
++                return std::nullopt;
++            }
++            const auto shifted{Scale(*insert, u64{1} << inst.Arg(2).U32(), true)};
++            return shifted ? Loose(Sum(*base_value, *shifted)) : std::nullopt;
++        }
++        case IR::Opcode::SelectU32: {
++            const auto lhs{arg(1)};
++            const auto rhs{lhs ? arg(2) : std::nullopt};
++            return lhs && rhs ? Max(*lhs, *rhs) : std::nullopt;
++        }
++        case IR::Opcode::Phi: {
++            std::optional<IdBound> result;
++            for (size_t index = 0; index < inst.NumArgs(); ++index) {
++                const auto incoming{arg(index)};
++                if (!incoming) {
++                    return std::nullopt;
++                }
++                result = result ? Max(*result, *incoming) : incoming;
++                if (!result) {
++                    return std::nullopt;
++                }
++            }
++            return result;
++        }
++        default:
++            return std::nullopt;
++        }
++    }
++
++    StorageBufferAddr buffer;
++    std::array<u32, 3> workgroup;
++    std::unordered_map<const IR::Inst*, std::optional<IdBound>> memo;
++    std::unordered_set<const IR::Inst*> active;
++    std::optional<IdBound> guard;
++    bool guard_failed{};
++};
++
++/// EDEN_UP_FRITCHII_WRITEMARK: the store extent of each written buffer whose every write was
++/// rebased onto it (`to_replace`); none when any write stays global, since a global write can land
++/// in any bound buffer (native programs pick theirs at run time among all of them).
++std::map<StorageBufferAddr, StorageWriteExtent> StoreExtents(const IR::Program& program,
++                                                             const StorageInfo& info) {
++    std::map<StorageBufferAddr, StorageWriteExtent> extents;
++    std::unordered_set<const IR::Inst*> replaced;
++    for (const StorageInst& storage_inst : info.to_replace) {
++        replaced.insert(storage_inst.inst);
++    }
++    for (const IR::Block* const block : program.post_order_blocks) {
++        for (const IR::Inst& inst : block->Instructions()) {
++            if (IsGlobalMemoryWrite(inst) && !replaced.contains(&inst)) {
++                return extents;
++            }
++        }
++    }
++    std::map<StorageBufferAddr, StoreExtentAnalysis> analyses;
++    for (const StorageInst& storage_inst : info.to_replace) {
++        if (!IsGlobalMemoryWrite(*storage_inst.inst)) {
++            continue;
++        }
++        auto analysis{analyses.find(storage_inst.storage_buffer)};
++        if (analysis == analyses.end()) {
++            analysis = analyses
++                           .emplace(storage_inst.storage_buffer,
++                                    StoreExtentAnalysis{storage_inst.storage_buffer,
++                                                        program.workgroup_size})
++                           .first;
++            // An empty bounded extent, widened by every store
++            extents.emplace(storage_inst.storage_buffer, StorageWriteExtent{.bounded = true});
++        }
++        analysis->second.AddStore(*storage_inst.inst, extents[storage_inst.storage_buffer]);
++    }
++    return extents;
++}
++
+ /// Returns the offset in indices (not bytes) for an equivalent storage instruction
+ IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment) {
+     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+@@ -1767,6 +2304,12 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
+                     StorageBufferLimit(env));
+     }
+     program.info.native_global_bounds |= info.native_runtime_bounds;
++    // EDEN_UP_FRITCHII_WRITEMARK: store extents of native compute programs, before the accesses
++    // are rebased (the analysis reads the guest addresses).
++    const std::map<StorageBufferAddr, StorageWriteExtent> extents{
++        WriteMarkSwitch() && program.stage == Stage::Compute && env.IsNativeProgram()
++            ? StoreExtents(program, info)
++            : std::map<StorageBufferAddr, StorageWriteExtent>{}};
+     for (const StorageBufferAddr& storage_buffer : info.set) {
+         program.info.storage_buffers_descriptors.push_back({
+             .cbuf_index = storage_buffer.index,
+@@ -1775,6 +2318,16 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
+             .is_written = info.writes.contains(storage_buffer),
+             .indirect_offset = storage_buffer.indirect,
+         });
++        const auto extent{extents.find(storage_buffer)};
++        if (extent != extents.end() && extent->second.bounded &&
++            info.writes.contains(storage_buffer)) {
++            program.info.storage_write_extents.push_back({
++                .cbuf_index = storage_buffer.index,
++                .cbuf_offset = storage_buffer.offset,
++                .indirect_offset = storage_buffer.indirect,
++                .extent = extent->second,
++            });
++        }
+     }
+     for (const StorageInst& storage_inst : info.to_replace) {
+         const StorageBufferAddr storage_buffer{storage_inst.storage_buffer};
+@@ -1789,6 +2342,9 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
+ }
+ 
+ void JoinStorageInfo(Info& base, Info& source) {
++    // EDEN_UP_FRITCHII_WRITEMARK: store extents are only worked out for compute programs, which
++    // are never joined; drop any rather than keep one that misses the other program's stores.
++    base.storage_write_extents.clear();
+     base.native_global_bounds |= source.native_global_bounds;
+     auto& descriptors = base.storage_buffers_descriptors;
+     for (auto& desc : source.storage_buffers_descriptors) {
+diff --git a/src/shader_recompiler/shader_info.h b/src/shader_recompiler/shader_info.h
+index f9bd412..fd36e3d 100644
+--- a/src/shader_recompiler/shader_info.h
++++ b/src/shader_recompiler/shader_info.h
+@@ -15,6 +15,7 @@
+ 
+ #include "common/common_types.h"
+ #include "shader_recompiler/frontend/ir/type.h"
++#include "shader_recompiler/storage_write_extent.h"
+ #include "shader_recompiler/varying_state.h"
+ 
+ #include <boost/container/small_vector.hpp>
+@@ -182,6 +183,16 @@ struct StorageBufferDescriptor {
+     auto operator<=>(const StorageBufferDescriptor&) const = default;
+ };
+ 
++/// EDEN_UP_FRITCHII_WRITEMARK: how far a native compute program's stores reach into the storage
++/// buffer of the descriptor with this constant buffer slot (Fritchii keeps it in the descriptor;
++/// kept apart here, so Info, which holds up to 64 descriptors inline, does not grow 4 KiB).
++struct StorageWriteExtentEntry {
++    u32 cbuf_index;
++    u32 cbuf_offset;
++    u32 indirect_offset;
++    StorageWriteExtent extent;
++};
++
+ struct TextureBufferDescriptor {
+     bool has_secondary;
+     u32 cbuf_index;
+@@ -388,8 +399,24 @@ struct Info {
+     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
+     std::vector<std::vector<u32>> handle_programs;
+     ImageDescriptors image_descriptors;
++    /// EDEN_UP_FRITCHII_WRITEMARK: the written storage buffers whose store extent was proven
++    /// (GlobalMemoryToStorageBufferPass); empty unless the switch is set. See FindStorageWriteExtent.
++    std::vector<StorageWriteExtentEntry> storage_write_extents;
+ };
+ 
++/// EDEN_UP_FRITCHII_WRITEMARK: the store extent proven for `desc`, unbounded when none was.
++inline const StorageWriteExtent& FindStorageWriteExtent(const Info& info,
++                                                        const StorageBufferDescriptor& desc) {
++    static constexpr StorageWriteExtent unbounded{};
++    for (const StorageWriteExtentEntry& entry : info.storage_write_extents) {
++        if (entry.cbuf_index == desc.cbuf_index && entry.cbuf_offset == desc.cbuf_offset &&
++            entry.indirect_offset == desc.indirect_offset) {
++            return entry.extent;
++        }
++    }
++    return unbounded;
++}
++
+ template <typename Descriptors>
+ u32 NumDescriptors(const Descriptors& descriptors) {
+     u32 num{};
+diff --git a/src/shader_recompiler/storage_write_extent.h b/src/shader_recompiler/storage_write_extent.h
+new file mode 100644
+index 0000000..2d5aa7d
+--- /dev/null
++++ b/src/shader_recompiler/storage_write_extent.h
+@@ -0,0 +1,126 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <compare>
++#include <optional>
++
++#include "common/common_types.h"
++
++namespace Shader {
++
++/// How far a program's stores and atomics to one storage buffer can reach, in bytes past the
++/// pointer it reads from its constant buffer. Every store ends at or below
++///
++///   const_end + sum(local_stride[i] * local_id[i]) + sum(group_stride[i] * group_id[i])
++///
++/// for every invocation, where local_id is gl_LocalInvocationID and group_id gl_WorkGroupID. The
++/// bound only holds while each value the stores' offsets split into 16-bit halves (multiplications
++/// lowered from native IMAD) stays below 2^16: guard_* is an upper bound of the largest of them in
++/// the same form, and the extent is unknown when it can reach 2^16 for a dispatch.
++///
++/// A native (Switch 2) program's storage pointer carries no size, so the buffer cache binds up to
++/// 8 MiB behind it; this is what it can claim the dispatch wrote instead of all of it.
++///
++/// From Frizti/Fritchii ca82af4712 (zortos293/Lichii#415). Only filled in for native compute
++/// programs with EDEN_UP_FRITCHII_WRITEMARK=1 (GlobalMemoryToStorageBufferPass); unbounded otherwise.
++struct StorageWriteExtent {
++    /// False: the reach is not known (or the buffer is never written); take the whole binding.
++    bool bounded{};
++    /// Whether the bound needs the guard below.
++    bool guarded{};
++    u32 const_end{};
++    std::array<u32, 3> local_stride{};
++    std::array<u32, 3> group_stride{};
++    u32 guard_const{};
++    std::array<u32, 3> guard_local_stride{};
++    std::array<u32, 3> guard_group_stride{};
++
++    auto operator<=>(const StorageWriteExtent&) const = default;
++};
++
++/// Bytes a dispatch's stores can reach past the pointer, or nullopt when unknown. grid is nullopt
++/// for an indirect dispatch, whose group count is read by the GPU.
++[[nodiscard]] constexpr std::optional<u64> ResolveStorageWriteExtent(
++    const StorageWriteExtent& extent, const std::array<u32, 3>& block,
++    const std::optional<std::array<u32, 3>>& grid) {
++    if (!extent.bounded) {
++        return std::nullopt;
++    }
++    const auto evaluate = [&](u64 constant, const std::array<u32, 3>& local,
++                              const std::array<u32, 3>& group) -> std::optional<u64> {
++        // Anything past 2^62 bytes is as good as unknown, and stops the sum from overflowing.
++        constexpr u64 limit = u64{1} << 62;
++        u64 total = constant;
++        for (size_t i = 0; i < 3; ++i) {
++            if (block[i] == 0) {
++                return std::nullopt;
++            }
++            const u64 local_max = u64{block[i]} - 1;
++            if (local[i] != 0 && local_max != 0) {
++                if (local_max > limit / local[i]) {
++                    return std::nullopt;
++                }
++                total += u64{local[i]} * local_max;
++            }
++            if (group[i] == 0) {
++                continue;
++            }
++            if (!grid || (*grid)[i] == 0) {
++                return std::nullopt;
++            }
++            const u64 group_max = u64{(*grid)[i]} - 1;
++            if (group_max != 0) {
++                if (group_max > limit / group[i]) {
++                    return std::nullopt;
++                }
++                total += u64{group[i]} * group_max;
++            }
++            if (total > limit) {
++                return std::nullopt;
++            }
++        }
++        return total;
++    };
++    if (extent.guarded) {
++        const auto guard =
++            evaluate(extent.guard_const, extent.guard_local_stride, extent.guard_group_stride);
++        if (!guard || *guard >= 0x10000) {
++            return std::nullopt;
++        }
++    }
++    return evaluate(extent.const_end, extent.local_stride, extent.group_stride);
++}
++
++/// Widens an extent to also cover another (both bounds hold for each component's maximum).
++constexpr void MergeStorageWriteExtent(StorageWriteExtent& base, const StorageWriteExtent& other) {
++    if (!base.bounded || !other.bounded) {
++        base = StorageWriteExtent{};
++        return;
++    }
++    const auto max3 = [](std::array<u32, 3>& lhs, const std::array<u32, 3>& rhs) {
++        for (size_t i = 0; i < 3; ++i) {
++            lhs[i] = (std::max)(lhs[i], rhs[i]);
++        }
++    };
++    base.const_end = (std::max)(base.const_end, other.const_end);
++    max3(base.local_stride, other.local_stride);
++    max3(base.group_stride, other.group_stride);
++    if (other.guarded) {
++        if (base.guarded) {
++            base.guard_const = (std::max)(base.guard_const, other.guard_const);
++            max3(base.guard_local_stride, other.guard_local_stride);
++            max3(base.guard_group_stride, other.guard_group_stride);
++        } else {
++            base.guarded = true;
++            base.guard_const = other.guard_const;
++            base.guard_local_stride = other.guard_local_stride;
++            base.guard_group_stride = other.guard_group_stride;
++        }
++    }
++}
++
++} // namespace Shader
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index cebfca7..b65c2cd 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -974,12 +974,23 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
+ 
+ template <class P>
+ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
+-                                              bool is_written, u32 indirect_offset) {
++                                              bool is_written, u32 indirect_offset,
++                                              const Shader::StorageWriteExtent& write_extent) {
+     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
+         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
+                   ssbo_index);
+         return;
+     }
++    // EDEN_UP_FRITCHII_WRITEMARK=1 (Frizti/Fritchii b4204230c9, zortos293/Lichii#415): a native
++    // compute program's written binding is marked GPU-written only as far as its stores reach
++    // (write_extent, worked out by GlobalMemoryToStorageBufferPass), not whole: its pointer has
++    // no size, so the binding runs up to 8 MiB past it, and marking all of it puts the CPU's later
++    // writes to those pages behind the next fence and marks their pages GPU-written for good.
++    // The whole binding until worked out below. Off unless exactly "1"; read once.
++    static const bool fritchii_write_mark = Common::PeSwitch("EDEN_UP_FRITCHII_WRITEMARK");
++    if (fritchii_write_mark) {
++        channel_state->compute_storage_write_marks[ssbo_index] = ~0U;
++    }
+     const bool already_enabled =
+         ((channel_state->enabled_compute_storage_buffers >> ssbo_index) & 1U) != 0;
+     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
+@@ -1040,6 +1051,43 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+         StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
+                              kepler_compute->IsDlssDispatch() || indirect_offset != ~0U,
+                              indirect_offset != ~0U);
++    // EDEN_UP_FRITCHII_WRITEMARK: unknown extents, indirect dispatches with workgroup-id terms,
++    // Maxwell programs, DLSS passes and bindings of 2 GiB or more keep the whole binding (a
++    // store's offset may wrap to 2^31 bytes past the pointer and more, never less).
++    if (fritchii_write_mark && is_written && kepler_compute->IsNativeMode() &&
++        !kepler_compute->IsDlssDispatch() && !kepler_compute->InDlssEvaluation()) {
++        const Binding& binding = channel_state->compute_storage_buffers[ssbo_index];
++        if (binding.size != 0 && binding.size < (1U << 31)) {
++            const std::array<u32, 3> block{launch_desc.block_dim_x.Value(),
++                                           launch_desc.block_dim_y.Value(),
++                                           launch_desc.block_dim_z.Value()};
++            std::optional<std::array<u32, 3>> grid;
++            if (!kepler_compute->GetIndirectComputeAddress()) {
++                grid = std::array<u32, 3>{launch_desc.grid_dim_x.Value(),
++                                          launch_desc.grid_dim_y.Value(),
++                                          launch_desc.grid_dim_z.Value()};
++            }
++            if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
++                // The extent counts from the pointer, the binding from the pointer aligned down.
++                const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
++                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
++                const u64 mark = (std::min<u64>)(binding.size, pad + *extent);
++                channel_state->compute_storage_write_marks[ssbo_index] = static_cast<u32>(mark);
++                // Runs on one thread; the log thins out as the count doubles.
++                static u64 narrowed{};
++                static u64 unmarked{};
++                ++narrowed;
++                unmarked += binding.size - mark;
++                if ((narrowed & (narrowed - 1)) == 0) {
++                    LOG_INFO(HW_GPU,
++                             "EDEN_UP_FRITCHII_WRITEMARK: {} native written bindings marked as far "
++                             "as their stores reach, {} MiB fewer bytes marked; last {} of {} "
++                             "bytes",
++                             narrowed, unmarked >> 20, mark, binding.size);
++                }
++            }
++        }
++    }
+ }
+ 
+ template <class P>
+@@ -2263,7 +2311,8 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
+ 
+ template <class P>
+ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_written,
+-                                           std::span<const MultiRangeSegment> pool) {
++                                           std::span<const MultiRangeSegment> pool,
++                                           u64 write_mark_limit) {
+     if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
+         if (binding.segment_count < 2) {
+             return false;
+@@ -2282,8 +2331,14 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+             }
+             const u32 offset = buffer.Offset(segment.device_addr);
+             buffer.MarkUsage(offset, segment.size);
+-            if (is_written) {
++            if (is_written && write_mark_limit == ~u64{0}) {
+                 MarkWrittenBuffer(segment.buffer_id, segment.device_addr, segment.size);
++            } else if (is_written && write_mark_limit != 0) {
++                // EDEN_UP_FRITCHII_WRITEMARK: the native write mark, spread over the segments in
++                // order (Fritchii b4204230c9).
++                const u32 mark = static_cast<u32>((std::min<u64>)(segment.size, write_mark_limit));
++                MarkWrittenBuffer(segment.buffer_id, segment.device_addr, mark);
++                write_mark_limit -= mark;
+             }
+             runtime.PushMultiRangeSource(buffer, offset, segment.size);
+         }
+@@ -2447,7 +2502,13 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
+         const Binding& binding = channel_state->compute_storage_buffers[index];
+         const bool is_written =
+             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
+-        if (BindMultiRangeStorage(binding, is_written, compute_segments)) {
++        // EDEN_UP_FRITCHII_WRITEMARK: what BindComputeStorageBuffer worked out the dispatch can
++        // write; the binding keeps its size, so the shader can still read all of it.
++        static const bool fritchii_write_mark = Common::PeSwitch("EDEN_UP_FRITCHII_WRITEMARK");
++        const u32 stored_mark =
++            fritchii_write_mark ? channel_state->compute_storage_write_marks[index] : ~0U;
++        const u64 write_mark_limit = stored_mark == ~0U ? ~u64{0} : u64{stored_mark};
++        if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
+             return;
+         }
+         Buffer& buffer = slot_buffers[binding.buffer_id];
+@@ -2458,8 +2519,11 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
+         const u32 offset = buffer.Offset(binding.device_addr);
+         buffer.MarkUsage(offset, size);
+ 
+-        if (is_written) {
++        if (is_written && write_mark_limit == ~u64{0}) {
+             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size, true);
++        } else if (is_written && write_mark_limit != 0) {
++            MarkWrittenBuffer(binding.buffer_id, binding.device_addr,
++                              static_cast<u32>((std::min<u64>)(size, write_mark_limit)), true);
+         }
+ 
+         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 0607a31..afdd75d 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -35,6 +35,7 @@
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
++#include "shader_recompiler/storage_write_extent.h"
+ #include "video_core/buffer_cache/buffer_base.h"
+ #include "video_core/buffer_cache/uniform_stream_reuse.h"
+ #include "video_core/buffer_cache/virtual_range_cache.h"
+@@ -160,6 +161,9 @@ public:
+     std::array<u64, NUM_STAGES> written_storage_buffers{};
+     u64 enabled_compute_storage_buffers = 0;
+     u64 written_compute_storage_buffers = 0;
++    /// EDEN_UP_FRITCHII_WRITEMARK: bytes from each compute storage binding's start that the
++    /// dispatch marks GPU-written (~0: the whole binding). Only read with the switch.
++    std::array<u32, NUM_COMPUTE_STORAGE_BUFFERS> compute_storage_write_marks{};
+ 
+     u32 total_graphics_storage_buffers = 0;
+     u32 total_compute_storage_buffers = 0;
+@@ -257,8 +261,10 @@ public:
+     /// GPU.
+     void ReleaseFinished();
+ 
++    /// write_mark_limit: EDEN_UP_FRITCHII_WRITEMARK's mark, spread over the segments in order.
+     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
+-                               std::span<const MultiRangeSegment> pool);
++                               std::span<const MultiRangeSegment> pool,
++                               u64 write_mark_limit = ~u64{0});
+ 
+     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
+                                   std::vector<MultiRangeSegment>& pool);
+@@ -334,8 +340,11 @@ public:
+ 
+     void UnbindComputeStorageBuffers();
+ 
++    /// write_extent: how far the program's stores reach past the pointer (native programs,
++    /// EDEN_UP_FRITCHII_WRITEMARK).
+     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
+-                                  bool is_written, u32 indirect_offset = ~0U);
++                                  bool is_written, u32 indirect_offset = ~0U,
++                                  const Shader::StorageWriteExtent& write_extent = {});
+ 
+     void UnbindComputeTextureBuffers();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 27e6e8a..638c92f 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -170,7 +170,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+     for (const auto& desc : info.storage_buffers_descriptors) {
+         ASSERT(desc.count == 1);
+         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+-                                              desc.is_written, desc.indirect_offset);
++                                              desc.is_written, desc.indirect_offset,
++                                              Shader::FindStorageWriteExtent(info, desc));
+         ++ssbo_index;
+     }
+ 

@@ -1,0 +1,92 @@
+Subject: [PATCH] fritchii-shadowmore: register shadow forms for IMAD cbuf/uniform, LOP3.LUT cbuf/uniform, ATOMG and
+
+fritchii-shadowmore: register shadow forms for IMAD cbuf/uniform, LOP3.LUT cbuf/uniform, ATOMG and
+TXD, and the bit-32 register check for ATOMG and TXD.
+Switch EDEN_UP_FRITCHII_SHADOWMORE=1, off by default (Common::PeSwitch).
+
+Upstream:
+- zortos293/Lichii#279: IMAD 0xa24/0xc24 (constant buffer / uniform multiplier) shadow forms; two
+  Kakariko graveyard pixel programs rejected, logged on an RX 9060 XT under RADV, a tombstone
+  missing. Fritchii has 0xa24 only (register_pressure.h, with 0xa23/0x623/0x423).
+- Frizti/Fritchii dd83423533 (#241, cherry-pick of f2960358b8): LOP3.LUT 0xa12/0xc12 (constant
+  buffer / uniform B) shadow forms; in Ocarina both rejected pixel shaders of the Gerudo Valley rock
+  draws, so the rocks were skipped and the sky showed through.
+- Frizti/Fritchii 06bb2da979 (#588, imports #189 by vouion, cherry-pick of 33acb0e1a0): ATOMG
+  0x9a8 and TXD 0xb6c/0xf6c shadow forms, and their bits 32-39 are checked against the mirrors.
+
+What: the Ampere lowering shadows native registers that sit in its uniform mirrors and scratch
+(R216-R246 and up). An instruction form missing from PrepareRegisterPressure gets the program
+rejected ("native program uses lowering scratch registers") and its draws skipped ("Draw skipped
+(no pipeline)"). For TXD and ATOMG the operand at bit 32 was never checked, so a gradient or data
+register inside the mirrors silently read the mirror's value instead.
+
+Operand sets (same as Fritchii v5 register_pressure.h): 0xa24/0xc24/0xa12/0xc12 Rd(16), A(24),
+C(64); 0x9a8 Rd(16), data(32); 0xb6c/0xf6c Rd pair(16), coordinates (24, three registers for
+ARRAY_2D: Bits(61,3) == 5), four gradients (32), second destination pair (64).
+
+Unset: the new cases return valid = false exactly like the default case, and the bit-32 test is
+unchanged, so lowering is byte-identical.
+
+Not needed here: #241's retry with a realigned high uniform base (our shadow_boundary is already
+aligned down to four, lower_to_maxwell.h:280). SHF 0x219 (#241's other form) is already in as 0346
+behind EDEN_UP_SHADOW_REGISTERS (Gerudo Valley needs both switches). The lowering of these opcodes
+already exists (0xc24 at :732, 0xa24 :887, 0xb6c :1182, 0x9a8 :1400, 0xa12/0xc12 :3030); 0xf6c
+has no lowering here, so its shadow form is inert until one is added (kept to match upstream).
+
+With the switch on, a TXD/ATOMG whose register is in the mirrors and cannot be shadowed now gets
+the program rejected (draw skipped) instead of reading a wrong value. Catch2 tests not ported.
+
+PS5: low value now (513 logs from 6-9 Nov, Kokiri/pond/walks, show no rejection of these opcodes),
+real from Kakariko (graveyard tombstone) and Gerudo Valley (rocks, with EDEN_UP_SHADOW_REGISTERS=1).
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index f13f8c6..57951d0 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -108,6 +108,28 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     case 0xa20: case 0x621: case 0x808: case 0x923: operand(16); operand(24); break;
+     case 0x209: operand(16); operand(24); operand(32); break;
+     case 0xa23: case 0x623: case 0x423: operand(16); operand(24); operand(64); break;
++    // EDEN_UP_FRITCHII_SHADOWMORE=1: shadow forms Fritchii/Lichii have and this table lacked.
++    // Unset: no shadow form, as before (the program is rejected and its draws skipped).
++    // IMAD with a constant buffer or uniform multiplier (zortos293/Lichii#279: two Kakariko
++    // graveyard pixel programs, logged on RADV) and LOP3.LUT with a constant buffer or uniform B
++    // (#241, Fritchii dd83423533: Gerudo Valley rocks): Rd, A and C, no register at bit 32.
++    case 0xa24: case 0xc24: case 0xa12: case 0xc12: {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_SHADOWMORE");
++        if (!enabled) { result.valid = false; return result; }
++        operand(16); operand(24); operand(64); break;
++    }
++    case 0x9a8: { // ATOMG (#588, Fritchii 06bb2da979): result in Rd, data operand at bit 32.
++        static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_SHADOWMORE");
++        if (!enabled) { result.valid = false; return result; }
++        operand(16); operand(32); break;
++    }
++    case 0xb6c: case 0xf6c: { // TXD (#588): Rd pair, coordinates (+ layer for ARRAY_2D),
++        // four gradients at bit 32, second destination pair.
++        static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_SHADOWMORE");
++        if (!enabled) { result.valid = false; return result; }
++        operand(16, 2); operand(24, input.Bits(61, 3) == 5 ? 3 : 2); operand(32, 4); operand(64, 2);
++        break;
++    }
+     case 0x321: operand(16, input.Bits(74, 2) + 1); operand(24); operand(32); break;
+     case 0x322: operand(24); operand(32, input.Bits(74, 2) + 1); break;
+     case 0x927: operand(24); operand(32); break;
+@@ -306,10 +328,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+         // that could alias that state go through shadow copies, or are rejected.
+         RegisterPressure pressure{insn};
+         bool requires_shadow = false;
++        // EDEN_UP_FRITCHII_SHADOWMORE=1 (#588, Fritchii 06bb2da979): TXD's gradients and ATOMG's
++        // data word sit at bits 32-39 too; unchecked, a register in the uniform mirrors read the
++        // mirror instead of its own value. Unset: not checked, as before.
++        static const bool shadow_more = Common::PeSwitch("EDEN_UP_FRITCHII_SHADOWMORE");
++        const bool bit32_register =
++            shadow_more && (opcode == 0xb6c || opcode == 0xf6c || opcode == 0x9a8);
+         for (u32 bit : {16U, 24U, 32U, 64U}) {
+             if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xf66 &&
+                 opcode != 0x988 && opcode != 0x986 && opcode != 0x927 && opcode != 0x98e &&
+-                opcode != 0x59f) continue;
++                opcode != 0x59f && !bit32_register) continue;
+             const u32 reg = insn.Bits(bit, 8);
+             if (reg >= shadow_boundary && reg < 255) requires_shadow = true;
+         }

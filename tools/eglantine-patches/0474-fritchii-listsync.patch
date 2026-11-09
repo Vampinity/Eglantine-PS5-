@@ -1,0 +1,308 @@
+Subject: [PATCH] fritchii2-listsync: a command entry on pages no GPU work has written yet waits only for the compute
+
+fritchii2-listsync: a command entry on pages no GPU work has written yet waits only for the compute
+and copy work sent before the last host-level wait (EDEN_UP_FRITCHII_LISTSYNC=1); with
+EDEN_UP_FRITCHII_LISTSKIP=1 (includes LISTSYNC) an entry that begins between methods does not wait
+at all while no copy engine work is queued. Both off unless exactly "1"; behaviour unchanged unset.
+
+Upstream: Frizti/Fritchii 6baafdd7d9 (the new LIST_WAIT_SKIP shape, EXP41=0 default, released in
+fritchii-v5), ported from zortos293/Lichii#805 by jpkto (PR still open): 6229487c8c (wait only for
+the writers sent before the last host sync) and d4e8d85d4d (entries that begin between methods
+don't wait). Lichii's numbers, Ocarina's Hyrule Field on PC: the list-writer wait took 142 ms of
+every front second before 6229487c8c and still 263 ms/s (1,104 waits/s, test49c) after it; the
+d4e8d85d4d dump found every GPU-written list was macro data begun in the entry before (3D 0xe62,
+compute 0xe74) and no wait ever found its entry newly GPU-written.
+
+What changes (DmaPusher::Step, the "list writers" site, the largest front wait in
+my PS5 timing notes: ~5,100 waits/s, 6.3 ms a frame):
+- Unset: before each entry not on GPU-written pages the front waits until the back ran every queued
+  dispatch and copy (GpuSplit::WaitForWriters), as before.
+- LISTSYNC: GpuSplit::WaitForSyncedWriters waits for min(last writer, last host-level wait). Host-
+  level waits are noted (GpuSplit::NoteListSync) at a GP entry's sync bit, the puller WaitForIdle
+  and the 3D wait_for_idle (through NoteSync), every syncpoint acquire, every semaphore acquire
+  (SemaphoreOperation and SEM_EXECUTE) and every resumed acquire. Fritchii notes only the acquires
+  met without a drain; here every acquire is noted however it is met (our SEM_FAST, pending-
+  release and same-read paths differ from Fritchii's), which can only add waits.
+- LISTSKIP: an entry with dma_state.method_count == 0 skips the wait unless copy engine work the
+  back has not run is queued (GpuSplit::NoteCopyWriter, after NoteWriter for MaxwellDMA writers).
+  Entries that begin inside a method's data (the parameters compute writes) still wait.
+- An entry that did not wait for every writer while a later one was still queued gets a read-only
+  check deferred to the back at its ring position (FastDrawNeutral): if one of those writers marked
+  its pages GPU-written it logs "EDEN_UP_FRITCHII_LISTSYNC: command entry at ... was GPU-written by
+  work queued before it and read from its submit copy" (first 32, then powers of two). The count
+  must stay 0: a line is a stale entry parsed.
+
+Not ported: the removal of EDEN_NX2_LIST_FAST (kept as is), EXP41 (our two switches play its
+part), any change to the ListGpuWritten wait in ReadGpuWrittenCommands (unchanged, still every
+writer), and 266cb620c1's word-level list reads (EXP40) and LIST_VERIFY.
+
+Risk: an entry parsed before a queued writer marked its page reads the CPU's submitted words: a
+stale command list can lose the device or hang. Only a page's first GPU write can be missed (the
+bit never clears; later entries there take the GPU-written path). LISTSYNC follows the hardware's
+fetch ordering; LISTSKIP is Lichii's measured heuristic. With EDEN_UP_OOT_FRONT_WAIT the guest can
+run ahead of the back, so a CPU-side wait no longer orders a writer before the next submission's
+entries for the front. Cost with a switch on: one Defer (a page-bit read) per entry while writers
+are queued. Files: dma_pusher.cpp and engines/puller.cpp (both also compiled as derived copies,
+none of the derivation anchors touched), gpu_split.h, gpu_split.cpp.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 687f0ab..61ae6cf 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -436,6 +436,61 @@ static u64 NoteFetchRecheck(GPUVAddr address, u64 words, int mode) {
+     return hit;
+ }
+ 
++// EDEN_UP_FRITCHII_LISTSYNC / _LISTSKIP (GpuSplit::ListSyncMode; Frizti/Fritchii 6baafdd7d9, from
++// zortos293/Lichii#805 6229487c8c + d4e8d85d4d): the wait before an entry on pages no GPU work has
++// written yet. Unset: for every queued dispatch and copy, as before. LISTSYNC: for those sent
++// before the last host-level wait. LISTSKIP: an entry that begins between methods
++// (`command_entry`) skips it while no copy engine work is queued (`skipped`). Returns whether any
++// of the work it waited for was still queued.
++static bool WaitForListWriters(VideoCommon::GpuSplit& split, bool command_entry, bool& skipped) {
++    const int mode = VideoCommon::GpuSplit::ListSyncMode();
++    if (mode == 0) {
++        return split.WaitForWriters();
++    }
++    if (mode >= 2 && command_entry && !split.CopyWritersPending()) {
++        skipped = true;
++        return false;
++    }
++    return split.WaitForSyncedWriters();
++}
++
++// An entry left on its submit copy after WaitForListWriters, with writers sent after what it
++// waited for still queued: the back checks at the entry's place (every writer sent before it has
++// run there) whether one of them marked the entry's pages GPU-written, i.e. whether the full wait
++// would have taken the entry from GPU memory, and logs each one (the count should stay 0). It only
++// reads the page bits. Nothing unless set.
++static void CheckListWriters(VideoCommon::GpuSplit& split, MemoryManager& memory, GPUVAddr address,
++                             size_t size, bool skipped) {
++    if (VideoCommon::GpuSplit::ListSyncMode() == 0 || size == 0 ||
++        split.Ran(split.LastWriterPosition())) {
++        return;
++    }
++    split.Defer(
++        [memory = &memory, address, size, skipped] {
++            bool written = false;
++            for (GPUVAddr page = address & ~GPUVAddr{0xfff}; !written && page < address + size;
++                 page += 0x1000) {
++                const auto device = memory->GpuToCpuAddress(page);
++                written = device && Nx2IsGpuWritten(*device);
++            }
++            if (!written) {
++                return;
++            }
++            static std::atomic<u32> missed{};
++            const u32 count = missed.fetch_add(1, std::memory_order_relaxed) + 1;
++            if (count <= 32 || (count & (count - 1)) == 0) {
++                LOG_WARNING(HW_GPU,
++                            "EDEN_UP_FRITCHII_LISTSYNC: command entry at {:#x} ({} bytes) was "
++                            "GPU-written by work queued before it and read from its submit copy "
++                            "({} so far; {})",
++                            address, size, count,
++                            skipped ? "skipped the wait, LISTSKIP"
++                                    : "waited for the writers before the last sync");
++            }
++        },
++        VideoCommon::GpuSplit::FastDrawNeutral);
++}
++
+ bool DmaPusher::WrittenPagesSettled() {
+     const u64 marks = Tegra::g_nx2_new_written_pages.load(std::memory_order_relaxed);
+     const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+@@ -611,6 +666,11 @@ bool DmaPusher::Step() {
+     }
+ 
+     if (header.size > 0) {
++        // EDEN_UP_FRITCHII_LISTSYNC: a GP entry with its sync bit is fetched after the work before
++        // it completed, a host-level wait (GpuSplit::NoteListSync; nothing unless set).
++        if (header.sync && g_nx2_ampere.load(std::memory_order_relaxed)) {
++            VideoCommon::GpuSplit::Get().NoteListSync();
++        }
+         if (!resumed_entry && subchannels[dma_state.subchannel] && dma_state.method_count) {
+             const auto engine = subchannel_type[dma_state.subchannel];
+             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
+@@ -690,7 +750,10 @@ bool DmaPusher::Step() {
+             const int list_fast = ListFastMode();
+             const bool settled = list_fast != 0 && WrittenPagesSettled();
+             if (!(settled && list_fast == 1)) {
+-                if (VideoCommon::GpuSplit::Get().WaitForWriters()) {
++                // EDEN_UP_FRITCHII_LISTSYNC / _LISTSKIP: which writers (WaitForListWriters).
++                bool list_wait_skipped = false;
++                if (WaitForListWriters(VideoCommon::GpuSplit::Get(), dma_state.method_count == 0,
++                                       list_wait_skipped)) {
+                     gpu_written =
+                         IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+                     if (settled) {
+@@ -708,6 +771,10 @@ bool DmaPusher::Step() {
+                         NoteListFastCheck(dma_state.dma_get, true);
+                     }
+                 }
++                if (!gpu_written) {
++                    CheckListWriters(VideoCommon::GpuSplit::Get(), memory_manager, dma_state.dma_get,
++                                     size_t{header.size} * sizeof(u32), list_wait_skipped);
++                }
+             }
+         }
+         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
+@@ -1203,6 +1270,9 @@ void DmaPusher::CallMethod(u32 argument) {
+         SCOPE_EXIT {
+             if (writer) {
+                 split.NoteWriter();
++                if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::MaxwellDMA) {
++                    split.NoteCopyWriter(); // EDEN_UP_FRITCHII_LISTSKIP; nothing unless set
++                }
+             } else if (memory_writer) {
+                 split.NoteUnrangedWriter();
+             }
+@@ -1269,6 +1339,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+         SCOPE_EXIT {
+             if (writer) {
+                 split.NoteWriter();
++                if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::MaxwellDMA) {
++                    split.NoteCopyWriter(); // EDEN_UP_FRITCHII_LISTSKIP; nothing unless set
++                }
+             } else if (memory_writer) {
+                 split.NoteUnrangedWriter();
+             }
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 3d9aae5..f71aa19 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -338,6 +338,9 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
+     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
+     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
+     if (pending_acquire) {
++        // EDEN_UP_FRITCHII_LISTSYNC: the met acquire orders the work sent so far before the
++        // commands after it (other channels' releases included; nothing unless set).
++        VideoCommon::GpuSplit::Get().NoteListSync();
+         pending_acquire.reset();
+         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+         Nx2SemaphoreWaiters::Get().Remove(this);
+@@ -406,6 +409,8 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
+         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
+         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
++        // EDEN_UP_FRITCHII_LISTSYNC: a syncpoint acquire is a host-level wait (nothing unless set).
++        VideoCommon::GpuSplit::Get().NoteListSync();
+         break;
+     case Puller::FenceOperation::Increment:
+         if (auto& split = VideoCommon::GpuSplit::Get();
+@@ -487,6 +492,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+             LOG_ERROR(HW_GPU, "Invalid semaphore operation {}", static_cast<u32>(op));
+             return;
+         }
++        // EDEN_UP_FRITCHII_LISTSYNC: a semaphore acquire is a host-level wait, whichever way it is
++        // met below (drained, queued release, SEM_FAST; a suspended one again at ResumeAcquire).
++        // Nothing unless set.
++        VideoCommon::GpuSplit::Get().NoteListSync();
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+         const auto matches = [&acquire](u32 value) { return acquire.Matches(value); };
+         if (MetByPendingRelease(dma_pusher, acquire.address, matches,
+@@ -602,6 +611,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+         NoteReleaseWrite(dma_pusher, address);
+         return;
+     }
++    // EDEN_UP_FRITCHII_LISTSYNC: an acquire, met or not below (nothing unless set).
++    VideoCommon::GpuSplit::Get().NoteListSync();
+     const auto met = [operation, payload](u32 word) {
+         return operation == 0   ? word == payload
+                : operation == 2 ? word >= payload
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 22a516c..e5f3df7 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -197,6 +197,8 @@ void GpuSplit::Stop() {
+     front_reports.clear();
+     reported_words.clear();
+     sync_position = 0;
++    list_sync_position = 0;
++    last_copy_writer_position = 0;
+     same_read_count = 0;
+     same_read_position = 0;
+     back_engine_now.store(nullptr, std::memory_order_relaxed);
+@@ -444,6 +446,13 @@ bool GpuSplit::WaitForWriters(DrainSite site) {
+     return WaitFor(std::min(last_writer_position, write_position), site);
+ }
+ 
++// EDEN_UP_FRITCHII_LISTSYNC (Fritchii 6baafdd7d9, zortos293/Lichii#805 6229487c8c): the earlier of
++// the last writer and the last host-level wait. A writer before the wait is waited for with
++// everything before it; one after it is not.
++bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
++    return WaitFor(std::min({last_writer_position, list_sync_position, write_position}), site);
++}
++
+ // From Lichii (zortos293/Lichii, nx2 at 27226d2568): one wait with a site for the report. It waits
+ // as WaitForWriters and WaitForSpace did, and now both wake a parked back and report as Drain does.
+ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index a269023..feb89e5 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -337,9 +337,54 @@ public:
+     /// DMA reads) of bytes not flushed after it wait for it (a drain does not make GPU-written
+     /// data visible, only a flush of those bytes does).
+     void NoteSync() {
++        NoteListSync(); // EDEN_UP_FRITCHII_LISTSYNC; nothing unless set
+         if (!DmaReadAhead()) return;
+         sync_position = write_position;
+     }
++
++    // EDEN_UP_FRITCHII_LISTSYNC=1 (Frizti/Fritchii 6baafdd7d9, from zortos293/Lichii#805
++    // 6229487c8c by jpkto): before the front parses a command entry on pages no GPU work has
++    // written yet, it waits only for the compute and copy work sent before the last host-level
++    // wait, not for every queued writer (DmaPusher::Step, the "list writers" site). The PBDMA
++    // fetches an entry ahead of the engines running the work before it; only a host-level wait
++    // in between (a GP entry's sync bit, a host or 3D wait for idle, a syncpoint or semaphore
++    // acquire) makes that work complete first, so a game cannot rely on a later writer.
++    // EDEN_UP_FRITCHII_LISTSKIP=1 (Lichii#805 d4e8d85d4d; includes LISTSYNC): an entry that begins
++    // between methods (a command buffer the CPU writes) does not wait at all while no copy engine
++    // work is queued; entries that begin inside a method's data (the parameters compute writes,
++    // as Ocarina's 0xe62/0xe74 macro data) still wait. Entries that skipped any writer are checked
++    // on the back and logged when one of those writers wrote them. Both off unless exactly "1".
++    /// 0: wait for every writer (unset), 1: LISTSYNC, 2: LISTSKIP.
++    static int ListSyncMode() {
++        static const int mode = Common::PeSwitch("EDEN_UP_FRITCHII_LISTSKIP")   ? 2
++                                : Common::PeSwitch("EDEN_UP_FRITCHII_LISTSYNC") ? 1
++                                                                                : 0;
++        return mode;
++    }
++    /// Front: a host-level wait was just sent or passed (see ListSyncMode). Every acquire counts,
++    /// drained or not: more syncs only make command entries wait for more writers.
++    void NoteListSync() {
++        if (ListSyncMode() == 0) return;
++        list_sync_position = write_position;
++    }
++    /// Front, EDEN_UP_FRITCHII_LISTSKIP: copy engine work that may write memory was just sent (after
++    /// NoteWriter). It can copy GPU-written words anywhere, so every entry waits while it is queued.
++    void NoteCopyWriter() {
++        if (ListSyncMode() < 2) return;
++        last_copy_writer_position = write_position;
++    }
++    /// Front, EDEN_UP_FRITCHII_LISTSKIP: whether copy engine work sent so far may still be queued.
++    [[nodiscard]] bool CopyWritersPending() const {
++        return consumed.load(std::memory_order_acquire) < last_copy_writer_position;
++    }
++    /// Front, EDEN_UP_FRITCHII_LISTSYNC: waits until the back executed the compute and copy work
++    /// sent before the last NoteListSync. Returns whether any of it was still queued.
++    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
++    /// Whether the back executed the work sent before `position` (as far as it stored `consumed`,
++    /// every few thousand words of a batch and at its end).
++    [[nodiscard]] bool Ran(u64 position) const {
++        return consumed.load(std::memory_order_acquire) >= position;
++    }
+     /// The ring position of the last wait for idle sent; 0 when none was sent this session.
+     [[nodiscard]] u64 SyncPosition() const {
+         return sync_position;
+@@ -604,6 +649,10 @@ private:
+     std::unordered_map<u64, u64> front_reports; ///< key of each word -> write_position after it
+     std::unordered_set<u64> reported_words;     ///< every word a report was sent to
+     u64 sync_position{};
++    /// EDEN_UP_FRITCHII_LISTSYNC / _LISTSKIP: the last host-level wait and the last copy engine
++    /// writer (NoteListSync, NoteCopyWriter); 0 before the first this session.
++    u64 list_sync_position{};
++    u64 last_copy_writer_position{};
+     /// EDEN_UP_DRAIN_SKIP_SAME: the words whose drained reads hold at same_read_position.
+     std::array<u64, 4> same_read_keys{};
+     size_t same_read_count{};

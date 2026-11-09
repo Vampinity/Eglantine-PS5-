@@ -1,0 +1,175 @@
+Subject: [PATCH] fritchii2-grhand: a guest read of cached memory whose cache mutexes stay taken is answered with a
+
+fritchii2-grhand: a guest read of cached memory whose cache mutexes stay taken is answered with a
+flush request served by the back, instead of waiting for the mutexes.
+Switch EDEN_UP_FRITCHII_GRHAND=1, off by default.
+
+Upstream: Frizti/Fritchii e423d1bd17 (EXP60=1; "live, off by default", never made a default, no
+fps figure). Credit Frizti. Their reason: the split's back holds texture_cache.mutex and
+buffer_cache.mutex through bursts of draws and takes them again right after each release, so a
+guest read waiting for them lost to it draw after draw (guest threads asleep 5-6 ms in the frames
+of the close-camera dips).
+
+What it does (RasterizerVulkan::GetFlushArea): try the mutexes the read needs (texture unless
+EDEN_PE_IMAGE_PAGES says no image ever held the pages, and buffer) up to 256 times with a yield in
+between. All taken: the same answers as the normal path, under them. Not: return the read's pages
+as a non-preemptive area; GPU::OnCPURead then queues InvalidateGPUCache + FlushRegion(pages) as a
+sync request and waits; the back serves it after its current draw (PrepareDraw's SCOPE_EXIT
+TickWork, as in Fritchii), and a flush of pages with nothing GPU-written does nothing.
+
+Deviations: (1) an attempt that does not get every mutex releases what it got before yielding
+(std::try_lock); Fritchii keeps the first while it retries the second, which holds the back up.
+(2) Only while buffer_cache.FlushesOnCpuRead() (Switch 2 native tiling: true): with async buffer
+downloads the request's FlushRegion would download buffer data this path never downloads on a
+read, so the normal path runs (counted as "not handed"). (3) Our normal path asks the texture cache
+first and the buffer cache only with FlushesOnCpuRead, both kept. (4) Counters every 5 s:
+"EDEN_UP_FRITCHII_GRHAND: guest reads of cached memory (N ms): L locked, H handed to the back as
+flush requests, A not handed (async buffer downloads)".
+
+Review fix (9 Nov): the handed answer skipped the caches' GetFlushArea, which also forgets the
+pages' read trap (BufferCache::read_trapped_ranges) and marks GPU-written data for downloads at
+fences (Preflushable, the images' PreemtiveDownload/forced_flushed). The core then kept the handed
+pages as its read area, and the next GPU write there was deduplicated (ArmReadTraps finds the range
+still armed) and did not move the read trap generation: the core could read older bytes until some
+other arm moved it. The handed path now queues the same texture-then-buffer GetFlushArea calls for
+the back (GPU::RunOnGpuThread) ahead of the flush request OnCPURead queues next. Sync requests run in
+order and OnCPURead waits for the later one, so the side effects land before the guest reads.
+
+Honest value for the PS5: low, possibly negative. Reads only get here for pages with a GPU-written
+mark (HandleRasterizerDownload reads the rest directly) that miss the core's area. A handed read
+still waits for the back's current draw (a pipeline build inside the draw is waited out in full
+either way, so GrowingBlackBeans' "guest cores in HandleRasterizerDownload while the back builds a
+pipeline" is not fixed by this), may re-download an image already downloaded at a fence
+(forced_flushed, which the locked path would answer preemptively), remembers only the read's pages
+instead of the image's range (more later misses), and spins up to 256 yields on a guest core, which
+is our bottleneck. It only helps if the lock convoy is real here; the counters show whether reads
+are handed at all. Gate (review): test only if EDEN_DEV_GUEST cpu_read_ns and cache_lock_blocked
+in existing control logs show guest cores waiting on these locks for a real share of their time.
+
+Files: src/video_core/renderer_vulkan/vk_rasterizer.cpp (compiled from the generated copy, made by
+tools/prepare-vulkan-port.py; same anchor skips before and after). Unset: identical behaviour (one
+static bool test per GetFlushArea).
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -22,6 +22,7 @@
+ #include <fstream>
+ #include <mutex>
+ #include <string_view>
++#include <thread>
+ #include <vector>
+ #include <bit>
+ #include <optional>
+@@ -2238,8 +2239,111 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+     fence_manager.SignalAndWait();
+ }
+ 
++namespace {
++/// EDEN_UP_FRITCHII_GRHAND: guest reads of cached memory answered under the caches' mutexes, and
++/// those handed to the back as flush requests, logged every 5 s.
++struct GuestReadHandCounts {
++    std::atomic<u64> locked{};
++    std::atomic<u64> handed{};
++    std::atomic<u64> async_buffers{}; ///< not handed: the buffer cache flushes no CPU read
++    std::atomic<s64> last_log_ms{};
++};
++GuestReadHandCounts g_guest_read_hand;
++
++void CountGuestRead(std::atomic<u64>& counter) {
++    if (((counter.fetch_add(1, std::memory_order_relaxed) + 1) & 255) != 0) {
++        return;
++    }
++    auto& c = g_guest_read_hand;
++    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                        std::chrono::steady_clock::now().time_since_epoch())
++                        .count();
++    s64 last = c.last_log_ms.load(std::memory_order_relaxed);
++    if (now - last < 5000 ||
++        !c.last_log_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
++        return;
++    }
++    LOG_INFO(Render_Vulkan,
++             "EDEN_UP_FRITCHII_GRHAND: guest reads of cached memory ({} ms): {} locked, {} handed "
++             "to the back as flush requests, {} not handed (async buffer downloads)",
++             last == 0 ? 0 : now - last, c.locked.exchange(0, std::memory_order_relaxed),
++             c.handed.exchange(0, std::memory_order_relaxed),
++             c.async_buffers.exchange(0, std::memory_order_relaxed));
++}
++} // Anonymous namespace
++
+ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+     static const bool pages = Common::PeSwitch("EDEN_PE_IMAGE_PAGES");
++    // EDEN_UP_FRITCHII_GRHAND=1 (Frizti/Fritchii e423d1bd17, there EDEN_NX2_EXP60=1; live there,
++    // off by default, no fps figure): the split's back holds both cache mutexes through bursts of
++    // draws and takes them again right after each release, so a guest read waiting for them can
++    // lose to it draw after draw (Fritchii saw guest threads asleep 5-6 ms there). Try a little;
++    // if a mutex stays taken, answer with a flush request for the read's pages instead: OnCPURead
++    // queues it and the back serves it after its current draw (PrepareDraw's TickWork), and a
++    // flush of pages with nothing GPU-written does nothing. Only while the buffer cache flushes
++    // on CPU reads (FlushesOnCpuRead): otherwise the request's FlushRegion would download buffer
++    // data this path never downloads on a read, and the path below runs as without the switch.
++    static const bool hand = Common::PeSwitch("EDEN_UP_FRITCHII_GRHAND");
++    if (hand && !buffer_cache.FlushesOnCpuRead()) [[unlikely]] {
++        CountGuestRead(g_guest_read_hand.async_buffers);
++    } else if (hand) [[unlikely]] {
++        const bool ask_texture = !pages || !Eden::ImagePages::NeverHeld(addr, size);
++        std::unique_lock texture_lock{texture_cache.mutex, std::defer_lock};
++        std::unique_lock buffer_lock{buffer_cache.mutex, std::defer_lock};
++        // Unlike Fritchii, which keeps a mutex it got while it retries the other, an attempt that
++        // does not get every mutex it needs releases them before it yields (std::try_lock), so
++        // the back is not held up by the guest's retries.
++        constexpr int Tries = 256;
++        bool held = false;
++        for (int attempt = 0; attempt < Tries && !held; ++attempt) {
++            held = ask_texture ? std::try_lock(texture_lock, buffer_lock) == -1
++                               : buffer_lock.try_lock();
++            if (!held) {
++                std::this_thread::yield();
++            }
++        }
++        if (!held) {
++            CountGuestRead(g_guest_read_hand.handed);
++            // The core keeps the area OnCPURead returns until the read trap generation moves.
++            // The caches' GetFlushArea is what forgets the pages' read trap (the buffer cache's
++            // read_trapped_ranges, so that the next GPU write there moves the generation again)
++            // and marks GPU-written data for downloads at fences (Preflushable, the images'
++            // PreemtiveDownload and forced_flushed). Skipped, the area would outlive the next GPU
++            // write to these pages and the core would read their older bytes. So the back runs
++            // the same calls as the path below, before the flush request OnCPURead queues next
++            // (sync requests run in order, and OnCPURead waits for the later one).
++            static_cast<void>(gpu.RunOnGpuThread([this, addr, size, ask_texture] {
++                if (ask_texture) {
++                    std::scoped_lock lock{texture_cache.mutex};
++                    if (texture_cache.GetFlushArea(addr, size)) {
++                        return;
++                    }
++                }
++                std::scoped_lock lock{buffer_cache.mutex};
++                static_cast<void>(buffer_cache.GetFlushArea(addr, size));
++            }));
++            return VideoCore::RasterizerDownloadArea{
++                .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
++                .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),
++                .preemtive = false,
++            };
++        }
++        // Held: the answers of the path below, under the same mutexes.
++        CountGuestRead(g_guest_read_hand.locked);
++        if (ask_texture) {
++            if (auto area = texture_cache.GetFlushArea(addr, size)) {
++                return *area;
++            }
++        }
++        if (auto area = buffer_cache.GetFlushArea(addr, size)) {
++            return *area;
++        }
++        return VideoCore::RasterizerDownloadArea{
++            .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
++            .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),
++            .preemtive = true,
++        };
++    }
+     if (!pages || !Eden::ImagePages::NeverHeld(addr, size)) {
+         static const bool skip = Common::PeSwitch("EDEN_PE_CPU_READ_SKIP");
+         std::unique_lock lock{texture_cache.mutex, std::defer_lock};

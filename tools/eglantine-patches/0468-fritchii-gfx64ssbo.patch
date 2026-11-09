@@ -1,0 +1,165 @@
+Subject: [PATCH] fritchii-gfx64ssbo: graphics stages (vertex..fragment, task and mesh programs) bind up to 64
+
+fritchii-gfx64ssbo: graphics stages (vertex..fragment, task and mesh programs) bind up to 64
+storage buffers, as compute already can with 0350.
+Switch EDEN_UP_FRITCHII_GFX64SSBO=1, off by default (Common::PeSwitch).
+
+Upstream: Frizti/Fritchii 5d0032b054 "shader, buffer_cache: bind up to 64 storage buffers per
+stage" (cherry-pick of f25c551c77, zortos293/Lichii#434), with the limit guard of aaa992e8bf
+(dual vertex programs), merged as b727011f95 into fritchii-v4. Our 0350 (EDEN_UP_WIDE_COMPUTE_SSBOS,
+from de4ed9d9d7) already ported the compute half and left graphics at 32; this is the graphics half.
+
+Why: a native (Switch 2) program takes a storage buffer for every raw pointer it reads. Past the
+cap, pointer table entries (the per-type instance tables) are left out and every instance of a
+type whose table is unbound is culled. Ocarina's grass in Hyrule Field runs as task/mesh programs
+too (on the PS5 through EDEN_NX2_RADV_MESH_COMPUTE, the play env's path: RADV runs them as
+compute, to Eden they stay task/mesh stages bound through the graphics stage arrays, task in the
+vertex slot, mesh in the tessellation slot; EDEN_NX2_MESH_AS_COMPUTE is retired), and
+PS5 logs show "All 32 storage buffer bindings taken" lines near Task/Mesh program translation
+(pipeline workers log in parallel, so the line next to it is not proof of the stage).
+
+Changes:
+- global_memory_to_storage_buffer_pass.cpp StorageBufferLimit: non-compute stages return
+  Info::MAX_SSBOS (64) with the switch, MAX_GRAPHICS_SSBOS (32) without; compute unchanged.
+- translate_program.cpp AddNVNStorageBuffers: the same per-stage limit for the NVN buffer slots
+  (0350's review fix kept graphics at 32 there for the same reason).
+- buffer_cache_base.h: per-stage graphics storage_buffers arrays hold 64 (new
+  NUM_GRAPHICS_STORAGE_BUFFERS) and enabled/written_storage_buffers are u64 masks.
+  buffer_cache.h BindGraphicsStorageBuffer shifts u64{1}. ForEachEnabledBit is already templated
+  (0350); popcount, >> tests and the KeptGraphicsBindingsHash mix take u64 as they are.
+- JoinStorageInfo (dual vertex A/B programs, Switch 1 only): throws NotImplementedException when
+  the joined list would overflow the 64-entry static_vector, as Fritchii aaa992e8bf does (pipeline
+  build fails cleanly instead of overflowing). Unconditional but inert without the switch: two
+  halves of at most 32 never reach 64.
+
+Byte-identical when unset: no stage is offered more than 32 bindings, so the wider masks and the
+extra 32 array entries per stage (about 2.5 KiB per channel) stay unused; the values in them are
+the same. Side effect when unset: a dual vertex program that joined to 33-64 bindings used to
+shift 1U << 32 and write past storage_buffers[stage][31]; it now lands in the wider arrays.
+
+Deviations from upstream:
+- Switch-gated, compute and graphics stay separate switches (0350 / this).
+- Not ported: upstream's device cap (HostTranslateInfo::max_per_stage_descriptor_storage_buffers +
+  maxDescriptorSetStorageBuffers, c7a95c13cb) and its NVN/limit exceptions. RADV reports per-stage
+  and per-set storage buffer limits in the millions, so 64 never hits them on the PS5; on a device
+  that binds fewer than 64 per stage, leave the switch off. Adding a HostTranslateInfo field was
+  avoided on purpose (it feeds shader cache state).
+- Not ported: e7c60bdbf2 / e56faa4700 / bf03eefdf1 (compute pipeline rebuild bookkeeping that
+  came with #434; compute is 0350's area).
+- Catch2 tests not ported.
+
+PS5 risk: more buffers bound per draw (bigger buffer cache, each read-only table pointer up to
+EDEN_NX2_TABLE_POOL_MIB), more instances drawn (GPU time), changed programs get new SPIR-V and miss
+the driver pipeline cache once. Watch the largest free block at area loads. Pair with
+EDEN_UP_FRITCHII_TABLECHARGE=1 and EDEN_UP_WIDE_COMPUTE_SSBOS=1.
+
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index 947886d..f750573 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -123,10 +123,13 @@ void AddNVNStorageBuffers(IR::Program& program) {
+         throw InvalidArgument("Invalid stage {}", program.stage);
+     }()};
+     auto& descs{program.info.storage_buffers_descriptors};
+-    // Info::MAX_SSBOS is 64 for EDEN_UP_WIDE_COMPUTE_SSBOS; graphics stages (32-bit enable masks,
+-    // 32 bindings per stage in the buffer cache) and every stage with the switch unset keep 32.
++    // Info::MAX_SSBOS is 64 for EDEN_UP_WIDE_COMPUTE_SSBOS (compute) and
++    // EDEN_UP_FRITCHII_GFX64SSBO (graphics stages, task and mesh programs among them: Fritchii
++    // 5d0032b054); a stage whose switch is unset keeps 32, the same limit as
++    // GlobalMemoryToStorageBufferPass's StorageBufferLimit.
+     static const bool wide_compute = ::Common::PeSwitch("EDEN_UP_WIDE_COMPUTE_SSBOS");
+-    const size_t max_ssbos{wide_compute && program.stage == Stage::Compute
++    static const bool wide_graphics = ::Common::PeSwitch("EDEN_UP_FRITCHII_GFX64SSBO");
++    const size_t max_ssbos{(program.stage == Stage::Compute ? wide_compute : wide_graphics)
+                                ? Info::MAX_SSBOS
+                                : Info::MAX_GRAPHICS_SSBOS};
+     for (u32 index = 0; index < num_buffers; ++index) {
+diff --git a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+index 61f8397..9924078 100644
+--- a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
++++ b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include "common/alignment.h"
+ #include "shader_recompiler/environment.h"
++#include "shader_recompiler/exception.h"
+ #include "shader_recompiler/frontend/ir/basic_block.h"
+ #include "shader_recompiler/frontend/ir/breadth_first_search.h"
+ #include "shader_recompiler/frontend/ir/ir_emitter.h"
+@@ -35,6 +36,12 @@ namespace {
+ 
+ size_t StorageBufferLimit(const Environment& env) {
+     static const bool wide = Common::PeSwitch("EDEN_UP_WIDE_COMPUTE_SSBOS");
++    // EDEN_UP_FRITCHII_GFX64SSBO=1 (Fritchii 5d0032b054, zortos293/Lichii#434): graphics stages,
++    // task and mesh programs among them, bind up to MAX_SSBOS (64) as well. Unset: 32, as before.
++    static const bool wide_graphics = Common::PeSwitch("EDEN_UP_FRITCHII_GFX64SSBO");
++    if (env.ShaderStage() != Stage::Compute) {
++        return wide_graphics ? Info::MAX_SSBOS : Info::MAX_GRAPHICS_SSBOS;
++    }
+     return wide && env.ShaderStage() == Stage::Compute ? Info::MAX_SSBOS : Info::MAX_GRAPHICS_SSBOS;
+ }
+ 
+@@ -1768,6 +1775,12 @@ void JoinStorageInfo(Info& base, Info& source) {
+             it->is_written |= desc.is_written;
+             continue;
+         }
++        if (descriptors.size() >= descriptors.capacity()) {
++            // Two halves of up to 64 each (EDEN_UP_FRITCHII_GFX64SSBO) can overflow the static
++            // vector; with 32 per half they never reach it. Rejected as Fritchii aaa992e8bf does.
++            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
++                                          descriptors.size() + 1, descriptors.capacity());
++        }
+         descriptors.push_back(desc);
+     }
+ }
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index c709c1b..99258d3 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -885,8 +885,9 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
+             }
+         }
+     }
+-    channel_state->enabled_storage_buffers[stage] |= 1U << ssbo_index;
+-    channel_state->written_storage_buffers[stage] |= (is_written ? 1U : 0U) << ssbo_index;
++    // 64-bit masks: a stage binds up to 64 storage buffers with EDEN_UP_FRITCHII_GFX64SSBO.
++    channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
++    channel_state->written_storage_buffers[stage] |= u64{is_written ? 1U : 0U} << ssbo_index;
+     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
+         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
+             ++channel_state->total_graphics_storage_buffers;
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index a87353b..2588948 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -67,6 +67,10 @@ constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
+ constexpr u32 NUM_STORAGE_BUFFERS = 32;
+ // Compute programs can take pointer table entries beyond 32 bindings (Shader::Info::MAX_SSBOS).
+ constexpr u32 NUM_COMPUTE_STORAGE_BUFFERS = 64;
++// Graphics stages too with EDEN_UP_FRITCHII_GFX64SSBO (Fritchii 5d0032b054): 64 bindings and
++// 64-bit enable masks per stage. Without the switch no stage gets past 32; the room is unused.
++constexpr u32 NUM_GRAPHICS_STORAGE_BUFFERS = 64;
++static_assert(NUM_GRAPHICS_STORAGE_BUFFERS <= 64, "graphics storage binding masks must fit u64");
+ constexpr u32 NUM_TEXTURE_BUFFERS = 32;
+ constexpr u32 NUM_STAGES = 5;
+ 
+@@ -136,7 +140,7 @@ public:
+     Binding index_buffer;
+     std::array<Binding, NUM_VERTEX_BUFFERS> vertex_buffers;
+     std::array<std::array<Binding, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_buffers;
+-    std::array<std::array<Binding, NUM_STORAGE_BUFFERS>, NUM_STAGES> storage_buffers;
++    std::array<std::array<Binding, NUM_GRAPHICS_STORAGE_BUFFERS>, NUM_STAGES> storage_buffers;
+     std::array<std::array<TextureBufferBinding, NUM_TEXTURE_BUFFERS>, NUM_STAGES> texture_buffers;
+     std::array<Binding, NUM_TRANSFORM_FEEDBACK_BUFFERS> transform_feedback_buffers;
+     Binding count_buffer_binding;
+@@ -152,8 +156,8 @@ public:
+     const UniformBufferSizes* uniform_buffer_sizes{};
+     const ComputeUniformBufferSizes* compute_uniform_buffer_sizes{};
+ 
+-    std::array<u32, NUM_STAGES> enabled_storage_buffers{};
+-    std::array<u32, NUM_STAGES> written_storage_buffers{};
++    std::array<u64, NUM_STAGES> enabled_storage_buffers{};
++    std::array<u64, NUM_STAGES> written_storage_buffers{};
+     u64 enabled_compute_storage_buffers = 0;
+     u64 written_compute_storage_buffers = 0;
+ 

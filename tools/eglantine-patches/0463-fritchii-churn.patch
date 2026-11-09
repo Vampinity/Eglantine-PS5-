@@ -1,0 +1,454 @@
+Subject: [PATCH] Fritchii v5: churn counters and the slow clear log (EDEN_UP_FRITCHII_CHURN, off by default)
+
+Port of Frizti/Fritchii dcbd696438 (churn counters, EDEN_NX2_CHURN_LOG) and 55dcce4217 (slow clear
+log), author Frizti with Claude Opus 5.5 (fable_answer_16 4). Measurement for fritchii-relocate.diff
+and fritchii-fbindex.diff on the console.
+
+With EDEN_UP_FRITCHII_CHURN=1 (counting and logging both off without it; one cached-bool check per
+site):
+- video_core/churn_counters.h: relaxed counters of images created/deleted, image views created/
+  destroyed, Vulkan framebuffers created, buffer cache CreateBuffer (both insert sites) /
+  DeleteBuffer / JoinOverlap and the bytes joins copy, staging buffers and their bytes, the
+  allocator's device memory allocations and frees (VMA pDeviceMemoryCallbacks, only set with the
+  switch), descriptor pools created. TextureCache::TickFrame logs "Churn (600 frames): ..." with the
+  image count.
+- RasterizerVulkan::Clear: a clear over 300 us is logged (at most 40 per 5 s) with the flush and
+  render target time, the targets, and what was made while its targets were set up (counter deltas).
+
+Deviations: fc40c591e9's per-join timers (rt_stats: walk/create/upload/delete/framebuffer ns,
+framebuffers scanned/removed) are replaced by the counter deltas: their hooks sit in JoinImages,
+GetFramebufferId and RemoveFramebuffers, which the relocation and framebuffer-index ports change.
+Relocated/pooled counts are not here (relocation logs its own line; no EXP42 pool). Framebuffers are
+counted in Vulkan Framebuffer::CreateFramebuffer. DeleteImage counts after its view loop, so its
+generator-pinned accounting slice is untouched; the staging counter sits after the generator's
+pinned CreateBuffer line.
+
+Checks (fritchii-churn_checks.sh, log fritchii-churn.checks.log): git apply --check on
+$R/Eglantine; 6 anchor skips before and after (same); generated copies that change:
+vk_texture_cache_cost, vulkan-cache buffer_cache.h and texture_cache.h, vulkan_device,
+vulkan_rasterizer, vulkan_staging_buffer_pool; -fsyntax-only of 11 TUs incl. those generated
+copies, the Vulkan/OpenGL texture and buffer cache instantiations and vk_descriptor_pool: rc=0;
+injected static_assert in churn_counters.h reported by 7 TUs, injected calls in each generated copy
+reported. Expected cost: negligible (relaxed adds); nothing without the switch.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index c709c1b..cb008bb 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -21,6 +21,7 @@
+ #include "common/range_sets.inc"
+ #include "video_core/buffer_cache/buffer_cache_base.h"
+ #include "video_core/buffer_cache/uniform_stream_reuse.h"
++#include "video_core/churn_counters.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+@@ -3044,6 +3045,8 @@ void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
+         .size = overlap.SizeBytes(),
+     });
+     new_buffer.MarkUsage(copies[0].dst_offset, copies[0].size);
++    Churn::Add(Churn::BuffersJoined);
++    Churn::Add(Churn::BufferJoinBytes, overlap.SizeBytes());
+     runtime.CopyBuffer(new_buffer, overlap, copies, true);
+ #ifdef YUZU_LEGACY
+     if (immediately_free)
+@@ -3096,6 +3099,7 @@ BufferId BufferCache<P>::JoinBuffer(DAddr device_addr, u32 wanted_size, bool spa
+     } else {
+         new_buffer_id = slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
+     }
++    Churn::Add(Churn::BuffersCreated);
+     auto& new_buffer = slot_buffers[new_buffer_id];
+     const size_t size_bytes = new_buffer.SizeBytes();
+     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
+@@ -3190,6 +3194,7 @@ BufferId BufferCache<P>::CreateRefusedBuffer(DAddr device_addr, u32 wanted_size,
+             continue;
+         }
+         const BufferId id = slot_buffers.insert(std::move(*made));
++        Churn::Add(Churn::BuffersCreated);
+         Buffer& buffer = slot_buffers[id];
+         runtime.ClearBuffer(buffer, 0, bytes, 0);
+         buffer.MarkUsage(0, bytes);
+@@ -3698,6 +3703,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+ 
+ template <class P>
+ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
++    Churn::Add(Churn::BuffersDeleted);
+     nx2_synced_ranges.fill({});
+     nx2_synced_vertex_buffers.fill({});
+     if (buffer_id == inline_buffer_id) {
+diff --git a/src/video_core/churn_counters.h b/src/video_core/churn_counters.h
+new file mode 100644
+index 0000000..ca8a847
+--- /dev/null
++++ b/src/video_core/churn_counters.h
+@@ -0,0 +1,154 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++
++/// EDEN_UP_FRITCHII_CHURN=1 (off unless set; Fritchii dcbd696438 + 55dcce4217, fable_answer_16 4):
++/// what the caches make and destroy, the per-frame churn of objects that should be reused (render
++/// targets at drifted addresses, buffers joined over drifted ranges, device memory blocks).
++/// Counted only with the switch (one relaxed add where an object is made or destroyed, next to
++/// far larger work); TextureCache::TickFrame logs "Churn (600 frames)", and
++/// RasterizerVulkan::Clear logs clears over 300 us with what the texture cache made for them.
++namespace VideoCommon::Churn {
++
++enum Counter : size_t {
++    ImagesCreated,
++    ImagesDeleted,
++    ImageViewsCreated,
++    ImageViewsDestroyed,
++    FramebuffersCreated, ///< Vulkan Framebuffer::CreateFramebuffer
++    BuffersCreated,      ///< BufferCache::CreateBuffer
++    BuffersDeleted,      ///< BufferCache::DeleteBuffer
++    BuffersJoined,       ///< BufferCache::JoinOverlap (each also deletes the joined buffer)
++    BufferJoinBytes,     ///< Bytes copied by those joins
++    StagingBuffers,      ///< StagingBufferPool::CreateStagingBuffer
++    StagingBytes,
++    DeviceAllocations,   ///< vkAllocateMemory by the allocator (blocks and dedicated memory)
++    DeviceFrees,
++    DescriptorPools,     ///< New descriptor pools (a bank ran out)
++    Count,
++};
++
++[[nodiscard]] inline bool Enabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_CHURN");
++    return enabled;
++}
++
++inline std::array<std::atomic<u64>, Count> g_counters{};
++
++inline void Add(Counter counter, u64 amount = 1) {
++    if (Enabled()) {
++        g_counters[counter].fetch_add(amount, std::memory_order_relaxed);
++    }
++}
++
++/// The counts so far, left as they are.
++[[nodiscard]] inline std::array<u64, Count> Peek() {
++    std::array<u64, Count> values{};
++    for (size_t i = 0; i < Count; ++i) {
++        values[i] = g_counters[i].load(std::memory_order_relaxed);
++    }
++    return values;
++}
++
++/// The counts since the last call, and resets them.
++[[nodiscard]] inline std::array<u64, Count> Take() {
++    std::array<u64, Count> values{};
++    for (size_t i = 0; i < Count; ++i) {
++        values[i] = g_counters[i].exchange(0, std::memory_order_relaxed);
++    }
++    return values;
++}
++
++/// RasterizerVulkan::Clear with the switch on (Fritchii 55dcce4217, with these counters in place
++/// of fc40c591e9's per-join timers): a clear over 300 us is logged with the flush and render
++/// target time and what was made while its render targets were set up, at most 40 per 5 s.
++class SlowClear {
++public:
++    using Clock = std::chrono::steady_clock;
++
++    SlowClear() : start{Clock::now()} {}
++    void Flushed() {
++        flushed = Clock::now();
++    }
++    void TargetsBegin() {
++        before = Peek();
++    }
++    void TargetsEnd(u64 rt0, u32 width, u32 height, u32 format, u64 zeta, bool zeta_on,
++                    u32 zeta_format, u32 surface, u32 layers) {
++        targets = Clock::now();
++        after = Peek();
++        target = {rt0, width, height, format, zeta, zeta_on, zeta_format, surface, layers};
++        has_targets = true;
++    }
++    ~SlowClear() {
++        const auto end = Clock::now();
++        if (end - start < std::chrono::microseconds{300}) {
++            return;
++        }
++        static std::atomic<s64> window_start{};
++        static std::atomic<u32> logged{};
++        const s64 now_ms =
++            std::chrono::duration_cast<std::chrono::milliseconds>(end.time_since_epoch()).count();
++        if (now_ms - window_start.load(std::memory_order_relaxed) > 5000) {
++            window_start.store(now_ms, std::memory_order_relaxed);
++            logged.store(0, std::memory_order_relaxed);
++        }
++        if (logged.fetch_add(1, std::memory_order_relaxed) >= 40) {
++            return;
++        }
++        const auto us = [](auto d) {
++            return static_cast<s64>(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
++        };
++        const s64 flush_us = flushed != Clock::time_point{} ? us(flushed - start) : -1;
++        if (!has_targets) {
++            LOG_INFO(Render_Vulkan, "Slow clear {} us (flush work {} us), no render targets set up",
++                     us(end - start), flush_us);
++            return;
++        }
++        const auto made = [this](Counter counter) { return after[counter] - before[counter]; };
++        LOG_INFO(Render_Vulkan,
++                 "Slow clear {} us (flush work {} us, render targets {} us): rt0 {:#x} {}x{} fmt "
++                 "{:#x}, zeta {:#x} {} fmt {:#x}, surface {:#x}, layers {}; while the targets were "
++                 "set up: images {} created, {} deleted, views {} created, {} destroyed, "
++                 "framebuffers {} created, device memory {} allocations, {} frees",
++                 us(end - start), flush_us, us(targets - flushed), target.rt0, target.width,
++                 target.height, target.format, target.zeta, target.zeta_on ? "on" : "off",
++                 target.zeta_format, target.surface, target.layers, made(ImagesCreated),
++                 made(ImagesDeleted), made(ImageViewsCreated), made(ImageViewsDestroyed),
++                 made(FramebuffersCreated), made(DeviceAllocations), made(DeviceFrees));
++    }
++    SlowClear(const SlowClear&) = delete;
++    SlowClear& operator=(const SlowClear&) = delete;
++
++private:
++    struct Target {
++        u64 rt0{};
++        u32 width{};
++        u32 height{};
++        u32 format{};
++        u64 zeta{};
++        bool zeta_on{};
++        u32 zeta_format{};
++        u32 surface{};
++        u32 layers{};
++    };
++    Clock::time_point start;
++    Clock::time_point flushed{};
++    Clock::time_point targets{};
++    std::array<u64, Count> before{};
++    std::array<u64, Count> after{};
++    Target target{};
++    bool has_targets{};
++};
++
++} // namespace VideoCommon::Churn
+diff --git a/src/video_core/renderer_vulkan/vk_descriptor_pool.cpp b/src/video_core/renderer_vulkan/vk_descriptor_pool.cpp
+index e19daba..02b7a32 100644
+--- a/src/video_core/renderer_vulkan/vk_descriptor_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_descriptor_pool.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "common/common_types.h"
+ #include <ranges>
++#include "video_core/churn_counters.h"
+ #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+ #include "video_core/renderer_vulkan/vk_resource_pool.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+@@ -80,6 +81,7 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
+     add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info.images);
+     add(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, info.sampled_images);
+     add(VK_DESCRIPTOR_TYPE_SAMPLER, info.samplers);
++    VideoCommon::Churn::Add(VideoCommon::Churn::DescriptorPools);
+     bank.pools.push_back(device.GetLogical().CreateDescriptorPool({
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+         .pNext = nullptr,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index e1d6c28..d613cc4 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -37,6 +37,7 @@
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
++#include "video_core/churn_counters.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/native_query_trace.h"
+@@ -1690,8 +1691,17 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+                  regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
+     }
+     TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
++    // EDEN_UP_FRITCHII_CHURN=1 (Fritchii 55dcce4217): a clear over 300 us is logged with where the
++    // time went and what the texture cache made for its targets (at most 40 per 5 s).
++    std::optional<VideoCommon::Churn::SlowClear> slow_clear;
++    if (VideoCommon::Churn::Enabled()) {
++        slow_clear.emplace();
++    }
+     FlushWork();
+     gpu_memory->FlushCaching();
++    if (slow_clear) {
++        slow_clear->Flushed();
++    }
+ 
+     auto& regs = maxwell3d->regs;
+     const bool use_color = regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
+@@ -1703,8 +1713,17 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+     }
+ 
+     std::scoped_lock lock{texture_cache.mutex};
++    if (slow_clear) {
++        slow_clear->TargetsBegin();
++    }
+     texture_cache.UpdateRenderTargets(true);
+     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
++    if (slow_clear) {
++        slow_clear->TargetsEnd(regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
++                               static_cast<u32>(regs.rt[0].format), regs.zeta.Address(),
++                               regs.zeta_enable != 0, static_cast<u32>(regs.zeta.format),
++                               regs.clear_surface.raw, layer_count);
++    }
+     const VkExtent2D render_area = framebuffer->RenderArea();
+ 
+     constexpr bool ENABLE_DEFERRED_CLEAR = true;
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 1e65b99..f5fa4d7 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -15,6 +15,7 @@
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+ #include "common/common_types.h"
++#include "video_core/churn_counters.h"
+ #include "common/literals.h"
+ #include "common/logging.h"
+ #include "common/pe_switch.h"
+@@ -390,6 +391,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+         ++buffer_index;
+         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
+     }
++    VideoCommon::Churn::Add(VideoCommon::Churn::StagingBuffers);
++    VideoCommon::Churn::Add(VideoCommon::Churn::StagingBytes, buffer_ci.size);
+     const std::span<u8> mapped_span = buffer.Mapped();
+     const VkDeviceAddress buffer_address =
+         device.IsBufferDeviceAddressSupported()
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index bc89ac0..c8b573c 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -41,6 +41,7 @@
+ #include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
++#include "video_core/churn_counters.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #ifdef EGLANTINE_STREAMLINE
+ #include "video_core/vulkan_common/streamline.h"
+@@ -5093,6 +5094,7 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
+     }
+ 
+     num_color_buffers = static_cast<u32>(num_colors);
++    VideoCommon::Churn::Add(VideoCommon::Churn::FramebuffersCreated);
+     framebuffer = runtime.device.GetLogical().CreateFramebuffer({
+         .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+         .pNext = nullptr,
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 968ae0f..82f23f2 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -40,6 +40,7 @@
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/churn_counters.h"
+ #include "video_core/textures/decoders.h"
+ 
+ namespace VideoCommon {
+@@ -1144,6 +1145,22 @@ void TextureCache<P>::TickFrame() {
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    // EDEN_UP_FRITCHII_CHURN=1 (Fritchii dcbd696438): what the caches made and destroyed.
++    if (Churn::Enabled() && frame_tick % 600 == 0) {
++        const auto churn = Churn::Take();
++        LOG_INFO(HW_GPU,
++                 "Churn (600 frames): images created {}, deleted {}; image views created {}, "
++                 "destroyed {}; framebuffers created {}; buffers created {}, deleted {}, joined {} "
++                 "({} KiB copied); staging buffers allocated {} ({} MiB); device memory "
++                 "allocations {}, frees {}; descriptor pools created {}; {} images now",
++                 churn[Churn::ImagesCreated], churn[Churn::ImagesDeleted],
++                 churn[Churn::ImageViewsCreated], churn[Churn::ImageViewsDestroyed],
++                 churn[Churn::FramebuffersCreated], churn[Churn::BuffersCreated],
++                 churn[Churn::BuffersDeleted], churn[Churn::BuffersJoined],
++                 churn[Churn::BufferJoinBytes] >> 10, churn[Churn::StagingBuffers],
++                 churn[Churn::StagingBytes] >> 20, churn[Churn::DeviceAllocations],
++                 churn[Churn::DeviceFrees], churn[Churn::DescriptorPools], slot_images.size());
++    }
+     if (RefusalEvictEnabled()) {
+         // EDEN_NX2_REFUSAL_EVICT=1: a refusal anywhere since the last frame's end (an image here,
+         // or the allocator: staging and other buffers, decode images, an image placed in host
+@@ -3313,6 +3330,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
+     const ImageInfo info(config);
+     if (info.type == ImageType::Buffer) {
+         const ImageViewInfo view_info(config, 0);
++        Churn::Add(Churn::ImageViewsCreated);
+         return slot_image_views.insert(runtime, info, view_info, config.Address());
+     }
+     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
+@@ -4290,6 +4308,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+         }
+         ++images_created;
+         ++area_images_created;
++        Churn::Add(Churn::ImagesCreated);
+     }
+ 
+     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
+@@ -5004,6 +5023,7 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
+                  info.range.extent.layers);
+     }
+     const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
++    Churn::Add(Churn::ImageViewsCreated);
+     image.InsertView(info, image_view_id);
+     return image_view_id;
+ }
+@@ -5261,6 +5281,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+         }
+         slot_image_views.erase(image_view_id);
+     }
++    Churn::Add(Churn::ImagesDeleted);
++    Churn::Add(Churn::ImageViewsDestroyed, image_view_ids.size());
+     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
+                                                        uncommitted_downloads, committed_downloads);
+     if (retained) {
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 54cdf8b..cfb9f0c 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -28,6 +28,7 @@
+ #include <ranges>
+ #include "common/settings.h"
+ #include "common/settings_enums.h"
++#include "video_core/churn_counters.h"
+ #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
+ #include "video_core/vulkan_common/vma.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+@@ -815,6 +816,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+             vma_block_bytes = VkDeviceSize{mib} << 20;
+         }
+     }
++    // EDEN_UP_FRITCHII_CHURN=1 (Fritchii dcbd696438): counts the allocator's vkAllocateMemory /
++    // vkFreeMemory calls (blocks and dedicated memory) for the "Churn (600 frames)" line.
++    static const VmaDeviceMemoryCallbacks churn_callbacks{
++        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
++            VideoCommon::Churn::Add(VideoCommon::Churn::DeviceAllocations);
++        },
++        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
++            VideoCommon::Churn::Add(VideoCommon::Churn::DeviceFrees);
++        },
++        .pUserData = nullptr,
++    };
+     const VmaAllocatorCreateInfo allocator_info{
+             .flags = flags,
+             .physicalDevice = physical,
+@@ -828,7 +840,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
+             .preferredLargeHeapBlockSize = vma_block_bytes,
+             .pAllocationCallbacks = nullptr,
+-            .pDeviceMemoryCallbacks = nullptr,
++            .pDeviceMemoryCallbacks = VideoCommon::Churn::Enabled() ? &churn_callbacks : nullptr,
+             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
+             .pVulkanFunctions = &functions,
+             .instance = instance,

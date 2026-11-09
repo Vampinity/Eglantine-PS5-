@@ -1,0 +1,70 @@
+Subject: [PATCH] djihads-channel-ids: clear a deleted buffer's id in every channel (EDEN_UP_DJ_CHANNEL_IDS=1)
+
+djihads-channel-ids: clear a deleted buffer's id in every channel (EDEN_UP_DJ_CHANNEL_IDS=1)
+
+Ported from Djihads80/Eglantine nx2-experimental c6d2acd37 ("nx2: Ocarina of Time stability,
+shader and performance fixes", #794, "clear deleted buffer ids in every channel"),
+GPL-3.0-or-later, BufferCache::DeleteBuffer. Co-authors per that commit.
+
+DeleteBuffer cleared the deleted id only from the current channel's bindings. The other channels
+keep theirs, and their resolved buffer ids survive across draws there: a stale id then addresses
+whatever buffer reuses the slot. Upstream: Ocarina of Time draws from several channels, and
+descriptors ended up ~100 MiB past 128 KiB buffers until the GPU faulted. With the switch, every
+other active channel gets the same clean-up (index, vertex, uniform, storage, transform feedback,
+compute bindings; their 3D dirty flags; has_deleted_buffers so they rebind).
+Off (unset): byte-identical. Upstream's unresolved_uniform_buffers reset is left out (that field
+does not exist in our tree).
+
+Checks (djihads-c6d2_checks.sh, log djihads-c6d2.checks.log): git apply --check on the T82 core,
+patch on a copy, prepare-vulkan-port.py same 6 anchor skips as baseline, -fsyntax-only rc=0 on
+every TU the diff reaches (generated copies included), injected static_assert seen in each,
+and all four djihads-*.diff stack in one tree (same anchors, rc=0). Not built, not run.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 8eb840f..7dc7351 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -3759,6 +3759,43 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+     replace(channel_state->compute_uniform_buffers);
+     replace(channel_state->compute_storage_buffers);
+ 
++    // EDEN_UP_DJ_CHANNEL_IDS=1 (Djihads80/Eglantine c6d2acd37, "clear deleted buffer ids in every
++    // channel"): the other channels keep their own bindings, and their resolved buffer ids survive
++    // across draws there. Left alone, a stale id addresses whatever buffer reuses this slot next.
++    // Ocarina of Time draws from several channels; upstream saw descriptors ~100 MiB past 128 KiB
++    // buffers and a GPU fault. The same clean-up as above, for every other active channel.
++    static const bool all_channels = Common::PeSwitch("EDEN_UP_DJ_CHANNEL_IDS");
++    if (all_channels) {
++        for (const size_t other_id : active_channel_ids) {
++            BufferCacheChannelInfo& other = channel_storage[other_id];
++            if (&other == channel_state) {
++                continue;
++            }
++            auto& other_flags = other.maxwell3d.dirty.flags;
++            if (other.index_buffer.buffer_id == buffer_id) {
++                other.index_buffer.buffer_id = BufferId{};
++                other_flags[Dirty::IndexBuffer] = true;
++            }
++            for (u32 index = 0; index < other.vertex_buffers.size(); index++) {
++                if (other.vertex_buffers[index].buffer_id == buffer_id) {
++                    other.vertex_buffers[index].buffer_id = BufferId{};
++                    other_flags[Dirty::VertexBuffers] = true;
++                    other_flags[Dirty::VertexBuffer0 + index] = true;
++                }
++            }
++            std::ranges::for_each(other.uniform_buffers, replace);
++            std::ranges::for_each(other.storage_buffers, replace);
++            replace(other.transform_feedback_buffers);
++            replace(other.compute_uniform_buffers);
++            replace(other.compute_storage_buffers);
++            if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
++                other.dirty_uniform_buffers.fill(~u32{0});
++                other.uniform_buffer_binding_sizes.fill({});
++            }
++            other.has_deleted_buffers = true;
++        }
++    }
++
+     // Mark the whole buffer as CPU written to stop tracking CPU writes
+     if (!do_not_mark) {
+         Buffer& buffer = slot_buffers[buffer_id];

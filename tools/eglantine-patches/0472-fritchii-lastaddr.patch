@@ -1,0 +1,182 @@
+Subject: [PATCH] fritchii2-lastaddr: a core's write area in HandleRasterizerWrite (last_address) now holds for one
+
+fritchii2-lastaddr: a core's write area in HandleRasterizerWrite (last_address) now holds for one
+gather only, so guest CPU writes to a page that no longer holds GPU-written data are marked
+CPU-modified at once, instead of waiting for the next gather while the tracker holds the page
+clean. Switch
+EDEN_UP_FRITCHII_LASTADDR=1, off by default.
+
+Upstream: the diagnosis is Frizti/Fritchii 9e8cb73ede (Frizti, 2026-11-07, "buffer_cache:
+EDEN_NX2_EXP9, check native uniform bank pages only when they may have changed", in fritchii-v4):
+HandleRasterizerWrite keeps each core's last_address on a page once a write to it was collected
+and never resets it, so later writes to that page are only collected, not marked CPU-modified,
+until the next InvalidateGPUCache. Fritchii never changed last_address (still the same at
+fritchii-v5.2, 18a68f26ad); it worked around it in its bank check (EXP9 flags, our
+fritchii2-bankflag) and in v5 with EXP35 (collect all writes, apply at each FlushCaching). So this
+reset is our own fix of the mechanism Fritchii found; there is no upstream line to cherry-pick.
+It is the narrow core of our EDEN_UP_HELD_VS_DOWNLOAD (MythosOfs/Orchid f2eb04babd, whose
+CollectWrite reports a page again after each gather) without that switch's download hold-back.
+t71-o ran HELD_VS_DOWNLOAD only without the frame wait (dark flashes, no effect).
+
+Mechanism. OnCPUWrite answers true for a page the buffer cache holds GPU-modified: the write is
+collected and applied at the next gather (GPU::InvalidateGPUCache: fences, MemOpB, guest reads of
+GPU data). The core then sets last_address to that page and skips OnCPUWrite for every later
+write there. When the page later loses its GPU-written data (download, gather), those writes are
+still only collected: the tracker holds the page clean, so a draw binding it before the next
+gather uploads nothing and reads the older host bytes. The back is often caught up with the game
+(GPU back ~37% waiting for the front, front ~23% waiting for the game, more so with the full frame
+wait), so a gather often runs before the game writes the words of its next list. Those writes then
+miss every draw of that list.
+
+With =1:
+- GPUDirtyMemoryManager::Gather moves Generation on (as it does for HELD_VS_DOWNLOAD).
+- HandleRasterizerWrite (the default path, not the HELD_VS_DOWNLOAD one) keeps the generation with
+  last_address. A write to the same page in a later generation asks OnCPUWrite again. If the page
+  is still GPU-modified, the write is collected as before and the area is armed for this
+  generation. If not, OnCPUWrite marks the write CPU-modified (buffer, texture and pipeline caches)
+  and does not collect it, as for a write to any other clean cached page.
+- Log, at each power of two: "EDEN_UP_FRITCHII_LASTADDR: N writes to a core's last collected page
+  asked again after a gather, M of them taken at once". M counts the writes the old path held back
+  while the page was clean. If M stays 0 for a session, the mechanism does not fire in our build.
+
+Unset: Generation() is not read (seen = 0) and every area's generation stays 0, so the test is the
+old `last_address != subaddress`. Gather leaves the counter alone and the HELD_VS_DOWNLOAD path is
+untouched, so behaviour is byte-identical. The checks run T82's text and the patched text through
+the same model (random writes, GPU writes, downloads and gathers) and get identical traces.
+
+Cost on the PS5 (guest cores are the limit, 82-88% busy). Per core and gather, at most one extra
+OnCPUWrite (the buffer cache mutex) for a page that is still GPU-modified. A page found clean costs
+one OnCPUWrite (both cache mutexes). After that the page is CPU-modified and unprotected, so the
+following writes skip HandleRasterizerWrite until the next upload protects it again. The old path
+sent each of those writes through the slow path to Collect instead. Expect about no fps change;
+measure the walk fps and read the log counts.
+
+Bright or dark: this leaves the host copy too OLD, never too new. A draw gets the bank words from
+before the game's latest write: the previous user of that slot (another object's material, or
+last frame's). That is the white-material flash kraibse saw in Ocarina of Time (Eglantine
+031e07436c, about 1 in 500 presents) and Fritchii v4's "fewer white flashes". It lasts one frame
+at most: the next gather (several a frame) or the next frame's once-a-frame bank re-mark
+(EDEN_NX2_BANK_REUPLOAD unset = 1) applies the write. Our dark full-scene flashes were the
+opposite, too new (frame N drawn with N+1's words), and the full frame wait removed them. The
+wait makes the back catch up with the game every frame, which widens this too-old window. So rare
+bright one-frame flashes with the wait on fit this mechanism. That is plausible, not proven: the
+log shows whether it fires. Not covered: writes to pages that are still GPU-modified wait for the
+gather by design (EDEN_NX2_HELD_WRITES=1, a gather before each list, covers those too).
+One trade (review 9 Nov): a write found clean is no longer collected, so if the back uploads the
+page in the short gap between OnCPUWrite's mark and the guest's store, nothing applies that write
+later (until the page's next write or the once-a-frame bank re-mark). Every first write to any
+clean page already has this gap; the old collect closed it for these writes only, at the cost of
+holding them until the gather.
+Independent of fritchii2-bankflag; the two apply on T82 in either order.
+
+diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
+--- a/src/core/gpu_dirty_memory_manager.h
++++ b/src/core/gpu_dirty_memory_manager.h
+@@ -76,10 +76,21 @@
+     /// EDEN_UP_HELD_VS_DOWNLOAD: moves on with each Gather. A page the core reported to the GPU
+     /// before must be reported again on its next write: the write held back for it has been
+     /// applied. Read after Collect, it tells whether the write went into the list after a Gather.
++    /// EDEN_UP_FRITCHII_LASTADDR moves it on too (ResetWriteAreas); with neither it stays 0.
+     [[nodiscard]] u64 Generation() const {
+         return generation.load(std::memory_order_acquire);
+     }
+ 
++    /// EDEN_UP_FRITCHII_LASTADDR=1 (diagnosis: Frizti/Fritchii 9e8cb73ede): Memory's
++    /// HandleRasterizerWrite asks OnCPUWrite again on a core's first write to its last collected
++    /// page after each Gather. Off: as before, every later write to that page is only collected
++    /// (applied at the next Gather) until the core collects a write to another page, even once
++    /// the page holds no GPU-written data any more.
++    [[nodiscard]] static bool ResetWriteAreas() {
++        static const bool on = Common::PeSwitch("EDEN_UP_FRITCHII_LASTADDR");
++        return on;
++    }
++
+     /// The page a core last reported to the GPU, and in which generation.
+     struct ReportedPage {
+         PAddr page{~PAddr{}};
+@@ -134,7 +145,7 @@
+         {
+             std::scoped_lock lk(guard);
+             TransformAddress t;
+-            if (HeldVsDownload()) {
++            if (HeldVsDownload() || ResetWriteAreas()) {
+                 // Before the exchange: a Collect that lands in the next list sees the new
+                 // generation.
+                 generation.fetch_add(1, std::memory_order_relaxed);
+@@ -225,7 +236,7 @@
+     }
+ 
+     std::atomic<TransformAddress> current{};
+-    std::atomic<u64> generation{}; ///< EDEN_UP_HELD_VS_DOWNLOAD only
++    std::atomic<u64> generation{}; ///< EDEN_UP_HELD_VS_DOWNLOAD / EDEN_UP_FRITCHII_LASTADDR only
+     std::mutex guard;
+     std::mutex gather_guard;
+     std::vector<TransformAddress> back_buffer;
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -924,29 +924,63 @@
+             });
+             return;
+         }
++        // EDEN_UP_FRITCHII_LASTADDR (diagnosis: Frizti/Fritchii 9e8cb73ede): last_address spares
++        // OnCPUWrite for the page whose writes the GPU collects, but it stays on that page after a
++        // Gather applied them and the page lost its GPU-written data. Later writes there are then
++        // still only collected, so the buffer cache holds the page clean and draws with its older
++        // bytes until the next Gather. With the switch the area holds for one Gather only.
++        const bool reset_areas = Core::GPUDirtyMemoryManager::ResetWriteAreas();
+         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+             auto& current_area = rasterizer_write_areas[core];
+             PAddr subaddress = address >> YUZU_PAGEBITS;
++            // Unset: 0 here and in every area, so only the page decides, as before.
++            const u64 seen = reset_areas ? gpu_dirty_managers[core].Generation() : 0;
++            const bool same_page = current_area.last_address == subaddress;
+             // Performance note:
+             // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
+             // It is often the case the games like to access wildly different addresses. Hence why I propose
+             // we should let the compiler just do it's thing...
+-            if (current_area.last_address != subaddress) {
++            if (!same_page || current_area.generation != seen) {
+                 // Short circuit the need to check for address/size
+                 auto const do_collection = (address != 0 && size != 0)
+                     && system.GPU().OnCPUWrite(address, size);
++                if (same_page) {
++                    NoteWriteAreaReset(!do_collection);
++                }
+                 if (do_collection) {
+                     current_area.last_address = subaddress;
++                    current_area.generation = seen;
+                 } else {
+                     return;
+                 }
+             }
+             gpu_dirty_managers[core].Collect(address, size);
+         });
++    }
++
++    /// EDEN_UP_FRITCHII_LASTADDR: counts the writes to a core's last collected page asked again
++    /// after a Gather, and those OnCPUWrite took at once (no GPU-written data left there: marked
++    /// CPU-modified now, where the old path only collected them for the next Gather), logged at
++    /// each power of two.
++    static void NoteWriteAreaReset(bool taken_at_once) {
++        static std::atomic<u64> asked{};
++        static std::atomic<u64> at_once{};
++        const u64 at_once_count =
++            at_once.fetch_add(taken_at_once ? 1 : 0, std::memory_order_relaxed) +
++            (taken_at_once ? 1 : 0);
++        const u64 count = asked.fetch_add(1, std::memory_order_relaxed) + 1;
++        if ((count & (count - 1)) == 0) {
++            LOG_INFO(HW_Memory,
++                     "EDEN_UP_FRITCHII_LASTADDR: {} writes to a core's last collected page asked "
++                     "again after a gather, {} of them taken at once (the page had no GPU-written "
++                     "data left; the old path held them for the next gather)",
++                     count, at_once_count);
++        }
+     }
+ 
+     struct GPUDirtyState {
+         PAddr last_address;
++        u64 generation; ///< EDEN_UP_FRITCHII_LASTADDR: Generation() when last_address was set
+     };
+ 
+     void InvalidateGPUMemory(u8* p, size_t size) {

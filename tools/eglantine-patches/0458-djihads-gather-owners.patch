@@ -1,0 +1,104 @@
+Subject: [PATCH] djihads-gather-owners: gathered multi-range copies die with their sources (EDEN_UP_DJ_GATHER_OWNERS=1)
+
+djihads-gather-owners: gathered multi-range copies die with their sources (EDEN_UP_DJ_GATHER_OWNERS=1)
+
+Ported from Djihads80/Eglantine nx2-experimental c6d2acd37 ("nx2: Ocarina of Time stability,
+shader and performance fixes", #794, "release gathered buffers together with their sources"),
+GPL-3.0-or-later, vk_multi_range_buffer.cpp/.h and BufferCacheRuntime::TickFrame.
+Co-authors per that commit.
+
+A multi-range storage binding that can't be bound sparse is served by a gathered device-local
+copy. Only sparse entries recorded their source buffers as owners, so deleting a source dropped
+the sparse alias but never the gathered copy: it lived on until its key came back with another
+layout (device memory held for buffers that are gone; on a reused VkBuffer handle the cached copy
+can be taken for the new buffer's). With the switch every entry records its owners, DropOwner
+retires gathered copies too, and the retired ones are freed each frame once the GPU is done with
+them (TickFrame) instead of only on the next Get.
+Off (unset): byte-identical (TickFrame returns at once). No new scheduler Wait/Finish site
+(prepare-vulkan-port counts them).
+
+Checks (djihads-c6d2_checks.sh, log djihads-c6d2.checks.log): git apply --check on the T82 core,
+patch on a copy, prepare-vulkan-port.py same 6 anchor skips as baseline, -fsyntax-only rc=0 on
+every TU the diff reaches (generated copies included), injected static_assert seen in each,
+and all four djihads-*.diff stack in one tree (same anchors, rc=0). Not built, not run.
+
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index 3a3fa51..2b828ee 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -518,6 +518,7 @@ void BufferCacheRuntime::ThrowRefused() const {
+ }
+ 
+ void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept {
++    multi_range_buffers.TickFrame(scheduler); // EDEN_UP_DJ_GATHER_OWNERS only
+     for (auto it = slot_buffers.begin(); it != slot_buffers.end(); it++) {
+         if (scheduler.IsFree(it->LastUsageTick())) {
+             it->ResetUsageTracking();
+diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
+index 4d84390..76739af 100644
+--- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
++++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
+@@ -5,6 +5,7 @@
+ #include <mutex>
+ #include <utility>
+ 
++#include "common/pe_switch.h"
+ #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+@@ -168,6 +169,24 @@ SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler
+     return handle;
+ }
+ 
++namespace {
++// EDEN_UP_DJ_GATHER_OWNERS=1 (Djihads80/Eglantine c6d2acd37, "release gathered buffers together
++// with their sources"): a gathered copy (the path when the sources can't be bound sparse) records
++// its source buffers as owners too, so DropOwner retires it when one of them is deleted, and the
++// retired copies are freed each frame (TickFrame), not only on the next Get. Off: a gathered copy
++// lives until its key comes back with another layout, after its sources are gone.
++bool GatherOwners() {
++    static const bool on = Common::PeSwitch("EDEN_UP_DJ_GATHER_OWNERS");
++    return on;
++}
++} // Anonymous namespace
++
++void MultiRangeBufferCache::TickFrame(Scheduler& scheduler) {
++    if (GatherOwners() && !retired.empty()) {
++        DrainRetired(scheduler);
++    }
++}
++
+ void MultiRangeBufferCache::RetireEntry(Scheduler& scheduler, Entry& entry) {
+     if (!entry.sparse_handle && !entry.gathered) {
+         return;
+@@ -248,9 +267,15 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
+     entry.geometry = geometry;
+     entry.content = content;
+     entry.size = total;
++    if (GatherOwners()) {
++        entry.owners.reserve(sources.size());
++        for (const MultiRangeSource& source : sources) {
++            entry.owners.push_back(source.handle);
++        }
++    }
+     if (CanBindSparse(sources)) {
+         entry.sparse_handle = CreateSparse(device, scheduler, sources, total);
+-        if (entry.sparse_handle) {
++        if (entry.sparse_handle && !GatherOwners()) {
+             entry.owners.reserve(sources.size());
+             for (const MultiRangeSource& source : sources) {
+                 entry.owners.push_back(source.handle);
+diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.h b/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
+index f40d3aa..86ad308 100644
+--- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
++++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
+@@ -59,6 +59,9 @@ public:
+ 
+     void DropOwner(Scheduler& scheduler, VkBuffer owner);
+ 
++    /// EDEN_UP_DJ_GATHER_OWNERS: frees the retired buffers the GPU is done with (else nothing).
++    void TickFrame(Scheduler& scheduler);
++
+     VkDeviceSize block_size{DEFAULT_BLOCK_SIZE};
+     bool use_sparse{};
+ 

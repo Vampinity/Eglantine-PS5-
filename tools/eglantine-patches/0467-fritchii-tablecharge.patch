@@ -1,0 +1,103 @@
+Subject: [PATCH] fritchii-tablecharge: pointer table entries are charged only for bindings the first pass left free.
+
+fritchii-tablecharge: pointer table entries are charged only for bindings the first pass left free.
+Switch EDEN_UP_FRITCHII_TABLECHARGE=1, off by default (Common::PeSwitch).
+
+Upstream: Frizti/Fritchii a0bcae9b25 "shader: charge pointer table entries only for bindings the
+first pass left free" (cherry-pick of 4ff805a0c0), from zortos293/Lichii#421, also the first commit
+of #434; merged as b727011f95 into fritchii-v4 ("Hyrule Field grass no longer disappears").
+
+What it fixes: GlobalMemoryToStorageBufferPass binds pointer table entries in the storage buffer
+bindings the pass without them leaves free (table_budget). The second pass started from an empty
+set, so a table entry's holder that the first pass had bound (and so already kept out of the
+budget) was charged again and shut out other tables. Ocarina's foliage culling compute
+331e607152ce78d5 bound 28 of 32 bindings and 4 of its 8 per-type instance tables; a plant type
+whose table is not bound is culled whole. Upstream: all 8 tables with the fix (541ba22d44898196: 7,
+was 6).
+
+With the switch: the second pass carries the first pass's set as `counted`; candidates and holders
+in it take nothing from table_budget. If the result plus the reserved NVN bindings still goes past
+the stage limit, the program keeps the first pass's buffers (tables left out, bindings_full, so the
+"All N storage buffer bindings taken" warning still shows). Unset: `counted` stays empty, the
+takes_binding test is the old test, and the second pass is the old code path (moves included).
+
+Deviations from upstream:
+- Switch-gated (upstream is unconditional).
+- Our stage limit is StorageBufferLimit(env) (0350 EDEN_UP_WIDE_COMPUTE_SSBOS) minus our T61
+  PendingNvnBindings reservation, so the fallback compares set.size() + reserved with the limit.
+- The fallback sets bindings_full (upstream drops silently) so the PS5 log still says it happened.
+- Catch2 tests not ported (no test build here).
+
+PS5: logs from 6-9 Nov show "All 32 storage buffer bindings taken, the rest stay global" about 5
+times per run in Kokiri (2012 lines in 411 logs). Test together with EDEN_UP_WIDE_COMPUTE_SSBOS=1
+(Fritchii needs 33 bindings in Hyrule Field, 37 in Castle Town) and, for task/mesh grass programs,
+fritchii-gfx64ssbo (EDEN_UP_FRITCHII_GFX64SSBO=1). Programs whose bindings change get new SPIR-V and miss the driver pipeline cache once.
+
+diff --git a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+index 61f8397..cb447e4 100644
+--- a/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
++++ b/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp
+@@ -97,6 +97,10 @@ struct StorageInfo {
+     size_t table_budget{};
+     size_t table_used{};
+     small_vector<StorageBufferAddr, 8> table_candidates;
++    /// The storage buffers the pass without table entries bound. Bound again, they take nothing
++    /// from table_budget, which they were already left out of (EDEN_UP_FRITCHII_TABLECHARGE).
++    /// Empty without the switch.
++    StorageBufferSet counted;
+     /// A buffer was left out, its accesses global: every binding was taken.
+     bool bindings_full{};
+ };
+@@ -1416,10 +1420,15 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info,
+             for (const StorageBufferAddr& candidate : candidates) {
+                 const StorageBufferAddr holder{.index = candidate.index,
+                                                .offset = candidate.offset};
++                // A buffer takes a binding unless this pass or the one before it (counted) bound
++                // it; counted is empty without EDEN_UP_FRITCHII_TABLECHARGE.
++                const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
++                    return info.set.find(buffer) == info.set.end() &&
++                           !info.counted.contains(buffer);
++                };
+                 const size_t added{
+-                    (info.set.find(candidate) == info.set.end() ? 1U : 0U) +
+-                    (candidate.indirect != ~0U && info.set.find(holder) == info.set.end() ? 1U
+-                                                                                          : 0U)};
++                    (takes_binding(candidate) ? 1U : 0U) +
++                    (candidate.indirect != ~0U && takes_binding(holder) ? 1U : 0U)};
+                 const bool table{std::ranges::find(info.table_candidates, candidate) !=
+                                  info.table_candidates.end()};
+                 if ((table && info.table_used + added > info.table_budget) ||
+@@ -1720,12 +1729,29 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
+     if (info.tables_seen && info.set.size() + reserved < StorageBufferLimit(env)) {
+         // Again with pointer table entries, in the bindings the first pass left free.
+         StorageInfo with_tables;
+-        with_tables.iterator_words = std::move(info.iterator_words);
+-        with_tables.atomic_pointers = std::move(info.atomic_pointers);
+         with_tables.tables_enabled = true;
+         with_tables.table_budget = StorageBufferLimit(env) - info.set.size() - reserved;
+-        info = std::move(with_tables);
+-        collect();
++        // EDEN_UP_FRITCHII_TABLECHARGE=1 (zortos293/Lichii#421, Fritchii a0bcae9b25): the buffers
++        // the first pass bound take nothing from table_budget when this pass binds them again,
++        // and a result past the stage limit falls back to the first pass's buffers.
++        static const bool charge_once = Common::PeSwitch("EDEN_UP_FRITCHII_TABLECHARGE");
++        if (charge_once) {
++            with_tables.iterator_words = info.iterator_words;
++            with_tables.atomic_pointers = info.atomic_pointers;
++            with_tables.counted = info.set;
++            std::swap(info, with_tables);
++            collect();
++            if (info.set.size() + reserved > StorageBufferLimit(env)) {
++                // Never more storage buffers than a stage binds: without the table entries, then.
++                info = std::move(with_tables);
++                info.bindings_full = true;
++            }
++        } else {
++            with_tables.iterator_words = std::move(info.iterator_words);
++            with_tables.atomic_pointers = std::move(info.atomic_pointers);
++            info = std::move(with_tables);
++            collect();
++        }
+     } else if (info.tables_seen) {
+         info.bindings_full = true;
+     }

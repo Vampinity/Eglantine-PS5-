@@ -1,0 +1,61 @@
+Subject: [PATCH] fritchii-pr700 v2, incremental on T82 (0451 applied): takes 0451's InvalidationAccumulator hunks
+
+fritchii-pr700 v2, incremental on T82 (0451 applied): takes 0451's InvalidationAccumulator hunks
+back, as Fritchii v5.1 did. The result is the same tree as replacing 0451 with
+fritchii-pr700-v2.diff. EDEN_UP_FRITCHII_PR700=1 keeps only the QueryCacheBase::IterateCache early
+exit (query_cache_base.h is not touched here).
+
+Upstream: zortos293/Lichii#700 (zortos293), ported to Fritchii in f9c0e2d611 (Frizti,
+fritchii-v5); its accumulator half rolled back by Frizti (with Claude Opus 5.5) in c2d2f50d15
+"Revert the accumulator half of the zortos293/Lichii#700 port for Fritchii v5.1" (fritchii-v5.1,
+2026-11-09; unchanged in fritchii-v5.2).
+
+Why: rounding a write's invalidation out to whole 32-byte blocks reaches bytes the CPU did not
+write; when those are GPU-written and not yet in guest memory, the invalidation reloads stale guest
+bytes over them (Fritchii's owner: glowing geometry over the Hyrule Field drawbridge, the Kakariko
+graveyard stale-vertex class). Here MemoryManager::FlushCaching -> RasterizerVulkan::
+InnerInvalidation -> BufferCache::WriteMemory drops the GPU-modified state of exactly the range it
+is given, so the same applies. invalidation_accumulator.h goes back to the base commit's bytes
+(its old arithmetic was what T82 ran with the switch unset).
+
+diff --git a/src/video_core/invalidation_accumulator.h b/src/video_core/invalidation_accumulator.h
+index 40f5cfa..eb18856 100644
+--- a/src/video_core/invalidation_accumulator.h
++++ b/src/video_core/invalidation_accumulator.h
+@@ -10,7 +10,6 @@
+ #include <vector>
+ 
+ #include "common/common_types.h"
+-#include "common/pe_switch.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -22,14 +21,8 @@ public:
+     void Add(GPUVAddr address, size_t size) noexcept {
+         auto const end_address = start_address + accumulated_size;
+         if (!(address >= start_address && address + size <= end_address)) {
+-            // EDEN_UP_FRITCHII_PR700=1 (zortos293/Lichii#700, Fritchii f9c0e2d611): the range runs
+-            // from the start of the first 32-byte block the write touches to the end of the last
+-            // one. Unset, the size is taken before the address is aligned down, so a write past its
+-            // block's start gets a range ending short of it (a lone word at 0x54 gives [0x40, 0x4c)).
+-            const GPUVAddr first_block = address & atomicity_mask;
+-            size = ((address + size + atomicity_size_mask) & atomicity_mask) -
+-                   (BlockFix() ? first_block : address);
+-            address = first_block;
++            size = ((address + size + atomicity_size_mask) & atomicity_mask) - address;
++            address = address & atomicity_mask;
+             if (start_address == 0) {
+                 start_address = address;
+                 accumulated_size = size;
+@@ -59,11 +52,6 @@ public:
+     }
+ 
+ private:
+-    static bool BlockFix() noexcept {
+-        static const bool on = ::Common::PeSwitch("EDEN_UP_FRITCHII_PR700");
+-        return on;
+-    }
+-
+     static constexpr size_t atomicity_bits = 5;
+     static constexpr size_t atomicity_size = 1ULL << atomicity_bits;
+     static constexpr size_t atomicity_size_mask = atomicity_size - 1;

@@ -27,7 +27,7 @@ Checked: applies on core16. PS5-target syntax compile of both files, no errors. 
 old scans: AreOrdered 38,024 pairs, block lookup 1.2 million queries, 0 differences. These tests ran
 the logic on plain containers, not boost's intrusive ones. Not run on the console.
 
-Co-authored-by: Zortos <zortosdev@proton.me>
+Co-authored-by: Zortos (zortos293)
 Co-authored-by: capy-ai[bot] <230910855+capy-ai[bot]@users.noreply.github.com>
 
 diff --git a/src/shader_recompiler/frontend/maxwell/control_flow.cpp b/src/shader_recompiler/frontend/maxwell/control_flow.cpp

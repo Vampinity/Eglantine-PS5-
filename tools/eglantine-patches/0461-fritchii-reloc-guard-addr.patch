@@ -1,0 +1,118 @@
+Subject: [PATCH] fritchii-reloc-guard-addr on fritchii-relocate-v2.diff: the render target relocation guard works
+
+fritchii-reloc-guard-addr on fritchii-relocate-v2.diff: the render target relocation guard works
+by address too (garbled dialogue text). Apply after fritchii-relocate-v2.diff (it does not apply
+on T82 alone or on fritchii-relocate.diff v1; for v1 use fritchii-reloc-guard-addr.diff). Same
+change as that diff; only the 600-frame "Render target relocation" hunk is rebased onto v2's
+line (which gained the exact-frame-boundary count). No new switch: it only acts inside
+EDEN_UP_FRITCHII_RELOCATE=1's relocation, which it makes refuse more.
+
+Upstream: Frizti/Fritchii b3396c01f9 "texture_cache: relocation guard by address too (garbled
+dialogue text)" (Frizti, with Claude Opus 5.5), released in fritchii-v5.1 (2026-11-09), unchanged
+in fritchii-v5.2. It fixes Fritchii's EXP43 relocation (07b38b3caf, 86a04911af), which
+fritchii-relocate-v2.diff ports.
+
+What it fixes (Fritchii v5.1 notes and commit): OoT draws each dialogue box's text into a render
+target at one address, sized to the box. The guard was per shape (format and size), so every new
+box size was relocated once before its own guard tripped, and that box's text showed scraps of
+other images (the owner's v5 session: dozens of guard trips at 0x8113100000, one per box size).
+A guard trip now also protects its address.
+
+Changes (as upstream):
+- NoteRelocationGuard: every trip ORs its reason into relocation_guarded_addresses[image.gpu_addr]
+  (before the shape's early return, so later trips on an already guarded shape note their address
+  too). Only with EDEN_UP_FRITCHII_RELOCATE=1 (review fix: with EDEN_UP_FRITCHII_COLD alone the map
+  only grew, one entry per tripped address for the session, and nothing read it).
+- JoinImages: a candidate is kept (counted in relocation_guarded) when its shape is guarded OR the
+  target's new address or the old image's address is in relocation_guarded_addresses.
+- texture_cache_base.h: the map (Common::unordered_map<GPUVAddr, u8>, sticky for the session like
+  relocation_shapes; one entry per guarded image address).
+Deviation: a counter of candidates kept by the address alone (relocation_guarded_by_address) and
+the map's size are added to the 600-frame "Render target relocation" line, so a run shows whether
+the address guard ever fires ("({} by the address alone)", "{} addresses guarded"). Upstream only
+counts them in relocation_guarded. The cold sweep (EDEN_UP_FRITCHII_COLD) still reads the shape
+guard only, as upstream.
+
+Unset EDEN_UP_FRITCHII_RELOCATE and EDEN_UP_FRITCHII_COLD: nothing runs (NoteRelocationGuard and
+the relocation block are behind FritchiiRelocationGuards()/FritchiiRelocate()), byte-identical
+behaviour. With only COLD set: one cached bool test per trip, nothing stored, as before.
+Memory: the map is sticky and unbounded like relocation_shapes, but keyed by address, so a
+drifting chain whose members trip adds one entry per address (16 bytes plus table overhead);
+the log line's "{} addresses guarded" shows the growth.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 71b90ac..c3c9cfd 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1286,17 +1286,19 @@ void TextureCache<P>::TickRelocation() {
+     }
+     LOG_INFO(HW_GPU,
+              "Render target relocation (EDEN_UP_FRITCHII_RELOCATE={}) last 600 frames: {} "
+-             "candidates, {} kept by the guard, {} relocated, {} over 2+ images of their shape; {} "
+-             "of {} shapes guarded; {} cleared targets over bad overlaps waited for an exact frame "
+-             "boundary{}",
++             "candidates, {} kept by the guard ({} by the address alone), {} relocated, {} over 2+ "
++             "images of their shape; {} of {} shapes guarded, {} addresses guarded; {} cleared "
++             "targets over bad overlaps waited for an exact frame boundary{}",
+              FritchiiRelocate() ? 1 : 0, relocation_candidates, relocation_guarded,
+-             relocation_relocated, relocation_crowded, guarded_shapes, relocation_shapes.size(),
++             relocation_guarded_by_address, relocation_relocated, relocation_crowded,
++             guarded_shapes, relocation_shapes.size(), relocation_guarded_addresses.size(),
+              relocation_unreliable,
+              Tegra::g_nx2_render_clock_lost.load(std::memory_order_relaxed)
+                  ? " (clock lost: relocation off for the session)"
+                  : "");
+     relocation_candidates = relocation_guarded = relocation_relocated = relocation_crowded = 0;
+     relocation_unreliable = 0;
++    relocation_guarded_by_address = 0;
+ }
+ 
+ template <class P>
+@@ -4798,8 +4800,13 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             RelocationShape& shape = relocation_shapes[RelocationShapeKey(new_info)];
+             relocation_seen = true;
+             ++relocation_candidates;
+-            if (shape.guard != 0) {
++            // The guard by address too (Fritchii b3396c01f9): a trip also protects the address of
++            // the image it tripped on, checked for the target's new and old address.
++            const bool address_guarded = relocation_guarded_addresses.contains(gpu_addr) ||
++                                         relocation_guarded_addresses.contains(old_gpu_addr);
++            if (shape.guard != 0 || address_guarded) {
+                 ++relocation_guarded;
++                relocation_guarded_by_address += shape.guard == 0 ? 1 : 0;
+             } else {
+                 if (!shape.relocated_logged) {
+                     shape.relocated_logged = true;
+@@ -6068,6 +6075,11 @@ ImageId TextureCache<P>::RelocationCandidate(const ImageInfo& new_info, GPUVAddr
+ template <class P>
+ void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reason) {
+     image.relocation_guard_noted |= reason;
++    // Every trip notes its address (Fritchii b3396c01f9), also when the shape was guarded already.
++    // Only the relocation reads it, so with EDEN_UP_FRITCHII_COLD alone nothing is kept.
++    if (FritchiiRelocate()) {
++        relocation_guarded_addresses[image.gpu_addr] |= reason;
++    }
+     RelocationShape& shape = relocation_shapes[RelocationShapeKey(image.info)];
+     if ((shape.guard & reason) != 0) {
+         return;
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index d111d39..e436c90 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -668,9 +668,16 @@ private:
+         u32 same_frame_refused{}; ///< Since the last report (render-frame clock line)
+     };
+     ::Common::unordered_map<u64, RelocationShape> relocation_shapes;
++    /// The guard by address too (Fritchii b3396c01f9, fritchii-v5.1): each trip also guards the
++    /// address of the image it tripped on (its RelocationGuard bits), and JoinImages checks a
++    /// target's new and old address. OoT draws each dialogue box's text into a render target at
++    /// one address, sized to the box: per shape, every new box size was relocated once before its
++    /// own guard tripped, and that box's text showed other images' contents. Sticky, as the shapes.
++    ::Common::unordered_map<GPUVAddr, u8> relocation_guarded_addresses;
+     /// Since the last report (TickRelocation, every 600 frames once a candidate was seen).
+     u64 relocation_candidates{};
+     u64 relocation_guarded{};
++    u64 relocation_guarded_by_address{}; ///< Of relocation_guarded: the shape was not guarded
+     u64 relocation_relocated{};
+     u64 relocation_crowded{}; ///< Cleared targets over two or more images of their shape
+     u64 relocation_same_frame{}; ///< Candidates whose only predecessors were written this frame

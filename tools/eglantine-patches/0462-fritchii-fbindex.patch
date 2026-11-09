@@ -1,0 +1,208 @@
+Subject: [PATCH] Fritchii v5: framebuffers indexed by image view, drift shortcut in JoinImages' overlap walk (EDEN_UP_FRITCHII_FBINDEX / EDEN_UP_FRITCHII_DRIFT, off by default)
+
+Port of Frizti/Fritchii d69ecefe34 (author Frizti, with Claude Opus 5.5; fable_answer_12 2E),
+without its rt_stats lines (fc40c591e9 is not in this tree).
+
+- EDEN_UP_FRITCHII_FBINDEX=1: GetFramebufferId files each new framebuffer under its views
+  (framebuffers_by_view) and its key (framebuffer_keys); RemoveFramebuffers takes a deleted image's
+  framebuffers from the index instead of scanning the whole framebuffer map, which grows by one
+  entry per drifted render target per frame until the collector deletes them. A null view in the
+  list still takes the full scan (which now also unindexes). Same framebuffers removed either way:
+  every key holding one of the views; ASSERTs on the key lookup and on framebuffers.erase(key)==1.
+  The only users of the map are GetFramebufferId's try_emplace and RemoveFramebuffers (checked).
+- EDEN_UP_FRITCHII_DRIFT=1: a single-level, single-layer 2D image overlapping another such image
+  (same layer stride) at a non-zero offset under one layer, its size and the other's size is filed
+  as a bad overlap at once. That offset is no mip or layer base of either image (TryFindBase /
+  ResolveOverlapLeft/Right2D need a mip offset of 0 for one level), so ResolveOverlap and both
+  IsSubresource checks would return nothing: same outcome, less CPU. Separate switch so the
+  equivalence can be A/B'd on its own.
+
+Checks (fritchii-fbindex_checks.sh, log fritchii-fbindex.checks.log): git apply --check on
+$R/Eglantine; 6 anchor skips before and after (same); only the generated texture_cache.h copy
+differs; -fsyntax-only of vk_texture_cache_base.cpp (Vulkan instantiation), vk_texture_cache_cost,
+vulkan_rasterizer, gl_texture_cache_base, texture_cache.cpp: rc=0; injected static_assert in
+texture_cache_base.h and 4 injected calls in the new code (index, unindex, indexed removal, drift
+shortcut) all reported by the Vulkan instantiation. Stacks with the other fritchii-*.diff in any order.
+
+Expected effect: less back-thread CPU in collector bursts (each delete scanned the whole map) and in
+JoinImages for drifted targets; no memory cost (two small maps). Risk: low; a desync shows as an
+ASSERT in the log.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 968ae0f..715f414 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -71,6 +71,24 @@ namespace VideoCommon {
+     return enabled;
+ }
+ 
++/// EDEN_UP_FRITCHII_FBINDEX=1 (off unless set; Fritchii d69ecefe34, fable_answer_12 2E): the
++/// framebuffers are indexed by their image views, so RemoveFramebuffers takes a deleted image's
++/// framebuffers from the index instead of scanning the whole framebuffer map (one entry per
++/// drifted render target a frame until the collector deletes them). Same framebuffers removed.
++[[nodiscard]] inline bool FritchiiFramebufferIndex() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_FBINDEX");
++    return enabled;
++}
++
++/// EDEN_UP_FRITCHII_DRIFT=1 (off unless set; Fritchii d69ecefe34): JoinImages files a single-level,
++/// single-layer 2D image that overlaps another such image at an offset under one layer (and not
++/// 0) as a bad overlap at once: that offset is no mip or layer base of either image, so
++/// ResolveOverlap and both IsSubresource checks would fail anyway.
++[[nodiscard]] inline bool FritchiiDriftShortcut() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_DRIFT");
++    return enabled;
++}
++
+ using Tegra::Texture::TICEntry;
+ using Tegra::Texture::TSCEntry;
+ using VideoCore::Surface::GetFormatType;
+@@ -1802,6 +1820,9 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
+     ImageView* const depth_buffer = key.depth_buffer_id ? &slot_image_views[key.depth_buffer_id] : nullptr;
+     runtime.FlushDeferredClear();
+     framebuffer_id = slot_framebuffers.insert(runtime, color_buffers, depth_buffer, key);
++    if (FritchiiFramebufferIndex()) {
++        IndexFramebuffer(framebuffer_id, key);
++    }
+     return framebuffer_id;
+ }
+ 
+@@ -4124,6 +4145,23 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             return;
+         }
+         join_overlaps_found.insert(overlap_id);
++        // EDEN_UP_FRITCHII_DRIFT: a drift, a single-level, single-layer 2D target placed a little
++        // off a previous one (Ocarina of Time's bump-allocated per-frame targets move 40 KB - 2 MB
++        // a frame). The offset is under one layer, and not 0, so it is no mip or layer base of
++        // either image: ResolveOverlap and both IsSubresource checks below would fail. Skips them.
++        if (FritchiiDriftShortcut() && new_info.type == ImageType::e2D &&
++            overlap.info.type == ImageType::e2D && new_info.resources.levels == 1 &&
++            overlap.info.resources.levels == 1 && new_info.resources.layers == 1 &&
++            overlap.info.resources.layers == 1 &&
++            new_info.layer_stride == overlap.info.layer_stride && gpu_addr != overlap.gpu_addr) {
++            const u64 distance = gpu_addr > overlap.gpu_addr ? gpu_addr - overlap.gpu_addr
++                                                             : overlap.gpu_addr - gpu_addr;
++            const u64 limit = new_info.layer_stride != 0 ? new_info.layer_stride : size_bytes;
++            if (distance < limit && distance < size_bytes && distance < overlap.guest_size_bytes) {
++                join_bad_overlap_ids.push_back(overlap_id);
++                return;
++            }
++        }
+         constexpr bool strict_size = true;
+         const std::optional<OverlapResult> solution = ResolveOverlap(
+             new_info, gpu_addr, cpu_addr, overlap, strict_size, broken_views, native_bgr);
+@@ -5321,6 +5359,40 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
+ template <class P>
+ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_views) {
+     runtime.FlushDeferredClear();
++    // EDEN_UP_FRITCHII_FBINDEX: the same framebuffers the scan below finds (every key that holds
++    // one of the views), by index. A null id matches every unused slot of a key: only the full
++    // scan finds those.
++    if (FritchiiFramebufferIndex() &&
++        std::ranges::none_of(removed_views, [](ImageViewId view) { return !view; })) {
++        boost::container::small_vector<FramebufferId, 16> removed;
++        for (const ImageViewId view : removed_views) {
++            const auto it = framebuffers_by_view.find(view);
++            if (it == framebuffers_by_view.end()) {
++                continue;
++            }
++            for (const FramebufferId framebuffer_id : it->second) {
++                if (std::ranges::find(removed, framebuffer_id) == removed.end()) {
++                    removed.push_back(framebuffer_id);
++                }
++            }
++        }
++        for (const FramebufferId framebuffer_id : removed) {
++            const auto key_it = framebuffer_keys.find(framebuffer_id);
++            ASSERT(key_it != framebuffer_keys.end());
++            const RenderTargets key = key_it->second;
++            UnindexFramebuffer(framebuffer_id, key);
++            [[maybe_unused]] const size_t erased = framebuffers.erase(key);
++            ASSERT(erased == 1);
++            ASSERT(framebuffer_id);
++            if (framebuffer_id == last_framebuffer_id) {
++                last_framebuffer_id = {};
++                last_framebuffer_serial = 0;
++            }
++            sentenced_framebuffers.Push(std::move(slot_framebuffers[framebuffer_id]));
++            slot_framebuffers.erase(framebuffer_id);
++        }
++        return;
++    }
+     auto it = framebuffers.begin();
+     while (it != framebuffers.end()) {
+         if (it->first.Contains(removed_views)) {
+@@ -5330,6 +5402,9 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
+                 last_framebuffer_id = {};
+                 last_framebuffer_serial = 0;
+             }
++            if (FritchiiFramebufferIndex()) {
++                UnindexFramebuffer(framebuffer_id, it->first);
++            }
+             sentenced_framebuffers.Push(std::move(slot_framebuffers[framebuffer_id]));
+             slot_framebuffers.erase(framebuffer_id);
+             it = framebuffers.erase(it);
+@@ -5339,6 +5414,43 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
+     }
+ }
+ 
++template <class P>
++void TextureCache<P>::IndexFramebuffer(FramebufferId framebuffer_id, const RenderTargets& key) {
++    framebuffer_keys.emplace(framebuffer_id, key);
++    const auto index_view = [this, framebuffer_id](ImageViewId view) {
++        if (!view) {
++            return;
++        }
++        auto& ids = framebuffers_by_view[view];
++        if (std::ranges::find(ids, framebuffer_id) == ids.end()) {
++            ids.push_back(framebuffer_id);
++        }
++    };
++    std::ranges::for_each(key.color_buffer_ids, index_view);
++    index_view(key.depth_buffer_id);
++}
++
++template <class P>
++void TextureCache<P>::UnindexFramebuffer(FramebufferId framebuffer_id, const RenderTargets& key) {
++    const auto unindex_view = [this, framebuffer_id](ImageViewId view) {
++        if (!view) {
++            return;
++        }
++        const auto it = framebuffers_by_view.find(view);
++        if (it == framebuffers_by_view.end()) {
++            return;
++        }
++        auto& ids = it->second;
++        ids.erase(std::remove(ids.begin(), ids.end(), framebuffer_id), ids.end());
++        if (ids.empty()) {
++            framebuffers_by_view.erase(it);
++        }
++    };
++    std::ranges::for_each(key.color_buffer_ids, unindex_view);
++    unindex_view(key.depth_buffer_id);
++    framebuffer_keys.erase(framebuffer_id);
++}
++
+ template <class P>
+ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+     image.flags |= ImageFlagBits::GpuModified;
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 3ef0a0b..f346d00 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -663,6 +663,15 @@ private:
+     /// Remove framebuffers using the given image views from the cache
+     void RemoveFramebuffers(std::span<const ImageViewId> removed_views);
+ 
++    /// EDEN_UP_FRITCHII_FBINDEX (Fritchii d69ecefe34): the framebuffers each image view is in, and
++    /// each framebuffer's key, kept by GetFramebufferId and RemoveFramebuffers. RemoveFramebuffers
++    /// takes a deleted image's framebuffers from here instead of scanning the whole map.
++    void IndexFramebuffer(FramebufferId framebuffer_id, const RenderTargets& key);
++    void UnindexFramebuffer(FramebufferId framebuffer_id, const RenderTargets& key);
++    ::Common::unordered_map<ImageViewId, boost::container::small_vector<FramebufferId, 4>>
++        framebuffers_by_view;
++    ::Common::unordered_map<FramebufferId, RenderTargets> framebuffer_keys;
++
+     /// Mark an image as modified from the GPU
+     void MarkModification(ImageBase& image) noexcept;
+ 

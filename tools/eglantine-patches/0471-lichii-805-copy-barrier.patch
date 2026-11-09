@@ -1,0 +1,75 @@
+Subject: [PATCH] Fritchii: the barrier after an in-order buffer copy also orders later transfers (EDEN_UP_FRITCHII_COPY_BARRIER, off by default)
+
+Port of Frizti/Fritchii 15f8e4c5c2 (Frizti), itself zortos293/Lichii#805 commit 8b5be87f79
+(jpkto, with Claude Opus 5.5; PR open): "vulkan: order later transfers after a copy that asked for
+barriers".
+
+EDEN_UP_FRITCHII_COPY_BARRIER=1 (Common::PeSwitch, exact "1"; unset = T82 exactly: the same
+GRAPHICS|COMPUTE destination stages): the post barrier of BufferCacheRuntime::CopyBuffer (in-order
+copies that asked for barriers) and of PostCopyBarrier (the downloads, gathers and compute uploads
+it closes) also has TRANSFER in its destination stages. Mechanism (upstream): a reordered upload in
+a later submission (RecordWithUploadBuffer, which runs ahead of that submission's work) has no
+barrier of its own before it, and in-order copies do not count as uses for CanReorderUpload, so when
+it writes bytes the older copy wrote, nothing orders the two writes and the older one can land last.
+The access masks are unchanged (MEMORY_READ|MEMORY_WRITE already covers transfer writes).
+
+Deviation: Lichii's commit changes CopyBuffer only; Fritchii's also PostCopyBarrier, ported as
+Fritchii. ClearBuffer's barrier has the same shape and is left as both upstreams leave it.
+
+Honest value for the PS5: near zero. RADV's waits for a barrier come from the source stage mask
+(here TRANSFER: wait for the copy to finish), so the older copy is already done before later work
+on the queue starts with or without TRANSFER in the destination; the access masks, which drive the
+cache flushes, are unchanged. A spec (validation-layer) fix, not a flash or desync fix on RADV.
+No test slot of its own; it can ride along in a safety group.
+
+Checks (VM scratch /tmp/fr2-sr8k, fritchii2-safety_checks.sh, log fritchii2-safety.checks.log):
+git apply --check on $R/Eglantine (T82); prepare-vulkan-port.py anchor skips identical (6, among
+them the vk_buffer_cache wait-site count, unchanged); the generated vk_buffer_cache_cost.cpp
+carries the change; -fsyntax-only with the build's flags: rc=0; an injected error in
+PostCopyDstStages is reported.
+
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index 3a3fa51..e878cc6 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -29,6 +29,18 @@
+ 
+ namespace Vulkan {
+ namespace {
++// EDEN_UP_FRITCHII_COPY_BARRIER=1 (Fritchii 15f8e4c5c2, port of zortos293/Lichii#805 8b5be87f79 by
++// jpkto; off unless set): the barrier after an in-order buffer copy (CopyBuffer with barriers,
++// PostCopyBarrier) also orders later transfers, not only graphics and compute. A reordered upload
++// of the same bytes in a later submission (RecordWithUploadBuffer, ahead of that submission's
++// work) has no barrier of its own before it, and in-order copies are not uses for
++// CanReorderUpload, so the older copy could land last. Read where the barrier is recorded.
++VkPipelineStageFlags PostCopyDstStages() {
++    static const bool transfers_too = Common::PeSwitch("EDEN_UP_FRITCHII_COPY_BARRIER");
++    return transfers_too ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
++                         : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE;
++}
++
+ VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
+     return VkBufferCopy{
+         .srcOffset = copy.src_offset,
+@@ -614,8 +626,8 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
+         }
+         cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+         if (barrier) {
+-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, WRITE_BARRIER);
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, PostCopyDstStages(), 0,
++                                   WRITE_BARRIER);
+         }
+     });
+ }
+@@ -643,8 +655,8 @@ void BufferCacheRuntime::PostCopyBarrier() {
+     };
+     scheduler.RequestOutsideRenderPassOperationContext();
+     scheduler.Record([](vk::CommandBuffer cmdbuf) {
+-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+-                               0, WRITE_BARRIER);
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, PostCopyDstStages(), 0,
++                               WRITE_BARRIER);
+     });
+ }
+ 

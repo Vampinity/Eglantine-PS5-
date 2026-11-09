@@ -54,7 +54,7 @@ buffer_cache.h and texture_cache.h came from the tree. A deliberate typo in the 
 the check. The function's own text ran in a small harness under ThreadSanitizer and AddressSanitizer:
 on time, lost, and late after giving up. Not built, not run on a PS5.
 
-Co-authored-by: AManWithAPlan <amanwithaplan_dev@proton.me>
+Co-authored-by: AManWithAPlan
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/video_core/engines/maxwell_3d.cpp            |    4 +-
  src/video_core/fence_manager.h                   |   36 ++++++++++++++++++++++

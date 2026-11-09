@@ -1,0 +1,261 @@
+Subject: [PATCH] djihads-frag-barrier: defer the 3D fragment barrier to the next draw that reads the pass (EDEN_UP_DJ_FRAG_BARRIER=1)
+
+djihads-frag-barrier: defer the 3D fragment barrier to the next draw that reads the pass (EDEN_UP_DJ_FRAG_BARRIER=1)
+
+Ported from Djihads80/Eglantine nx2-experimental c6d2acd37 ("nx2: Ocarina of Time stability,
+shader and performance fixes", #794, Nx2Perf fragment_barrier, from #161; on by default there),
+GPL-3.0-or-later: RasterizerVulkan::FragmentBarrier, the scheduler's barrier state
+(fragment_barrier_state.h folded into vk_scheduler.h), GraphicsPipeline::writes_storage and the
+draw-side test, TextureCache::SamplesRenderTarget. Co-authors per that commit.
+
+The 3D engine's fragment barrier (method 0x0DE0) ended the render pass at once; the pass end
+carries the barrier. Upstream measured Ocarina of Time ending ~5,900 render passes a second
+there. With the switch the barrier is noted while a pass is open, and the next draw ends the pass
+only if it samples an image bound as a render target (colour or depth) or a draw of the pass
+writes storage buffers, images or global memory; otherwise the pass goes on. The note clears
+whenever the pass ends for any other reason (compute, copies, a new framebuffer, a submit).
+Both draw paths test it: ConfigureImpl and EDEN_UP_FAST_DRAW's ConfigureDelta.
+Review fixes (2026-11-09, not upstream; both only end a pass where T82 ended one):
+- A barrier that arrives while no pass is open but a deferred clear waits (DeferColorClear,
+  DeferDepthStencilClear; used by default) is pending too. T82's barrier realized that clear
+  before the next draw; upstream's version let a draw that samples the cleared target land in
+  the clear's own pass, with no barrier after the load-op clear.
+- DrawTexture (Maxwell draw_texture) samples its source without the draw-side test: with a
+  barrier pending it ends the pass first, as T82 did.
+Off (unset): byte-identical commands (writes_storage is noted but only read with the switch).
+
+Checks (djihads-c6d2_checks.sh, log djihads-c6d2.checks.log): git apply --check on the T82 core,
+patch on a copy, prepare-vulkan-port.py same 6 anchor skips as baseline, -fsyntax-only rc=0 on
+every TU the diff reaches (generated copies included), injected static_assert seen in each,
+and all four djihads-*.diff stack in one tree (same anchors, rc=0). Not built, not run.
+Re-run after the review fixes: review-djihads-c6d2/rv_checks.sh (+ rv_stack_parallel.sh, on top
+of fritchii-relocate-v2, its reloc guard, fritchii2-grhand/copybarrier/bankflag/writemark), same
+results.
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 89cb629..a5c85c0 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -340,6 +340,13 @@ GraphicsPipeline::GraphicsPipeline(
+     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+     fragment_writes_color = stage_infos[NUM_STAGES - 1].stores_frag_color;
+     fragment_color_components = stage_infos[NUM_STAGES - 1].frag_color_components;
++    writes_storage = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
++        const auto written = [](const auto& descs) {
++            return std::ranges::any_of(descs, [](const auto& desc) { return desc.is_written; });
++        };
++        return info.stores_global_memory || written(info.storage_buffers_descriptors) ||
++               written(info.image_descriptors) || written(info.image_buffer_descriptors);
++    });
+     // EDEN_UP_FAST_DRAW: what delta draws and the texture memo may skip for this pipeline.
+     if (VideoCommon::Nx2FastDraw::Enabled()) {
+         const auto any_written = [](const auto& descs) {
+@@ -895,6 +902,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+         texture_cache.UpdateRenderTargets(false);
+         texture_cache.CheckFeedbackLoop(
+             std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
++        // EDEN_UP_DJ_FRAG_BARRIER: a deferred fragment barrier ends the pass before this draw
++        // only if the draw samples a bound render target or the pass wrote storage.
++        if (scheduler.HasFragmentBarrier() &&
++            (scheduler.RenderPassHasStores() ||
++             texture_cache.SamplesRenderTarget(
++                 std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()}))) {
++            scheduler.RequestOutsideRenderPassOperationContext();
++        }
+     }
+     if (IsBuilt() && !pipeline) {
+         return false;
+@@ -982,6 +997,13 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
+         textures.UpdateRenderTargets(false);
+         textures.CheckFeedbackLoop(
+             std::span<const VideoCommon::ImageViewInOut>{delta_views.data(), delta_views.size()});
++        // As ConfigureImpl (EDEN_UP_DJ_FRAG_BARRIER).
++        if (scheduler.HasFragmentBarrier() &&
++            (scheduler.RenderPassHasStores() ||
++             textures.SamplesRenderTarget(std::span<const VideoCommon::ImageViewInOut>{
++                 delta_views.data(), delta_views.size()}))) {
++            scheduler.RequestOutsideRenderPassOperationContext();
++        }
+     }
+     if (!pipeline && IsBuilt()) {
+         return false;
+@@ -1035,6 +1057,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+         return false;
+     }
+     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
++    if (writes_storage) {
++        scheduler.NoteRenderPassStores(); // Read only with EDEN_UP_DJ_FRAG_BARRIER
++    }
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 0034cb6..6cd18bf 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -316,6 +316,8 @@ private:
+     std::vector<VideoCommon::ImageViewInOut> delta_views;
+     std::vector<VideoCommon::SamplerId> delta_samplers;
+     std::array<u8, 8> fragment_color_components{};
++    /// EDEN_UP_DJ_FRAG_BARRIER: a stage writes storage buffers, images or global memory.
++    bool writes_storage{};
+ 
+     vk::DescriptorSetLayout descriptor_set_layout;
+     DescriptorAllocator descriptor_allocator;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index e1d6c28..92b882c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1643,6 +1643,11 @@ void RasterizerVulkan::DrawTexture() {
+     std::scoped_lock l{texture_cache.mutex};
+     texture_cache.SynchronizeDescriptors(false);
+     texture_cache.UpdateRenderTargets(false);
++    // EDEN_UP_DJ_FRAG_BARRIER: DrawTexture samples its source without the draw-side test, so a
++    // deferred fragment barrier ends the pass here as it did before (review fix, not upstream).
++    if (scheduler.HasFragmentBarrier()) {
++        scheduler.RequestOutsideRenderPassOperationContext();
++    }
+ 
+     UpdateDynamicStates();
+ 
+@@ -2574,6 +2579,12 @@ void RasterizerVulkan::WaitForIdle() {
+ }
+ 
+ void RasterizerVulkan::FragmentBarrier() {
++    // EDEN_UP_DJ_FRAG_BARRIER: the next draw ends the render pass only if it reads what the pass
++    // wrote (GraphicsPipeline::ConfigureImpl and ConfigureDelta).
++    if (Scheduler::DeferFragmentBarriers()) {
++        scheduler.DeferFragmentBarrier();
++        return;
++    }
+     // We already put barriers when a render pass finishes
+     scheduler.RequestOutsideRenderPassOperationContext();
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index df7e6c6..ea11262 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -526,6 +526,11 @@ void Scheduler::RequestOutsideRenderPassOperationContext() {
+     EndRenderPass();
+ }
+ 
++bool Scheduler::DeferFragmentBarriers() {
++    static const bool on = Common::PeSwitch("EDEN_UP_DJ_FRAG_BARRIER");
++    return on;
++}
++
+ bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
+     if (state.graphics_pipeline == pipeline) {
+         if (pipeline && pipeline->UsesExtendedDynamicState() &&
+@@ -739,6 +744,9 @@ void Scheduler::EndRenderPass()
+         if (!state.renderpass) {
+             return;
+         }
++        // The end below carries what a deferred fragment barrier asked for.
++        fragment_barrier_pending = false;
++        render_pass_has_stores = false;
+ 
+         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 7ab19af..d1d0b27 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -102,6 +102,35 @@ public:
+     /// of a renderpass.
+     void RequestOutsideRenderPassOperationContext();
+ 
++    /// EDEN_UP_DJ_FRAG_BARRIER=1 (Djihads80/Eglantine c6d2acd37, Nx2Perf fragment_barrier, from
++    /// #161): the 3D engine's fragment barrier no longer ends the render pass at once. It is noted,
++    /// and the next draw ends the pass (whose end carries the barrier) only when it samples one of
++    /// the bound render targets or the pass has a draw that writes storage; otherwise the pass goes
++    /// on. Upstream: Ocarina of Time ended ~5,900 render passes a second at its fragment barriers.
++    [[nodiscard]] static bool DeferFragmentBarriers();
++
++    /// A fragment barrier arrived: pending while a render pass is open (EDEN_UP_DJ_FRAG_BARRIER),
++    /// or a deferred clear waits to begin one: the end the barrier asked for realized that clear
++    /// before the next draw (review fix, not upstream; the end then still comes when that draw
++    /// reads a render target).
++    void DeferFragmentBarrier() noexcept {
++        fragment_barrier_pending =
++            state.renderpass != VK_NULL_HANDLE || deferred_clear.framebuffer != nullptr;
++    }
++
++    [[nodiscard]] bool HasFragmentBarrier() const noexcept {
++        return fragment_barrier_pending;
++    }
++
++    /// A draw in the open render pass writes storage buffers, images or global memory.
++    void NoteRenderPassStores() noexcept {
++        render_pass_has_stores = true;
++    }
++
++    [[nodiscard]] bool RenderPassHasStores() const noexcept {
++        return render_pass_has_stores;
++    }
++
+     /// EDEN_NX2_COMPUTE_TO_DRAW=1: a dispatch was recorded, the next render pass must see what it
+     /// wrote.
+     void NoteComputeWrites() {
+@@ -403,6 +432,8 @@ private:
+ 
+     std::unique_ptr<MasterSemaphore> master_semaphore;
+     bool compute_writes_pending{};
++    bool fragment_barrier_pending{}; ///< EDEN_UP_DJ_FRAG_BARRIER: reset when the render pass ends
++    bool render_pass_has_stores{};   ///< Any draw of the open render pass writes storage
+     bool graphics_pipeline_missing{};
+     std::unique_ptr<CommandPool> command_pool;
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 968ae0f..8eb7edf 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1492,6 +1492,33 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
+     }
+ }
+ 
++// Djihads80/Eglantine c6d2acd37 (EDEN_UP_DJ_FRAG_BARRIER).
++template <class P>
++bool TextureCache<P>::SamplesRenderTarget(std::span<const ImageViewInOut> views) {
++    if (rt_active_mask == 0 || views.empty()) {
++        return false;
++    }
++    const u32 color_mask = rt_active_mask & ((1u << NUM_RT) - 1);
++    const bool depth_active = (rt_active_mask & (1u << NUM_RT)) != 0;
++    ImageViewId last_view_id{};
++    for (const auto& view : views) {
++        if (!view.id || view.id == last_view_id) {
++            continue;
++        }
++        last_view_id = view.id;
++        const ImageId image_id = slot_image_views[view.id].image_id;
++        if (depth_active && image_id == rt_depth_image_id) {
++            return true;
++        }
++        for (u32 mask = color_mask; mask != 0; mask &= mask - 1) {
++            if (image_id == rt_image_id[static_cast<size_t>(std::countr_zero(mask))]) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ template <class P>
+ typename P::Sampler* TextureCache<P>::GetSampler(u32 index, bool compute) {
+     return &slot_samplers[GetSamplerId(index, compute)];
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 3ef0a0b..0894c0d 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -392,6 +392,10 @@ public:
+     /// Handle feedback loops during draws.
+     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
+ 
++    /// Whether a view samples an image bound as a render target (after UpdateRenderTargets):
++    /// EDEN_UP_DJ_FRAG_BARRIER's test for a deferred fragment barrier.
++    [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
++
+     /// EDEN_UP_FAST_DRAW: fills views and samplers of a draw from the pipeline's memo when nothing
+     /// they were resolved from has changed since (true), and prepares the images as
+     /// FillImageViews does. handle_addresses are where the draw reads its texture handles from,

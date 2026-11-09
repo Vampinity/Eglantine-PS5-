@@ -27,7 +27,7 @@ Changed from the source:
 Runs on the PS5: only where native mesh draws run, and those can freeze the console. Pool memory:
 none. No cache version bump: the switch is off and a refused program was never saved.
 
-Co-authored-by: Frizti <FriztiMouche@gmail.com>
+Co-authored-by: Frizti
 
 diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
 index 219165a4b2..3757bfd951 100644

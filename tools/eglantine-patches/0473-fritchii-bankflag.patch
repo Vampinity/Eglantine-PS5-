@@ -1,0 +1,280 @@
+Subject: [PATCH] fritchii2-bankflag: a bind of a native 64 KiB uniform bank marks the pages that guest CPU writes
+
+fritchii2-bankflag: a bind of a native 64 KiB uniform bank marks the pages that guest CPU writes
+were collected for, and that still wait for the next gather, as CPU-modified, so that bind uploads
+the guest's current bytes. Switch EDEN_UP_FRITCHII_BANKFLAG=1, off by default.
+
+Upstream: Frizti/Fritchii 9e8cb73ede (Frizti, 2026-11-07, EDEN_NX2_EXP9: Core::DevicePageFlags,
+g_collected_write_pages and its Mark after Collect in HandleRasterizerWrite), with 1a64fe5002 and
+29c7b12286 (EXP9=3 by default), released in fritchii-v4 and v5. Upstream EXP9 filters the per-bind
+snapshot compare (d79572d28a / Lichii PR 345 a1b555012a, our 0245 EDEN_NX2_BANK_REUPLOAD=4, which
+was worse at the pond in run329): only flagged pages are compared. This port keeps only the part
+aimed at the mechanism, the collected-write flags. With no snapshots to compare, a flagged page of
+a native bank is simply marked CPU-modified at the bind.
+Not ported: the snapshot compare, g_buffer_write_pages (WriteMemory, inline and download writes
+reach the tracker anyway; upstream needed them only to refresh snapshots), the hot-page and
+frame-check rules, the node map (8b7bb3fab5), EXP9=2 verify and its 5 s stats. This neither
+depends on nor changes EDEN_NX2_BANK_REUPLOAD in any mode, including the default 1.
+
+Why: see fritchii2-lastaddr. A guest write that HandleRasterizerWrite only collects (its page was
+GPU-modified, or the core's last_address is stuck on it) reaches the buffer cache at the next
+gather. Until then the tracker holds the page clean, and a bind uploads nothing new. Eglantine
+031e07436c (kraibse) fixed the resulting white material in Ocarina of Time by re-uploading every
+bank on every bind; Fritchii 9e8cb73ede found these collected writes were what that check caught.
+This catches only them.
+
+Details:
+- Mark: in GPUDirtyMemoryManager::Collect, so both HandleRasterizerWrite paths are covered (the
+  HELD_VS_DOWNLOAD one too). Upstream marked in memory.cpp right after Collect; Collect is the same
+  point and leaves memory.cpp alone, so this diff and fritchii2-lastaddr apply in either order.
+- Take: in BindHostGraphicsUniformBuffer, for a native bank (native tiling, the whole bank not
+  GPU-modified) of size 0x10000. It runs after the BANK_REUPLOAD block and before SynchronizeBuffer
+  (the UBO snapshot path returns earlier and is untouched). Pages already CPU-modified are not
+  marked again. A flag is set before its write's bytes land (HandleRasterizerWrite runs before the
+  store), so a page taken at one bind is marked once more at its next bind (upstream's `recheck`;
+  the list is capped at 256 pages). A bank that is GPU-modified at the bind keeps its flags for a
+  later bind; the gather writes those pages inline, by design.
+- The 2 MiB of flags (one bit per 4 KiB of the 36-bit device space) are allocated at first use,
+  so only with the switch.
+- Log: "EDEN_UP_FRITCHII_BANKFLAG on" once, then at each power of two "N bank pages held clean
+  with collected guest writes marked at a bind, R marked again one bind later, C flagged pages
+  were CPU-modified already". N is an upper bound, not a count of stale draws: a flag is only
+  cleared by a bank bind, so N also counts writes that were already applied without one (a
+  gather that wrote a GPU-modified page inline, or an upload through another binding of the
+  page). There are no snapshots to tell those apart. If N stays 0 for a session, the mechanism
+  does not reach the banks in our build: retire the switch. N > 0 alone proves nothing; the
+  flash count decides.
+  (Review 9 Nov: wording corrected, and upstream's static_assert that the flags cover the
+  device address space restored.)
+
+Cost: on the guest cores, one relaxed load per collected write (fetch_or only for a page not yet
+flagged). On the back, 16 relaxed loads and page-table lookups per 64 KiB bank bind, plus a short
+list scan while the list is not empty. Each flagged page that is clean costs a 4 KiB re-upload,
+and one more a bind later. The mark also moves the write epoch of its 4 MiB (see
+EDEN_NX2_UBO_BANK_DIRECT), so nearby buffers are walked again at their next sync. A page the game
+rewrites between every two draws is flagged at every bind, so it is uploaded at every bind, as
+any page the tracker sees written would be. Cheap when N grows slowly; if N grows by thousands a
+second, watch the walk fps. Upstream only used the flags to choose which pages to memcmp, so a
+stale flag cost it a compare, not an upload. Upstream's verify mode (1a64fe5002) also found the
+flags missed about one changed bank page per 15 s in Ocarina of Time, so they do not catch every
+bank change; the once-a-frame bank re-mark stays as the backstop.
+
+Bright or dark: it fixes too-OLD bank words (see fritchii2-lastaddr), the white-material kind. It
+pulls guest bytes in at the bind, earlier than the gather would. Without the frame wait that adds
+the too-new risk BANK_REUPLOAD=4 showed at the pond. With the full frame wait (the play env) the
+game does not run a frame ahead, so test it with the wait on.
+
+T83: rebased onto the T83 stack (context only: fritchii-churn and fritchii2-lastaddr changed neighbouring lines).
+
+diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
+index 52889b8..2c89300 100644
+--- a/src/core/gpu_dirty_memory_manager.h
++++ b/src/core/gpu_dirty_memory_manager.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <bit>
+ #include <cstdlib>
+@@ -16,6 +18,64 @@
+ 
+ namespace Core {
+ 
++/// One bit per 4 KiB device page of the 36-bit device address space (2 MiB), set by writers and
++/// taken by a reader (Frizti/Fritchii 9e8cb73ede).
++class DevicePageFlags {
++public:
++    static constexpr u64 AddressBits = 36;
++
++    void Mark(u64 address, u64 size) noexcept {
++        constexpr u64 limit = u64{1} << AddressBits;
++        if (size == 0 || address >= limit) {
++            return;
++        }
++        u64 page = address >> DEVICE_PAGEBITS;
++        const u64 last = ((std::min)(address + size, limit) - 1) >> DEVICE_PAGEBITS;
++        while (page <= last) {
++            const u64 first_bit = page % 64;
++            const u64 bits = (std::min<u64>)(64 - first_bit, last - page + 1);
++            const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
++            std::atomic<u64>& word = words[page / 64];
++            if ((word.load(std::memory_order_relaxed) & mask) != mask) {
++                word.fetch_or(mask, std::memory_order_seq_cst);
++            }
++            page += bits;
++        }
++    }
++
++    /// Clears the bit of the page holding `address`, returning whether it was set.
++    bool Take(u64 address) noexcept {
++        if (address >= (u64{1} << AddressBits)) {
++            return false;
++        }
++        const u64 page = address >> DEVICE_PAGEBITS;
++        const u64 bit = u64{1} << (page % 64);
++        std::atomic<u64>& word = words[page / 64];
++        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
++            return false;
++        }
++        return (word.fetch_and(~bit, std::memory_order_seq_cst) & bit) != 0;
++    }
++
++private:
++    std::array<std::atomic<u64>, (u64{1} << (AddressBits - DEVICE_PAGEBITS)) / 64> words{};
++};
++
++/// EDEN_UP_FRITCHII_BANKFLAG=1 (Frizti/Fritchii 9e8cb73ede, EXP9's collected-write flags): each
++/// guest CPU write collected for the GPU flags its pages in CollectedWritePages(). The buffer
++/// cache sees such a write only at the next Gather (GPU::InvalidateGPUCache) and holds the page
++/// clean until then; a bind of a native 64 KiB uniform bank takes the flags of its pages and marks
++/// them CPU-modified, so that bind uploads the guest's current bytes.
++[[nodiscard]] inline bool BankFlagPages() {
++    static const bool on = Common::PeSwitch("EDEN_UP_FRITCHII_BANKFLAG");
++    return on;
++}
++/// EDEN_UP_FRITCHII_BANKFLAG only: allocated at the first use, so the 2 MiB exist only with it.
++[[nodiscard]] inline DevicePageFlags& CollectedWritePages() {
++    static DevicePageFlags* const flags = new DevicePageFlags{};
++    return *flags;
++}
++
+ class GPUDirtyMemoryManager {
+ public:
+     GPUDirtyMemoryManager() : current{default_transform} {
+@@ -47,6 +107,11 @@ public:
+     }
+ 
+     void Collect(PAddr address, size_t size) {
++        if (BankFlagPages()) {
++            // Set before the write's bytes land: a bank bind that takes the flag marks the page
++            // again at the bank's next bind (BufferCache::Nx2BankFlagPages).
++            CollectedWritePages().Mark(address, size);
++        }
+         TransformAddress t = BuildTransform(address, size);
+         TransformAddress tmp, original;
+         do {
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 394cab9..cebfca7 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -19,6 +19,7 @@
+ #include <fmt/ranges.h>
+ 
+ #include "common/range_sets.inc"
++#include "core/gpu_dirty_memory_manager.h"
+ #include "video_core/buffer_cache/buffer_cache_base.h"
+ #include "video_core/buffer_cache/uniform_stream_reuse.h"
+ #include "video_core/churn_counters.h"
+@@ -1893,6 +1894,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+             memory_tracker.MarkRegionAsCpuModified(device_addr, upload_size);
+         }
+     }
++    // EDEN_UP_FRITCHII_BANKFLAG (Frizti/Fritchii 9e8cb73ede): guest CPU writes into this bank
++    // that were only collected reach the buffer cache at the next InvalidateGPUCache, and until
++    // then the tracker holds their pages clean. Mark those pages so the upload below takes the
++    // guest's current bytes. Independent of EDEN_NX2_BANK_REUPLOAD: no snapshots, no compares.
++    if (Core::BankFlagPages() && native_bank &&
++        (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000) {
++        Nx2BankFlagPages(device_addr, size);
++    }
+     const bool use_fast_buffer = needs_alignment_stream
+         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
+             && !memory_tracker.IsRegionGpuModified(device_addr, size));
+@@ -2022,6 +2031,72 @@ bool BufferCache<P>::BindSnapshotUniformBuffer(size_t stage, u32 index, u32 bind
+     }
+ }
+ 
++template <class P>
++void BufferCache<P>::Nx2BankFlagPages(DAddr device_addr, u64 size) {
++    // The flags must cover every device address (Frizti/Fritchii 9e8cb73ede).
++    static_assert(Core::DevicePageFlags::AddressBits >=
++                  Tegra::MaxwellDeviceTraits::device_virtual_bits);
++    [[maybe_unused]] static const bool announced = [] {
++        LOG_INFO(HW_GPU, "EDEN_UP_FRITCHII_BANKFLAG on: native bank binds mark pages with "
++                         "collected guest writes");
++        return true;
++    }();
++    const DAddr end = device_addr + size;
++    for (DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE); page < end;
++         page += Core::DEVICE_PAGESIZE) {
++        // The bank size is only an upper limit: stop at the end of the mapped memory.
++        if (device_memory.template GetPointer<u8>(page) == nullptr) {
++            break;
++        }
++        const bool flagged = Core::CollectedWritePages().Take(page);
++        // A flag is set before its write's bytes land, so a page taken at one bind may have been
++        // uploaded without them: it is marked again at the next bind that covers it.
++        bool recheck = false;
++        if (!nx2_bank_flag_recheck.empty()) {
++            const auto it =
++                std::find(nx2_bank_flag_recheck.begin(), nx2_bank_flag_recheck.end(), page);
++            if (it != nx2_bank_flag_recheck.end()) {
++                *it = nx2_bank_flag_recheck.back();
++                nx2_bank_flag_recheck.pop_back();
++                recheck = true;
++            }
++        }
++        if (!flagged && !recheck) {
++            continue;
++        }
++        if (flagged) {
++            // Pages of banks not bound again stay listed: forget them all past a bound.
++            if (nx2_bank_flag_recheck.size() >= 256) {
++                nx2_bank_flag_recheck.clear();
++            }
++            nx2_bank_flag_recheck.push_back(page);
++        }
++        const DAddr begin = (std::max<DAddr>)(page, device_addr);
++        const u64 length = (std::min<DAddr>)(page + Core::DEVICE_PAGESIZE, end) - begin;
++        if (memory_tracker.IsRegionCpuModified(begin, length)) {
++            // Uploaded by this bind anyway.
++            ++nx2_bank_flag_stats.already_modified;
++            continue;
++        }
++        memory_tracker.MarkRegionAsCpuModified(begin, length);
++        if (!flagged) {
++            ++nx2_bank_flag_stats.marked_again;
++            continue;
++        }
++        // A page the tracker held clean although a guest write to it was collected: without the
++        // switch this bind would have drawn with its older bytes.
++        const u64 marked = ++nx2_bank_flag_stats.marked;
++        if ((marked & (marked - 1)) == 0) {
++            LOG_INFO(HW_GPU,
++                     "EDEN_UP_FRITCHII_BANKFLAG: {} bank pages held clean with collected guest "
++                     "writes marked at a bind, {} marked again one bind later, {} flagged pages "
++                     "were CPU-modified already",
++                     marked, nx2_bank_flag_stats.marked_again,
++                     nx2_bank_flag_stats.already_modified);
++        }
++    }
++}
++
+ template <class P>
+ void BufferCache<P>::Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, bool stats) {
+     // The bank size is only an upper limit: stop at the end of the mapped memory.
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 2588948..0607a31 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -482,6 +482,17 @@ public:
+     /// Compares each page of a bank with its snapshot (EDEN_NX2_BANK_REUPLOAD=4 marks the ones
+     /// that changed as CPU modified, EDEN_NX2_BANK_STATS=1 logs what it finds).
+     void Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, bool stats);
++    /// EDEN_UP_FRITCHII_BANKFLAG: marks the pages of a native 64 KiB bank that guest writes were
++    /// collected for (Core::CollectedWritePages) as CPU modified, and those taken at the
++    /// previous bind once more.
++    void Nx2BankFlagPages(DAddr device_addr, u64 size);
++    /// EDEN_UP_FRITCHII_BANKFLAG: pages whose flag a bind took, marked again at their next bind.
++    std::vector<DAddr> nx2_bank_flag_recheck;
++    struct Nx2BankFlagStats {
++        u64 marked = 0;           ///< flagged pages the tracker held clean
++        u64 marked_again = 0;     ///< pages marked again one bind after their flag
++        u64 already_modified = 0; ///< flagged or rechecked pages CPU-modified already
++    } nx2_bank_flag_stats;
+ 
+     /// EDEN_NX2_DRAW_TUNING=0 turns off the two per-draw shortcuts below.
+     static bool Nx2DrawTuning() {

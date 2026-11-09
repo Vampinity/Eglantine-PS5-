@@ -7,7 +7,7 @@ Subject: [PATCH] maxwell_3d: EDEN_NX2_COND_MODE decides guest render conditions
 Core patch on mig020-core (the v1.219.020 series), off unless EDEN_NX2_COND_MODE or
 EDEN_NX2_COND_TRACE is set.
 
-Ocarina's water surface switches on and off whole, from one game frame to the next (Robin's hand
+Ocarina's water surface switches on and off whole, from one game frame to the next (the hand
 recording, 334.5 and 342.2 s; the white sheets are the correct picture). This is one suspect, not a
 proven cause: nothing yet shows that Ocarina gates the water with a render condition.
 

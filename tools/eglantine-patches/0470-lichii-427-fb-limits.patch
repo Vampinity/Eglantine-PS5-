@@ -1,0 +1,105 @@
+Subject: [PATCH] Fritchii: keep framebuffers within the device limits, pad the stream buffer by 64 KiB (EDEN_UP_FRITCHII_FB_LIMITS, off by default)
+
+Port of Frizti/Fritchii 2edbe3a2dd, itself zortos293/Lichii#427 (merged; author Zortos, #237):
+"vulkan: keep framebuffers within the device limits, pad the stream buffer".
+
+EDEN_UP_FRITCHII_FB_LIMITS=1 (Common::PeSwitch, exact "1"; unset = T82 exactly):
+- Framebuffer::CreateFramebuffer clamps the render area to maxFramebufferWidth/Height and the
+  layers to maxFramebufferLayers (at least 1 each). Draws without attachments take their size from
+  the surface clip, which Ocarina of Time leaves at 32768x32768 after the intro movie; RADV's limit
+  is 16384, so today we create a framebuffer outside the Vulkan spec. With attachments the size is
+  already the smallest attachment's, so this changes nothing there.
+- The stream buffer is created 64 KiB longer. Constant buffers are bound from it and shaders
+  declare each one at a full 64 KiB, so a binding near the end has 64 KiB behind its offset. The
+  tail is never handed out (the ring still wraps at stream_buffer_size; EDEN_STREAM_RING_MIB keeps
+  working as before).
+- vulkan_device.h: GetMaxFramebufferWidth/Height/Layers (three getters added to FN_MAX_LIMIT_LIST).
+
+Deviations from upstream: ClampFramebufferSize is inlined (no new framebuffer_limits.h header, no
+catch2 test, no CMake edits: our tests are not built); our CreateFramebuffer keeps the layer count
+in num_layers (s32), so the clamp works on that; both parts sit behind one switch.
+
+Honest value for the PS5: safety only, no fps. RADV bounds-checks UBO loads in hardware, so the
+pad is headroom there (it was a Metal device-loss fix). The clamp puts the attachment-less
+framebuffer back inside the spec; RADV has accepted the 32768 framebuffer so far, so no visible
+change is expected (attachment-less draws past x/y 16384 do not exist at our resolution). Not
+linked to the bright one-frame flashes. One test slot is enough (intro movie -> field route, no
+new warnings, no device loss); after that it can be folded into the default set.
+
+Checks (VM scratch /tmp/fr2-sr8k, fritchii2-safety_checks.sh, log fritchii2-safety.checks.log):
+git apply --check on $R/Eglantine (T82); prepare-vulkan-port.py anchor skips identical before and
+after (6); generated vk_texture_cache_cost.cpp and vulkan_staging_buffer_pool.cpp carry the change;
+-fsyntax-only with the build's flags of the generated TUs and of vulkan_device.cpp /
+vulkan_rasterizer.cpp (vulkan_device.h users): rc=0; injected errors in each new block reported.
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 1e65b99..e2463a8 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -43,6 +43,16 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+ #endif
+ 
++// EDEN_UP_FRITCHII_FB_LIMITS=1 (Fritchii 2edbe3a2dd, zortos293/Lichii#427; off unless set): 64 KiB
++// of unused space after the end of the stream buffer. Constant buffers are bound from it and the
++// shaders declare each one at its full 64 KiB, so a binding near the end has bytes behind it up to
++// 64 KiB from its offset (Metal checks this; RADV bounds-checks UBO loads, so there it is only
++// headroom). The tail is never handed out: the ring still wraps at stream_buffer_size.
++VkDeviceSize StreamBufferTail() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_FB_LIMITS");
++    return enabled ? VkDeviceSize{64_KiB} : VkDeviceSize{0};
++}
++
+ size_t GetStreamBufferSize(const Device& device) {
+     if (!device.HasDebuggingToolAttached()) {
+         if (device.IsIntegrated()) {
+@@ -115,7 +125,7 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .pNext = nullptr,
+         .flags = 0,
+-        .size = stream_buffer_size,
++        .size = stream_buffer_size + StreamBufferTail(),
+         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index bc89ac0..3813f7e 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -5064,6 +5064,20 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
+     runtime_ptr = &runtime;
+     render_area.width = (std::min)(render_area.width, width);
+     render_area.height = (std::min)(render_area.height, height);
++    // EDEN_UP_FRITCHII_FB_LIMITS=1 (Fritchii 2edbe3a2dd, zortos293/Lichii#427; off unless set):
++    // within the device's framebuffer limits. A framebuffer without attachments takes its size
++    // from the surface clip, which Ocarina of Time leaves at 32768x32768 after the intro movie;
++    // RADV allows 16384 (a larger one is outside the Vulkan spec). At least 1 pixel and 1 layer.
++    static const bool keep_within_limits = Common::PeSwitch("EDEN_UP_FRITCHII_FB_LIMITS");
++    if (keep_within_limits) {
++        const auto clamp = [](u32 value, u32 limit) {
++            return (std::max)(1U, (std::min)(value, limit));
++        };
++        render_area.width = clamp(render_area.width, runtime.device.GetMaxFramebufferWidth());
++        render_area.height = clamp(render_area.height, runtime.device.GetMaxFramebufferHeight());
++        num_layers = static_cast<s32>(clamp(static_cast<u32>((std::max)(num_layers, 1)),
++                                            runtime.device.GetMaxFramebufferLayers()));
++    }
+ 
+     if (do_resolve_color) {
+         const u32 layers = static_cast<u32>((std::max)(num_layers, 1));
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 9cbe7e0..ff9cb18 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -420,7 +420,10 @@ public:
+     FN_MAX_LIMIT_ELEM(DescriptorSetStorageBuffersDynamic) \
+     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
+     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
+-    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments)
++    FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
++    FN_MAX_LIMIT_ELEM(FramebufferWidth) \
++    FN_MAX_LIMIT_ELEM(FramebufferHeight) \
++    FN_MAX_LIMIT_ELEM(FramebufferLayers)
+ #define FN_MAX_LIMIT_ELEM(name) \
+     u32 GetMax##name() const { return properties.properties.limits.max##name; }
+ FN_MAX_LIMIT_LIST

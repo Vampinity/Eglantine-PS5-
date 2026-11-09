@@ -1,0 +1,62 @@
+Subject: [PATCH] fritchii-probeclamp: the storage binding's mapping size is clamped to 32 bits before it is
+
+fritchii-probeclamp: the storage binding's mapping size is clamped to 32 bits before it is
+narrowed, and a doubling-count log line says when that happens.
+Switch EDEN_UP_FRITCHII_PROBECLAMP=1, off by default (Common::PeSwitch).
+
+Upstream: Frizti/Fritchii 8193f926fa "buffer_cache: bind table-pointer pools as far as a storage
+buffer reaches" (jpkto, zortos293/Lichii#351, cherry-pick of b72195422b, fritchii-v4): "The mapping
+size is clamped to 32 bits before it is narrowed."
+
+What: StorageBufferBinding narrowed MemoryManager::GetMemoryLayoutSize (a size_t, the run of
+same-kind mapping from the pointer: kind_map.GetContinuousSizeFrom) straight to u32
+(buffer_cache.h:3837). A run of 4 GiB or more kept only its size modulo 4 GiB, so a read-only
+table pointer could be bound to a few bytes instead of EDEN_NX2_TABLE_POOL_MIB, and the packed-size
+test compared against the wrapped value. With the switch the size is min(size, 0xFFFFFFFF) first;
+every later cap (TABLE_POOL_MIB, the 8 MiB native/default caps, packed_size <= size) applies as
+before. When the clamp changes a value it logs "Storage binding mapping clamped to 4 GiB: N so far"
+(count 1, 2, 4, 8, ...) with the mapping size and the old narrowed size, so one PS5 run shows
+whether Ocarina has such mappings at all.
+
+Gated rather than unconditional on purpose: on the PS5 a wrapped (small) binding may currently be
+what keeps a pool binding small; un-wrapping it can grow that binding to the TABLE_POOL_MIB cap
+(128 MiB in the play env), which matters at 266 MiB free. Unset: narrowed as before, no log.
+
+Not ported (and not needed): the rest of #351, binding read-only table pointers to
+min(maxStorageBufferRange, 1 GiB) - 64 KiB. That is our 0201 EDEN_NX2_TABLE_POOL_MIB (0..1024
+MiB). Fritchii measured Hyrule Field light probes up to about 130 MiB past the pool pointer, so the
+play env's 128 can still miss the farthest cells (white haze / exposure jumps at the field's
+edges): test EDEN_NX2_TABLE_POOL_MIB=160 with a Hyrule Field picture check. The OpenGL halves of
+#351 are not used on the PS5.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index c709c1b..48004b9 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -3833,8 +3833,25 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+     }
+     const Binding binding = [&]() -> Binding {
+         u32 size = [&]() {
++            const u64 layout_size = static_cast<u64>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
++            // EDEN_UP_FRITCHII_PROBECLAMP=1 (Fritchii 8193f926fa, zortos293/Lichii#351): the
++            // mapping size is clamped to 32 bits before it is narrowed. Unset: narrowed directly,
++            // as before, so a mapping of 4 GiB or more keeps only its size modulo 4 GiB.
++            static const bool clamp_layout = Common::PeSwitch("EDEN_UP_FRITCHII_PROBECLAMP");
+             const u32 memory_layout_size =
+-                static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
++                clamp_layout ? static_cast<u32>((std::min)(layout_size, u64{0xFFFF'FFFFULL}))
++                             : static_cast<u32>(layout_size);
++            if (clamp_layout && layout_size > u64{0xFFFF'FFFFULL}) {
++                // The log thins out as the count doubles.
++                static std::atomic<u64> clamped_layouts{};
++                const u64 count = clamped_layouts.fetch_add(1, std::memory_order_relaxed) + 1;
++                if ((count & (count - 1)) == 0) {
++                    LOG_INFO(HW_GPU,
++                             "Storage binding mapping clamped to 4 GiB: {} so far; last {} MiB "
++                             "at {:#x}, narrowed it was {} bytes",
++                             count, layout_size >> 20, gpu_addr, static_cast<u32>(layout_size));
++                }
++            }
+             // A pointer read from a table in memory is the base of an object pool, read anywhere
+             // in it (Ocarina of Time's grass instances lie 12-18 MiB past theirs). With
+             // EDEN_NX2_TABLE_POOL_MIB=64 a read-only one is bound to the end of its mapping, up
