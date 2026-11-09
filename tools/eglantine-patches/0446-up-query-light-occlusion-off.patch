@@ -1,0 +1,845 @@
+Subject: [PATCH] EDEN_UP_QUERY_LIGHT, EDEN_UP_OOT_OCCLUSION_OFF, EDEN_UP_QUERY_STATS: Ocarina's Z pass reports and conditional-render macro reads stop ending fast draw reuse; cLohan's Occlusion Off game patch from Lichii PR 717 (stephenjayakar) as a built-in patch; per-second query statistics; all off by default
+
+diff --git a/src/core/file_sys/patch_manager.cpp b/src/core/file_sys/patch_manager.cpp
+index 1245039..2914ca2 100644
+--- a/src/core/file_sys/patch_manager.cpp
++++ b/src/core/file_sys/patch_manager.cpp
+@@ -57,8 +57,17 @@ struct BuiltinPatch {
+     size_t module_offset;
+     u32 original;
+     u32 replacement;
++    bool (*enabled)(); ///< The switch that applies it
+ };
+ 
++[[nodiscard]] bool BuiltinPatchesEnabled();
++[[nodiscard]] bool OcclusionOffEnabled();
++
++// Ocarina of Time's render pipeline mirrors its settings into nodes after
++// `bl getter; ldrb w8, [x0]`; `mov w8, wzr` there reads the setting as false.
++constexpr u32 OOT_LDRB_W8_X0 = 0x39400008;
++constexpr u32 OOT_MOV_W8_WZR = 0x2A1F03E8;
++
+ constexpr std::array BUILTIN_PATCHES{
+     // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
+     // instead of following the GPU-time controller.
+@@ -70,9 +79,45 @@ constexpr std::array BUILTIN_PATCHES{
+         .module_offset = 0x805BD0,
+         .original = 0x360041E8,    // tbz w8, #0, 0x80640c
+         .replacement = 0x1400020F, // b 0x80640c
++        .enabled = BuiltinPatchesEnabled,
+     },
++    // EDEN_UP_OOT_OCCLUSION_OFF=1, from Lichii PR 717 (stephenjayakar, eb3553bcb8), which carries
++    // cLohan's OcclusionOff_ZPrePassAndSamplesQuery: the game's settings
++    // CreateZPrePassOcclusionQuery and CreateSamplesPassedQuery read as false at their three
++    // sites each. The game then makes no per-object occlusion test draws, no Z pass reports and
++    // no conditional renders (NVN2 macro 0x142/0x143, which reads two reports back for every
++    // object), and draws every object instead.
++    BuiltinPatch{"Occlusion Off 1/6 (built-in)", 0x0400486024DEC000, "main",
++                 "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", 0x11ACE68, OOT_LDRB_W8_X0,
++                 OOT_MOV_W8_WZR, OcclusionOffEnabled},
++    BuiltinPatch{"Occlusion Off 2/6 (built-in)", 0x0400486024DEC000, "main",
++                 "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", 0x11B828C, OOT_LDRB_W8_X0,
++                 OOT_MOV_W8_WZR, OcclusionOffEnabled},
++    BuiltinPatch{"Occlusion Off 3/6 (built-in)", 0x0400486024DEC000, "main",
++                 "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", 0x11B82A4, OOT_LDRB_W8_X0,
++                 OOT_MOV_W8_WZR, OcclusionOffEnabled},
++    BuiltinPatch{"Occlusion Off 4/6 (built-in)", 0x0400486024DEC000, "main",
++                 "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", 0x11ACEC8, OOT_LDRB_W8_X0,
++                 OOT_MOV_W8_WZR, OcclusionOffEnabled},
++    BuiltinPatch{"Occlusion Off 5/6 (built-in)", 0x0400486024DEC000, "main",
++                 "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", 0x11B82DC, OOT_LDRB_W8_X0,
++                 OOT_MOV_W8_WZR, OcclusionOffEnabled},
++    BuiltinPatch{"Occlusion Off 6/6 (built-in)", 0x0400486024DEC000, "main",
++                 "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", 0x11B82F4, OOT_LDRB_W8_X0,
++                 OOT_MOV_W8_WZR, OcclusionOffEnabled},
+ };
+ 
++// EDEN_UP_OOT_OCCLUSION_OFF=1 (exact "1"): off unless set. Every object is then drawn, hidden
++// ones too (the depth test still hides them), and anything the game derives from a sample count
++// may differ.
++[[nodiscard]] bool OcclusionOffEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_UP_OOT_OCCLUSION_OFF");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return enabled;
++}
++
+ // EDEN_NX2_OOT_MAX_RESOLUTION=1 applies the table. Lichii has it on by default; here it is opt-in,
+ // because the bigger render targets come out of the same memory pool that ends a session.
+ [[nodiscard]] bool BuiltinPatchesEnabled() {
+@@ -86,11 +131,8 @@ constexpr std::array BUILTIN_PATCHES{
+ // `nso` is the module as loaded, `out` the same with the user's mods applied.
+ void ApplyBuiltinPatches(std::vector<u8>& out, const std::vector<u8>& nso, std::string_view name,
+                          std::string_view build_id, u64 title_id) {
+-    if (!BuiltinPatchesEnabled()) {
+-        return;
+-    }
+     for (const auto& patch : BUILTIN_PATCHES) {
+-        if (patch.title_id != title_id || patch.module != name) {
++        if (!patch.enabled() || patch.title_id != title_id || patch.module != name) {
+             continue;
+         }
+         if (patch.build_id != build_id) {
+@@ -561,9 +603,8 @@ bool PatchManager::HasNSOPatch(const BuildID& build_id_, std::string_view name)
+ 
+     LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}", build_id, name);
+ 
+-    if (BuiltinPatchesEnabled() &&
+-        std::ranges::any_of(BUILTIN_PATCHES, [&](const BuiltinPatch& patch) {
+-            return patch.title_id == title_id && patch.module == name;
++    if (std::ranges::any_of(BUILTIN_PATCHES, [&](const BuiltinPatch& patch) {
++            return patch.enabled() && patch.title_id == title_id && patch.module == name;
+         })) {
+         return true;
+     }
+diff --git a/src/video_core/engines/draw_manager.cpp b/src/video_core/engines/draw_manager.cpp
+index 4f4d701..8ca3367 100644
+--- a/src/video_core/engines/draw_manager.cpp
++++ b/src/video_core/engines/draw_manager.cpp
+@@ -9,6 +9,7 @@
+ #include "common/settings.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/nx2_query_light.h"
+ #include "video_core/query_dma.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/macro.h"
+@@ -314,6 +315,38 @@ void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
+     }
+ }
+ 
++namespace {
++/// EDEN_UP_QUERY_STATS (nx2_query_light.h): counts a draw, and logs the last second.
++void NoteQueryStatsDraw(const Maxwell3D::Regs& regs, bool executed) {
++    namespace QueryLight = VideoCommon::QueryLight;
++    auto& stats = QueryLight::g_stats;
++    if (!executed) {
++        QueryLight::Add(stats.draws_skipped);
++    } else {
++        QueryLight::Add(stats.draws_run);
++        if (regs.zpass_pixel_count_enable != 0) {
++            QueryLight::Add(stats.counted_draws);
++            ++QueryLight::g_window_draws;
++            // A stencil test counts as a write here: a draw named as only counting never is one.
++            bool writes = regs.stencil_enable != 0 ||
++                          (regs.zeta_enable != 0 && regs.depth_test_enable != 0 &&
++                           regs.depth_write_enabled != 0);
++            const u32 targets = regs.rt_control.count.Value();
++            for (u32 target = 0; target < targets && target < Maxwell3D::Regs::NumRenderTargets &&
++                                 !writes;
++                 ++target) {
++                const u32 mask = regs.color_mask[regs.color_mask_common != 0 ? 0 : target].raw;
++                writes = (mask & 0x1111) != 0;
++            }
++            if (!writes) {
++                QueryLight::Add(stats.proxy_draws);
++            }
++        }
++    }
++    QueryLight::Report();
++}
++} // Anonymous namespace
++
+ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count) {
+     draw_state.draw_element_count =
+         draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+@@ -323,6 +356,9 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
+         VideoCommon::QueryDma::NoteDraw(maxwell3d.ShouldExecute(),
+                                         static_cast<u32>(maxwell3d.regs.render_enable_override));
+     }
++    if (VideoCommon::QueryLight::StatsEnabled()) [[unlikely]] {
++        NoteQueryStatsDraw(maxwell3d.regs, maxwell3d.ShouldExecute());
++    }
+     if (maxwell3d.ShouldExecute()) {
+         if (draw_indexed && maxwell3d.regs.IsShaderConfigEnabled(4)) {
+             maxwell3d.GetNativeMacroEngine().RecordBananzaTerrainDepthDraw(maxwell3d, instance_count);
+@@ -335,6 +371,9 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
+     draw_state.draw_element_count = 0;
+     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
+     UpdateTopology(maxwell3d);
++    if (VideoCommon::QueryLight::StatsEnabled()) [[unlikely]] {
++        NoteQueryStatsDraw(maxwell3d.regs, maxwell3d.ShouldExecute());
++    }
+     if (maxwell3d.ShouldExecute()) {
+         maxwell3d.rasterizer->DrawIndirect();
+     }
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index f8115c0..a01f1c2 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -29,6 +29,7 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/nx2_query_light.h"
+ #include "video_core/query_dma.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/textures/texture.h"
+@@ -357,6 +358,72 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+     method_sink.clear();
+ }
+ 
++namespace {
++/// EDEN_UP_QUERY_LIGHT (nx2_query_light.h): whether writing `argument` to `method` is a report
++/// that only queues a Z pass count: Release or ReportOnly of ZPassPixelCount64, and not a short
++/// release, which signals a fence. For such a report QueryCacheBase::CounterReport records the
++/// end of the host query and queues the value; guest memory gets it on the fencing thread.
++bool IsQueuedCounterReport(u32 method, u32 argument) {
++    using Semaphore = Maxwell3D::Regs::ReportSemaphore;
++    if (method != MAXWELL3D_REG_INDEX(report_semaphore.query) ||
++        !VideoCommon::QueryLight::Enabled()) {
++        return false;
++    }
++    Semaphore report{};
++    report.query.raw = argument;
++    if (report.query.report.Value() != Semaphore::Report::ZPassPixelCount64) {
++        return false;
++    }
++    const Semaphore::Operation operation = report.query.operation.Value();
++    return operation == Semaphore::Operation::ReportOnly ||
++           (operation == Semaphore::Operation::Release && report.query.short_query == 0);
++}
++
++/// EDEN_UP_QUERY_LIGHT: whether a macro DMA read's call on the split's back ends fast draw reuse
++/// only when it flushes. With a query DMA sync or trace mode the call can wait for the host GPU
++/// or write reports out, and ends reuse as before.
++bool DmaReadCallIsNeutral() {
++    static const bool neutral = VideoCommon::QueryLight::Enabled() &&
++                                VideoCommon::QueryDma::SyncMode() == 0 &&
++                                !VideoCommon::QueryDma::TraceEnabled();
++    return neutral;
++}
++
++/// EDEN_UP_QUERY_STATS (nx2_query_light.h): counts the report ProcessQueryGet just ran.
++void NoteReportStats(const Maxwell3D::Regs& regs, const MemoryManager& memory, u64 start) {
++    namespace QueryLight = VideoCommon::QueryLight;
++    using Semaphore = Maxwell3D::Regs::ReportSemaphore;
++    auto& stats = QueryLight::g_stats;
++    QueryLight::Add(stats.report_ns, VideoCommon::Nx2Profile::Now() - start);
++    const auto& query = regs.report_semaphore.query;
++    const Semaphore::Operation operation = query.operation.Value();
++    if (operation != Semaphore::Operation::Release &&
++        operation != Semaphore::Operation::ReportOnly) {
++        QueryLight::Add(stats.other_reports);
++        return;
++    }
++    const bool fence = operation == Semaphore::Operation::Release && query.short_query != 0;
++    switch (query.report.Value()) {
++    case Semaphore::Report::Payload:
++        QueryLight::Add(fence ? stats.payload_releases : stats.payload_reports);
++        break;
++    case Semaphore::Report::ZPassPixelCount64:
++        if (fence) {
++            QueryLight::Add(stats.zpass_fence_reports);
++        } else {
++            QueryLight::Add(stats.zpass_reports);
++            if (const auto device = memory.GpuToCpuAddress(regs.report_semaphore.Address())) {
++                QueryLight::NoteZpassReport(*device);
++            }
++        }
++        break;
++    default:
++        QueryLight::Add(stats.other_reports);
++        break;
++    }
++}
++} // Anonymous namespace
++
+ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+     // The instances after the first are drawn together once their loop ends, and they must see
+     // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
+@@ -365,7 +432,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+         draw_manager.DrawDeferred(*this, true);
+     }
+     if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
+-        !IsFastDrawParameter(method)) {
++        !IsFastDrawParameter(method) && !IsQueuedCounterReport(method, argument)) {
+         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+     }
+     regs.reg_array[method] = argument;
+@@ -441,6 +508,19 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
+ //   to guest memory) still ends reuse.
+ bool Maxwell3D::IsFastDrawExempt(u32 method) {
+     namespace FastDraw = VideoCommon::Nx2FastDraw;
++    // EDEN_UP_QUERY_LIGHT (nx2_query_light.h): a report's address and payload, which only
++    // ProcessQueryGet reads, and the MME memory words (address A and B, data RAM address,
++    // MME_DMA_READ and MME_DMA_READ_FIFOED), which only the macro engine reads. In the Maxwell
++    // layout those five are padding inside the transform feedback block (bytes 0x550 to 0x563).
++    // Only while macros run on the split's front, where the read is a call that ends reuse
++    // itself when it flushes: a macro run on the back reads inline, with no break of its own.
++    if (VideoCommon::QueryLight::Enabled() &&
++        (method == MAXWELL3D_REG_INDEX(report_semaphore.address_high) ||
++         method == MAXWELL3D_REG_INDEX(report_semaphore.address_low) ||
++         method == MAXWELL3D_REG_INDEX(report_semaphore.payload) ||
++         (method >= 0x154 && method <= 0x158 && VideoCommon::GpuSplit::Get().FrontMacros()))) {
++        return true;
++    }
+     if (!FastDraw::OotExemptEnabled()) {
+         return false;
+     }
+@@ -481,7 +561,8 @@ bool Maxwell3D::IsFastDrawExemptMethod(u32 method) {
+ 
+ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
+     if (VideoCommon::Nx2FastDraw::Enabled() && !DrawManager::IsInstanceLoopMethod(method) &&
+-        !IsFastDrawDeltaMethod(method) && !IsFastDrawExemptMethod(method)) {
++        !IsFastDrawDeltaMethod(method) && !IsFastDrawExemptMethod(method) &&
++        !IsQueuedCounterReport(method, argument)) {
+         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
+     }
+     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
+@@ -796,6 +877,14 @@ void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_qu
+ }
+ 
+ void Maxwell3D::ProcessQueryGet() {
++    // EDEN_UP_QUERY_STATS (nx2_query_light.h)
++    const bool query_stats = VideoCommon::QueryLight::StatsEnabled();
++    const u64 stats_start = query_stats ? VideoCommon::Nx2Profile::Now() : 0;
++    SCOPE_EXIT {
++        if (query_stats) [[unlikely]] {
++            NoteReportStats(regs, memory_manager, stats_start);
++        }
++    };
+     VideoCommon::QueryPropertiesFlags flags{};
+     if (regs.report_semaphore.query.short_query == 0) {
+         flags |= VideoCommon::QueryPropertiesFlags::HasTimeout;
+@@ -897,6 +986,11 @@ void NoteRenderCondition(const MemoryManager& memory, GPUVAddr address, bool on_
+ } // Anonymous namespace
+ 
+ void Maxwell3D::ProcessQueryCondition() {
++    if (VideoCommon::QueryLight::StatsEnabled()) [[unlikely]] {
++        const u32 mode = static_cast<u32>(regs.render_enable.mode);
++        VideoCommon::QueryLight::Add(
++            VideoCommon::QueryLight::g_stats.enable_writes[mode < 2 ? mode : 2]);
++    }
+     if (VideoCommon::QueryDma::FlipTraceEnabled()) [[unlikely]] {
+         VideoCommon::QueryDma::NoteCondition(static_cast<u32>(regs.render_enable.mode));
+     }
+@@ -1006,7 +1100,21 @@ void Maxwell3D::ProcessCounterReset() {
+             return VideoCommon::QueryType::Payload;
+         }
+     }();
++    // EDEN_UP_QUERY_STATS (nx2_query_light.h)
++    const bool query_stats = VideoCommon::QueryLight::StatsEnabled();
++    const u64 stats_start = query_stats ? VideoCommon::Nx2Profile::Now() : 0;
+     rasterizer->ResetCounter(query_type);
++    if (query_stats) [[unlikely]] {
++        namespace QueryLight = VideoCommon::QueryLight;
++        QueryLight::Add(QueryLight::g_stats.reset_ns,
++                        VideoCommon::Nx2Profile::Now() - stats_start);
++        if (query_type == VideoCommon::QueryType::ZPassPixelCount64) {
++            QueryLight::Add(QueryLight::g_stats.zpass_resets);
++            QueryLight::g_window_draws = 0;
++        } else {
++            QueryLight::Add(QueryLight::g_stats.other_resets);
++        }
++    }
+ }
+ 
+ void Maxwell3D::ProcessSyncPoint() {
+@@ -1814,8 +1922,11 @@ void Maxwell3D::FrontDmaReadAhead(VideoCommon::GpuSplit& split, FrontState& fs,
+     const size_t flush_bytes =
+         device ? static_cast<size_t>(((source + read_bytes + 0xfff) & ~GPUVAddr{0xfff}) - flush_begin)
+                : read_bytes;
++    // EDEN_UP_QUERY_LIGHT (nx2_query_light.h): the call ends fast draw reuse only when it flushes.
++    const bool neutral = DmaReadCallIsNeutral();
+     split.Defer([this, memory = &memory_manager, macro, method, source, read_bytes, flush_begin,
+-                 flush_bytes, dirty_ptr = trust && trust->count >= 0 ? &read_dirty : nullptr] {
++                 flush_bytes, dirty_ptr = trust && trust->count >= 0 ? &read_dirty : nullptr,
++                 neutral] {
+         // EDEN_NX2_QUERY_DMA_TRACE / EDEN_NX2_QUERY_DMA_SYNC: below High accuracy, counter reports
+         // reach guest memory when a later fence pops, and nothing here waits for them.
+         VideoCommon::QueryDma::BeforeRead(*memory, *rasterizer, macro, method, source, read_bytes);
+@@ -1823,10 +1934,13 @@ void Maxwell3D::FrontDmaReadAhead(VideoCommon::GpuSplit& split, FrontState& fs,
+             *dirty_ptr = memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+         }
+         if (memory->IsMemoryDirty(flush_begin, flush_bytes, VideoCommon::CacheType::BufferCache)) {
++            if (neutral) {
++                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Call);
++            }
+             memory->FlushRegion(flush_begin, flush_bytes, VideoCommon::CacheType::BufferCache);
+         }
+         VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+-    });
++    }, neutral ? VideoCommon::GpuSplit::FastDrawNeutral : 0);
+     split.Drain(VideoCommon::DrainSite::DmaReadAhead);
+     // Taken after the drain: the whole pages are current up to what was sent.
+     const u64 position = split.SentPosition();
+@@ -1861,6 +1975,18 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+     }
++    // EDEN_UP_QUERY_STATS (nx2_query_light.h): notes a read once its words are known, after any
++    // drain, so "pending" means the back has run the report and its value has not landed.
++    const auto note_stats = [&](const u32* read_words) {
++        if (const auto stats_device = memory_manager.GpuToCpuAddress(source)) {
++            VideoCommon::QueryLight::NoteMacroRead(*stats_device, read_words, words,
++                                                   fs.parameters.empty() ? ~0U : fs.parameters[0]);
++        }
++    };
++    const bool query_stats = VideoCommon::QueryLight::StatsEnabled() && method == 0x158;
++    // EDEN_UP_QUERY_LIGHT (nx2_query_light.h): the calls below end fast draw reuse only when
++    // they flush.
++    const bool neutral = DmaReadCallIsNeutral();
+     // EDEN_NX2_DMA_SNAPSHOT (Frizti/Fritchii 8ac3666f7b, EvilOOT's dma-snapshot fix): Ocarina
+     // reads an occlusion report for each object (MME_DMA_READ_FIFOED), ~35,000 times a second,
+     // and its pages are GPU-written, so each read drained the back: the front and the back took
+@@ -1902,7 +2028,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                 snap_words.resize(words);
+                 const auto drained_read = [&](u32* out, VideoCommon::DrainSite site) {
+                     split.Defer([memory = &memory_manager, rasterizer_ptr = rasterizer, macro,
+-                                 method, source, read_bytes] {
++                                 method, source, read_bytes, neutral] {
+                         VideoCommon::QueryDma::BeforeRead(*memory, *rasterizer_ptr, macro, method,
+                                                           source, read_bytes);
+                         // The GPU data of the whole pages (a flush of only the bytes read left
+@@ -1912,12 +2038,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                         const size_t flush_bytes = static_cast<size_t>(flush_end - flush_begin);
+                         if (memory->IsMemoryDirty(flush_begin, flush_bytes,
+                                                   VideoCommon::CacheType::BufferCache)) {
++                            if (neutral) {
++                                VideoCommon::Nx2FastDraw::Break(
++                                    VideoCommon::Nx2FastDraw::Reason::Call);
++                            }
+                             memory->FlushRegion(flush_begin, flush_bytes,
+                                                 VideoCommon::CacheType::BufferCache);
+                         }
+                         VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer_ptr, source,
+                                                                 read_bytes);
+-                    });
++                    }, neutral ? VideoCommon::GpuSplit::FastDrawNeutral : 0);
+                     split.Drain(site);
+                     memory_manager.ReadBlockUnsafe(source, out, read_bytes);
+                 };
+@@ -1957,6 +2087,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                              hits, misses, differences, report_reads, miss_reasons[0],
+                              miss_reasons[1], miss_reasons[2], miss_reasons[3]);
+                 }
++                if (query_stats) [[unlikely]] {
++                    note_stats(snap_words.data());
++                }
+                 for (u32 i = 0; i < words; ++i) {
+                     fs.parameters.push_back(snap_words[i]);
+                 }
+@@ -1966,20 +2099,30 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+         }
+     }
+     if (!split.DmaReadAhead() || words > 64) {
+-        split.Defer([this, memory = &memory_manager, macro, method, source, read_bytes] {
++        split.Defer([this, memory = &memory_manager, macro, method, source, read_bytes, neutral] {
+             // EDEN_NX2_QUERY_DMA_TRACE / EDEN_NX2_QUERY_DMA_SYNC: below High accuracy, counter
+             // reports reach guest memory when a later fence pops, and nothing here waits for them.
+             VideoCommon::QueryDma::BeforeRead(*memory, *rasterizer, macro, method, source, read_bytes);
+             if (memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
++                if (neutral) {
++                    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Call);
++                }
+                 memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+             }
+             VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+-        });
++        }, neutral ? VideoCommon::GpuSplit::FastDrawNeutral : 0);
+         split.Drain(method == 0x158 ? VideoCommon::DrainSite::MacroDmaRead
+                                     : VideoCommon::DrainSite::MacroDmaReadRam);
+     } else {
+         FrontDmaReadAhead(split, fs, macro, method, source, words);
+     }
++    if (query_stats && words <= 8) [[unlikely]] {
++        std::array<u32, 8> stats_words{};
++        for (u32 i = 0; i < words; ++i) {
++            stats_words[i] = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
++        }
++        note_stats(stats_words.data());
++    }
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+         if (method == 0x158) {
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 4aad854..4cf6bea 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -32,6 +32,7 @@
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/nx2_query_light.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/readback_wait.h"
+ 
+@@ -743,7 +744,15 @@ private:
+     /// the operations fences carry along (query slot cleanup) keep running.
+     bool SkipEmptyFence() {
+         if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
+-            if (skipped_fences >= 64 || query_cache.HasPendingFenceWork()) {
++            if (skipped_fences >= 64) {
++                return false;
++            }
++            if (query_cache.HasPendingFenceWork()) {
++                // EDEN_UP_QUERY_STATS (nx2_query_light.h): a fence that pending query work
++                // keeps from being skipped (a queued report also leaves an operation, below).
++                if (QueryLight::StatsEnabled()) [[unlikely]] {
++                    QueryLight::Add(QueryLight::g_stats.forced_fences);
++                }
+                 return false;
+             }
+             {
+diff --git a/src/video_core/nx2_query_light.h b/src/video_core/nx2_query_light.h
+new file mode 100644
+index 0000000..a56d708
+--- /dev/null
++++ b/src/video_core/nx2_query_light.h
+@@ -0,0 +1,271 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "video_core/nx2_fast_draw.h"
++#include "video_core/nx2_profile.h"
++
++/// What Ocarina of Time (Switch 2) does around its draws, and two switches for it.
++///
++/// The game culls with NVN2's conditional rendering. For an object it tests: reset the Z pass
++/// counter (clear_report_value), draw, then report the count (report_semaphore, long form
++/// ZPassPixelCount64, not fence-flagged) into a counter buffer. Where it uses a result: NVN2's
++/// macro 0x142/0x143 sets the MME memory address (3D words 0x154/0x155), reads two counters with
++/// MME_DMA_READ_FIFOED (word 0x158, 6 words: a counter, its timestamp, the next counter),
++/// compares them in the macro and writes render_enable.mode True or False. No guest render
++/// condition reaches the host (EDEN_NX2_COND_TRACE counts 0), and nothing reads a report on the
++/// host GPU.
++///
++/// The emulator's cost for a report is small on the thread that runs it (the query cache queues
++/// the value for the next fence). What costs is that both steps end fast draw reuse
++/// (EDEN_UP_FAST_DRAW, nx2_fast_draw.h): the report as a 3D method with side effects, the macro's
++/// read as a deferred call on the split's back and as changes of words 0x154/0x155. In the Kokiri
++/// walk those were the last break before 8,200 to 16,100 of 20,500 to 27,000 draws a second
++/// (run489: method 0x6c3 4,674 to 8,755, deferred call 3,528 to 7,342).
++///
++/// EDEN_UP_QUERY_LIGHT=1 (exact "1", with EDEN_UP_FAST_DRAW=1) keeps reuse across them. It needs
++/// EDEN_UP_FAST_DRAW_OOT_EXEMPT=1 beside it to show anything: the counter reset and the
++/// render_enable write that surround every test are exempt only there.
++/// - A report_semaphore.query write that only queues a Z pass count (Release or ReportOnly of
++///   ZPassPixelCount64, not a short release) ends no reuse, and neither do the report's address
++///   and payload words. Such a report records an EndQuery and queues the value; the value reaches
++///   guest memory on the fencing thread, which ends reuse itself before and after
++///   (Reason::Fence), and a sync of pending reports ends the render pass, which changes the
++///   recording epoch TakeReusableDraw checks. Every other report (payload releases, fences,
++///   counters without a streamer, which are written at once) still ends reuse.
++/// - The MME memory words 0x154 to 0x158 end no reuse while macros run on the split's front:
++///   the macro engine reads them, no draw does. In the Maxwell layout they are padding inside
++///   the transform feedback block (bytes 0x550 to 0x563, between its buffers at 0x380 and its
++///   controls at 0x700). With macros on the back (EDEN_NX2_SPLIT=1, EDEN_NX2_MME_JIT=0) the
++///   read runs inline there with no call of its own, so the words keep ending reuse.
++/// - A macro DMA read's deferred call on the back ends reuse only when it flushes GPU-written
++///   buffer data to guest memory, or when a query DMA sync or trace mode is on.
++/// EDEN_UP_FAST_DRAW_VERIFY=1 checks the draws this adds like any other delta draw.
++///
++/// EDEN_UP_QUERY_STATS=1 (exact "1", alone or with the above) logs once a second what the game
++/// does: reports by kind, counter resets, render_enable writes by value, draws run and skipped by
++/// the render enable, draws that only count (no colour, depth or stencil write), counted draws
++/// per report, how many reports a macro read before the next report to the same counter, macro
++/// reads that came before the report they read had landed (the timing race a frame wait hides),
++/// fences made only for query work, query syncs, and the time in the report and reset calls.
++/// Log only: it changes nothing else. Macro reads are counted on the split's front only.
++///
++/// EDEN_UP_OOT_OCCLUSION_OFF=1 (core/file_sys/patch_manager.cpp) is the other way: the game's own
++/// two occlusion settings are turned off, so it makes no test draws, reports or conditions at
++/// all and draws every object.
++namespace VideoCommon::QueryLight {
++
++/// EDEN_UP_QUERY_LIGHT=1 (exact "1") with EDEN_UP_FAST_DRAW=1, read once.
++[[nodiscard]] inline bool Enabled() {
++    static const bool enabled = Nx2FastDraw::Enabled() && Common::PeSwitch("EDEN_UP_QUERY_LIGHT");
++    return enabled;
++}
++
++/// EDEN_UP_QUERY_STATS=1 (exact "1"), read once.
++[[nodiscard]] inline bool StatsEnabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_QUERY_STATS");
++    return enabled;
++}
++
++/// Counters of the last second. Relaxed atomics: several threads add, the line is a guide.
++struct Stats {
++    using Count = std::atomic<u64>;
++
++    // The 3D engine's thread (the split's back).
++    Count zpass_reports;       ///< ZPassPixelCount64, queued for a fence (what QUERY_LIGHT exempts)
++    Count zpass_fence_reports; ///< ZPassPixelCount64 as a short release
++    Count payload_releases;    ///< Payload, short release (a fence)
++    Count payload_reports;     ///< Payload, any other form
++    Count other_reports;       ///< Other counters and operations
++    Count zpass_resets;
++    Count other_resets;
++    Count report_ns; ///< In RasterizerInterface::Query, all kinds
++    Count reset_ns;  ///< In RasterizerInterface::ResetCounter
++    /// render_enable.mode written False, True, a guest condition
++    std::array<Count, 3> enable_writes;
++    Count draws_run;
++    Count draws_skipped; ///< By the render enable
++    Count counted_draws; ///< Run with the Z pass counter on
++    Count proxy_draws;   ///< Of counted_draws: no colour, depth or stencil write
++    /// Z pass reports by counted draws run since the previous report or reset: 0, 1, 2-4, 5+
++    std::array<Count, 4> window_draws;
++    Count reports_first;    ///< Z pass reports to a counter not seen before
++    Count reports_consumed; ///< ...to a counter a macro read since its last report
++    Count reports_unread;   ///< ...to a counter no macro read since its last report
++    Count reports_unlanded; ///< ...to a counter whose last report had not landed yet
++
++    // The split's front.
++    Count macro_reads;           ///< MME_DMA_READ_FIFOED
++    Count macro_reads_of_report; ///< Of those: covering a counter a Z pass report wrote
++    // Of the 6-word reads (NVN2's condition macro: counter, its timestamp, the next counter):
++    /// By the macro's first parameter: 0 draw when they differ, 1 draw when equal, other
++    std::array<Count, 3> macro_polarity;
++    Count macro_reads_equal;     ///< The two counters were equal
++    Count macro_reads_pending;   ///< One of the two had a report issued that had not landed
++    Count macro_reads_zero_time; ///< The first counter's timestamp was 0: no report landed there
++    Count macro_reads_suspect;   ///< Equal, and pending or with a zero timestamp
++
++    // The fence manager and the query cache (the back).
++    Count forced_fences;   ///< Fences that could not be skipped as empty with query work pending
++    Count presyncs;        ///< Syncs of pending reports (QueryCacheBase::NotifyWFI with work)
++    Count presync_ns;      ///< In them
++    Count presync_reports; ///< Z pass reports in them
++    Count presync_slots;   ///< Host query slots in them
++    Count presync_scans;   ///< Z pass syncs with the prefix scan compute pass
++    Count host_queries;    ///< Host occlusion queries begun
++};
++
++inline Stats g_stats;
++
++inline void Add(Stats::Count& count, u64 amount = 1) {
++    count.fetch_add(amount, std::memory_order_relaxed);
++}
++
++/// Per 8-byte counter, by a hash of its device address: bit 0 reported at least once, bit 1 read
++/// by a macro since its last report, the bits above how many of its reports have been issued and
++/// not yet settled (written to guest memory, or dropped). Collisions only blur the counts.
++inline std::array<std::atomic<u16>, 1 << 16> g_counter_marks{};
++inline constexpr u16 MarkReported = 1;
++inline constexpr u16 MarkRead = 2;
++inline constexpr u16 MarkPendingOne = 4;
++
++[[nodiscard]] inline size_t MarkIndex(DAddr device) {
++    return static_cast<size_t>(((device >> 3) * 0x9E3779B97F4A7C15ULL) >> 48);
++}
++
++/// The back: counted draws run since the last Z pass report or counter reset.
++inline u32 g_window_draws{};
++
++/// The back: a Z pass report was queued for the counter at `device`.
++inline void NoteZpassReport(DAddr device) {
++    auto& mark = g_counter_marks[MarkIndex(device)];
++    const u16 old = mark.load(std::memory_order_relaxed);
++    Add((old & MarkReported) == 0   ? g_stats.reports_first
++        : old >= MarkPendingOne     ? g_stats.reports_unlanded
++        : (old & MarkRead) != 0     ? g_stats.reports_consumed
++                                    : g_stats.reports_unread);
++    mark.fetch_and(static_cast<u16>(~MarkRead), std::memory_order_relaxed);
++    mark.fetch_add(MarkPendingOne, std::memory_order_relaxed);
++    mark.fetch_or(MarkReported, std::memory_order_relaxed);
++    const u32 draws = g_window_draws;
++    Add(g_stats.window_draws[draws == 0 ? 0 : draws == 1 ? 1 : draws <= 4 ? 2 : 3]);
++    g_window_draws = 0;
++}
++
++/// The thread that runs a queued report's operation (the fencing thread): the report for the
++/// counter at `device` was written to guest memory, or dropped.
++inline void NoteReportSettled(DAddr device) {
++    auto& mark = g_counter_marks[MarkIndex(device)];
++    if (mark.load(std::memory_order_relaxed) >= MarkPendingOne) {
++        mark.fetch_sub(MarkPendingOne, std::memory_order_relaxed);
++    }
++}
++
++/// The front: a macro read `count` words at `device` into its load FIFO, after any drain.
++/// `words` are the words read, `polarity` the macro's first parameter.
++inline void NoteMacroRead(DAddr device, const u32* words, u32 count, u32 polarity) {
++    Add(g_stats.macro_reads);
++    bool reported = false;
++    bool pending = false;
++    // The counters at +0 and +16; the 8 bytes between them are the first one's timestamp.
++    for (u32 word = 0; word + 2 <= count; word += 4) {
++        auto& mark = g_counter_marks[MarkIndex(device + u64{word} * sizeof(u32))];
++        const u16 state = mark.load(std::memory_order_relaxed);
++        reported |= (state & MarkReported) != 0;
++        pending |= state >= MarkPendingOne;
++        mark.fetch_or(MarkRead, std::memory_order_relaxed);
++    }
++    if (reported) {
++        Add(g_stats.macro_reads_of_report);
++    }
++    if (count != 6) {
++        return;
++    }
++    Add(g_stats.macro_polarity[polarity < 2 ? polarity : 2]);
++    const bool equal = words[0] == words[4] && words[1] == words[5];
++    const bool zero_time = (words[2] | words[3]) == 0;
++    Add(g_stats.macro_reads_equal, equal ? 1 : 0);
++    Add(g_stats.macro_reads_pending, pending ? 1 : 0);
++    Add(g_stats.macro_reads_zero_time, zero_time ? 1 : 0);
++    Add(g_stats.macro_reads_suspect, equal && (pending || zero_time) ? 1 : 0);
++}
++
++/// The back, at each draw: logs the last second.
++inline void Report() {
++    static u64 last = Nx2Profile::Now();
++    const u64 now = Nx2Profile::Now();
++    if (now - last < 1'000'000'000ULL) {
++        return;
++    }
++    const double seconds = static_cast<double>(now - last) / 1e9;
++    last = now;
++    const auto take = [seconds](Stats::Count& count) {
++        return static_cast<u64>(
++            static_cast<double>(count.exchange(0, std::memory_order_relaxed)) / seconds + 0.5);
++    };
++    Stats& s = g_stats;
++    const u64 zpass = take(s.zpass_reports);
++    const u64 zpass_fence = take(s.zpass_fence_reports);
++    const u64 releases = take(s.payload_releases);
++    const u64 payload = take(s.payload_reports);
++    const u64 other = take(s.other_reports);
++    const u64 reports = zpass + zpass_fence + releases + payload + other;
++    const u64 zpass_resets = take(s.zpass_resets);
++    const u64 other_resets = take(s.other_resets);
++    const u64 resets = zpass_resets + other_resets;
++    // Both rates are per second, so their quotient is the time of one call.
++    const auto each_us = [](u64 ns, u64 calls) {
++        return calls != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(calls) : 0.0;
++    };
++    const double report_us = each_us(take(s.report_ns), reports);
++    const double reset_us = each_us(take(s.reset_ns), resets);
++    LOG_INFO(HW_GPU,
++             "Query stats per second: reports {} Z pass queued, {} Z pass fence, {} payload "
++             "release, {} payload other, {} other ({:.2f} us each) | resets {} Z pass, {} other "
++             "({:.2f} us each) | render enable written False {}, True {}, guest condition {}",
++             zpass, zpass_fence, releases, payload, other, report_us, zpass_resets, other_resets,
++             reset_us, take(s.enable_writes[0]), take(s.enable_writes[1]),
++             take(s.enable_writes[2]));
++    const u64 run = take(s.draws_run);
++    const u64 skipped = take(s.draws_skipped);
++    const u64 counted = take(s.counted_draws);
++    const u64 proxy = take(s.proxy_draws);
++    const u64 w0 = take(s.window_draws[0]);
++    const u64 w1 = take(s.window_draws[1]);
++    const u64 w2 = take(s.window_draws[2]);
++    const u64 w3 = take(s.window_draws[3]);
++    LOG_INFO(HW_GPU,
++             "Query stats per second: draws {} run, {} skipped by the render enable, {} counted, "
++             "{} of those write no colour, depth or stencil | Z pass reports by counted draws "
++             "since the last report or reset: none {}, one {}, 2-4 {}, more {} | counters "
++             "reported: {} new, {} read by a macro since their last report, {} not read, {} "
++             "reported again before the last report landed",
++             run, skipped, counted, proxy, w0, w1, w2, w3, take(s.reports_first),
++             take(s.reports_consumed), take(s.reports_unread), take(s.reports_unlanded));
++    LOG_INFO(HW_GPU,
++             "Query stats per second: macro reads {}, {} of a reported counter | conditions: "
++             "draw when the counters differ {}, when equal {}, other {} | counters equal {} | "
++             "read before a report landed {}, with a zero timestamp {}, equal and one of those "
++             "two {}",
++             take(s.macro_reads), take(s.macro_reads_of_report), take(s.macro_polarity[0]),
++             take(s.macro_polarity[1]), take(s.macro_polarity[2]), take(s.macro_reads_equal),
++             take(s.macro_reads_pending), take(s.macro_reads_zero_time),
++             take(s.macro_reads_suspect));
++    const u64 presyncs = take(s.presyncs);
++    const double presync_us = each_us(take(s.presync_ns), presyncs);
++    LOG_INFO(HW_GPU,
++             "Query stats per second: fences not skipped with query work pending {} | report "
++             "syncs {} ({} Z pass reports, {} host slots, {} with the prefix scan, {:.1f} us "
++             "each) | host queries begun {}",
++             take(s.forced_fences), presyncs, take(s.presync_reports), take(s.presync_slots),
++             take(s.presync_scans), presync_us, take(s.host_queries));
++}
++
++} // namespace VideoCommon::QueryLight
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+index de08712..d229f79 100644
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -25,6 +25,7 @@
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
++#include "video_core/nx2_query_light.h"
+ #include "video_core/query_cache/bank_base.h"
+ #include "video_core/query_cache/query_base.h"
+ #include "video_core/query_cache/query_cache_base.h"
+@@ -305,8 +306,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     const bool hold_release =
+         (is_fence || counter_type == QueryType::Payload) && VideoCore::Readback::HoldRelease();
+     bool is_synced = !keep_pending && !hold_release && (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
++    // EDEN_UP_QUERY_STATS (nx2_query_light.h): Maxwell3D counted this report as pending.
++    const bool stats_settle = QueryLight::StatsEnabled() && !is_fence &&
++                              counter_type == QueryType::ZPassPixelCount64;
+     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+-                                     pointer, pointer_timestamp, cpu_addr] {
++                                     pointer, pointer_timestamp, cpu_addr, stats_settle] {
++        if (stats_settle) [[unlikely]] {
++            QueryLight::NoteReportSettled(cpu_addr);
++        }
+         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+             if (!is_synced) [[likely]] {
+                 impl->pending_unregister.push_back(query_location);
+@@ -433,10 +440,17 @@ void QueryCacheBase<Traits>::NotifyWFI() {
+         return;
+     }
+ 
++    // EDEN_UP_QUERY_STATS (nx2_query_light.h)
++    const bool query_stats = QueryLight::StatsEnabled();
++    const u64 stats_start = query_stats ? Nx2Profile::Now() : 0;
+     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->PresyncWrites(); });
+     impl->runtime.Barriers(true);
+     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->SyncWrites(); });
+     impl->runtime.Barriers(false);
++    if (query_stats) [[unlikely]] {
++        QueryLight::Add(QueryLight::g_stats.presyncs);
++        QueryLight::Add(QueryLight::g_stats.presync_ns, Nx2Profile::Now() - stats_start);
++    }
+ }
+ 
+ template <typename Traits>
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index f190c4a..c0a875b 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -31,6 +31,7 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "video_core/nx2_query_light.h"
+ #include "video_core/zpass_cut.h"
+ 
+ namespace Vulkan {
+@@ -174,6 +175,10 @@ public:
+         }
+ 
+         ReserveHostQuery();
++        // EDEN_UP_QUERY_STATS (nx2_query_light.h)
++        if (VideoCommon::QueryLight::StatsEnabled()) [[unlikely]] {
++            VideoCommon::QueryLight::Add(VideoCommon::QueryLight::g_stats.host_queries);
++        }
+ 
+         scheduler.Record([query_pool = current_query_pool,
+                                  query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
+@@ -395,6 +400,13 @@ public:
+             });
+         }
+ 
++        // EDEN_UP_QUERY_STATS (nx2_query_light.h)
++        if (VideoCommon::QueryLight::StatsEnabled()) [[unlikely]] {
++            namespace QueryLight = VideoCommon::QueryLight;
++            QueryLight::Add(QueryLight::g_stats.presync_reports, pending_sync.size());
++            QueryLight::Add(QueryLight::g_stats.presync_slots, num_slots_used);
++            QueryLight::Add(QueryLight::g_stats.presync_scans, has_multi_queries ? 1 : 0);
++        }
+         ReplicateCurrentQueryIfNeeded();
+         std::function<void()> func([this] { amend_value = accumulation_value; });
+         rasterizer->SyncOperation(std::move(func));

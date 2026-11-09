@@ -4,6 +4,7 @@
 #include "stall_watchdog.h"
 #include "../src/fastmem.h"
 #include "common/cpu_features.h"
+#include "common/pe_switch.h"
 #include "common/sparse_large_vector.h"
 #include <string_view>
 #include <algorithm>
@@ -168,6 +169,13 @@ cpuset_t topology_allowed{};
 bool topology_allowed_valid = false;
 std::atomic<bool> placement_secondary{false};
 std::atomic<unsigned> secondary_reports{};
+// EDEN_UP_GPU_PIN_EXCLUSIVE=1 (PlanGpuExclusive): the shared mask that replaces secondary_cpus, and
+// the GPU threads' whole cores. 0 = off. Set per session before the game's threads start.
+std::atomic<unsigned long long> exclusive_shared{0}, exclusive_gpu{0};
+unsigned long long SharedCpus() {
+    const unsigned long long shared = exclusive_shared.load(std::memory_order_relaxed);
+    return shared != 0 ? shared : secondary_cpus;
+}
 void CheckWorkerTopology() {
     cpuset_t original{};
     if (__get_cpuid_max(0, nullptr) < 0xb ||
@@ -287,9 +295,14 @@ unsigned long long PlacementOverride(const char* name) {
 }
 void PlaceSecondary(const char* name) {
     unsigned long long cpus = PlacementOverride(name);
+    const unsigned long long gpu = exclusive_gpu.load(std::memory_order_relaxed);
     if (cpus == 0) {
-        if (!placement_secondary.load(std::memory_order_relaxed) || !secondary_cpus) return;
-        cpus = secondary_cpus;
+        if (!placement_secondary.load(std::memory_order_relaxed) || !SharedCpus()) return;
+        cpus = SharedCpus();
+    } else if (gpu != 0 && std::strcmp(name, "GPUBack") != 0 && (cpus & ~gpu) != 0) {
+        // EDEN_UP_GPU_PIN_EXCLUSIVE: a placed thread keeps off the GPU threads' cores, unless it was
+        // placed on nothing else.
+        cpus &= ~gpu;
     }
     cpuset_t mask{};
     for (unsigned cpu = 0; cpu < 64; ++cpu)
@@ -323,6 +336,178 @@ void PinWorker(unsigned index, cpuset_t& affinity) {
     }
     affinity = verified;
     std::printf("EDEN_WORKER_PIN name=%s cpu=%u verified=1\n", names[index], cpu);
+}
+#endif
+#ifdef PS5_NATIVE
+// EDEN_UP_CPU_PAIR_PROBE=1 (log only): the round trip of one cache line between every two allowed
+// CPUs. CPUID gives every CPU the same x2APIC ID on this firmware (EDEN_WORKER_PROBE first_id=0
+// last_id=0), so which CPUs are SMT siblings and which share an L3 is a guess: EDEN_PS5_PIN=pairs
+// takes 2n and 2n+1. On Zen 2 siblings answer in tens of ns, two cores of one CCX in about 100 and
+// cores of the two CCXs in a few hundred. One line per CPU: the median of 7 x 200 round trips to each
+// allowed CPU in that order, in ns (-1: not measured). Once at start, tens of ms for 13 CPUs.
+void ProbeCpuPairs(const cpuset_t& allowed) {
+    std::vector<unsigned> cpus;
+    for (unsigned cpu = 0; cpu < 64; ++cpu)
+        if (CPU_ISSET(cpu, &allowed)) cpus.push_back(cpu);
+    if (cpus.size() < 2) return;
+    const auto pin = [](unsigned cpu) {
+        cpuset_t one{};
+        CPU_SET(cpu, &one);
+        return cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &one) == 0;
+    };
+    // False after ~100 ms; the clock is read only every 4096 spins, never on a quick answer.
+    const auto wait_until = [](const auto& done) {
+        std::chrono::steady_clock::time_point deadline{};
+        for (unsigned spins = 1; !done(); ++spins) {
+            if ((spins & 4095) != 0) continue;
+            const auto now = std::chrono::steady_clock::now();
+            if (deadline == std::chrono::steady_clock::time_point{})
+                deadline = now + std::chrono::milliseconds(100);
+            else if (now > deadline)
+                return false;
+        }
+        return true;
+    };
+    alignas(64) std::atomic<unsigned> ball{0};
+    alignas(64) std::atomic<unsigned> request{0};
+    std::atomic<unsigned> answered{0};
+    std::atomic<int> target{-1};
+    std::atomic<bool> pinned{false}, stop{false};
+    // Same-priority threads are not time-sliced here, so main and the spinning helper must never
+    // share a CPU (main would never run again). Main takes cpus[0] and asks for the last CPU before
+    // the helper exists: the helper inherits cpus[0], runs once main yields and leaves at once. Main
+    // then visits cpus[0..n-2] only, and the helper ends every row on cpus[n-1]. A helper whose move
+    // failed yields on every turn.
+    unsigned asked = 1;
+    bool aborted = !pin(cpus.front());
+    target.store(static_cast<int>(cpus.back()), std::memory_order_relaxed);
+    request.store(asked, std::memory_order_release);
+    // The helper moves to the CPU asked for, then answers every odd ball with the next even one.
+    std::thread helper;
+    if (!aborted) helper = std::thread([&] {
+        unsigned seen = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            const unsigned now_asked = request.load(std::memory_order_acquire);
+            if (now_asked != seen) {
+                seen = now_asked;
+                pinned.store(pin(static_cast<unsigned>(target.load(std::memory_order_relaxed))),
+                             std::memory_order_relaxed);
+                answered.store(now_asked, std::memory_order_release);
+                continue;
+            }
+            const unsigned value = ball.load(std::memory_order_acquire);
+            if (value & 1) ball.store(value + 1, std::memory_order_release);
+            if (!pinned.load(std::memory_order_relaxed)) std::this_thread::yield();
+        }
+    });
+    // Yield while the helper moves: a helper the OS queued on this CPU still gets to run.
+    const auto moved = [&] {
+        const auto moved_by = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        while (answered.load(std::memory_order_acquire) != asked &&
+               std::chrono::steady_clock::now() < moved_by)
+            std::this_thread::yield();
+        return answered.load(std::memory_order_acquire) == asked;
+    };
+    if (!aborted) aborted = !moved() || !pinned.load(std::memory_order_relaxed);
+    std::vector<std::vector<long long>> trip(cpus.size(), std::vector<long long>(cpus.size(), -1));
+    for (size_t i = 0; i + 1 < cpus.size() && !aborted; ++i) {
+        if (i != 0 && !pin(cpus[i])) continue;
+        for (size_t j = i + 1; j < cpus.size() && !aborted; ++j) {
+            target.store(static_cast<int>(cpus[j]), std::memory_order_relaxed);
+            request.store(++asked, std::memory_order_release);
+            if (!moved()) {
+                aborted = true;
+                break;
+            }
+            if (!pinned.load(std::memory_order_relaxed)) continue;
+            std::array<long long, 7> batches{};
+            for (long long& batch : batches) {
+                const auto start = std::chrono::steady_clock::now();
+                for (unsigned k = 0; k < 200 && !aborted; ++k) {
+                    const unsigned sent = ball.load(std::memory_order_relaxed) + 1;
+                    ball.store(sent, std::memory_order_release);
+                    aborted = !wait_until([&] { return ball.load(std::memory_order_acquire) == sent + 1; });
+                }
+                batch = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start).count() / 200;
+            }
+            if (aborted) break;
+            std::sort(batches.begin(), batches.end());
+            trip[i][j] = trip[j][i] = batches[3];
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    if (helper.joinable()) helper.join();
+    cpuset_t restored{};
+    if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &allowed) ||
+        cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &restored) ||
+        std::memcmp(&allowed, &restored, 8))
+        throw std::runtime_error("Cannot restore pair-probe thread affinity");
+    std::string order;
+    for (const unsigned cpu : cpus) order += (order.empty() ? "" : ",") + std::to_string(cpu);
+    std::printf("EDEN_UP_CPU_PAIR_PROBE cpus=%s aborted=%d\n", order.c_str(), int(aborted));
+    for (size_t i = 0; i < cpus.size(); ++i) {
+        std::string line;
+        for (size_t j = 0; j < cpus.size(); ++j)
+            line += (j ? "," : "") + (i == j ? std::string("-") : std::to_string(trip[i][j]));
+        std::printf("EDEN_UP_CPU_PAIRS cpu=%u rt_ns=%s\n", cpus[i], line.c_str());
+    }
+}
+// EDEN_UP_GPU_PIN_EXCLUSIVE=1 (zortos293/Lichii #913 by the-cashman, on #769): the GPU front ("GPU")
+// and back ("GPUBack") each keep their whole physical core. The shared mask (named threads without a
+// pin or placement, and what the main thread hands the threads it starts) becomes the allowed CPUs
+// minus the CPU each GPU thread is on and its SMT sibling, minus guest cores 0-2 with their SMT
+// siblings (as without the switch) and the one CPU CPUCore_3 and a pinned CPUCore_4/5 are on; a
+// placed thread other than GPUBack loses the GPU threads' cores unless nothing
+// else is left. Without EDEN_PS5_PIN=pairs too, where nothing else places the other threads. Only GPU
+// threads with a known CPU count: the front's pin or placement, GPUBack's placement. Siblings: the
+// topology reading when ready, else 2n and 2n+1. Threads a pinned thread starts without naming
+// themselves still inherit its CPU, as in #913. Off: nothing changes.
+void PlanGpuExclusive(bool enabled) {
+    exclusive_shared.store(0, std::memory_order_relaxed);
+    exclusive_gpu.store(0, std::memory_order_relaxed);
+    if (!enabled || !topology_allowed_valid || !Common::PeSwitch("EDEN_UP_GPU_PIN_EXCLUSIVE")) return;
+    unsigned long long allowed = 0;
+    for (unsigned cpu = 0; cpu < 64; ++cpu)
+        if (CPU_ISSET(cpu, &topology_allowed)) allowed |= 1ULL << cpu;
+    const auto core_of = [](unsigned cpu) {
+        if (!worker_topology_ready) return static_cast<int>(cpu / 2);
+        return cpu_core[cpu] >= 0 ? cpu_core[cpu] : -1 - static_cast<int>(cpu);
+    };
+    const auto whole_cores = [&](unsigned long long cpus) {
+        unsigned long long out = cpus;
+        for (unsigned cpu = 0; cpu < 64; ++cpu) {
+            if (!(cpus >> cpu & 1)) continue;
+            for (unsigned other = 0; other < 64; ++other)
+                if ((allowed >> other & 1) && core_of(other) == core_of(cpu)) out |= 1ULL << other;
+        }
+        return out;
+    };
+    const auto lowest = [](unsigned long long cpus) { return cpus & (0 - cpus); };
+    // As PinWorker: a placement's lowest CPU, else the topology pin.
+    const auto pinned = [&](unsigned index) {
+        const unsigned long long over = PlacementOverride(names[index]);
+        if (over != 0) return lowest(over);
+        return worker_topology_ready ? 1ULL << worker_cpus[index] : 0ULL;
+    };
+    const unsigned long long front = pinned(4) & allowed;
+    const unsigned long long back = PlacementOverride("GPUBack") & allowed;
+    const unsigned long long gpu = whole_cores(front | back);
+    // Guest cores 0-2 keep their whole cores, as the shared mask without the switch keeps them and
+    // their SMT siblings clear; CPUCore_3 and a one-CPU CPUCore_4/5 placement keep their own CPU.
+    unsigned long long guests = whole_cores(pinned(0) | pinned(1) | pinned(2)) | pinned(3);
+    for (const char* name : {"CPUCore_4", "CPUCore_5"}) {
+        const unsigned long long over = PlacementOverride(name);
+        if (over != 0 && lowest(over) == over) guests |= over;  // one CPU: a pin
+    }
+    guests &= allowed;
+    unsigned long long shared = allowed & ~gpu & ~guests;
+    if (shared == 0) shared = allowed & ~gpu;
+    std::printf("EDEN_UP_GPU_EXCLUSIVE front=%llx back=%llx reserved=%llx guests=%llx shared=%llx clash=%llx\n",
+                front, back, gpu, guests, shared, guests & gpu);
+    if (gpu == 0 || shared == 0) return;
+    exclusive_gpu.store(gpu, std::memory_order_relaxed);
+    exclusive_shared.store(shared, std::memory_order_relaxed);
 }
 #endif
 bool cpu_clocks_valid = false;
@@ -416,17 +601,22 @@ void ReportOwnThread(const char* name) {
 void SetSecondaryPlacement(bool enabled) {
 #ifdef PS5_NATIVE
     placement_secondary.store(enabled, std::memory_order_relaxed);
-    if (!secondary_cpus || !topology_allowed_valid) return;
+    // EDEN_UP_GPU_PIN_EXCLUSIVE: planned per session, once env-<title id>.txt is in. A main thread
+    // the last session narrowed gets its whole set back when the new one has no shared mask.
+    const bool was_exclusive = exclusive_shared.load(std::memory_order_relaxed) != 0;
+    PlanGpuExclusive(enabled);
+    const unsigned long long shared = SharedCpus();
+    if ((!shared && !was_exclusive) || !topology_allowed_valid) return;
     cpuset_t mask{};
-    if (enabled) {
+    if (enabled && shared) {
         for (unsigned cpu = 0; cpu < 64; ++cpu)
-            if (secondary_cpus & (1ULL << cpu)) CPU_SET(cpu, &mask);
+            if (shared & (1ULL << cpu)) CPU_SET(cpu, &mask);
     } else {
         mask = topology_allowed;
     }
     const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
     std::printf("EDEN_WORKER_INHERIT enabled=%d mask=%llx error=%d\n", enabled,
-                enabled ? secondary_cpus : 0ULL, result ? errno : 0);
+                enabled ? shared : 0ULL, result ? errno : 0);
 #else
     (void)enabled;
 #endif
@@ -1423,6 +1613,7 @@ void AllocatorCheck() {
 void PlatformChecks() {
 #ifdef PS5_NATIVE
     CheckWorkerTopology();
+    if (topology_allowed_valid && Common::PeSwitch("EDEN_UP_CPU_PAIR_PROBE")) ProbeCpuPairs(topology_allowed);
 #endif
     CheckCpuClocks();
 #ifdef EDEN_DEV_PROFILE
