@@ -1,0 +1,19 @@
+Subject: [PATCH] EDEN_UP_FRITCHII_BLITSTATE: Fritchii 2c6c844f4d (fc731789dc): the image-view BlitColor invalidates the scheduler state so the next draw rebinds its own pipeline; off by default
+
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+index 8a2718c..f555f25 100644
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -825,7 +825,11 @@ void BlitImageHelper::BlitColor(const Framebuffer* dst_framebuffer, VkImageView
+         cmdbuf.EndRenderPass();
+     });
+     // Lichii PR 353: the blit replaced the guest pipeline and its static write mask.
+-    if (MaskComponentsEnabled()) {
++    // EDEN_UP_FRITCHII_BLITSTATE=1 (Fritchii 2c6c844f4d): always, as BlitImpl does. Otherwise the
++    // next draw whose pipeline matches the one bound before skips the bind and runs with the blit
++    // pipeline, and the dynamic state the blit set (viewport, scissor) stays until dirtied.
++    static const bool fritchii_blit_state = Common::PeSwitch("EDEN_UP_FRITCHII_BLITSTATE");
++    if (MaskComponentsEnabled() || fritchii_blit_state) {
+         scheduler.InvalidateState();
+     }
+ }

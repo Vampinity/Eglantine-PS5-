@@ -1,0 +1,49 @@
+Subject: [PATCH] EDEN_UP_FRITCHII_DMALIST: Lichii 34656e8225 / Fritchii 266cb620c1 (#805 command-list page fixes): DMACopy and DMAClear tell command-list pages they wrote guest memory; off by default
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index c709c1b..8eb840f 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -558,6 +558,16 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+         .size = amount,
+     }};
+ 
++    // EDEN_UP_FRITCHII_DMALIST=1 (zortos293/Lichii#805 34656e8225, Fritchii 266cb620c1): guest
++    // memory gets the copy below (the unsafe scoped write at the end, which notes nothing), and it
++    // holds every byte the source has in guest memory. Command list pages in the destination read
++    // those from it, and their copies are stale. The bytes copied from GPU-written source ranges
++    // are noted as GPU writes after this.
++    static const bool fritchii_dma_list = Common::PeSwitch("EDEN_UP_FRITCHII_DMALIST");
++    if (fritchii_dma_list) {
++        Nx2NoteListHostWrite(*cpu_dest_address, amount);
++    }
++
+     boost::container::small_vector<std::pair<DAddr, size_t>, 4> tmp_intervals;
+     auto mirror = [&](DAddr base_address, DAddr base_address_end) {
+         const u64 size = base_address_end - base_address;
+@@ -605,14 +615,23 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
+     if (!cpu_dst_address) {
+         return false;
+     }
+-    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, amount);
++    // EDEN_UP_FRITCHII_DMALIST=1 (zortos293/Lichii#805 34656e8225, Fritchii 266cb620c1):
++    // `amount` counts words, and the check looked at a quarter of the range. A buffer registered
++    // only past it was never cleared, and the caller's unsafe guest write never reaches it.
++    static const bool fritchii_dma_list = Common::PeSwitch("EDEN_UP_FRITCHII_DMALIST");
++    const size_t size = amount * sizeof(u32);
++    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, fritchii_dma_list ? size : amount);
+     if (!dest_dirty) {
+         return false;
+     }
+ 
+-    const size_t size = amount * sizeof(u32);
+     ClearDownload(*cpu_dst_address, size);
+     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
++    if (fritchii_dma_list) {
++        // The caller writes the cleared words to guest memory after this (WriteBlockUnsafe), as
++        // an inline write: command list pages read them from guest memory, their copies are stale.
++        Nx2NoteListHostWrite(*cpu_dst_address, size);
++    }
+ 
+     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
+     Buffer& dest_buffer = slot_buffers[buffer];

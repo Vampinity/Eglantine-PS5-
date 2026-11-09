@@ -1,0 +1,103 @@
+Subject: [PATCH] EDEN_UP_FRITCHII_PR700: Lichii #700 (via Fritchii v5 f9c0e2d611): cached GPU writes invalidate every 32-byte block they touch, QueryCacheBase::IterateCache early exit; off by default
+
+diff --git a/src/video_core/invalidation_accumulator.h b/src/video_core/invalidation_accumulator.h
+index eb18856..40f5cfa 100644
+--- a/src/video_core/invalidation_accumulator.h
++++ b/src/video_core/invalidation_accumulator.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "common/common_types.h"
++#include "common/pe_switch.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -21,8 +22,14 @@ public:
+     void Add(GPUVAddr address, size_t size) noexcept {
+         auto const end_address = start_address + accumulated_size;
+         if (!(address >= start_address && address + size <= end_address)) {
+-            size = ((address + size + atomicity_size_mask) & atomicity_mask) - address;
+-            address = address & atomicity_mask;
++            // EDEN_UP_FRITCHII_PR700=1 (zortos293/Lichii#700, Fritchii f9c0e2d611): the range runs
++            // from the start of the first 32-byte block the write touches to the end of the last
++            // one. Unset, the size is taken before the address is aligned down, so a write past its
++            // block's start gets a range ending short of it (a lone word at 0x54 gives [0x40, 0x4c)).
++            const GPUVAddr first_block = address & atomicity_mask;
++            size = ((address + size + atomicity_size_mask) & atomicity_mask) -
++                   (BlockFix() ? first_block : address);
++            address = first_block;
+             if (start_address == 0) {
+                 start_address = address;
+                 accumulated_size = size;
+@@ -52,6 +59,11 @@ public:
+     }
+ 
+ private:
++    static bool BlockFix() noexcept {
++        static const bool on = ::Common::PeSwitch("EDEN_UP_FRITCHII_PR700");
++        return on;
++    }
++
+     static constexpr size_t atomicity_bits = 5;
+     static constexpr size_t atomicity_size = 1ULL << atomicity_bits;
+     static constexpr size_t atomicity_size_mask = atomicity_size - 1;
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+index 7eca6a1..11b46ea 100644
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -16,6 +16,7 @@
+ #include "common/assert.h"
+ #include "common/bit_field.h"
+ #include "common/common_types.h"
++#include "common/pe_switch.h"
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/page_filter.h"
+@@ -75,9 +76,11 @@ public:
+     /// Writes out the finalized reports in the region. True when some still wait for host results.
+     bool SemiFlushRegion(VAddr addr, std::size_t size) {
+         bool result = false;
++        // Visits every query in the range: each final value not written yet is written here. The
++        // callback returns nothing, so EDEN_UP_FRITCHII_PR700's early exit never ends this walk
++        // (the old `return result;` was never acted on either; zortos293/Lichii#700).
+         IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
+             result |= SemiFlushQueryDirty(location);
+-            return result;
+         });
+         return result;
+     }
+@@ -143,8 +146,11 @@ public:
+ protected:
+     template <bool remove_from_cache, typename Func>
+     void IterateCache(VAddr addr, std::size_t size, Func&& func) {
++        // invoke_result_t (zortos293/Lichii#700): with invoke_result (the trait, never bool) a
++        // callback returning bool never ended the walk. It still runs to the end unless
++        // EDEN_UP_FRITCHII_PR700=1; only IsRegionGpuModified's callback returns bool.
+         static constexpr bool RETURNS_BOOL =
+-            std::is_same_v<std::invoke_result<Func, QueryLocation>, bool>;
++            std::is_same_v<std::invoke_result_t<Func, QueryLocation>, bool>;
+         const u64 addr_begin = addr;
+         const u64 addr_end = addr_begin + size;
+ 
+@@ -167,7 +173,7 @@ protected:
+                     continue;
+                 }
+                 if constexpr (RETURNS_BOOL) {
+-                    if (func(query.second)) {
++                    if (func(query.second) && WalkEarlyExit()) {
+                         return;
+                     }
+                 } else {
+@@ -183,6 +189,12 @@ protected:
+         }
+     }
+ 
++    /// EDEN_UP_FRITCHII_PR700=1: an IterateCache callback returning true ends the walk.
++    static bool WalkEarlyExit() noexcept {
++        static const bool on = ::Common::PeSwitch("EDEN_UP_FRITCHII_PR700");
++        return on;
++    }
++
+     using ContentCache = ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>>;
+ 
+     void InvalidateQuery(QueryLocation location);
