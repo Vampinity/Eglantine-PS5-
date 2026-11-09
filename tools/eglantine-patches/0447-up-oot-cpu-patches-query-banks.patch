@@ -1,4 +1,4 @@
-Subject: [PATCH] EDEN_UP_OOT_NATIVE_ZSTD, EDEN_UP_OOT_FAST_LOOKUP, EDEN_UP_OOT_POLL_BACKOFF: the three game-side CPU patches of Lichii PR 717 (stephenjayakar) as built-in patches with their SVC handlers; EDEN_UP_ZPASS_QUERY_BANKS: the Z pass query bound of Lichii PR 718; all off by default
+Subject: [PATCH] EDEN_UP_OOT_NATIVE_ZSTD, EDEN_UP_OOT_FAST_LOOKUP, EDEN_UP_OOT_POLL_BACKOFF: the three game-side CPU patches of Lichii PR 717 (stephenjayakar) as built-in patches with their SVC handlers; EDEN_UP_ZPASS_QUERY_BANKS: the Z pass query bound of Lichii PR 718; all off by default. v2: native zstd host path capped at 32 MiB, buffers trimmed, failed host allocations fall back to the game
 
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
 index 1ff9f27..94cdb62 100644
@@ -301,10 +301,10 @@ index fbcd40c..e7f7754 100644
          // memory with the GPU and clear it on destruction; NVN can see it through QueryMemory.
 diff --git a/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp b/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp
 new file mode 100644
-index 0000000..74578a3
+index 0000000..e3bdbb8
 --- /dev/null
 +++ b/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,337 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -331,6 +331,8 @@ index 0000000..74578a3
 +// From Lichii PR 717 (stephenjayakar, zortos293/Lichii eb3553bcb8), unchanged but for the switch
 +// names. Here the game patch that reaches this code is off unless EDEN_UP_OOT_POLL_BACKOFF=1
 +// (core/file_sys/patch_manager.cpp).
++// Added after a review of this port (9 Nov), marked "port": the stats line also gives how long
++// the sleeps really took.
 +//
 +// Ocarina of Time (main build E0F3CCFA...): the resource request thread (main+0xF7A0, state 3)
 +// walks every entry of its pending-request ring. Per entry it locks the manager mutex, looks the
@@ -495,6 +497,10 @@ index 0000000..74578a3
 +    u64 measured{};
 +    s64 walk_ns{};
 +    s64 sleep_ns{};
++    // Port: what the sleeps took on the host clock, against sleep_ns asked for.
++    u64 timed_sleeps{};
++    s64 timed_sleep_ns{};
++    s64 longest_sleep_ns{};
 +    std::array<u64, static_cast<size_t>(Outcome::Count)> outcomes{};
 +};
 +
@@ -524,11 +530,14 @@ index 0000000..74578a3
 +    const auto n = [&](Outcome o) { return stats.outcomes[static_cast<size_t>(o)]; };
 +    LOG_INFO(Kernel_SVC,
 +             "OoT resource poll backoff: {} walks in {:.1f} s ({:.0f}/s), {} slept (avg walk {} "
-+             "us, avg sleep {} us); at once: {} issued loads, {} list changed, {} state, {} exit, "
-+             "{} frame",
++             "us, avg sleep asked {} us, measured {} us, longest {} us); at once: {} issued loads, "
++             "{} list changed, {} state, {} exit, {} frame",
 +             stats.calls, secs, secs > 0 ? static_cast<double>(stats.calls) / secs : 0.0,
 +             stats.slept, stats.measured ? stats.walk_ns / static_cast<s64>(stats.measured) / 1000 : 0,
 +             stats.slept ? stats.sleep_ns / static_cast<s64>(stats.slept) / 1000 : 0,
++             stats.timed_sleeps ? stats.timed_sleep_ns / static_cast<s64>(stats.timed_sleeps) / 1000
++                                : 0,
++             stats.longest_sleep_ns / 1000,
 +             n(Outcome::Progress), n(Outcome::ListChanged), n(Outcome::State), n(Outcome::Exit),
 +             n(Outcome::Frame));
 +}
@@ -607,7 +616,15 @@ index 0000000..74578a3
 +    }
 +
 +    if (sleep_ns > 0) {
++        // Port: a guest sleep wakes through the core timing host timer, whose precision on the
++        // console for waits this short is not known, so the real length is logged too.
++        const s64 before = NowNs();
 +        SleepThread(system, sleep_ns);
++        const s64 took = NowNs() - before;
++        std::scoped_lock lock{g_mutex};
++        ++g_stats.timed_sleeps;
++        g_stats.timed_sleep_ns += took;
++        g_stats.longest_sleep_ns = std::max(g_stats.longest_sleep_ns, took);
 +    }
 +
 +    // The next walk starts now: remember when, and the ring it starts from.
@@ -657,10 +674,10 @@ index 0000000..cf8b966
 +} // namespace Kernel::Svc
 diff --git a/src/core/hle/kernel/svc/svc_nx2_zstd.cpp b/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
 new file mode 100644
-index 0000000..7de0366
+index 0000000..615b1ce
 --- /dev/null
 +++ b/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,504 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -672,6 +689,7 @@ index 0000000..7de0366
 +#include <cstring>
 +#include <memory>
 +#include <mutex>
++#include <new>
 +#include <vector>
 +
 +#define ZSTD_STATIC_LINKING_ONLY
@@ -694,6 +712,10 @@ index 0000000..7de0366
 +// From Lichii PR 717 (stephenjayakar, zortos293/Lichii eb3553bcb8), unchanged but for the switch
 +// names. Here the game patch that reaches this code is off unless EDEN_UP_OOT_NATIVE_ZSTD=1
 +// (core/file_sys/patch_manager.cpp).
++// Changed after a review of this port (9 Nov), all marked "port": the host decodes only what fits
++// kHostMaxBytes, a host thread gives back any buffer above kKeepBytes after each call, a failed
++// host allocation falls back to the game's decoder instead of ending the emulator, and the
++// counters line also gives the time spent and the longest call.
 +//
 +// Ocarina of Time (main build E0F3CCFA...): the asset streaming jobs decompress with
 +// ZSTD_decompressMultiFrame(dctx, dst, dstCapacity, src, srcSize, dict, dictSize, ddict) at
@@ -704,7 +726,12 @@ index 0000000..7de0366
 +constexpr u64 kMultiFrameOffset = 0xEB380;
 +constexpr std::array<u64, 3> kCallSites{0xBF72E0, 0xF50164, 0xE910C};
 +constexpr u32 kFirstSvc = 0xF0;
-+constexpr size_t kMaxSize = size_t{512} << 20;
++// Port: the compressed input and the output together. The PR allowed 512 MiB for each; with one
++// pair of buffers per emulated core (6 host threads) that could pin gigabytes on the console.
++// Anything larger is decoded by the game, as before the patch.
++constexpr size_t kHostMaxBytes = size_t{32} << 20;
++// Port: a buffer larger than this is freed after the call that grew it.
++constexpr size_t kKeepBytes = size_t{4} << 20;
 +
 +// The guest ZSTD_DDict (0x6860 bytes, from ZSTD_createDDict_advanced at main+0x348B740 and
 +// ZSTD_initDDict_internal at main+0x348B850):
@@ -760,8 +787,39 @@ index 0000000..7de0366
 +    std::atomic<u64> bytes{};
 +    std::atomic<u64> dict_hits{};
 +    std::atomic<u64> dict_builds{};
++    // Port:
++    std::atomic<u64> over_limit{};     ///< Of fallbacks: larger than kHostMaxBytes
++    std::atomic<u64> alloc_failures{}; ///< Of fallbacks: a host allocation failed
++    std::atomic<s64> host_ns{};        ///< In calls the host decoded, copies in and out included
++    std::atomic<s64> longest_ns{};     ///< The longest of those since the last counters line
 +};
 +Stats g_stats;
++
++// Port: the buffers of one host thread (an emulated core; guest threads are fibers on it), kept
++// between calls only up to kKeepBytes each (TrimBuffers).
++Common::ScratchBuffer<u8>& InputBuffer() {
++    thread_local Common::ScratchBuffer<u8> buffer;
++    return buffer;
++}
++
++Common::ScratchBuffer<u8>& OutputBuffer() {
++    thread_local Common::ScratchBuffer<u8> buffer;
++    return buffer;
++}
++
++Common::ScratchBuffer<u8>& DictCheckBuffer() {
++    thread_local Common::ScratchBuffer<u8> buffer;
++    return buffer;
++}
++
++// Frees this thread's buffers that hold more than `keep` bytes.
++void TrimBuffers(size_t keep) noexcept {
++    for (auto* const buffer : {&InputBuffer(), &OutputBuffer(), &DictCheckBuffer()}) {
++        if (buffer->capacity() > keep) {
++            buffer->release();
++        }
++    }
++}
 +
 +// The guest ddict fields that decide how a frame decodes.
 +struct GuestDDict {
@@ -827,7 +885,7 @@ index 0000000..7de0366
 +
 +// Full check, at most once a second per dictionary: the whole guest dictionary matches the copy.
 +bool ContentMatches(Core::Memory::Memory& memory, const DictEntry& entry) {
-+    thread_local Common::ScratchBuffer<u8> scratch;
++    auto& scratch = DictCheckBuffer();
 +    const size_t size = entry.content.size();
 +    scratch.resize_destructive(size);
 +    return memory.ReadBlock(entry.key.content, scratch.data(), size) &&
@@ -955,8 +1013,12 @@ index 0000000..7de0366
 +    if (args[5] != 0 || args[6] != 0) {
 +        return "raw dict argument";
 +    }
-+    if (src_size == 0 || src_size > kMaxSize || !memory.IsValidVirtualAddressRange(src, src_size)) {
++    if (src_size == 0 || !memory.IsValidVirtualAddressRange(src, src_size)) {
 +        return "source size or range";
++    }
++    if (src_size > kHostMaxBytes) {
++        g_stats.over_limit.fetch_add(1, std::memory_order_relaxed);
++        return "over the host size limit";
 +    }
 +    // With a ddict, ZSTD_decompressMultiFrame is ZSTD_decompress_usingDDict: the same function
 +    // with the same ddict fields gives the same bytes and the same return value.
@@ -977,9 +1039,13 @@ index 0000000..7de0366
 +            return "dictionary type or dictID the host does not reproduce";
 +        }
 +    }
-+    thread_local Common::ScratchBuffer<u8> input;
-+    thread_local Common::ScratchBuffer<u8> output;
-+    thread_local std::unique_ptr<ZSTD_DCtx, DCtxDeleter> dctx{ZSTD_createDCtx()};
++    auto& input = InputBuffer();
++    auto& output = OutputBuffer();
++    // Port: tried again on a later call when the first attempt found no memory.
++    thread_local std::unique_ptr<ZSTD_DCtx, DCtxDeleter> dctx;
++    if (!dctx) {
++        dctx.reset(ZSTD_createDCtx());
++    }
 +    if (!dctx) {
 +        return "no host DCtx";
 +    }
@@ -996,8 +1062,9 @@ index 0000000..7de0366
 +        return "no decompression bound";
 +    }
 +    const u64 out_capacity = std::min<u64>(capacity, bound);
-+    if (out_capacity > kMaxSize) {
-+        return "output too large";
++    if (out_capacity > kHostMaxBytes - src_size) {
++        g_stats.over_limit.fetch_add(1, std::memory_order_relaxed);
++        return "over the host size limit";
 +    }
 +    output.resize_destructive(std::max<size_t>(out_capacity, 1));
 +    const size_t result =
@@ -1042,14 +1109,19 @@ index 0000000..7de0366
 +        return;
 +    }
 +    LOG_INFO(Kernel_SVC,
-+             "Native zstd: {} calls ({} with a ddict), {} MiB decompressed on the host, {} "
-+             "dictionary hits, {} dictionaries built, {} by the game",
++             "Native zstd: {} calls ({} with a ddict), {} MiB decompressed on the host in {} ms "
++             "(longest call {:.1f} ms since the last line), {} dictionary hits, {} dictionaries "
++             "built, {} by the game ({} over the {} MiB limit, {} after a failed host allocation)",
 +             g_stats.calls.load(std::memory_order_relaxed),
 +             g_stats.ddict_calls.load(std::memory_order_relaxed),
 +             g_stats.bytes.load(std::memory_order_relaxed) >> 20,
++             g_stats.host_ns.load(std::memory_order_relaxed) / 1'000'000,
++             static_cast<double>(g_stats.longest_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
 +             g_stats.dict_hits.load(std::memory_order_relaxed),
 +             g_stats.dict_builds.load(std::memory_order_relaxed),
-+             g_stats.fallbacks.load(std::memory_order_relaxed));
++             g_stats.fallbacks.load(std::memory_order_relaxed),
++             g_stats.over_limit.load(std::memory_order_relaxed), kHostMaxBytes >> 20,
++             g_stats.alloc_failures.load(std::memory_order_relaxed));
 +}
 +
 +} // Anonymous namespace
@@ -1067,20 +1139,45 @@ index 0000000..7de0366
 +    if (args[7] != 0) {
 +        g_stats.ddict_calls.fetch_add(1, std::memory_order_relaxed);
 +    }
-+    const char* const reason = HostDecompress(process.GetMemory(), args, now);
++    // Port: a failed host allocation (the PS5's new handler reports it and throws) must not end
++    // the emulator. Nothing has been returned to the game at that point, and the game's decoder
++    // writes the whole output itself.
++    const char* reason;
++    try {
++        reason = HostDecompress(process.GetMemory(), args, now);
++    } catch (const std::bad_alloc&) {
++        TrimBuffers(0);
++        g_stats.alloc_failures.fetch_add(1, std::memory_order_relaxed);
++        reason = "host allocation failed";
++    }
++    TrimBuffers(kKeepBytes);
 +    if (reason == nullptr) {
 +        g_stats.bytes.fetch_add(args[0], std::memory_order_relaxed);
++        // The whole call holds one emulated core: copy in, decode, copy out.
++        const s64 took = NowNs() - now;
++        g_stats.host_ns.fetch_add(took, std::memory_order_relaxed);
++        s64 longest = g_stats.longest_ns.load(std::memory_order_relaxed);
++        while (took > longest && !g_stats.longest_ns.compare_exchange_weak(
++                                     longest, took, std::memory_order_relaxed)) {
++        }
 +    } else {
++        // Port: the log lines allocate too; with no memory left they are dropped, not fatal.
 +        if (g_stats.fallbacks.fetch_add(1, std::memory_order_relaxed) < 16) {
-+            LOG_WARNING(Kernel_SVC,
-+                        "Native zstd (svc {:#x}): src={:#x} size={:#x} dst={:#x} cap={:#x} "
-+                        "dict={:#x}/{:#x} ddict={:#x}: {}; running the game's decoder",
-+                        imm, args[3], args[4], args[1], args[2], args[5], args[6], args[7],
-+                        reason);
++            try {
++                LOG_WARNING(Kernel_SVC,
++                            "Native zstd (svc {:#x}): src={:#x} size={:#x} dst={:#x} cap={:#x} "
++                            "dict={:#x}/{:#x} ddict={:#x}: {}; running the game's decoder",
++                            imm, args[3], args[4], args[1], args[2], args[5], args[6], args[7],
++                            reason);
++            } catch (const std::bad_alloc&) {
++            }
 +        }
 +        RunGuestFunction(system, process, imm);
 +    }
-+    MaybeLogCounters(now);
++    try {
++        MaybeLogCounters(now);
++    } catch (const std::bad_alloc&) {
++    }
 +    return true;
 +}
 +
