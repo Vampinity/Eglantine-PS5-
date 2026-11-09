@@ -1,0 +1,1501 @@
+Subject: [PATCH] Lichii #1056 (with #1057 and #1055): 3D macros that read memory run on the split's back; command list fetches wait only for the last writer before the last host sync (EDEN_UP_L1056_BACK_MACROS, EDEN_UP_L1056_LIST_FETCH, EDEN_UP_L1055_LIST_FETCH, EDEN_UP_L1056_STATS; all off by default)
+
+Port of zortos293/Lichii #1056 (zortos293's port of jpkto's #805 back macros, merged into nx2 as
+1a5e995a38 on 9 Nov: aa3853e6ea and 26aad9dc55 = jpkto's 6229487c8c/cb4c21d8ca and
+a442c38fe6/05a14638a1 from #805, 5bd45fb95c and 8d42747683 by zortos293; capy-ai co-authored the
+last three). Compared with #1057 (jpkto, closed for #1056) and #1055 (robertveloso, closed for
+#1056). #1032 (estevanbs) is not ported (see the end).
+
+#1056 or #1057: the same two #805 commits with the same code where it matters (the analysis in
+macro_turing.h, macro.h, the back macro code in maxwell_3d.cpp; checked hunk by hunk). #1057 keeps
+EDEN_NX2_BACK_MACROS=0 and [[unlikely]]; #1056 drops both and adds 5bd45fb95c (counters) and
+8d42747683 (review fix: the list wait targets the last writer sent before the last sync instead of
+min(last writer, last sync), and the page bits are read again after the wait whether or not it
+waited). Taken: #1056 (a superset); #1057's off switch is the EDEN_UP switch here.
+
+Commit by commit (have = in T84 already; line numbers are T84's):
+- aa3853e6ea list waits up to the last host sync (jpkto's 6229487c8c): have, as
+  EDEN_UP_FRITCHII_LISTSYNC (0474, Fritchii 6baafdd7d9 carries the same commit):
+  GpuSplit::WaitForSyncedWriters (gpu_split.cpp:496) waits for min(last writer, last host-level
+  wait); NoteListSync (gpu_split.h:410) notes GP entry sync bits (dma_pusher.cpp:675), 3D and
+  puller waits for idle (NoteSync, gpu_split.h:383), syncpoint acquires and every semaphore
+  acquire, however met, and every resumed acquire (puller.cpp:551, 621, 712, 853).
+- 26aad9dc55 back macros (jpkto's 05a14638a1): missing. T84's front runs every 3D macro itself
+  (FrontRunMacro, maxwell_3d.cpp:1834); its MME DMA reads (FrontDmaRead, :1999) drain the back, or
+  with EDEN_NX2_DMA_SNAPSHOT=1 (play env) skip the drain for pages a drained read flushed whole that
+  nothing sent since may write (:2034-2140; misses drain: the "dma snapshot miss" site).
+  DMA_READ_AHEAD (:1895), SEM_FAST and DRAIN_SKIP_SAME narrow other drains; nothing moves a macro
+  off the front. TuringMacroInterpreter (macro_turing.h) is byte for byte upstream's base, so
+  AnalyzeEffects applies as is. Ported: EDEN_UP_L1056_BACK_MACROS.
+- 5bd45fb95c counters (zortos293): missing (they extend #1028's async read-back line, which T84
+  does not have). Ported as EDEN_UP_L1056_STATS and two drain sites.
+- 8d42747683 review fix (zortos293): partly. The second look after a pass that found nothing queued
+  exists as EDEN_NX2_FETCH_RECHECK=1 (dma_pusher.cpp:417, :767; not in the play env, so LISTSYNC
+  runs without it); the narrower target is missing. Ported: EDEN_UP_L1056_LIST_FETCH (both).
+- Tests (turing_macro_effects.cpp, the split test in maxwell_fast_method.cpp): not ported (our
+  tests are not built); turing_macro_effects.cpp runs standalone in the checks.
+
+#1055, LISTSYNC and #1056, precisely. The wait before a command entry not on known GPU-written
+pages goes to a ring position; LW = after the last compute/copy writer sent, LS = the last
+host-level wait noted, LW@LS = LW as it was at LS:
+- T84 unset: LW (every queued writer; draws never).
+- LISTSYNC (0474; = #805's 6229487c8c = #1056's first commit before its review): min(LW, LS).
+- #1056 as merged (EDEN_UP_L1056_LIST_FETCH): LW@LS, which is <= min(LW, LS). The same as LISTSYNC
+  while no writer was sent since the last sync; narrower once one was (LISTSYNC then waits for
+  everything up to the sync, #1056 only up to the last writer before it). Plus the second look.
+- #1055 (EDEN_UP_L1055_LIST_FETCH): LS, which is >= min(LW, LS). Never narrower than LISTSYNC, and
+  wider than T84 whenever the last sync came after the last writer (it then also waits for the
+  draws and other work between them). Its one thing the others lack: it orders draws before the
+  last sync too (a page a draw wrote first; T84 never waited for draws). Same second look.
+So #1055 is not LISTSYNC: it is stricter (waits more), not a narrowing of T84, and complementary
+only in covering draw writers; its author closed it for #1056. Its EDEN_NX2_PERF_VERIFY (wait for
+every writer as well, log entries a later writer wrote) is not ported: LISTSYNC's back-side check
+(CheckListWriters, no wait) logs the same entries and now runs for both rules too. All three rules
+take the same sync notes (ours note every acquire however met, not only drained ones as upstream:
+more syncs only mean more waiting). LISTSKIP's skip still applies when set.
+
+What each switch does (Common::PeSwitch, exactly "1"; read once):
+EDEN_UP_L1056_BACK_MACROS=1 (needs the front macros: EDEN_NX2_SPLIT=2, the default, with the macro
+  JIT; else inert): at each 3D macro call the front looks the macro up once per macro code
+  generation. TuringMacroInterpreter::AnalyzeEffects follows the code from the call's start along
+  every path (each branch either way, each loop any number of times) with the register, carry and
+  method values the code fixes, and lists the methods it can write and whether it uses the data RAM.
+  A macro that writes MME_DMA_READ_FIFOED (0x158), uses no data RAM and writes only back-writable
+  registers goes to the back as one ring entry with its parameters (GpuSplit::DeferWords). The back
+  runs it as ProcessMacro would (ConsumeSink, then MacroEngine::Execute) with a MacroEngine of its
+  own (a copy of the code, its own JIT program, its own data RAM): its DMA reads flush and read at
+  its point of the stream, as a drained front read did, and the front neither drains nor looks up
+  a DMA snapshot for them. Registers such a macro can write are the back's until the front writes
+  them (FrontTakeOver: the write is sent even if the front's copy holds the value) or reads them
+  (FrontRegister, from a front macro's register read or FrontDmaRead's 0x154-0x156: waits until the
+  back ran that macro, site "back register", and takes the back's value); in a tracked shadow RAM
+  mode their shadow entries too (a replay takes the entry from the back first). A macro code change
+  waits for the queued back macros (site "back code") and analyses again. A back macro that writes
+  outside its predicted set (counted on the back) runs on the front from then on, after a drain and
+  a resync of every front register (FrontVerify). Back-writable: non-executable 3D registers below
+  0xe00, the root table methods, render_enable.mode, clear_report_value and the fragment, texture
+  and tiled cache barriers; never const_buffer.*, report_semaphore.*, upload.* to launch_dma,
+  load_mme.start_address_ptr, shadow_scratch, logic_op.enable or 0x157, and (not upstream) never
+  wait_for_idle (our front notes it: DMA read-ahead and list syncs) nor, with EDEN_UP_UBO_SNAPSHOT=1,
+  the bind groups (FrontNoteBind). In Ocarina the render enable macro qualifies (upstream: code at
+  0x142, writes 0x154, 0x155, 0x158 and 0x556; it is the source of the ~7,000 macro DMA reads a
+  second of the T84 walk, by the DMA snapshot line of t84-b run642: 262,144 reads in 37.5 s; the
+  8 Nov drain map counted ~11,800/s). The first 32
+  analysed macros that read memory are logged ("EDEN_UP_L1056_BACK_MACROS: split macro at ...
+  reads memory and runs on the back: writes ..." or "... on the front: <reason>").
+EDEN_UP_L1056_LIST_FETCH=1: the command entry wait goes to LW@LS (GpuSplit::WaitForLastSyncedWriter;
+  NoteListSync now also stores synced_writer_position), and when it found nothing queued the page
+  bits are read again (a writer the back ran since the first look may have marked them). With
+  LISTSYNC set as well, this target replaces LISTSYNC's (LISTSKIP's skip stays). Entries that
+  skipped a writer are checked on the back as LISTSYNC's are ("EDEN_UP_L1056_LIST_FETCH: command
+  entry at ... was GPU-written by work queued before it and read from its submit copy"; must stay 0).
+EDEN_UP_L1055_LIST_FETCH=1: the target is LS (GpuSplit::WaitForListSync), with the same second look
+  and check. EDEN_UP_L1056_LIST_FETCH wins when both are set. Ported for completeness and as a
+  stricter fallback; see Expected before giving it a slot.
+Diagnostics: EDEN_UP_L1056_STATS=1 logs every 10 s "Lichii #1056 in 10 s (EDEN_UP_L1056_BACK_MACROS=,
+  list fetch rule, LISTSYNC/LISTSKIP mode): back macros: S calls sent to the back (B while it still
+  had work queued: front waits avoided), R run there (X ms), their DMA reads N (F flushed
+  GPU-modified words), K macro DMA reads left on the front; front waits for back macros: ... back
+  register (ms), ... back code (ms), T registers taken over, E escapes; list entries not known
+  GPU-written L: would wait by T84's rule a, LISTSYNC's b, #1056's c, #1055's d; waited w (the
+  active rule), r found GPU-written by the second look". Each rule's verdict is taken before the
+  wait, on the same entries, so the control's line says how many of T84's list waits each rule
+  would drop. Its only effect besides counting: NoteListSync records its two positions, which only
+  a list rule reads. Give it to the control too. EDEN_NX2_SPLIT_WAITS gets the sites "back register"
+  and "back code".
+
+Deviations from upstream: everything behind the switches (upstream always on), and the list rule
+and the back macros as separate switches (upstream: one PR); wait_for_idle and, with UBO_SNAPSHOT,
+the bind groups are not back-writable; counters are EDEN_UP_L1056_STATS, not #1028's async
+read-back line (no #1028 here); the sync notes are LISTSYNC's (every acquire however met); the back
+macro's DMA read takes T84's MacroEngine::Execute path (QueryDma BeforeRead, FlushRegion of the
+bytes read when dirty, AfterBufferFlush) instead of upstream's QueryDma::FlushPending, the same
+path T84's drained front read defers; DeferWords has no Writes argument (no #1028 write tracking;
+a back macro writes no memory: report, upload, inline data and launch_dma methods are not
+back-writable); no ReleaseFront change (our front state lives as long as the engine); #1055's
+"list sync" site is not added (its waits count under "list writers", so arms compare directly).
+#1057's EDEN_NX2_BACK_MACROS=0 and #805's TEST commit (EDEN_NX2_BACK_MACRO_VERIFY, left out upstream
+too) are not ported; EDEN_NX2_SPLIT_VERIFY=1 is the verify run here.
+
+Unset (all switches): T84 behaviour. What still runs: one static switch test per front 3D macro
+call (FrontRunOnBack returns at once), a bitset test per front register write, multi-method write,
+macro register read and FrontDmaRead register read, a null test per macro write and DMA read in
+MacroEngine::Execute, CountListRules' early return and one more false test on list entries that
+did not wait, a switch test in NoteListSync, the report guards in MaybeStart; new members
+(FrontState: two u64 arrays of 0xe00 entries and a bitset, ~57 KB per 3D engine's front state;
+MacroEngine: a pointer and a counter; GpuSplit: three words), two more drain sites (array sizes).
+CheckListWriters builds its message from strings now; the LISTSYNC text is unchanged.
+
+Risks:
+- BACK_MACROS: the front reading a register a back macro wrote through a path that bypasses
+  FrontRegister/FrontTakeOver would use a stale copy. Audited: every fs.regs read in maxwell_3d.cpp
+  (report_semaphore, const_buffer, upload, load_mme, shadow_scratch and shadow_ram_control are not
+  back-writable; 0x154-0x156 and macro register reads go through FrontRegister; every 3D write the
+  front sends goes through FrontWrite or FrontCallMultiMethod). EDEN_NX2_SPLIT_VERIFY=1 would log
+  "Split front register ..." differences if one slipped.
+- The render enable decision now reads its report pair at the back's point of the stream instead
+  of a DMA snapshot hit; that is the exact read (the drained one), so a difference from T84 would
+  mean a snapshot hit was stale. Watch flashes and pop-in all the same.
+- AnalyzeEffects wrong for some real macro: the back counts the stray write, the macro goes back to
+  the front with one drain and a full register resync (an "escapes" count above 0 says so).
+- Back cost: ~7,000 calls a second in the walk run on the back with their dirty checks, flushes and
+  query hooks (upstream PC: 23 ms/s for 21,500 calls; here maybe 1-2 us each, ~7-15 ms/s). The back
+  idles 345-360 ms/s in T84 walks, but under the full frame wait it is the frame's long pole.
+- Memory: per 3D channel that runs back macros, one more MacroEngine (~70 KB) with its own Xbyak
+  JIT program (1 MiB AutoGrow buffer), recompiled after each macro code change; FrontState ~57 KB.
+- A macro code change after back macros were sent waits for them ("back code") and the next calls
+  are analysed again (one AnalyzeEffects per distinct macro); a game uploading macro code every
+  frame would pay that every frame (OoT: read "back code" in the stats).
+- Logs: the back's Execute logs its first 400 DMA reads ("Native MME DMA read ...") once and its
+  0x556 histogram ("Native MME render enable modes") every 20,000 writes (~every 3 s in the walk),
+  as without the split.
+- Not checked together: EDEN_UP_FAST_DRAW (every back macro call ends draw reuse: a Call entry
+  without FastDrawNeutral), EDEN_UP_QUERY_LIGHT/QUERY_STATS (their front notes miss back reads),
+  EDEN_NX2_MME_NATIVE (no native macro reads memory, so none of them runs on the back),
+  EDEN_UP_OOT_FRONT_WAIT (parked).
+- LIST_FETCH (both rules): a list on fresh pages written by a writer sent after the last host sync
+  (or, for #1056, by a draw) is read as the CPU submitted it, as hardware fetch ordering allows; a
+  stale list can lose the device or hang. The back-side check logs any such entry. #1056's rule
+  differs from LISTSYNC only after a writer sent since the last sync.
+- L1055_LIST_FETCH waits more than LISTSYNC, and more than T84 when the last sync followed the last
+  writer.
+
+Expected (Ocarina, docked full res, full frame wait; basis: EDEN_NX2_SPLIT_WAITS in the gameplay
+windows (>= 1.5M ring words/s) of the T84 controls run638/run642 (t84-b) and T83 controls
+run610/run614 (t83-r): front waited 419-438 ms/s, back idle 344-362 ms/s; list writers 157-167
+ms/s at 3,400-3,700 waits/s; dma snapshot miss 149-163 ms/s at 1,370-1,470 drains/s (windows
+66-235); acquire check 87-91 ms/s; acquire poll 17-24 ms/s; the macro DMA read wait is as large as
+the list-writer wait, not smaller):
+- BACK_MACROS: removes the "dma snapshot miss" site (~155 ms/s, 66-235) and the front's own work for
+  ~7,000 macro calls/s (JIT run, snapshot lookups); adds ~7-15 ms/s of back work. Removed waits
+  move: LISTSYNC cut list writers 160 -> 113 ms/s and acquire check rose 90 -> 131, total front
+  waiting unchanged (428 vs 419-438), yet +0.6 fps; #949's acquire part cut acquire check 90 -> 46,
+  total -16 ms/s, yet -0.7 fps (t84-b). So: net front wait -0 to -80 ms/s; fps 0 to +1.0 (0 to +7%), best
+  guess +0.5 (+3-4%) alone, +0.8 to +1.2 with LISTSYNC or L1056_LIST_FETCH (different sync families,
+  partly additive). Upstream: OoT Kokiri +8% (34.8 -> 37.6 fps, 5900X + RTX 3080, both parts);
+  #1057's tester +12% from the back macros (32.1 -> 36.0).
+- L1056_LIST_FETCH: LISTSYNC's 285 waits/s and 113 ms/s (t83-r run611) minus the waits where a
+  writer was sent after the last sync; expect 0-30 ms/s less than LISTSYNC, fps = LISTSYNC's +0.6
+  over the control within +-0.2. The stats line in a LISTSYNC arm gives the exact share (LISTSYNC's
+  vs #1056's verdicts).
+- L1055_LIST_FETCH: waits >= LISTSYNC's; expect 0 to +0.4 over the control, possibly negative. No
+  slot unless L1056_LIST_FETCH logs a stale entry (then it is the stricter fallback); else retire.
+
+Test arm (T84 + this diff; play env v2.1 docked with the full frame wait, the T84 batch env, walk
+script; every arm EDEN_UP_L1056_STATS=1 and EDEN_NX2_SPLIT_WAITS=1; at most 5 tests a batch, each
+batch with its own controls, ~3 valid runs per arm):
+- c (control): nothing else.
+- m: EDEN_UP_L1056_BACK_MACROS=1.
+- ml: EDEN_UP_L1056_BACK_MACROS=1 EDEN_UP_L1056_LIST_FETCH=1 (#1056 as merged).
+- s: EDEN_UP_FRITCHII_LISTSYNC=1 (the current list candidate).
+- v (1 run, correctness, not for fps): ml + EDEN_NX2_SPLIT_VERIFY=1.
+Batch 1: c, m, c, m, v. Stop there if v logs a "Split front register" or "Split front shadow
+register" difference, an escape or a "split back macro ... wrote outside" line, or an m run hangs
+or crashes. Batch 2: m, c, ml, c, ml (m: 3 runs against 4 controls, every batch with its own).
+Batch 3, only if m held up: s, ml, s, ml, s (ml against the current list candidate). Give
+EDEN_UP_L1056_LIST_FETCH=1 alone (l) or with LISTSYNC (ms) a slot only if the controls' #1056 line
+shows #1056's would-wait count clearly below LISTSYNC's (it can differ only after a writer sent
+since the last sync; within ~5% l is s). EDEN_UP_L1055_LIST_FETCH gets no slot.
+Proof the switch acted (m, ml, v): the start line "Lichii #1056: EDEN_UP_L1056_BACK_MACROS=1 ..."
+(ml: list fetch rule #1056); "EDEN_UP_L1056_BACK_MACROS: split macro at 0x142 reads memory and
+runs on the back: writes 0x154,0x155,0x158,0x556" (or the reason it stays on the front); the
+#1056 line: calls sent ~ the control's macro DMA read rate (~70,000 per 10 s) and all run there,
+macro DMA reads left on the front ~0 (control: ~70,000), escapes 0, "back register"/"back code"
+waits ~0 (upstream OoT: 0); SPLIT_WAITS "dma snapshot miss" gone (control ~150 ms/s); the "DMA
+snapshot:" line stops advancing; the back's first "Native MME DMA read fifoed start=0x142" lines
+and its "Native MME render enable modes" line every few seconds (front macros never logged them).
+Readouts: walk fps mean and 1% low, flashes/min (render enable decisions now on the back), pond
+load OK; SPLIT_WAITS front waited, back idle, list writers, acquire check; the #1056 line's back
+run time and "while it still had work queued"; the control's list counts (T84's vs LISTSYNC's vs
+#1056's vs #1055's verdicts); ml: waited and "found GPU-written by the second look"; no "command
+entry ... was GPU-written by work queued before it" line in any arm. v: "Split front register
+checks: N done, 0 differences". m wins only if it beats the same-batch controls in both batches,
+flashes/min are not higher, and back idle fell by more than the #1056 line's back run time (under
+the full frame wait the back is the frame's long pole: a busier back with no fewer gaps is a loss).
+
+Not ported: #1032 (estevanbs, "macro 0xe2c DMA reads of report slots skip the back drain"): its
+author closed it on 9 Nov because the fast path drew smoke in the wrong place in Ocarina; it is
+written against #1028's FrontDmaRead (WaitForWrites), which T84 does not have; T84's DMA_SNAPSHOT is
+the same skip with a stricter test (whole-page snapshot, every noted write since, the query cache's
+listed reports), and BACK_MACROS takes those reads off the front altogether.
+
+Stacked with the parallel ports (all on T84): fritchii-v54-shader-prep.diff applies with this diff
+in either order (no shared file). lichii-1028.diff shares maxwell_3d.cpp and gpu_split.h (those
+hunks apply together in either order) and conflicts only in gpu_split_sites.h, where both append
+drain sites after MapOnBack: whichever lands second takes the two-line merge (DmaSnapshotWrites,
+then BackRegister and BackCode; the names likewise). With that merge the three diffs together pass
+prepare-vulkan-port.py and -fsyntax-only with the build's flags on 11 TUs incl. the derived
+maxwell_3d.cpp, dma_pusher.cpp, macro_native.cpp and engines_puller.cpp. FrontDmaRead's 0x154-0x156
+reads stay FrontRegister reads there. With both switches set, EDEN_UP_L1028_DMA_WAIT no longer sees
+the render enable reads (they run on the back); it still narrows the other macros' snapshot misses.
+
+Review (9 Nov, adversarial pass; original kept as lichii-1056.diff.pre-review): no code defect
+found, the code is unchanged (code sha256 297e1a5ef6eee969). Header only: the test plan put 7
+tests in its first batch and no T84 control in its second; now at most 5 a batch with controls in
+each, the v gate in batch 1, l/ms only on evidence; the #1028 note says how the ports stack.
+Checked, no change needed: unset = T84 (every new path behind a static false test or an empty
+bitset; the LISTSYNC check's message text is unchanged); macro_turing.h before and after is
+upstream's blob for blob (600db48 -> 56af4e9); every fs.regs read on the front is either outside
+the back-writable set (FrontWrite's load_mme, report_semaphore, const_buffer and upload reads,
+FrontNoteMemoryWrite, FrontNoteSemaphoreWrite, FrontNoteBind) or goes through FrontRegister (the
+front JIT's register reads, FrontDmaRead's 0x154-0x156); wait_for_idle stays off the back, so
+NoteSync and the list syncs see every 3D wait; the "back register"/"back code" waits target sent
+positions only, never more than a drain, so they add no wait cycle under the frame wait; BackMacro
+records and the back engine's code are replaced only after the back ran back_last; the derived
+macro_native.cpp's back TryRun cannot take a back macro (every native replacement uses the data
+RAM); the back macro's read takes T84's own flush path and, with EDEN_NX2_QUERY_DMA_SYNC/TRACE
+unset, BeforeRead and AfterBufferFlush do nothing there as in the drained front read, so render
+enable decisions are those of T84's drained reads. Notes, not defects: with
+EDEN_NX2_MME_NATIVE=check the native comparison reads the front's register copies without
+FrontRegister (diagnostic only); EDEN_NX2_QUERY_FLIP_TRACE and EDEN_UP_QUERY_STATS no longer see
+the reads the back makes; after a split stop and restart, positions left in back_regs make the
+next takeover a full drain (no hang).
+
+Checks (VM scratch /tmp/l1056-chk-7e2b, ports/l1056-chk/checks.sh with inject.py, syn1056.py and
+tests/; log lichii-1056.checks.log; code sha256 297e1a5ef6eee969): git apply --check on
+$R/Eglantine (T84) and a reverse dry run; T84 has none of the switches; prepare-vulkan-port.py
+anchor skips identical before and after (6) and no generated Vulkan copy changes; the CMake
+derivations re-run with cmake -P (macro_recovery.cmake, macro_native.cmake, the dma_pusher/puller
+loop) reproduce the build's derived maxwell_3d.cpp, macro_recovery.cpp, macro_native.cpp,
+dma_pusher.cpp, engines_puller.cpp and macro-native macro.h byte for byte on T84, and on the
+patched tree change exactly as their sources (= the build's copies patched with the hunks); the
+derivation anchors are unchanged; -fsyntax-only with the build's flags (compile_commands.json,
+macro-native include pointed at the patched derived macro.h) rc=0 on 19 TUs incl. the derived
+maxwell_3d.cpp, macro_native.cpp, dma_pusher.cpp, engines_puller.cpp, gpu_thread.cpp, gpu.cpp and
+generated vulkan_rasterizer.cpp, and on 6 of them on T84; injected errors in every new block (43
+markers) reported by every TU that compiles them (header markers by each TU's own dependency
+list). Upstream's turing_macro_effects.cpp, unmodified with a small Catch2 stand-in, against the
+patched macro_turing.h: 4 cases, 6,785 checks, 0 failures. AnalyzeEffects against the macro JIT
+the back runs (x86-64 under Rosetta on the host, the VM being aarch64; ports/l1056-chk/jit_mac.sh):
+1,000 random programs, 4,000 runs, 9,210 JIT writes checked against known write sets, 0 outside
+them; calls predicted not to use the data RAM never changed it nor behaved differently with other
+data RAM contents; JIT and interpreter agree on all 523 runs both completed (they differ only on
+calls that fault). Not run: a build, the console.
+Re-run on this reviewed diff: VM scratch /tmp/l1056-rev-c41f, ports/l1056-rev/stack.sh, syn.sh,
+stack2.sh and synw3.py (log lichii-1056.review.log): git apply --check on T84 (this diff,
+fritchii-v54-shader-prep.diff, lichii-1028.diff); the derivations of T84 equal the build's copies;
+a syntax check with the build's own warning flags (no -Wno-everything; plus -Wsign-compare and
+-Wunused-but-set-variable) on gpu_split.cpp, kepler_compute.cpp, the generated
+vulkan_rasterizer.cpp and the derived maxwell_3d.cpp, dma_pusher.cpp, macro_native.cpp,
+engines_puller.cpp, gpu_thread.cpp and gpu.cpp: rc=0 and no warning on T84 nor on the patched
+tree; the stacks above.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 2431217..78459ae 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -446,15 +446,25 @@ static u64 NoteFetchRecheck(GPUVAddr address, u64 words, int mode) {
+ // before the last host-level wait. LISTSKIP: an entry that begins between methods
+ // (`command_entry`) skips it while no copy engine work is queued (`skipped`). Returns whether any
+ // of the work it waited for was still queued.
++// EDEN_UP_L1056_LIST_FETCH / EDEN_UP_L1055_LIST_FETCH (GpuSplit::ListFetchRule, zortos293/Lichii
++// #1056 and #1055): the target instead of LISTSYNC's (or T84's): the last writer sent before the
++// last host-level wait (#1056), or everything sent before that wait (#1055).
+ static bool WaitForListWriters(VideoCommon::GpuSplit& split, bool command_entry, bool& skipped) {
+     const int mode = VideoCommon::GpuSplit::ListSyncMode();
+-    if (mode == 0) {
++    const int rule = VideoCommon::GpuSplit::ListFetchRule();
++    if (mode == 0 && rule == 0) {
+         return split.WaitForWriters();
+     }
+     if (mode >= 2 && command_entry && !split.CopyWritersPending()) {
+         skipped = true;
+         return false;
+     }
++    if (rule == 2) {
++        return split.WaitForLastSyncedWriter();
++    }
++    if (rule == 1) {
++        return split.WaitForListSync();
++    }
+     return split.WaitForSyncedWriters();
+ }
+ 
+@@ -465,12 +475,19 @@ static bool WaitForListWriters(VideoCommon::GpuSplit& split, bool command_entry,
+ // reads the page bits. Nothing unless set.
+ static void CheckListWriters(VideoCommon::GpuSplit& split, MemoryManager& memory, GPUVAddr address,
+                              size_t size, bool skipped) {
+-    if (VideoCommon::GpuSplit::ListSyncMode() == 0 || size == 0 ||
++    const int rule = VideoCommon::GpuSplit::ListFetchRule(); // EDEN_UP_L1056/L1055_LIST_FETCH too
++    if ((VideoCommon::GpuSplit::ListSyncMode() == 0 && rule == 0) || size == 0 ||
+         split.Ran(split.LastWriterPosition())) {
+         return;
+     }
++    const char* const label = rule == 2   ? "EDEN_UP_L1056_LIST_FETCH"
++                              : rule == 1 ? "EDEN_UP_L1055_LIST_FETCH"
++                                          : "EDEN_UP_FRITCHII_LISTSYNC";
++    const char* const waited = rule == 2   ? "waited for the last writer before the last sync"
++                               : rule == 1 ? "waited for the work before the last sync"
++                                           : "waited for the writers before the last sync";
+     split.Defer(
+-        [memory = &memory, address, size, skipped] {
++        [memory = &memory, address, size, skipped, label, waited] {
+             bool written = false;
+             for (GPUVAddr page = address & ~GPUVAddr{0xfff}; !written && page < address + size;
+                  page += 0x1000) {
+@@ -484,12 +501,11 @@ static void CheckListWriters(VideoCommon::GpuSplit& split, MemoryManager& memory
+             const u32 count = missed.fetch_add(1, std::memory_order_relaxed) + 1;
+             if (count <= 32 || (count & (count - 1)) == 0) {
+                 LOG_WARNING(HW_GPU,
+-                            "EDEN_UP_FRITCHII_LISTSYNC: command entry at {:#x} ({} bytes) was "
++                            "{}: command entry at {:#x} ({} bytes) was "
+                             "GPU-written by work queued before it and read from its submit copy "
+                             "({} so far; {})",
+-                            address, size, count,
+-                            skipped ? "skipped the wait, LISTSKIP"
+-                                    : "waited for the writers before the last sync");
++                            label, address, size, count,
++                            skipped ? "skipped the wait, LISTSKIP" : waited);
+             }
+         },
+         VideoCommon::GpuSplit::FastDrawNeutral);
+@@ -756,13 +772,27 @@ bool DmaPusher::Step() {
+             if (!(settled && list_fast == 1)) {
+                 // EDEN_UP_FRITCHII_LISTSYNC / _LISTSKIP: which writers (WaitForListWriters).
+                 bool list_wait_skipped = false;
++                VideoCommon::GpuSplit::Get().CountListRules(); // EDEN_UP_L1056_STATS; else nothing
+                 if (WaitForListWriters(VideoCommon::GpuSplit::Get(), dma_state.method_count == 0,
+                                        list_wait_skipped)) {
++                    VideoCommon::L1056Count(VideoCommon::g_l1056_stats.list_waited);
+                     gpu_written =
+                         IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+                     if (settled) {
+                         NoteListFastCheck(dma_state.dma_get, gpu_written);
+                     }
++                } else if (VideoCommon::GpuSplit::ListFetchRule() != 0 &&
++                           IsGpuWrittenCommands(dma_state.dma_get,
++                                                size_t{header.size} * sizeof(u32))) {
++                    // EDEN_UP_L1056_LIST_FETCH / _L1055_ (zortos293/Lichii 8d42747683, fe3405894c):
++                    // the pages are read again though the wait found nothing queued: a writer the
++                    // back ran since the first look may have marked them. Unset: only with
++                    // EDEN_NX2_FETCH_RECHECK (below).
++                    VideoCommon::L1056Count(VideoCommon::g_l1056_stats.list_rechecked);
++                    gpu_written = true;
++                    if (settled) {
++                        NoteListFastCheck(dma_state.dma_get, true);
++                    }
+                 } else if (const int recheck = FetchRecheckMode();
+                            recheck != 0 &&
+                            IsGpuWrittenCommands(dma_state.dma_get,
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index ea4e25a..e8bed33 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <bitset>
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstring>
+@@ -1326,6 +1327,30 @@ struct Maxwell3D::FrontState {
+     /// EDEN_NX2_DMA_SNAPSHOT: device pages a drained macro DMA read flushed whole, and the split
+     /// position right after. Cleared past 8192 pages.
+     std::unordered_map<u64, u64> dma_snapshots;
++
++    /// EDEN_UP_L1056_BACK_MACROS (zortos293/Lichii #1056): registers a macro the back ran may have
++    /// written (FrontRunOnBack), and their shadow RAM entries: the ring position after the last
++    /// such macro, 0 once the front knows the value. All 0 with the switch off.
++    std::array<u64, Regs::NUM_REGS> back_regs{};
++    std::array<u64, Regs::NUM_REGS> back_shadow{};
++    std::bitset<Regs::NUM_REGS> back_owned; ///< back_regs or back_shadow set
++    struct BackMacro {
++        u32 start{};
++        bool back{};                           ///< Runs on the back (else on the front)
++        std::vector<u32> writes;               ///< The registers its code can write
++        std::bitset<Regs::NUM_REGS> write_set; ///< The same, for the back's check
++        std::atomic<bool> escaped{};           ///< The back saw it write another register
++    };
++    /// By start in the macro code of back_generation, once called.
++    std::vector<std::unique_ptr<BackMacro>> back_macros;
++    u64 back_generation{~u64{0}};
++    std::vector<u32> back_demoted; ///< Starts of macros that wrote outside their write set
++    /// The back's macro engine, its code a copy of the front's (when back_code_copied).
++    std::unique_ptr<MacroEngine> back_engine;
++    bool back_code_copied{};
++    u64 back_last{};                 ///< The position after the last macro sent to the back
++    std::atomic<u32> back_escapes{}; ///< Back macros that wrote outside their write set
++    u32 back_escapes_seen{};
+ };
+ 
+ namespace {
+@@ -1444,6 +1469,68 @@ void FrontNoteBind(const void* engine, MemoryManager& memory_manager, const u32*
+         valid ? memory_manager.GpuToCpuAddress(address) : std::optional<DAddr>{}, size);
+ }
+ 
++// EDEN_UP_L1056_BACK_MACROS (zortos293/Lichii #1056, BackWritable): whether a macro the split's
++// back runs may write `method`: the front then only loses track of the register's value. Not the
++// methods with effects the front tracks (macro code and bindings, the shadow RAM mode, draws,
++// constant buffer data, reports, uploads, syncpoints), nor the registers it reads to note their
++// memory writes, nor registers the back changes itself, nor MME_DMA_READ, whose words land in the
++// front's data RAM. Not upstream: wait_for_idle (the front's NoteSync: DMA read-ahead, LISTSYNC
++// and the list fetch rules) and, with EDEN_UP_UBO_SNAPSHOT, the bind groups (FrontNoteBind).
++bool BackWritable(const Maxwell3D& maxwell3d, u32 method) {
++    constexpr u32 const_buffer = MAXWELL3D_REG_INDEX(const_buffer);
++    constexpr u32 report = MAXWELL3D_REG_INDEX(report_semaphore);
++    constexpr u32 upload = MAXWELL3D_REG_INDEX(upload);
++    constexpr u32 upload_end = MAXWELL3D_REG_INDEX(launch_dma);
++    if (method - const_buffer < 4 || method - report < 4 || method - upload < upload_end - upload) {
++        return false;
++    }
++    switch (method) {
++    case MAXWELL3D_REG_INDEX(load_mme.start_address_ptr): // Advanced by load_mme.start_address
++    case MAXWELL3D_REG_INDEX(shadow_scratch):             // Set by falcon[4]
++    case MAXWELL3D_REG_INDEX(logic_op.enable):            // Cleared by draws on AMD
++    case 0x157:
++    case MAXWELL3D_REG_INDEX(wait_for_idle):              // NoteSync (not upstream)
++        return false;
++    case MAXWELL3D_REG_INDEX(bind_groups[0].raw_config):
++    case MAXWELL3D_REG_INDEX(bind_groups[1].raw_config):
++    case MAXWELL3D_REG_INDEX(bind_groups[2].raw_config):
++    case MAXWELL3D_REG_INDEX(bind_groups[3].raw_config):
++    case MAXWELL3D_REG_INDEX(bind_groups[4].raw_config):
++        return !VideoCommon::UboSnapshot::Enabled(); // FrontNoteBind (not upstream)
++    case Maxwell3D::RootTables::SelectMethod:
++    case Maxwell3D::RootTables::LoadMethod:
++    case MAXWELL3D_REG_INDEX(render_enable.mode):
++    case MAXWELL3D_REG_INDEX(clear_report_value):
++    case MAXWELL3D_REG_INDEX(fragment_barrier):
++    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
++    case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
++        return true; // Executable, with effects on the back only
++    default:
++        return method < MacroRegistersStart && !maxwell3d.execution_mask[method];
++    }
++}
++
++// EDEN_UP_L1056_BACK_MACROS: split.WaitUntil for a macro the back runs in the front's place,
++// counted with EDEN_UP_L1056_STATS (the waits are SPLIT_WAITS' "back register"/"back code" too).
++bool WaitForBackMacros(VideoCommon::GpuSplit& split, u64 position, VideoCommon::DrainSite site) {
++    if (!VideoCommon::g_l1056_counting) {
++        return split.WaitUntil(position, site);
++    }
++    const auto begin = std::chrono::steady_clock::now();
++    const bool waited = split.WaitUntil(position, site);
++    if (waited) {
++        const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                            std::chrono::steady_clock::now() - begin)
++                                            .count());
++        auto& stats = VideoCommon::g_l1056_stats;
++        const bool code = site == VideoCommon::DrainSite::BackCode;
++        (code ? stats.code_waits : stats.register_waits).fetch_add(1, std::memory_order_relaxed);
++        (code ? stats.code_wait_ns : stats.register_wait_ns)
++            .fetch_add(ns, std::memory_order_relaxed);
++    }
++    return waited;
++}
++
+ } // Anonymous namespace
+ 
+ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSplit& split) {
+@@ -1479,14 +1566,16 @@ void Maxwell3D::SwapMacroState(u32& macro, std::vector<u32>& parameters) {
+ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                            u32 argument, bool is_last_call, bool from_macro) {
+     namespace Profile = VideoCommon::Nx2Profile;
+-    // As ProcessShadowRam does on the back.
++    // As ProcessShadowRam does on the back. EDEN_UP_L1056_BACK_MACROS: a register a macro the back
++    // ran may have written is the front's again, and its write is sent even if the front's copies
++    // hold the value (FrontTakeOver; back_owned is never set with the switch off).
+     u32 value = argument;
+-    bool shadow_kept = true;
++    bool shadow_kept = !(fs.back_owned[method] && FrontTakeOver(split, fs, method));
+     bool payload_release = false;
+     bool report_write = false;
+     if (fs.control == Regs::ShadowRamControl::Track ||
+         fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+-        shadow_kept = fs.shadow[method] == argument;
++        shadow_kept = shadow_kept && fs.shadow[method] == argument;
+         fs.shadow[method] = argument;
+     } else if (fs.control == Regs::ShadowRamControl::Replay) {
+         value = fs.shadow[method];
+@@ -1668,7 +1757,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+         }
+         return;
+     }
+-    // What CallMultiMethod does to the registers on the back, then one entry for all the words.
++    // What CallMultiMethod does to the registers on the back, then one entry for all the words
++    // (sent whatever the front's copies hold). EDEN_UP_L1056_BACK_MACROS: as in FrontWrite.
++    if (fs.back_owned[method]) {
++        FrontTakeOver(split, fs, method);
++    }
+     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+     const auto tracked = [&fs] {
+         return fs.control == Regs::ShadowRamControl::Track ||
+@@ -1839,7 +1932,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+     auto& engine = GetNativeMacroEngine();
+     const auto positions = GetNativeMacroPositions();
+     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+-    {
++    // EDEN_UP_L1056_BACK_MACROS: a macro that reads memory may run on the back instead.
++    if (!FrontRunOnBack(system, split, fs, engine, start)) {
+         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+         engine.native_interpreter.active_dram = &native_data_ram;
+         if (!engine.native_jit) {
+@@ -1849,7 +1943,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+         const size_t parameter_count = fs.parameters.size();
+         const auto result = engine.native_jit->Execute(
+             start, fs.parameters, std::span<u32>{native_data_ram},
+-            [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
++            [&](u32 address) {
++                if (address >= Regs::NUM_REGS) {
++                    return 0U;
++                }
++                // EDEN_UP_L1056_BACK_MACROS: what a macro the back ran may have written.
++                return fs.back_owned[address] ? FrontRegister(split, fs, address) : fs.regs[address];
++            },
+             [&](u32 address, u32 value) {
+                 if (address >= MacroRegistersStart) {
+                     return false;
+@@ -1886,6 +1986,188 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+ #endif
+ }
+ 
++// EDEN_UP_L1056_BACK_MACROS=1 (zortos293/Lichii #1056: jpkto's 05a14638a1 from #805 as 26aad9dc55,
++// with zortos293's counters 5bd45fb95c; merged into nx2 as 1a5e995a38). A macro whose code reads
++// memory into its FIFO (MME_DMA_READ_FIFOED) and writes only registers BackWritable allows runs on
++// the back, at its point of the method stream: it reads the words as a drained front would, and
++// the front goes on without waiting for the work queued before it (FrontDmaRead's drain or DMA
++// snapshot miss). The registers it can write (and, in a tracked shadow RAM mode, their entries)
++// are the back's until the front writes them (FrontTakeOver) or needs them (FrontRegister).
++// Returns whether the call went to the back; with the switch off, false at once.
++bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& fs,
++                               const MacroEngine& engine, u32 start) {
++    using DrainSite = VideoCommon::DrainSite;
++    using BackMacro = FrontState::BackMacro;
++    if (!VideoCommon::GpuSplit::L1056BackMacros() || fs.parameters.size() > 0x1000) {
++        return false;
++    }
++    // A macro the back ran wrote another register: the front's copies may be stale anywhere. It
++    // runs on the front from now on, and the front takes the back's registers (FrontVerify).
++    const auto take_escapes = [&] {
++        fs.back_escapes_seen = fs.back_escapes.load(std::memory_order_acquire);
++        for (const auto& macro : fs.back_macros) {
++            if (macro && macro->back && macro->escaped.load(std::memory_order_relaxed)) {
++                macro->back = false;
++                fs.back_demoted.push_back(macro->start);
++                VideoCommon::L1056Count(VideoCommon::g_l1056_stats.escapes);
++                LOG_ERROR(HW_GPU,
++                          "EDEN_UP_L1056_BACK_MACROS: split back macro at {:#x} wrote outside the "
++                          "registers its code can write; it runs on the front from now on",
++                          macro->start);
++            }
++        }
++        FrontVerify(split, fs);
++    };
++    if (fs.back_generation != engine.native_code_generation) {
++        // The macros sent before run the code they were sent with, and check their records.
++        WaitForBackMacros(split, fs.back_last, DrainSite::BackCode);
++        if (fs.back_escapes.load(std::memory_order_relaxed) != fs.back_escapes_seen) {
++            take_escapes();
++        }
++        fs.back_macros.clear();
++        fs.back_macros.resize(engine.native_code.size() / 3);
++        fs.back_generation = engine.native_code_generation;
++        fs.back_code_copied = false;
++    } else if (fs.back_escapes.load(std::memory_order_relaxed) != fs.back_escapes_seen) {
++        take_escapes();
++    }
++    if (start >= fs.back_macros.size()) {
++        return false;
++    }
++    auto& known = fs.back_macros[start];
++    if (!known) {
++        known = std::make_unique<BackMacro>();
++        known->start = start;
++        const auto effects = TuringMacroInterpreter::AnalyzeEffects(engine.native_code, start);
++        const auto& methods = effects.methods;
++        const bool fifo_read = std::ranges::binary_search(methods, 0x158U);
++        if (fifo_read || std::ranges::binary_search(methods, 0x157U)) {
++            std::string reason;
++            if (std::ranges::find(fs.back_demoted, start) != fs.back_demoted.end()) {
++                reason = "it wrote another register on the back before";
++            } else if (!effects.methods_known) {
++                reason = "it computes the method of a write";
++            } else if (effects.data_ram) {
++                reason = "it uses the data RAM";
++            } else if (const auto it = std::ranges::find_if(
++                           methods, [this](u32 m) { return !BackWritable(*this, m); });
++                       it != methods.end()) {
++                reason = fmt::format("it writes {:#x}", *it);
++            }
++            known->back = reason.empty() && fifo_read;
++            if (known->back) {
++                known->writes = methods;
++                for (const u32 written : methods) {
++                    known->write_set.set(written);
++                }
++            }
++            static u32 logged{};
++            if (logged < 32) {
++                ++logged;
++                LOG_INFO(HW_GPU,
++                         "EDEN_UP_L1056_BACK_MACROS: split macro at {:#x} reads memory and runs on "
++                         "the {}: {}",
++                         start, known->back ? "back" : "front",
++                         known->back ? fmt::format("writes {:#x}", fmt::join(methods, ","))
++                                     : reason);
++            }
++        }
++    }
++    if (!known->back) {
++        return false;
++    }
++    if (!fs.back_engine) {
++        fs.back_engine = std::make_unique<MacroEngine>(true);
++        fs.back_engine->native_turing = true;
++    }
++    MacroEngine& back = *fs.back_engine;
++    if (!fs.back_code_copied) {
++        // Nothing sent with the old code is left to run (waited for above).
++        back.native_code = engine.native_code;
++        back.native_code_generation = engine.native_code_generation;
++        fs.back_code_copied = true;
++    }
++    if (VideoCommon::g_l1056_counting) [[unlikely]] {
++        VideoCommon::L1056Count(VideoCommon::g_l1056_stats.sent);
++        if (split.ConsumedNow() < split.SentPosition()) {
++            VideoCommon::L1056Count(VideoCommon::g_l1056_stats.sent_behind);
++        }
++    }
++    split.DeferWords(
++        [this, system_ptr = &system, engine_ptr = &back, macro = known.get(),
++         escapes = &fs.back_escapes](std::span<const u32> parameters) {
++            // As ProcessMacro calls a macro, with the back's engine.
++            const bool counting = VideoCommon::g_l1056_counting;
++            const auto begin = counting ? std::chrono::steady_clock::now()
++                                        : std::chrono::steady_clock::time_point{};
++            ConsumeSink(*system_ptr);
++            engine_ptr->split_writes = &macro->write_set;
++            const u64 unexpected = engine_ptr->split_unexpected_writes;
++            engine_ptr->Execute(*system_ptr, *this, macro->start, parameters);
++            if (engine_ptr->split_unexpected_writes != unexpected) {
++                macro->escaped.store(true, std::memory_order_relaxed);
++                escapes->fetch_add(1, std::memory_order_release);
++            }
++            if (counting) {
++                VideoCommon::L1056Count(VideoCommon::g_l1056_stats.ran);
++                VideoCommon::L1056Count(
++                    VideoCommon::g_l1056_stats.ran_ns,
++                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                         std::chrono::steady_clock::now() - begin)
++                                         .count()));
++            }
++        },
++        fs.parameters);
++    const u64 position = split.SentPosition();
++    fs.back_last = position;
++    const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
++                         fs.control == Regs::ShadowRamControl::TrackWithFilter;
++    for (const u32 written : known->writes) {
++        fs.back_regs[written] = position;
++        if (tracked) {
++            fs.back_shadow[written] = position;
++        }
++        fs.back_owned[written] = true;
++    }
++    return true;
++}
++
++// EDEN_UP_L1056_BACK_MACROS: a register as the back holds it once it ran what the front sent: the
++// front's copy, or the back's once it ran the last macro there that can write it. No entry sent
++// after that macro writes the register (a front write takes it over first, a later macro there
++// would be the one waited for), so the back's value stays until the front writes it again.
++u32 Maxwell3D::FrontRegister(VideoCommon::GpuSplit& split, FrontState& fs, u32 method) {
++    if (fs.back_regs[method] != 0) {
++        WaitForBackMacros(split, fs.back_regs[method], VideoCommon::DrainSite::BackRegister);
++        fs.regs[method] = regs.reg_array[method];
++        fs.back_regs[method] = 0;
++        fs.back_owned[method] = fs.back_shadow[method] != 0;
++    }
++    return fs.regs[method];
++}
++
++// EDEN_UP_L1056_BACK_MACROS: before the front writes `method`, the register, and its shadow RAM
++// entry unless the mode leaves that alone, are the front's again; a replay takes the entry from
++// the back first (as FrontRegister). Returns whether the back may hold another value or entry
++// than the front's copies, so that the write must be sent even if it seems to change nothing.
++bool Maxwell3D::FrontTakeOver(VideoCommon::GpuSplit& split, FrontState& fs, u32 method) {
++    using Control = Regs::ShadowRamControl;
++    VideoCommon::L1056Count(VideoCommon::g_l1056_stats.takeovers);
++    const bool tracked = fs.control == Control::Track || fs.control == Control::TrackWithFilter;
++    if (fs.back_shadow[method] != 0 && fs.control == Control::Replay) {
++        WaitForBackMacros(split, fs.back_shadow[method], VideoCommon::DrainSite::BackRegister);
++        fs.shadow[method] = shadow_state.reg_array[method];
++        fs.back_shadow[method] = 0;
++    }
++    const bool differs = fs.back_regs[method] != 0 || (tracked && fs.back_shadow[method] != 0);
++    fs.back_regs[method] = 0;
++    if (tracked) {
++        fs.back_shadow[method] = 0;
++    }
++    fs.back_owned[method] = fs.back_shadow[method] != 0;
++    return differs;
++}
++
+ // EDEN_PE_DMA_READ_AHEAD: an MME DMA read of at most 64 words skips the drain when the back has no
+ // write the front sent to those words still to run and no wait for idle sent since their device
+ // pages were last flushed (a drained read here or in the DMA snapshot path, fs.dma_snapshots).
+@@ -2002,8 +2284,13 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     // from a culling dispatch), and the caches that may hold newer ones belong to it. The flush
+     // downloads through the scheduler, which the back owns even once it has drained (its idle
+     // hook submits deferred work): run it there, after those methods, and wait for it.
+-    const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
+-    const u32 ram = fs.regs[0x156];
++    // EDEN_UP_L1056_BACK_MACROS: a macro the back ran may have written these (FrontRegister).
++    const auto reg = [&](u32 index) {
++        return fs.back_owned[index] ? FrontRegister(split, fs, index) : fs.regs[index];
++    };
++    const GPUVAddr source = (GPUVAddr{reg(0x154) & 0x1ffffff} << 32) | reg(0x155);
++    const u32 ram = reg(0x156);
++    VideoCommon::L1056Count(VideoCommon::g_l1056_stats.front_reads); // EDEN_UP_L1056_STATS
+     const u32 words = std::min<u32>(count, 0x1000);
+     const size_t read_bytes = size_t{words} * sizeof(u32);
+     if (VideoCommon::Nx2Profile::Enabled()) {
+@@ -2205,6 +2492,20 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+             expected_shadow[method] = value;
+         }
+     }
++    // EDEN_UP_L1056_BACK_MACROS: what macros the back ran may have written, the front takes over.
++    if (fs.back_owned.any()) {
++        for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
++            if (fs.back_regs[i] != 0) {
++                fs.regs[i] = expected[i];
++            }
++            if (fs.back_shadow[i] != 0) {
++                fs.shadow[i] = expected_shadow[i];
++            }
++        }
++        fs.back_regs.fill(0);
++        fs.back_shadow.fill(0);
++        fs.back_owned.reset();
++    }
+     static u64 control_differences{};
+     if ((fs.control != shadow_state.shadow_ram_control ||
+          fs.shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] != expected_shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] ||
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index bb06ffc..381d4f5 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3435,6 +3435,13 @@ private:
+     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                     bool is_last_call, bool from_macro);
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
++    /// EDEN_UP_L1056_BACK_MACROS (zortos293/Lichii #1056): sends a macro call that reads memory
++    /// to the back instead (returns whether it did), and the front's register reads and writes
++    /// of what such calls may have written.
++    bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
++                        const MacroEngine& engine, u32 start);
++    u32 FrontRegister(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
++    bool FrontTakeOver(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
+                       u32 count);
+     /// EDEN_PE_DMA_READ_AHEAD: FrontDmaRead's drain (and flush) for a read of at most 64 words,
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 1619a1c..173e593 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -144,6 +144,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
+     if (active && g_l949_counting) [[unlikely]] {
+         ReportL949();
+     }
++    if (active && g_l1056_counting) [[unlikely]] {
++        ReportL1056();
++    }
+     if (active && !allowed) {
+         Drain();
+         Stop();
+@@ -158,6 +161,17 @@ void GpuSplit::MaybeStart(Core::System& system_) {
+     // zortos293/Lichii #949: set before the back starts (BackLoop copies them).
+     feed = Ship2Feed();
+     g_l949_counting = L949StatsSwitch() || L949AcquireVerify();
++    g_l1056_counting = L1056StatsSwitch(); // zortos293/Lichii #1056
++    if (L1056BackMacros() || ListFetchRule() != 0 || L1056StatsSwitch()) {
++        LOG_INFO(HW_GPU,
++                 "Lichii #1056: EDEN_UP_L1056_BACK_MACROS={} (3D macros that read memory into "
++                 "their FIFO run on the back), list fetch rule {} (EDEN_UP_L1056_LIST_FETCH: the "
++                 "last writer before the last host-level wait; EDEN_UP_L1055_LIST_FETCH: all work "
++                 "before it), EDEN_UP_FRITCHII_LISTSYNC/LISTSKIP mode {}, EDEN_UP_L1056_STATS={}",
++                 L1056BackMacros() ? 1 : 0,
++                 ListFetchRule() == 2 ? "#1056" : ListFetchRule() == 1 ? "#1055" : "none",
++                 ListSyncMode(), L1056StatsSwitch() ? 1 : 0);
++    }
+     if (feed || L949Acquire() || L949DrainValve()) {
+         LOG_INFO(HW_GPU,
+                  "Lichii #949: EDEN_UP_SHIP2_FEED={} (publish to a waiting back after {} words, "
+@@ -212,6 +226,10 @@ void GpuSplit::Stop() {
+     sync_position = 0;
+     list_sync_position = 0;
+     last_copy_writer_position = 0;
++    synced_writer_position = 0;
++    g_l1056_counting = false;
++    l1056_report_calls = 0;
++    l1056_window_start = 0;
+     same_read_count = 0;
+     same_read_position = 0;
+     // zortos293/Lichii #949: set again by the next start; the positions restart at 0.
+@@ -497,6 +515,19 @@ bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
+     return WaitFor(std::min({last_writer_position, list_sync_position, write_position}), site);
+ }
+ 
++// EDEN_UP_L1056_LIST_FETCH (zortos293/Lichii #1056, 8d42747683): the last compute or copy work sent
++// before the last host-level wait. A writer sent after it is not waited for, nor is other work
++// between that writer and the wait.
++bool GpuSplit::WaitForLastSyncedWriter(DrainSite site) {
++    return WaitFor(std::min(synced_writer_position, write_position), site);
++}
++
++// EDEN_UP_L1055_LIST_FETCH (zortos293/Lichii #1055, a926320e83): everything sent before the last
++// host-level wait, whatever it is.
++bool GpuSplit::WaitForListSync(DrainSite site) {
++    return WaitFor(std::min(list_sync_position, write_position), site);
++}
++
+ // From Lichii (zortos293/Lichii, nx2 at 27226d2568): one wait with a site for the report. It waits
+ // as WaitForWriters and WaitForSpace did, and now both wake a parked back and report as Drain does.
+ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+@@ -706,6 +737,62 @@ void GpuSplit::ReportL949() {
+     }
+ }
+ 
++void GpuSplit::ReportL1056() {
++    // MaybeStart runs once per GPU thread loop: read the clock every 256th call only.
++    if (++l1056_report_calls % 256 != 0) {
++        return;
++    }
++    const u64 now = WaitClockNs();
++    if (l1056_window_start == 0) {
++        l1056_window_start = now;
++        return;
++    }
++    if (now - l1056_window_start < 10'000'000'000ULL) {
++        return;
++    }
++    l1056_window_start = now;
++    auto& stats = g_l1056_stats;
++    const auto take = [](std::atomic<u64>& counter) {
++        return counter.exchange(0, std::memory_order_relaxed);
++    };
++    const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
++    const u64 sent = take(stats.sent);
++    const u64 sent_behind = take(stats.sent_behind);
++    const u64 front_reads = take(stats.front_reads);
++    const u64 register_waits = take(stats.register_waits);
++    const double register_wait_ms = ms(take(stats.register_wait_ns));
++    const u64 code_waits = take(stats.code_waits);
++    const double code_wait_ms = ms(take(stats.code_wait_ns));
++    const u64 takeovers = take(stats.takeovers);
++    const u64 escapes = take(stats.escapes);
++    const u64 ran = take(stats.ran);
++    const double ran_ms = ms(take(stats.ran_ns));
++    const u64 back_reads = take(stats.back_reads);
++    const u64 back_flushes = take(stats.back_flushes);
++    const u64 list_entries = take(stats.list_entries);
++    const u64 list_t84 = take(stats.list_t84);
++    const u64 list_listsync = take(stats.list_listsync);
++    const u64 list_1056 = take(stats.list_1056);
++    const u64 list_1055 = take(stats.list_1055);
++    const u64 list_waited = take(stats.list_waited);
++    const u64 list_rechecked = take(stats.list_rechecked);
++    LOG_INFO(HW_GPU,
++             "Lichii #1056 in 10 s (EDEN_UP_L1056_BACK_MACROS={}, list fetch rule {}, "
++             "LISTSYNC/LISTSKIP mode {}): back macros: {} calls sent to the back ({} while it "
++             "still had work queued: front waits avoided), {} run there ({:.1f} ms), their DMA "
++             "reads {} ({} flushed GPU-modified words), {} macro DMA reads left on the front; front "
++             "waits for back macros: {} back register ({:.1f} ms), {} back code ({:.1f} ms), {} "
++             "registers taken over, {} escapes; list entries not known GPU-written {}: would wait "
++             "by T84's rule {}, LISTSYNC's {}, #1056's {}, #1055's {}; waited {} (the active "
++             "rule), {} found GPU-written by the second look",
++             L1056BackMacros() ? 1 : 0,
++             ListFetchRule() == 2 ? "#1056" : ListFetchRule() == 1 ? "#1055" : "none",
++             ListSyncMode(), sent, sent_behind, ran, ran_ms, back_reads, back_flushes, front_reads,
++             register_waits, register_wait_ms, code_waits, code_wait_ms, takeovers, escapes,
++             list_entries, list_t84, list_listsync, list_1056, list_1055, list_waited,
++             list_rechecked);
++}
++
+ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
+     front_engine = engine;
+     u64* const entry = Reserve(2);
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index a77dde8..6f9ca79 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -14,6 +14,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <optional>
++#include <span>
+ #include <thread>
+ #include <type_traits>
+ #include <unordered_map>
+@@ -78,6 +79,43 @@ inline void L949Count(std::atomic<u64>& counter, u64 amount = 1) {
+     }
+ }
+ 
++// zortos293/Lichii #1056 (merged into nx2 as 1a5e995a38) and #1055: what the macros the back runs
++// in the front's place (EDEN_UP_L1056_BACK_MACROS) did and cost, and how the command list entries
++// on pages not known to be GPU-written waited (each list fetch rule's verdict, the active rule's
++// waits; EDEN_UP_L1056_LIST_FETCH, EDEN_UP_L1055_LIST_FETCH). Counted only with
++// EDEN_UP_L1056_STATS=1 (as of the split's last start; any arm, the control included: no behaviour
++// change) and logged every 10 s by the front (GpuSplit::ReportL1056).
++struct L1056Stats {
++    std::atomic<u64> sent{};         ///< Front: macro calls sent to the back (FrontRunOnBack)
++    std::atomic<u64> sent_behind{};  ///< ...while the back still had work queued: front waits avoided
++    std::atomic<u64> front_reads{};  ///< Front: macro DMA reads still made there (FrontDmaRead)
++    std::atomic<u64> register_waits{}; ///< Front waits for a register or shadow entry a back macro set
++    std::atomic<u64> register_wait_ns{};
++    std::atomic<u64> code_waits{};   ///< ...for the queued back macros before the macro code changes
++    std::atomic<u64> code_wait_ns{};
++    std::atomic<u64> takeovers{};    ///< Front writes of a register a back macro may have written
++    std::atomic<u64> escapes{};      ///< Back macros that wrote outside their predicted registers
++    std::atomic<u64> ran{};          ///< Back: the macro calls it ran in the front's place
++    std::atomic<u64> ran_ns{};
++    std::atomic<u64> back_reads{};   ///< Back: their MME DMA reads
++    std::atomic<u64> back_flushes{}; ///< ...that found GPU-modified words to flush
++    std::atomic<u64> list_entries{}; ///< Front: entries not on known GPU-written pages, split on
++    std::atomic<u64> list_t84{};     ///< ...for which T84's rule (every queued writer) would wait
++    std::atomic<u64> list_listsync{}; ///< ...EDEN_UP_FRITCHII_LISTSYNC's rule would wait
++    std::atomic<u64> list_1056{};    ///< ...#1056's rule would wait
++    std::atomic<u64> list_1055{};    ///< ...#1055's rule would wait
++    std::atomic<u64> list_waited{};  ///< ...the active rule waited
++    std::atomic<u64> list_rechecked{}; ///< ...a #1056/#1055 recheck found them GPU-written, no wait
++};
++inline L1056Stats g_l1056_stats;
++/// Whether g_l1056_stats counts, as of the split's last start (set before its back starts).
++inline bool g_l1056_counting{};
++inline void L1056Count(std::atomic<u64>& counter, u64 amount = 1) {
++    if (g_l1056_counting) [[unlikely]] {
++        counter.fetch_add(amount, std::memory_order_relaxed);
++    }
++}
++
+ // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
+ // CPU's commands, parses command lists and runs the puller; engine method calls and everything
+ // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a
+@@ -213,6 +251,29 @@ public:
+         std::memcpy(entry + 2, &func, sizeof(Func));
+         Commit(2 + payload);
+     }
++    /// EDEN_UP_L1056_BACK_MACROS (zortos293/Lichii #1056): Defer, calling `func` with a copy of
++    /// `words` (a std::span<const u32>) made at the send.
++    template <typename Func>
++    void DeferWords(const Func& func, std::span<const u32> words) {
++        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
++        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
++        const size_t payload = function_words + 1 + (words.size() + 1) / 2;
++        u64* const entry = Reserve(2 + payload);
++        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
++        entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
++        std::memcpy(entry + 2, &func, sizeof(Func));
++        entry[2 + function_words] = words.size();
++        if (!words.empty()) {
++            entry[1 + payload] = 0; // Padding after an odd count
++            std::memcpy(entry + 3 + function_words, words.data(), words.size_bytes());
++        }
++        Commit(2 + payload);
++    }
++    /// Front, EDEN_UP_L1056_BACK_MACROS: waits until the back executed the entries sent before
++    /// `position` (a SentPosition). Returns whether any of them was still queued.
++    bool WaitUntil(u64 position, DrainSite site) {
++        return WaitFor((std::min)(position, write_position), site);
++    }
+     void DeferFunction(std::function<void()>&& func);
+     /// Runs `func` on the back and waits for it, or at once on the back or without the split: for
+     /// work on back-owned state, such as a buffer cache flush that records a download into the
+@@ -405,11 +466,71 @@ public:
+                                                                                 : 0;
+         return mode;
+     }
++    // EDEN_UP_L1056_LIST_FETCH=1 (zortos293/Lichii #1056: jpkto's 6229487c8c from #805 as
++    // aa3853e6ea, with zortos293's review fix 8d42747683): the entry waits only for the compute
++    // and copy work sent before the last host-level wait, as LISTSYNC, but up to the last such
++    // writer itself (synced_writer_position), not to the wait; and the page bits are read again
++    // after the wait even when it found nothing queued. EDEN_UP_L1055_LIST_FETCH=1 (Lichii #1055,
++    // robertveloso; closed for #1056): the entry waits for all the work sent before the last
++    // host-level wait (draws too), then the same second look. Both take the host-level waits
++    // NoteListSync notes (as LISTSYNC: every semaphore acquire however met, GP sync bits, host and
++    // 3D waits for idle, syncpoint acquires). LISTSKIP's skip still applies when set. Off unless
++    // exactly "1"; read once. 0: none (LISTSYNC's or T84's rule), 1: #1055, 2: #1056 (wins).
++    [[nodiscard]] static int ListFetchRule() {
++        static const int rule = Common::PeSwitch("EDEN_UP_L1056_LIST_FETCH")   ? 2
++                                : Common::PeSwitch("EDEN_UP_L1055_LIST_FETCH") ? 1
++                                                                               : 0;
++        return rule;
++    }
++    /// EDEN_UP_L1056_STATS=1: count and log the #1056 line every 10 s (g_l1056_stats).
++    [[nodiscard]] static bool L1056StatsSwitch() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_L1056_STATS");
++        return enabled;
++    }
++    /// Whether NoteListSync records: for a list rule, or for the stats' verdicts of each rule.
++    [[nodiscard]] static bool ListSyncNotes() {
++        static const bool notes = ListSyncMode() != 0 || ListFetchRule() != 0 || L1056StatsSwitch();
++        return notes;
++    }
+     /// Front: a host-level wait was just sent or passed (see ListSyncMode). Every acquire counts,
+     /// drained or not: more syncs only make command entries wait for more writers.
+     void NoteListSync() {
+-        if (ListSyncMode() == 0) return;
++        if (!ListSyncNotes()) return;
+         list_sync_position = write_position;
++        synced_writer_position = last_writer_position; // EDEN_UP_L1056_LIST_FETCH
++    }
++    /// Front, EDEN_UP_L1056_LIST_FETCH: waits until the back executed the last compute or copy work
++    /// sent before the last NoteListSync. Returns whether it was still queued.
++    bool WaitForLastSyncedWriter(DrainSite site = DrainSite::ListWriters);
++    /// Front, EDEN_UP_L1055_LIST_FETCH: waits until the back executed everything sent before the
++    /// last NoteListSync. Returns whether any of it was still queued.
++    bool WaitForListSync(DrainSite site = DrainSite::ListWriters);
++    /// Front, while g_l1056_counting: counts, before an entry's wait, which list rules would wait.
++    void CountListRules() {
++        if (!g_l1056_counting) [[likely]] {
++            return;
++        }
++        const u64 now = consumed.load(std::memory_order_acquire);
++        auto& stats = g_l1056_stats;
++        const auto count = [now](std::atomic<u64>& counter, u64 target) {
++            if (now < target) {
++                counter.fetch_add(1, std::memory_order_relaxed);
++            }
++        };
++        stats.list_entries.fetch_add(1, std::memory_order_relaxed);
++        count(stats.list_t84, (std::min)(last_writer_position, write_position));
++        count(stats.list_listsync,
++              (std::min)({last_writer_position, list_sync_position, write_position}));
++        count(stats.list_1056, (std::min)(synced_writer_position, write_position));
++        count(stats.list_1055, (std::min)(list_sync_position, write_position));
++    }
++
++    // EDEN_UP_L1056_BACK_MACROS=1 (zortos293/Lichii #1056, jpkto's 05a14638a1 from #805 as
++    // 26aad9dc55, counters 5bd45fb95c): the 3D macros whose code reads memory into their FIFO run on
++    // the back (Maxwell3D::FrontRunOnBack). Off unless exactly "1"; read once.
++    [[nodiscard]] static bool L1056BackMacros() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_L1056_BACK_MACROS");
++        return enabled;
+     }
+     /// Front, EDEN_UP_FRITCHII_LISTSKIP: copy engine work that may write memory was just sent (after
+     /// NoteWriter). It can copy GPU-written words anywhere, so every entry waits while it is queued.
+@@ -645,6 +766,13 @@ private:
+     static void CallThunk(const u64* payload) {
+         (*reinterpret_cast<const Func*>(payload))();
+     }
++    template <typename Func>
++    static void CallWordsThunk(const u64* payload) {
++        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
++        (*reinterpret_cast<const Func*>(payload))(
++            std::span<const u32>{reinterpret_cast<const u32*>(payload + function_words + 1),
++                                 static_cast<size_t>(payload[function_words])});
++    }
+ 
+     static constexpr u32 MaxRegs = 64;
+     void BlockWrite(Kind kind, Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+@@ -709,6 +837,8 @@ private:
+     void ReportBack();
+     /// Front thread, while g_l949_counting: logs g_l949_stats every 10 s.
+     void ReportL949();
++    /// Front thread, while g_l1056_counting: logs g_l1056_stats every 10 s.
++    void ReportL1056();
+     /// EDEN_UP_L949_ACQUIRE: NoteSemaphoreWrite with the switch on.
+     void RecordSemaphoreWrite(u64 device_address, u32 payload, bool known);
+     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+@@ -731,6 +861,9 @@ private:
+     /// Front, while g_l949_counting: calls of ReportL949 and the start of its window.
+     u32 l949_report_calls{};
+     u64 l949_window_start{};
++    /// Front, while g_l1056_counting: calls of ReportL1056 and the start of its window.
++    u32 l1056_report_calls{};
++    u64 l1056_window_start{};
+     u64 session_generation{};
+     std::unique_ptr<u64[]> ring;
+ 
+@@ -782,6 +915,8 @@ private:
+     /// writer (NoteListSync, NoteCopyWriter); 0 before the first this session.
+     u64 list_sync_position{};
+     u64 last_copy_writer_position{};
++    /// EDEN_UP_L1056_LIST_FETCH: last_writer_position at the last NoteListSync.
++    u64 synced_writer_position{};
+     /// EDEN_UP_L949_ACQUIRE: the last semaphore write sent to each word (NoteSemaphoreWrite), by
+     /// device address; what the back ran past is forgotten once there are more than the limit.
+     struct SemaphoreWrite {
+diff --git a/src/video_core/gpu_split_sites.h b/src/video_core/gpu_split_sites.h
+index be50e77..acc9151 100644
+--- a/src/video_core/gpu_split_sites.h
++++ b/src/video_core/gpu_split_sites.h
+@@ -34,6 +34,8 @@ enum class DrainSite : u32 {
+     DmaSnapshotCheck, ///< EDEN_NX2_DMA_SNAPSHOT=2: a covered read checked against a drained one
+     DmaReadAhead,  ///< EDEN_PE_DMA_READ_AHEAD: a macro read that could not run ahead
+     MapOnBack,     ///< EDEN_NX2_MAP_ON_BACK: the map's own drain
++    BackRegister,  ///< EDEN_UP_L1056_BACK_MACROS: a register a macro the back ran may have written
++    BackCode,      ///< EDEN_UP_L1056_BACK_MACROS: the macro code changes under queued back macros
+     Count,
+ };
+ 
+@@ -43,7 +45,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)>
+     "map",            "front start",     "front verify",     "acquire check",
+     "acquire recheck", "acquire poll",   "list gpu-written", "list first drain",
+     "macro dma read ram", "dma snapshot miss", "dma snapshot check", "dma read ahead",
+-    "map on back",
++    "map on back",    "back register",   "back code",
+ };
+ static_assert(drain_site_names.back() != nullptr, "a drain site without a name");
+ 
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index aff7682..6e3cc97 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -1462,7 +1462,10 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+         // Reused between calls (a macro never calls another: methods >= 0xe00 are refused below);
+         // filled only for calls that are interpreted.
+         auto& fifo = native_fifo;
+-        native_interpreter.active_dram = &maxwell3d.GetNativeDataRam();
++        // EDEN_UP_L1056_BACK_MACROS: the channel's data RAM is the split front's while it runs
++        // macros; a call the back runs in its place (split_writes) uses none, so it gets its own.
++        native_interpreter.active_dram =
++            split_writes != nullptr ? &native_interpreter.dram : &maxwell3d.GetNativeDataRam();
+         // EDEN_NX2_MME_RECORD=<file>: write the first 200000 calls (u32 start, u32 count, the
+         // parameters) and then the macro code to <file>.code, to check interpreter changes
+         // offline against the previous interpreter. EDEN_NX2_MME_RECORD_SKIP=<n>: skip the first
+@@ -1493,6 +1496,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+         bool read_memory = false;
+         const auto emit = [&](u32 address, u32 value) {
+                 if (address >= 0xe00) return false;
++                if (split_writes != nullptr && !(*split_writes)[address]) {
++                    ++split_unexpected_writes; // EDEN_UP_L1056_BACK_MACROS: an escape
++                }
+                 if (address == 0x556) {
+                     // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
+                     // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
+@@ -1550,13 +1556,22 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+                     if (flush_queries && !VideoCommon::GpuSplit::Get().Active()) {
+                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+                     }
+-                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
++                    const bool dirty =
++                        memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
++                    if (dirty) {
+                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                         static u64 flushes{};
+                         if (++flushes % 2000 == 1) {
+                             LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
+                         }
+                     }
++                    if (split_writes != nullptr) {
++                        // EDEN_UP_L1056_STATS: a read of a call the back runs in the front's place.
++                        VideoCommon::L1056Count(VideoCommon::g_l1056_stats.back_reads);
++                        if (dirty) {
++                            VideoCommon::L1056Count(VideoCommon::g_l1056_stats.back_flushes);
++                        }
++                    }
+                     if (owns_caches) {
+                         VideoCommon::QueryDma::AfterBufferFlush(memory, maxwell3d.Rasterizer(),
+                                                                 source, read_bytes);
+diff --git a/src/video_core/macro.h b/src/video_core/macro.h
+index 125e62b..c01899c 100644
+--- a/src/video_core/macro.h
++++ b/src/video_core/macro.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <bitset>
+ #include <memory>
+ #include <optional>
+ #include "video_core/bananza_terrain_compat.h"
+@@ -276,6 +277,12 @@ struct MacroEngine {
+     std::shared_ptr<TuringMacroJit> native_jit;
+     MacroMemoPairs native_writes;
+     u64 native_calls{};
++    /// EDEN_UP_L1056_BACK_MACROS (zortos293/Lichii #1056): on the engine the split GPU thread's
++    /// back runs calls with in its front's place (Maxwell3D::FrontRunOnBack), the 3D registers the
++    /// current call can write. Such a call uses no data RAM; its writes to other registers are
++    /// counted in split_unexpected_writes. Null on every other engine.
++    const std::bitset<0xe00>* split_writes{};
++    u64 split_unexpected_writes{};
+     BananzaTerrainDrawCompat bananza_terrain_compat;
+     std::optional<bool> bananza_terrain_enabled;
+     bool bananza_terrain_compat_logged{};
+diff --git a/src/video_core/macro_turing.h b/src/video_core/macro_turing.h
+index 600db48..56af4e9 100644
+--- a/src/video_core/macro_turing.h
++++ b/src/video_core/macro_turing.h
+@@ -10,6 +10,7 @@
+ #include <cstdint>
+ #include <span>
+ #include <string_view>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace Tegra {
+@@ -253,6 +254,271 @@ public:
+         return {false, pc, consumed, error};
+     }
+ 
++    /// What a call from `start` can do on any path through the code (each branch either way,
++    /// each loop any number of times), as Execute runs it: the methods it can write, each a
++    /// constant of the code unless `methods_known` is false, and whether it uses the data RAM.
++    struct Effects {
++        std::vector<Word> methods; ///< Ascending, each once
++        bool methods_known{true};
++        bool data_ram{};
++    };
++
++    static Effects AnalyzeEffects(std::span<const Word> code, Word start) {
++        // The values the code fixes, before an instruction runs: registers, carry, the method
++        // and its increment. Unknown values are always {false, 0}.
++        struct Value {
++            bool known;
++            Word value;
++            bool operator==(const Value&) const = default;
++        };
++        struct State {
++            std::array<Value, 24> regs;
++            Value carry, method, increment;
++            bool operator==(const State&) const = default;
++        };
++        // Where an instruction may continue: unchanged, at `pc` (a taken branch also sets
++        // whether it cancels an END), or nowhere (a branch that stops the call).
++        struct Flow {
++            enum Kind { Next, Jump, Branch, Stop } kind;
++            Word pc;
++            bool cancel_end;
++        };
++        constexpr Value unknown{false, 0};
++        const auto known = [](Word value) { return Value{true, value}; };
++        const Word count = static_cast<Word>(code.size() / 3);
++        Effects effects;
++        // By instruction, and whether an END before it makes it the call's last (pc * 2 + 1).
++        std::unordered_map<Word, State> states;
++        // By a loop's last instruction: where its loops start over.
++        std::unordered_map<Word, std::vector<Word>> loop_starts;
++        std::vector<Word> work;
++        const auto reach = [&](Word pc, bool last, const State& state) {
++            if (pc >= count) {
++                return; // The call fails there
++            }
++            const Word index = pc * 2 + (last ? 1U : 0U);
++            const auto [it, inserted] = states.try_emplace(index, state);
++            if (!inserted) {
++                State joined = it->second;
++                const auto join = [](Value& to, const Value& from) {
++                    if (to != from) to = Value{false, 0};
++                };
++                for (std::size_t i = 0; i < joined.regs.size(); ++i) {
++                    join(joined.regs[i], state.regs[i]);
++                }
++                join(joined.carry, state.carry);
++                join(joined.method, state.method);
++                join(joined.increment, state.increment);
++                if (joined == it->second) return;
++                it->second = joined;
++            }
++            work.push_back(index);
++        };
++        State entry;
++        entry.regs.fill(unknown); // Reading one before writing it fails the call
++        entry.carry = entry.method = entry.increment = known(0);
++        reach(start, false, entry);
++        while (!work.empty()) {
++            const Word index = work.back();
++            work.pop_back();
++            const Word pc = index / 2;
++            const bool last = (index & 1) != 0;
++            const State before = states.at(index);
++            const Decoded d = Decode({code[pc * 3 + 2], code[pc * 3 + 1], code[pc * 3]});
++            const auto get = [&d](const State& state, Word reg, Word lane) -> Value {
++                if (reg < 24) return state.regs[reg];
++                switch (reg) {
++                case 24: return Value{true, 0};
++                case 25: return Value{true, Word(std::int32_t(std::int16_t(d.imm[lane])))};
++                case 26: return Value{true, Word(std::int32_t(std::int16_t(d.imm[1 - lane])))};
++                case 27: return Value{true, (d.imm[0] << 16) | d.imm[1]};
++                default: return Value{false, 0}; // FIFO loads
++                }
++            };
++            // The lanes and outputs the predicate enables, both sets if its register is unknown.
++            std::array<Word, 2> masks{15, 15};
++            std::size_t mask_count = 1;
++            if (d.pred_mode) {
++                const Value predicate = get(before, d.pred_reg, 0);
++                masks = {d.mask_true, d.mask_false};
++                if (predicate.known) masks[0] = predicate.value ? d.mask_true : d.mask_false;
++                else mask_count = 2;
++            }
++            for (std::size_t m = 0; m < mask_count; ++m) {
++                const Word mask = masks[m];
++                State state = before;
++                std::array<Value, 2> xs{unknown, unknown}, ys{unknown, unknown};
++                for (Word lane = 0; lane < 2; ++lane) {
++                    if (mask & (1U << lane)) {
++                        xs[lane] = get(before, d.src_a[lane], lane);
++                        ys[lane] = get(before, d.src_b[lane], lane);
++                    }
++                }
++                std::array<Value, 2> alu{known(0), known(0)};
++                std::array<std::array<Flow, 2>, 2> flows{};
++                std::array<std::size_t, 2> flow_counts{1, 1}; // Flow::Next by default
++                for (Word lane = 0; lane < 2; ++lane) {
++                    if (!(mask & (1U << lane))) continue;
++                    const Value x = xs[lane], y = ys[lane];
++                    const bool both = x.known && y.known;
++                    const Word a = x.value, b = y.value, imm = d.imm[lane];
++                    auto& flow = flows[lane];
++                    auto& flow_count = flow_counts[lane];
++                    const auto taken = [&](Word op) {
++                        switch (op) {
++                        case 17: case 25: return std::int32_t(a) < std::int32_t(b);
++                        case 18: case 26: return a < b;
++                        case 19: case 27: return std::int32_t(a) <= std::int32_t(b);
++                        case 20: case 28: return a <= b;
++                        default: return a == b;
++                        }
++                    };
++                    Value value = known(0);
++                    switch (d.op[lane]) {
++                    case 0: case 2: {
++                        const Word result = d.op[lane] == 0 ? a + b : a - b;
++                        value = both ? known(result) : unknown;
++                        const bool carry = d.op[lane] == 0 ? result < a : result > a;
++                        state.carry = both ? known(carry) : unknown;
++                        break;
++                    }
++                    case 1: case 3:
++                        value = both && state.carry.known
++                                    ? known(d.op[lane] == 1 ? a + b + state.carry.value
++                                                            : a - b - state.carry.value)
++                                    : unknown;
++                        break;
++                    case 4: case 6: {
++                        const std::uint64_t product =
++                            d.op[lane] == 4 ? std::uint64_t(std::int64_t(std::int32_t(a))) *
++                                                  std::uint64_t(std::int64_t(std::int32_t(b)))
++                                            : std::uint64_t{a} * b;
++                        value = both ? known(Word(product)) : unknown;
++                        state.carry = both ? known(Word(product >> 32)) : unknown;
++                        break;
++                    }
++                    case 5: value = state.carry; break;
++                    case 8: value = x.known ? known(Word(std::countl_zero(a))) : unknown; break;
++                    case 9: value = both ? known(a << (b & 31)) : unknown; break;
++                    case 10: value = both ? known(a >> (b & 31)) : unknown; break;
++                    case 11:
++                        value = both ? known(Word(std::int32_t(a) >> (b & 31))) : unknown;
++                        break;
++                    case 12: value = both ? known(a & b) : unknown; break;
++                    case 13: value = both ? known(~(a & b)) : unknown; break;
++                    case 14: value = both ? known(a | b) : unknown; break;
++                    case 15: value = both ? known(a ^ b) : unknown; break;
++                    case 16: {
++                        const Word dest = (imm >> 10) & 63, bits = (imm >> 5) & 31;
++                        const Word bits_mask = (1U << bits) - 1;
++                        value = both && dest < 32
++                                    ? known((a & ~(bits_mask << dest)) |
++                                            (((b >> (imm & 31)) & bits_mask) << dest))
++                                    : unknown;
++                        break;
++                    }
++                    case 17: case 18: case 19: case 20: case 21:
++                        value = both ? known(taken(d.op[lane]) ? ~0U : 0) : unknown;
++                        break;
++                    case 22: value = unknown; break; // A register
++                    case 23:
++                        if (imm < 2) break;
++                        // Entered, or skipped with a count of 0. Its last instruction may start
++                        // it over: reached already, that instruction now continues here too.
++                        if (const Word end = pc + imm - 1; end < count) {
++                            auto& starts = loop_starts[end];
++                            if (std::ranges::find(starts, pc + 1) == starts.end()) {
++                                starts.push_back(pc + 1);
++                                for (const Word end_index : {end * 2, end * 2 + 1}) {
++                                    if (states.contains(end_index)) work.push_back(end_index);
++                                }
++                            }
++                        }
++                        flow_count = 0;
++                        if (!x.known || a != 0) flow[flow_count++] = {Flow::Next, 0, false};
++                        if (!x.known || a == 0) flow[flow_count++] = {Flow::Jump, pc + imm, false};
++                        break;
++                    case 24: flow[0] = {Flow::Jump, pc + (imm & 0x7fff), false}; break;
++                    case 25: case 26: case 27: case 28: case 29: {
++                        const auto offset = std::int32_t(imm << 19) >> 19;
++                        const Word target = Word(std::int32_t(pc) + offset);
++                        const bool jumps = taken(d.op[lane]) == bool(imm & 0x8000);
++                        flow_count = 0;
++                        if (!both || jumps) {
++                            const bool cancel_end = (imm & 0x4000) != 0;
++                            flow[flow_count++] = offset == -4096
++                                                     ? Flow{Flow::Stop, 0, false}
++                                                     : Flow{Flow::Branch, target, cancel_end};
++                        }
++                        if (!both || !jumps) flow[flow_count++] = {Flow::Next, 0, false};
++                        break;
++                    }
++                    case 30: effects.data_ram = true; value = unknown; break;
++                    case 31: effects.data_ram = true; break;
++                    default: break; // 7: the load barrier
++                    }
++                    alu[lane] = value;
++                    if (d.dst[lane] < 24) state.regs[d.dst[lane]] = value;
++                }
++                const auto output = [&](Word selector) -> Value {
++                    switch (selector) {
++                    case 1: return alu[0];
++                    case 2: return alu[1];
++                    case 5: return known(d.imm[0]);
++                    case 6: return known(d.imm[1]);
++                    case 8: return known(d.imm[0] >> 12);
++                    case 9: return known(d.imm[1] >> 12);
++                    case 10: return known((d.imm[0] << 16) | d.imm[1]);
++                    default: return unknown; // FIFO loads (the rest fail the call)
++                    }
++                };
++                for (Word lane = 0; lane < 2; ++lane) {
++                    if (!(mask & (4U << lane))) continue;
++                    if (d.out_method[lane]) {
++                        const Value address = output(d.out_method[lane]);
++                        state.method = address.known ? known(address.value & 0xfff) : unknown;
++                        state.increment =
++                            address.known ? known((address.value >> 12) & 15) : unknown;
++                    }
++                    if (d.out_emit[lane]) {
++                        if (state.method.known) effects.methods.push_back(state.method.value);
++                        else effects.methods_known = false;
++                        state.method = state.method.known && state.increment.known
++                                           ? known(state.method.value + state.increment.value)
++                                           : unknown;
++                    }
++                }
++                if (last) continue; // An END before this instruction ends the call after it
++                // Lane 1's control flow overrides lane 0's; a loop's last instruction may also
++                // start it over.
++                const auto loop = loop_starts.find(pc);
++                const std::vector<Word> repeats =
++                    loop != loop_starts.end() ? loop->second : std::vector<Word>{};
++                for (std::size_t i = 0; i < flow_counts[0]; ++i) {
++                    for (std::size_t j = 0; j < flow_counts[1]; ++j) {
++                        Word next = pc + 1;
++                        bool cancel_end = false, stopped = false;
++                        for (const Flow& flow : {flows[0][i], flows[1][j]}) {
++                            if (flow.kind == Flow::Jump || flow.kind == Flow::Branch) {
++                                next = flow.pc;
++                            }
++                            if (flow.kind == Flow::Branch) cancel_end = flow.cancel_end;
++                            stopped |= flow.kind == Flow::Stop;
++                        }
++                        if (stopped) continue;
++                        const bool end_next = d.end && !cancel_end;
++                        reach(next, end_next, state);
++                        for (const Word repeat : repeats) reach(repeat, end_next, state);
++                    }
++                }
++            }
++        }
++        std::ranges::sort(effects.methods);
++        effects.methods.erase(std::unique(effects.methods.begin(), effects.methods.end()),
++                              effects.methods.end());
++        return effects;
++    }
++
+     using DataRam = std::array<Word, 0xc00>;
+     DataRam dram{};
+     // The data RAM DREAD/DWRITE use: a channel's own copy when the caller sets one. Macro code is

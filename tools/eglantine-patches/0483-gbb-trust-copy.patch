@@ -1,0 +1,54 @@
+From: GrowingBlackBeans <gbb@local>
+Subject: [PATCH] EDEN_GBB_TRUST_COPY=1 (with EDEN_NX2_RESNAPSHOT=0): CPU-written entries parse their submit copy also on resume and across suspensions; off by default
+
+---
+Rebased onto T84 (context only: 0481 Lichii #949 moved neighbouring lines in dma_pusher.cpp). From GrowingBlackBeans' gist e3676cf28960bc360f5a5e3cd23c2646, issue 21, 9 Nov.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 8d8bf52..ad7c2f7 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -128,6 +128,23 @@ std::atomic<u64> fetch_dropped_words{};
+ // EDEN_GBB_DIFF_WORDS=1 (GrowingBlackBeans, with EDEN_NX2_FETCH_COUNT): which words of a command
+ // entry change after submit, by their role in the submitted words. Answers which methods the game
+ // patches after submitting (issue 21: "which words legitimately change after submit?").
++// EDEN_GBB_TRUST_COPY=1 (GrowingBlackBeans, issue 21; use with EDEN_NX2_RESNAPSHOT=0): an entry on
++// pages no GPU work wrote parses its words as submitted, also when it resumes after a semaphore
++// wait (from its resume word) and when a suspension came between its copy and its parse. In
++// Ocarina the words the game submits never change before the parse (FETCH_COUNT with the full
++// frame wait: 0 of 7,675,038 copies read again after submit, 0 of 27,857 resumed entries). Run a
++// frame ahead, the game rewrites the same ring for the next frame, and reading memory again at a
++// resume (the refresh, or the read at the parse) took those words for this frame's: methods on
++// unbound subchannels, then std::bad_alloc on GPUBack. GPU-written entries (the culling's group
++// counts) and entries empty at submit still read the GPU's or memory's words.
++bool TrustCopy() {
++    static const bool on = [] {
++        const char* value = std::getenv("EDEN_GBB_TRUST_COPY");
++        return value != nullptr && value[0] == '1';
++    }();
++    return on;
++}
++
+ bool DiffWordsOn() {
+     static const bool on = [] {
+         const char* value = std::getenv("EDEN_GBB_DIFF_WORDS");
+@@ -867,14 +884,15 @@ bool DmaPusher::Step() {
+         // when memory holds other commands). Off, a resumed entry reads memory, and
+         // after an acquire in Ocarina's pond that held a later frame's commands (run 306: entry
+         // 3808 resumed at word 831 read 22 of them and left a method open into entry 3809).
+-        const bool resume_from_copy = command_resume_offset != 0 && resume_checked;
++        const bool trust_copy = TrustCopy();
++        const bool resume_from_copy = command_resume_offset != 0 && (resume_checked || trust_copy);
+         const bool submitted = (command_resume_offset == 0 || resume_from_copy) &&
+                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                                command_list.submitted_offsets[dma_pushbuffer_subindex] <
+                                    command_list.submitted_words.size() &&
+-                               (command_list.snapshot_suspensions & 1) == 0 &&
+-                               command_list.snapshot_suspensions ==
+-                                   suspensions.load(std::memory_order_acquire) &&
++                               (trust_copy || ((command_list.snapshot_suspensions & 1) == 0 &&
++                                               command_list.snapshot_suspensions ==
++                                                   suspensions.load(std::memory_order_acquire))) &&
+                                !std::ranges::binary_search(
+                                    command_list.deferred_entries,
+                                    static_cast<u32>(dma_pushbuffer_subindex)) &&

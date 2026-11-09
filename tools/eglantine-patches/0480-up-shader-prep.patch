@@ -1,0 +1,2698 @@
+Subject: [PATCH] EDEN_UP_SHADER_PREP: shaders prepared before play (the idea of Fritchii v5, zortos293/Lichii#895 and #896 by zmckenney): every graphics record of the console's own disk cache is translated once at boot and its SPIR-V, infos and answers kept; draws make such a pipeline from the kept translation instead of translating on the GPU thread; off by default
+
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 4362fa0..2b9cda5 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -202,6 +202,8 @@ add_library(video_core STATIC
+     renderer_vulkan/vk_master_semaphore.h
+     renderer_vulkan/vk_pipeline_cache.cpp
+     renderer_vulkan/vk_pipeline_cache.h
++    renderer_vulkan/vk_pipeline_prep.cpp
++    renderer_vulkan/vk_pipeline_prep.h
+     renderer_vulkan/vk_present_manager.cpp
+     renderer_vulkan/vk_present_manager.h
+     renderer_vulkan/vk_query_cache.cpp
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index ef3950d..10f9301 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -7,6 +7,8 @@
+ #include "common/pe_switch.h"
+ #include <algorithm>
+ #include <chrono>
++#include <condition_variable>
++#include <map>
+ #include <cstddef>
+ #include <cstdlib>
+ #include <fstream>
+@@ -1543,6 +1545,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
+     used_pipelines_saved = std::chrono::steady_clock::now();
+     used_pipelines_loaded = used_pipelines_saved;
++    // EDEN_UP_SHADER_PREP: the kept translations of this build, driver and switches.
++    const bool prep =
++        ShaderPrep::Enabled() &&
++        prep_store.Open(base_dir, ShaderPrep::MakeStamp(CACHE_VERSION,
++                                                        static_cast<u32>(device.GetDriverID()),
++                                                        device.GetDriverVersion()));
++    std::atomic<size_t> prep_compared{};
++    std::atomic<size_t> prep_differed{};
+     size_t skipped_pipelines = 0;
+     size_t queued_graphics = 0;
+ 
+@@ -1651,14 +1661,20 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         }
+         ++queued_graphics;
+ 
+-        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
++        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback, prep,
++                           &prep_compared, &prep_differed]() mutable {
+             ShaderPools pools;
+             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+             for (auto& env : envs_) {
+                 env_ptrs.push_back(&env);
+             }
++            ShaderPrep::Stages prep_stages;
+             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
+-                                                 state.statistics.get(), false)};
++                                                 state.statistics.get(), false,
++                                                 prep ? &prep_stages : nullptr)};
++            if (prep && pipeline) {
++                NotePrepared(key, prep_stages, envs_, prep_compared, prep_differed);
++            }
+ 
+             std::scoped_lock lock{state.mutex};
+             if (pipeline) {
+@@ -1693,6 +1709,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+ 
+     workers.WaitForRequests(stop_loading);
+ 
++    if (prep && !stop_loading.stop_requested()) {
++        PrepareKept(stop_loading, callback, prep_compared.load(), prep_differed.load());
++    }
++
+     if (use_vulkan_pipeline_cache) {
+         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                      CACHE_VERSION);
+@@ -1910,7 +1930,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
+ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
+-    bool build_in_parallel) try {
++    bool build_in_parallel, ShaderPrep::Stages* kept_out) try {
+     auto hash = key.Hash();
+     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
+     size_t env_index{0};
+@@ -2055,6 +2075,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+         device.SaveShader(code);
+         modules[stage_index] = BuildShader(device, code);
++        if (kept_out) {
++            kept_out->present[stage_index] = true;
++            kept_out->spirv[stage_index] = code;
++        }
+ 
+         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
+         // is independent and gated only by gpu_log_shader_dumps.
+@@ -2126,9 +2150,27 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+                  mesh_program.mesh.vertex_lines.size(), mesh_program.mesh.primitive_lines.size(),
+                  mesh_program.mesh.payload_words);
+     }
++    if (kept_out) {
++        // The infos the pipeline is made with, read where it reads them: after every stage.
++        for (size_t stage = 0; stage < infos.size(); ++stage) {
++            if (infos[stage] != nullptr) {
++                kept_out->infos[stage] = *infos[stage];
++                kept_out->unsuitable |= infos[stage]->requires_layer_emulation;
++            }
++        }
++        // Mesh programs run as compute, a generated layer passthrough or a merged vertex A
++        // program: more than SPIR-V and infos makes these, so they are not kept.
++        kept_out->unsuitable |=
++            mesh_compute != nullptr || layer_source_program != nullptr || uses_vertex_a;
++    }
++    // EDEN_UP_SHADER_PREP: a pipeline that is only being prepared is built with the driver's
++    // own cache alone (the emulator's is held in memory whole and written whole at each save).
++    vk::PipelineCache& driver_cache{kept_out != nullptr && kept_out->driver_cache_only
++                                        ? prep_no_cache
++                                        : vulkan_pipeline_cache};
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+     return std::make_unique<GraphicsPipeline>(
+-        scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
++        scheduler, buffer_cache, texture_cache, driver_cache, &shader_notify, device,
+         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+         render_pass_cache, key, std::move(modules), infos, mesh_scratch.get(),
+         std::move(mesh_compute));
+@@ -2211,9 +2253,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     GraphicsEnvironments environments;
+     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+ 
++    // EDEN_UP_SHADER_PREP: a pipeline whose translation was kept is made from that, without
++    // translating on this thread (null: translated as before). What follows is the same for
++    // both: the check asked the game's state every question the translation would have.
++    auto kept{CreateKeptGraphicsPipeline(environments)};
++
+     main_pools.ReleaseContents();
+-    auto pipeline{
+-        CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr, true)};
++    auto pipeline{kept ? std::move(kept)
++                       : CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(),
++                                                nullptr, true)};
+     if (!pipeline || pipeline_cache_filename.empty()) {
+         return pipeline;
+     }
+@@ -2554,4 +2602,673 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
+     }
+ }
+ 
++// EDEN_UP_SHADER_PREP (vk_pipeline_prep.h): shaders prepared before play.
++
++void PipelineCache::KeepPrepared(const GraphicsPipelineCacheKey& key,
++                                 const ShaderPrep::Stages& stages,
++                                 std::span<const VideoCommon::FileEnvironment> envs, u32 flags) {
++    if (stages.unsuitable || envs.empty() || envs.size() > ShaderPrep::NumStages) {
++        return;
++    }
++    std::vector<std::vector<u8>> answers(envs.size());
++    for (size_t i = 0; i < envs.size(); ++i) {
++        envs[i].SerializeAnswers(answers[i]);
++    }
++    prep_store.Add(key.Hash(), stages, answers, flags);
++}
++
++void PipelineCache::NotePrepared(const GraphicsPipelineCacheKey& key,
++                                 const ShaderPrep::Stages& stages,
++                                 std::span<const VideoCommon::FileEnvironment> envs,
++                                 std::atomic<size_t>& compared,
++                                 std::atomic<size_t>& differed) noexcept try {
++    const u64 hash = key.Hash();
++    if (stages.unsuitable) {
++        // More than SPIR-V and infos makes it: remembered, so no later start tries again.
++        prep_store.AddNotKeepable(hash);
++        return;
++    }
++    if (!prep_store.Contains(hash)) {
++        KeepPrepared(key, stages, envs, 0);
++        return;
++    }
++    if (!prep_store.IsKept(hash)) {
++        return;
++    }
++    // Kept by an earlier start: this start translated the same record again, so the two must be
++    // the same SPIR-V. They are not when the translation changed without the stamp noticing.
++    if (prep_store.SameSpirv(hash, stages)) {
++        compared.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    if (prep_store.IsPredicted(hash)) {
++        // Kept from a predicted record, with guessed answers; this is the game's own record of
++        // the same key, which the boot builds and draws with. It takes the predicted one's place.
++        prep_store.Forget(hash);
++        KeepPrepared(key, stages, envs, 0);
++        return;
++    }
++    compared.fetch_add(1, std::memory_order_relaxed);
++    differed.fetch_add(1, std::memory_order_relaxed);
++} catch (const std::exception&) {
++    // No memory to keep this one: the boot goes on, a later start keeps it.
++}
++
++void PipelineCache::PrepareKept(std::stop_token stop_loading,
++                                const VideoCore::DiskResourceLoadCallback& callback,
++                                size_t compared, size_t differed) {
++    const auto begin = std::chrono::steady_clock::now();
++    const auto seconds_since = [](std::chrono::steady_clock::time_point since) {
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
++    };
++    if (differed != 0) {
++        LOG_WARNING(Render_Vulkan,
++                    "Shader preparation: {} of {} pipelines built at boot translate differently "
++                    "from the kept ones; the translation changed, everything is prepared again",
++                    differed, compared);
++        prep_store.Reset();
++    }
++    if (!prep_store.IsOpen()) {
++        return;
++    }
++    const auto predicted_filename = pipeline_cache_filename.parent_path() / "prep_predicted.bin";
++    // Beside this stamp's store, and removed with it: another build starts without strikes.
++    const auto journal_filename = prep_store.Sidecar(".inflight");
++    const auto strikes_filename = prep_store.Sidecar(".strikes");
++    const size_t max_in_flight = std::max<size_t>(GetTotalPipelineWorkers() * 2, 8);
++
++    // A pipeline whose build took the app down twice is left to the draw that needs it. The
++    // journal holds the key hashes being built; what it still holds at the next start was in
++    // flight when the app ended (a crash, or the PS menu's close: those count too, so a record
++    // can be struck out without fault; it then only builds as it did before).
++    std::unordered_map<u64, u32> strikes;
++    {
++        std::ifstream file{strikes_filename};
++        u64 hash{};
++        u32 count{};
++        while (file >> std::hex >> hash >> std::dec >> count) {
++            strikes.emplace(hash, count);
++        }
++    }
++    {
++        std::ifstream file{journal_filename, std::ios::binary};
++        u64 hash{};
++        bool added = false;
++        while (file.read(reinterpret_cast<char*>(&hash), sizeof(hash))) {
++            if (hash != 0) {
++                ++strikes[hash];
++                added = true;
++            }
++        }
++        if (added) {
++            std::ofstream out{strikes_filename, std::ios::trunc};
++            for (const auto& [struck, count] : strikes) {
++                out << std::hex << struck << ' ' << std::dec << count << '\n';
++            }
++        }
++    }
++    const auto struck_out = [&strikes](u64 hash) {
++        const auto it = strikes.find(hash);
++        return it != strikes.end() && it->second >= 2;
++    };
++
++    struct {
++        std::mutex mutex;
++        std::condition_variable cv;
++        size_t in_flight{};
++        size_t finished{};
++        size_t failed{};
++        size_t total{};
++        std::vector<u32> free_slots;
++        std::fstream journal;
++    } state;
++    {
++        // Created with every slot zero, then opened to write single slots.
++        std::ofstream create{journal_filename, std::ios::binary | std::ios::trunc};
++        const std::vector<char> zeros(max_in_flight * sizeof(u64), 0);
++        create.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
++    }
++    state.journal.open(journal_filename, std::ios::binary | std::ios::in | std::ios::out);
++    state.free_slots.reserve(max_in_flight);
++    for (u32 slot = 0; slot < max_in_flight; ++slot) {
++        state.free_slots.push_back(slot);
++    }
++    // Under state.mutex.
++    const auto note_slot = [&state](u32 slot, u64 hash) noexcept {
++        try {
++            if (!state.journal.is_open()) {
++                return;
++            }
++            state.journal.clear();
++            state.journal.seekp(static_cast<std::streamoff>(slot * sizeof(u64)));
++            state.journal.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
++            state.journal.flush();
++        } catch (const std::exception&) {
++        }
++    };
++    const auto wait_for_jobs = [&state] {
++        // Every job holds references to what is on this stack: all of them end first.
++        std::unique_lock lock{state.mutex};
++        state.cv.wait(lock, [&] { return state.in_flight == 0; });
++    };
++
++    // Which records can be prepared at all. Task and mesh records are only whole in the mesh file
++    // (the other one does not carry their mesh state); a key made for another driver version or
++    // drawn inside an HLE macro is never asked for again, or always refused when it is.
++    // Returns 0 when it can, else why not: 1 its stages, 2 another driver, 3 an HLE macro.
++    const auto preparable = [this](const GraphicsPipelineCacheKey& key,
++                                   const std::vector<FileEnvironment>& envs,
++                                   bool mesh_file) -> u32 {
++        if (envs.empty() || envs.size() > ShaderPrep::NumStages || key.unique_hashes[0] != 0) {
++            return 1;
++        }
++        if (key.state.driver_id != dynamic_features.driver_id ||
++            key.state.driver_version != dynamic_features.driver_version) {
++            return 2;
++        }
++        if (key.state.app_stage.Value() == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro) {
++            return 3;
++        }
++        const bool mesh = std::ranges::any_of(envs, [](const FileEnvironment& env) {
++            return env.ShaderStage() == Shader::Stage::Task ||
++                   env.ShaderStage() == Shader::Stage::Mesh;
++        });
++        return mesh && !mesh_file ? 1 : 0;
++    };
++    // The files are read with a reader of our own: the boot's reader cuts a file back when
++    // anything in its loop runs out of memory, and these passes would be two more chances.
++    const auto read_files = [&](const auto& graphics_for) {
++        const auto skip_compute = [](std::ifstream& file, FileEnvironment) {
++            ComputePipelineCacheKey key;
++            file.read(reinterpret_cast<char*>(&key), sizeof(key));
++        };
++        bool whole = VideoCommon::ReadPipelines(pipeline_cache_filename, CACHE_VERSION,
++                                                skip_compute, graphics_for(true, false), false);
++        if (device.IsExtMeshShaderSupported()) {
++            whole &= VideoCommon::ReadPipelines(mesh_pipeline_cache_filename, CACHE_VERSION,
++                                                skip_compute, graphics_for(true, true), true);
++        }
++        whole &= VideoCommon::ReadPipelines(predicted_filename, CACHE_VERSION, skip_compute,
++                                            graphics_for(false, false), false);
++        return whole;
++    };
++
++    // First pass: which records are left to prepare. Own records are the ones the boot above took
++    // from the disk cache (disk_pipelines: they passed its checks for this device); the records
++    // of prep_predicted.bin are taken as they are.
++    // A sample of the records kept already is translated again and compared, another sample at
++    // each boot: the boot above only compared the pipelines it built, and a translation that
++    // changed without the stamp noticing may have changed only others.
++    constexpr size_t MaxProbes = 48;
++    const u64 salt =
++        static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count() >> 10);
++    std::atomic<size_t> probed{};
++    std::atomic<size_t> probe_differed{};
++    std::unordered_set<u64> todo;
++    std::array<size_t, 4> left_out{};
++    size_t struck = 0;
++    size_t own_left = 0;
++    size_t probes_queued = 0;
++    const auto scan_graphics = [&](bool own, bool mesh_file) {
++        return [&, own, mesh_file](std::ifstream& file, std::vector<FileEnvironment> envs) {
++            GraphicsPipelineCacheKey key;
++            file.read(reinterpret_cast<char*>(&key), sizeof(key));
++            const u64 hash = key.Hash();
++            if (stop_loading.stop_requested() || (own && !disk_pipelines.contains(hash))) {
++                return;
++            }
++            if (const u32 why_not = preparable(key, envs, mesh_file); why_not != 0) {
++                ++left_out[why_not];
++                return;
++            }
++            if (prep_store.Contains(hash)) {
++                if (probes_queued >= MaxProbes || ((hash ^ salt) & 7) != 0 ||
++                    !prep_store.IsKept(hash)) {
++                    return;
++                }
++                ++probes_queued;
++                {
++                    std::scoped_lock lock{state.mutex};
++                    ++state.in_flight;
++                }
++                try {
++                    workers.QueueWork([this, key, hash, envs_ = std::move(envs), &state, &probed,
++                                       &probe_differed]() mutable {
++                        try {
++                            ShaderPrep::Stages stages;
++                            stages.driver_cache_only = true;
++                            ShaderPools pools;
++                            boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
++                            for (auto& env : envs_) {
++                                env_ptrs.push_back(&env);
++                            }
++                            const auto pipeline{CreateGraphicsPipeline(
++                                pools, key, MakeSpan(env_ptrs), nullptr, false, &stages)};
++                            if (pipeline != nullptr && !stages.unsuitable) {
++                                probed.fetch_add(1, std::memory_order_relaxed);
++                                if (!prep_store.SameSpirv(hash, stages)) {
++                                    probe_differed.fetch_add(1, std::memory_order_relaxed);
++                                }
++                            }
++                        } catch (const std::exception&) {
++                        }
++                        std::scoped_lock lock{state.mutex};
++                        --state.in_flight;
++                        state.cv.notify_all();
++                    });
++                } catch (...) {
++                    std::scoped_lock lock{state.mutex};
++                    --state.in_flight;
++                    state.cv.notify_all();
++                    throw;
++                }
++                return;
++            }
++            if (struck_out(hash)) {
++                ++struck;
++                return;
++            }
++            todo.insert(hash);
++        };
++    };
++    for (int attempt = 0; attempt < 2; ++attempt) {
++        todo.clear();
++        left_out = {};
++        struck = 0;
++        own_left = 0;
++        size_t own_seen = 0;
++        const bool whole = read_files([&](bool own, bool mesh_file) {
++            return [&, own, scan = scan_graphics(own, mesh_file)](
++                       std::ifstream& file, std::vector<FileEnvironment> envs) {
++                scan(file, std::move(envs));
++                if (own) {
++                    own_seen = todo.size();
++                }
++            };
++        });
++        own_left = own_seen;
++        wait_for_jobs();
++        if (!whole) {
++            LOG_WARNING(Render_Vulkan, "Shader preparation: a cache file could not be read to its "
++                                       "end; what was read is prepared");
++        }
++        if (probe_differed.load() == 0) {
++            break;
++        }
++        LOG_WARNING(Render_Vulkan,
++                    "Shader preparation: {} of {} kept pipelines translate differently now; the "
++                    "translation changed, everything is prepared again",
++                    probe_differed.load(), probed.load());
++        prep_store.Reset();
++        probe_differed.store(0);
++        probes_queued = MaxProbes;
++        if (!prep_store.IsOpen()) {
++            state.journal.close();
++            return;
++        }
++    }
++    const size_t left = todo.size();
++    const size_t limit = std::min(left, ShaderPrep::MaxPerBoot());
++    state.total = limit;
++    LOG_INFO(Render_Vulkan,
++             "Shader preparation: {} pipelines known, {} left to prepare ({} of this console's own "
++             "records, {} predicted), {} struck out, {} left out (stages {}, another driver {}, "
++             "HLE macro {}), {} compared at boot and {} more now; {} now",
++             prep_store.Size(), left, own_left, left - own_left, struck,
++             left_out[1] + left_out[2] + left_out[3], left_out[1], left_out[2], left_out[3],
++             compared, probed.load(), limit);
++    if (limit == 0) {
++        state.journal.close();
++        std::error_code error;
++        std::filesystem::remove(journal_filename, error);
++        if (prep_store.Uncommitted() != 0) {
++            prep_store.Commit();
++        }
++        prep_store.Compact();
++        return;
++    }
++    callback(VideoCore::LoadCallbackStage::Build, 0, limit);
++
++    // Second pass: each record left is translated and built once on a worker, kept, and dropped.
++    // Built with the driver's own cache only: the emulator's VkPipelineCache is held in memory
++    // whole and written whole at each save, and these are pipelines no draw has asked for yet.
++    size_t queued = 0;
++    const auto build_graphics = [&](bool own, bool) {
++        return [&, own](std::ifstream& file, std::vector<FileEnvironment> envs) {
++            GraphicsPipelineCacheKey key;
++            file.read(reinterpret_cast<char*>(&key), sizeof(key));
++            const u64 hash = key.Hash();
++            if (queued >= limit || stop_loading.stop_requested() || todo.erase(hash) == 0) {
++                return;
++            }
++            if (prep_store.Uncommitted() >= 512) {
++                prep_store.Commit();
++            }
++            u32 slot{};
++            {
++                // The records are read no faster than they are built: each holds its programs.
++                std::unique_lock lock{state.mutex};
++                state.cv.wait(lock, [&] { return state.in_flight < max_in_flight; });
++                ++state.in_flight;
++                slot = state.free_slots.back();
++                state.free_slots.pop_back();
++                note_slot(slot, hash);
++            }
++            ++queued;
++            const u32 flags = own ? 0U : ShaderPrep::KeptStore::FlagPredicted;
++            try {
++                workers.QueueWork([this, key, hash, slot, flags, envs_ = std::move(envs), &state,
++                                   &note_slot, &callback, begin]() mutable {
++                    bool ok = false;
++                    try {
++                        ShaderPrep::Stages stages;
++                        stages.driver_cache_only = true;
++                        ShaderPools pools;
++                        boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
++                        for (auto& env : envs_) {
++                            env_ptrs.push_back(&env);
++                        }
++                        // Built on this worker, then dropped: the driver keeps what it compiled.
++                        const auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
++                                                                   nullptr, false, &stages)};
++                        ok = pipeline != nullptr;
++                        if (ok && !stages.unsuitable) {
++                            KeepPrepared(key, stages, envs_, flags);
++                        } else {
++                            // Not translated, or more than SPIR-V and infos makes it: remembered,
++                            // so no later start of this build tries again.
++                            prep_store.AddNotKeepable(hash);
++                        }
++                    } catch (const std::exception& e) {
++                        LOG_DEBUG(Render_Vulkan, "Shader preparation: a pipeline failed: {}",
++                                  e.what());
++                    }
++                    std::scoped_lock lock{state.mutex};
++                    --state.in_flight;
++                    ++state.finished;
++                    if (!ok) {
++                        ++state.failed;
++                    }
++                    state.free_slots.push_back(slot); // room reserved: cannot throw
++                    note_slot(slot, 0);
++                    try {
++                        if (state.finished % 16 == 0 || state.finished == state.total) {
++                            callback(VideoCore::LoadCallbackStage::Build, state.finished,
++                                     state.total);
++                        }
++                        if (state.finished % ShaderPrep::LogEvery() == 0) {
++                            const double seconds = std::chrono::duration<double>(
++                                                       std::chrono::steady_clock::now() - begin)
++                                                       .count();
++                            LOG_INFO(Render_Vulkan,
++                                     "Shader preparation: {} of {} pipelines, {:.1f} s, {} failed, "
++                                     "about {:.0f} s left",
++                                     state.finished, state.total, seconds, state.failed,
++                                     seconds / static_cast<double>(state.finished) *
++                                         static_cast<double>(state.total - state.finished));
++                        }
++                    } catch (const std::exception&) {
++                    }
++                    state.cv.notify_all();
++                });
++            } catch (...) {
++                std::scoped_lock lock{state.mutex};
++                --state.in_flight;
++                state.free_slots.push_back(slot);
++                note_slot(slot, 0);
++                state.cv.notify_all();
++                throw;
++            }
++        };
++    };
++    const bool whole = read_files(build_graphics);
++    wait_for_jobs();
++    {
++        std::scoped_lock lock{state.mutex};
++        state.journal.close();
++    }
++    const bool committed = prep_store.Commit();
++    prep_store.Compact();
++    std::error_code error;
++    std::filesystem::remove(journal_filename, error);
++    LOG_INFO(Render_Vulkan,
++             "Shader preparation: {} pipelines prepared in {:.1f} s ({} failed, {} left for the "
++             "next start); {} kept in {} MiB{}{}",
++             state.finished, seconds_since(begin), state.failed, left - std::min(left, queued),
++             prep_store.Size(), prep_store.DataBytes() >> 20,
++             committed ? "" : "; the index was NOT written",
++             whole ? "" : "; a cache file could not be read to its end");
++}
++
++std::unique_ptr<GraphicsPipeline> PipelineCache::CreateKeptGraphicsPipeline(
++    GraphicsEnvironments& environments) {
++    if (!prep_store.IsOpen() || !ShaderPrep::FastPath()) {
++        return nullptr;
++    }
++    const u64 hash = graphics_key.Hash();
++    ShaderPrep::KeptStore::Record record;
++    if (prep_rejected.contains(hash) || !prep_store.Find(hash, record) ||
++        (record.flags & ShaderPrep::KeptStore::FlagNotKeepable) != 0) {
++        return nullptr;
++    }
++    // GPU thread only: what the kept translations did since the last report.
++    static u32 used{}, refused{}, audit_same{}, audit_differ{}, redone{};
++    static std::chrono::steady_clock::duration spent{};
++    static std::map<std::string, u32> reasons;
++    static auto window = std::chrono::steady_clock::now();
++    const auto begin = std::chrono::steady_clock::now();
++    // Neither of these lets an exception out: a pipeline whose build is queued on a worker must
++    // never be dropped because the bookkeeping after it ran out of memory.
++    const auto report = [&]() noexcept {
++        try {
++            spent += std::chrono::steady_clock::now() - begin;
++            if (begin - window < std::chrono::seconds{10}) {
++                return;
++            }
++            std::string why;
++            for (const auto& [reason, count] : reasons) {
++                why += fmt::format("{}{} {}", why.empty() ? "" : ", ", count, reason);
++            }
++            LOG_INFO(Render_Vulkan,
++                     "Kept translations in the last 10 s: {} pipelines made without translating, "
++                     "{:.1f} ms on the GPU thread, {} refused{}{}{}",
++                     used, std::chrono::duration<double, std::milli>(spent).count(), refused,
++                     why.empty() ? "" : " (", why, why.empty() ? "" : ")");
++            if (ShaderPrep::Verify()) {
++                LOG_INFO(Render_Vulkan,
++                         "Kept translations verified so far: {} the same, {} differ", audit_same,
++                         audit_differ);
++            }
++            used = 0;
++            refused = 0;
++            spent = {};
++            reasons.clear();
++            window = begin;
++        } catch (const std::exception&) {
++        }
++    };
++    const auto note_refusal = [&](const char* why) noexcept {
++        try {
++            ++refused;
++            prep_rejected.insert(hash);
++            ++reasons[why];
++        } catch (const std::exception&) {
++        }
++        report();
++    };
++    const auto refuse = [&](const char* why) noexcept -> std::unique_ptr<GraphicsPipeline> {
++        note_refusal(why);
++        return nullptr;
++    };
++    // The kept bytes did not read back whole: this pipeline is prepared again at the next start.
++    const auto unreadable = [&]() noexcept -> std::unique_ptr<GraphicsPipeline> {
++        try {
++            prep_store.Forget(hash);
++            if (redone++ < 8) {
++                prep_store.Commit();
++            }
++        } catch (const std::exception&) {
++        }
++        return refuse("files unreadable");
++    };
++    const auto live = environments.Span();
++    // A vertex A program is merged into vertex B: never kept.
++    if (graphics_key.unique_hashes[0] != 0 || live.size() != record.env_count) {
++        return refuse("other stages");
++    }
++    // Outside the try: once made, its build is queued on a worker and it has to be returned.
++    std::unique_ptr<GraphicsPipeline> made;
++    bool verified_same = true;
++    try {
++        std::vector<u8> bytes;
++        std::array<Shader::Info, ShaderPrep::NumStages> infos{};
++        std::array<const Shader::Info*, Maxwell::MaxShaderStage> info_ptrs{};
++        for (size_t stage = 0; stage < ShaderPrep::NumStages; ++stage) {
++            if (record.infos[stage] == ShaderPrep::NoBlob) {
++                continue;
++            }
++            if (!prep_store.Read(record.infos[stage], bytes) ||
++                !ShaderPrep::DeserializeInfo(bytes, infos[stage]) ||
++                infos[stage].requires_layer_emulation) {
++                return unreadable();
++            }
++            info_ptrs[stage] = &infos[stage];
++        }
++        // As CreateGraphicsPipeline decides it: task and mesh programs the emulator runs as
++        // compute are made of more than their modules (and are never kept).
++        const bool mesh_as_compute{mesh_scratch != nullptr && mesh_scratch->IsValid() &&
++                                   (!MeshComputeLoneOnly() || graphics_key.unique_hashes[3] == 0)};
++        if (info_ptrs[0] == nullptr ||
++            (mesh_as_compute && (infos[0].is_task || infos[0].is_mesh))) {
++            return refuse("other stages");
++        }
++        // Each environment against the answers its translation got. The words a stage's
++        // descriptors read their texture handles from may hold other handles now.
++        size_t env_index = 0;
++        std::vector<VideoCommon::FileEnvironment::AnswerHandle> handles;
++        for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
++            if (graphics_key.unique_hashes[index] == 0) {
++                continue;
++            }
++            if (env_index >= live.size() || info_ptrs[index - 1] == nullptr) {
++                return refuse("other stages");
++            }
++            const Shader::Info& info = infos[index - 1];
++            handles.clear();
++            const auto add = [&handles](const auto& desc, bool has_secondary, u32 shift_left,
++                                        u32 secondary_index, u32 secondary_offset,
++                                        u32 secondary_shift_left) {
++                if (desc.handle_program != ~0U) {
++                    return; // computed per draw: its words are compared like any other
++                }
++                handles.push_back({.index = desc.cbuf_index,
++                                   .offset = desc.cbuf_offset,
++                                   .shift_left = shift_left,
++                                   .secondary_index = secondary_index,
++                                   .secondary_offset = secondary_offset,
++                                   .secondary_shift_left = secondary_shift_left,
++                                   .has_secondary = has_secondary});
++            };
++            for (const auto& desc : info.texture_buffer_descriptors) {
++                add(desc, desc.has_secondary, desc.shift_left, desc.secondary_cbuf_index,
++                    desc.secondary_cbuf_offset, desc.secondary_shift_left);
++            }
++            for (const auto& desc : info.texture_descriptors) {
++                add(desc, desc.has_secondary, desc.shift_left, desc.secondary_cbuf_index,
++                    desc.secondary_cbuf_offset, desc.secondary_shift_left);
++            }
++            for (const auto& desc : info.image_buffer_descriptors) {
++                add(desc, false, 0, 0, 0, 0);
++            }
++            for (const auto& desc : info.image_descriptors) {
++                add(desc, false, 0, 0, 0, 0);
++            }
++            if (!prep_store.Read(record.answers[env_index], bytes)) {
++                return unreadable();
++            }
++            const char* why = "";
++            if (!VideoCommon::FileEnvironment::AnswersHoldFor(bytes, *live[env_index], handles,
++                                                              &why)) {
++                return refuse(why);
++            }
++            ++env_index;
++        }
++        if (env_index != live.size()) {
++            return refuse("other stages");
++        }
++        std::array<std::vector<u8>, ShaderPrep::NumStages> spirv;
++        for (size_t stage = 0; stage < ShaderPrep::NumStages; ++stage) {
++            if (info_ptrs[stage] != nullptr &&
++                (!prep_store.Read(record.spirv[stage], spirv[stage]) || spirv[stage].empty())) {
++                return unreadable();
++            }
++        }
++        if (ShaderPrep::Verify()) {
++            // What the translation of the game's state gives now, built like any new pipeline
++            // (with its own pools: the caller releases main_pools after this). It is the one
++            // drawn with either way: its build is queued on a worker already.
++            ShaderPrep::Stages fresh;
++            ShaderPools pools;
++            made = CreateGraphicsPipeline(pools, graphics_key, live, nullptr, true, &fresh);
++            if (made == nullptr) {
++                return refuse("not translated (verify)");
++            }
++            verified_same = !fresh.unsuitable;
++            for (size_t stage = 0; verified_same && stage < ShaderPrep::NumStages; ++stage) {
++                verified_same = fresh.present[stage] == (info_ptrs[stage] != nullptr);
++                if (!verified_same || !fresh.present[stage]) {
++                    continue;
++                }
++                std::vector<u8> fresh_info, kept_info;
++                ShaderPrep::SerializeInfo(fresh.infos[stage], fresh_info);
++                ShaderPrep::SerializeInfo(infos[stage], kept_info);
++                const auto& words = fresh.spirv[stage];
++                verified_same =
++                    fresh_info == kept_info && words.size() * sizeof(u32) == spirv[stage].size() &&
++                    std::memcmp(words.data(), spirv[stage].data(), spirv[stage].size()) == 0;
++                if (!verified_same && audit_differ < 32) {
++                    LOG_ERROR(Render_Vulkan,
++                              "Kept translation of pipeline {:016x} differs at stage {} ({})", hash,
++                              stage, fresh_info == kept_info ? "SPIR-V" : "infos");
++                }
++            }
++        } else {
++            std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
++            for (size_t stage = 0; stage < ShaderPrep::NumStages; ++stage) {
++                if (info_ptrs[stage] == nullptr) {
++                    continue;
++                }
++                const std::span<const u32> words{
++                    reinterpret_cast<const u32*>(spirv[stage].data()),
++                    spirv[stage].size() / sizeof(u32)};
++                modules[stage] = BuildShader(device, words);
++            }
++            if (graphics_key.unique_hashes[1] != 0 && StaticVertexInputEnabled()) {
++                EdenRecordAttributeless(
++                    {graphics_key.unique_hashes[0], graphics_key.unique_hashes[1]}, infos[0]);
++            }
++            made = std::make_unique<GraphicsPipeline>(
++                scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify,
++                device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, &workers,
++                nullptr, render_pass_cache, graphics_key, std::move(modules), info_ptrs,
++                mesh_scratch.get(), nullptr);
++        }
++    } catch (const std::exception&) {
++        if (made == nullptr) {
++            return refuse("files unreadable");
++        }
++        // The pipeline exists and its build is queued: it is returned whatever failed after it.
++    }
++    if (ShaderPrep::Verify()) {
++        ++(verified_same ? audit_same : audit_differ);
++    }
++    if (verified_same) {
++        ++used;
++        report();
++    } else {
++        note_refusal("differs from its translation (verify)");
++    }
++    return made;
++}
++
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 62ca8e8..85113a8 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -37,6 +37,7 @@
+ #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
++#include "video_core/renderer_vulkan/vk_pipeline_prep.h"
+ #include "video_core/shader_cache.h"
+ 
+ namespace Core {
+@@ -193,10 +194,28 @@ private:
+ 
+     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+ 
++    /// kept_out (EDEN_UP_SHADER_PREP): takes the SPIR-V and shader infos of the translation.
+     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
+         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
+-        bool build_in_parallel);
++        bool build_in_parallel, ShaderPrep::Stages* kept_out = nullptr);
++
++    /// EDEN_UP_SHADER_PREP (vk_pipeline_prep.h). GPU thread: the pipeline of graphics_key from
++    /// its kept SPIR-V and infos when the game's state still gives the answers its
++    /// translation got; null otherwise (the caller then translates, as before).
++    std::unique_ptr<GraphicsPipeline> CreateKeptGraphicsPipeline(
++        GraphicsEnvironments& environments);
++    /// Boot: translates, builds once and keeps every disk cache record not kept yet.
++    void PrepareKept(std::stop_token stop_loading,
++                     const VideoCore::DiskResourceLoadCallback& callback, size_t compared,
++                     size_t differed);
++    /// Workers: keeps one translated record (flags: ShaderPrep::KeptStore::Flag...).
++    void KeepPrepared(const GraphicsPipelineCacheKey& key, const ShaderPrep::Stages& stages,
++                      std::span<const VideoCommon::FileEnvironment> envs, u32 flags);
++    /// Workers, for a record built at boot: keeps it, or compares it with the kept one.
++    void NotePrepared(const GraphicsPipelineCacheKey& key, const ShaderPrep::Stages& stages,
++                      std::span<const VideoCommon::FileEnvironment> envs,
++                      std::atomic<size_t>& compared, std::atomic<size_t>& differed) noexcept;
+ 
+     std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineCacheKey& key,
+                                                            const ShaderInfo* shader,
+@@ -300,6 +319,13 @@ private:
+     std::atomic<size_t> pipelines_saved{};
+     std::atomic<size_t> written_cache_size{NO_CACHE_WRITTEN};
+ 
++    /// EDEN_UP_SHADER_PREP: the kept translations (declared before the workers that fill it),
++    /// the keys the GPU thread found unusable this session, and the null handle that makes
++    /// the driver build with its own cache only.
++    ShaderPrep::KeptStore prep_store;
++    std::unordered_set<u64> prep_rejected;
++    vk::PipelineCache prep_no_cache;
++
+     Common::ThreadWorker workers;
+     Common::ThreadWorker serialization_thread;
+     DynamicFeatures dynamic_features;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+new file mode 100644
+index 0000000..ba6b18f
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -0,0 +1,1211 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// EDEN_UP_SHADER_PREP: the kept translations (see vk_pipeline_prep.h). The Shader::Info
++// serializer follows zortos293/Lichii#896's shader_recompiler/info_serialize.cpp (zmckenney),
++// with this tree's fields.
++
++#include "video_core/renderer_vulkan/vk_pipeline_prep.h"
++
++#include <algorithm>
++#include <bit>
++#include <bitset>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <stdexcept>
++#include <string_view>
++#include <system_error>
++#include <type_traits>
++
++#include <fmt/format.h>
++
++#include "common/cityhash.h"
++#include "common/fs/path_util.h"
++#include "common/logging.h"
++#include "common/settings.h"
++#include "common/zstd_compression.h"
++
++namespace Vulkan::ShaderPrep {
++namespace {
++
++constexpr u32 FormatVersion = 1;
++constexpr std::string_view DataMagic{"EUPKEPT1"};
++constexpr std::string_view IndexMagic{"EUPKIDX1"};
++/// Stores of other stamps left on disk (a test batch's arms each have their own).
++constexpr size_t StoresKept = 3;
++
++// Every EDEN_ switch the shader translation sources and the Vulkan backend name. One that changes
++// what a translation gives must change the stamp; the others only cost a store of their own when
++// they are flipped. Generated from the tree (tools: shader-prep/make_switch_list.py); the check
++// script fails when a name is missing here.
++constexpr const char* TranslationSwitches[] = {
++    "EDEN_GBB_FLUSH_PAGE_CHECK", "EDEN_GBB_PIPELINE_ONCE", "EDEN_GBB_PIPELINE_SAVE_20S",
++    "EDEN_GBB_QUAD_NO_WAIT", "EDEN_GMMU_SPARSE", "EDEN_GPU_TIME", "EDEN_NATIVE_DRAW_CAPTURE",
++    "EDEN_NATIVE_DRAW_DIAGNOSTICS", "EDEN_NATIVE_FRAME_CAPTURE", "EDEN_NATIVE_SHADER_OVERRIDE_DIR",
++    "EDEN_NX2_3D_HISTORY", "EDEN_NX2_3D_METHODS", "EDEN_NX2_A2C_REFRESH", "EDEN_NX2_AB_LOG",
++    "EDEN_NX2_AB_SKIP", "EDEN_NX2_AMD_PR273", "EDEN_NX2_AMD_SHADER_FIXES", "EDEN_NX2_AREA_EVICT",
++    "EDEN_NX2_AREA_EVICT_BURST", "EDEN_NX2_AREA_EVICT_DIRTY", "EDEN_NX2_ASTC_ARRAY_MIB",
++    "EDEN_NX2_ASTC_BC1", "EDEN_NX2_ASTC_FLUSH", "EDEN_NX2_AV1_FRAME_DELAY", "EDEN_NX2_AV1_THREADS",
++    "EDEN_NX2_BAD_ALLOC_ENDS", "EDEN_NX2_BANK_PAGES", "EDEN_NX2_BANK_REUPLOAD",
++    "EDEN_NX2_BANK_STATS", "EDEN_NX2_BC_COLLECT_MIB", "EDEN_NX2_BLEND_ALWAYS",
++    "EDEN_NX2_BORDER_LOG", "EDEN_NX2_BUFFER_CUT", "EDEN_NX2_BUFFER_DOWNLOADS",
++    "EDEN_NX2_BUFFER_WAIT", "EDEN_NX2_CAS_RETURNED", "EDEN_NX2_CB24_TRACE", "EDEN_NX2_CB_BATCH",
++    "EDEN_NX2_CLEAN_BY_TIME", "EDEN_NX2_CLEAR_BEFORE_COPY", "EDEN_NX2_CLEAR_UPLOAD_GUARDS",
++    "EDEN_NX2_COMPOSE_GUARD", "EDEN_NX2_COMPOSE_GUARD_HASHES", "EDEN_NX2_COMPUTE_SAME",
++    "EDEN_NX2_COMPUTE_TO_DRAW", "EDEN_NX2_COND_MODE", "EDEN_NX2_COND_TRACE",
++    "EDEN_NX2_DEFER_CONDITIONAL_CLEARS", "EDEN_NX2_DEFER_RECORD", "EDEN_NX2_DEPTH_EQUAL_RELAX",
++    "EDEN_NX2_DESYNC_FIX", "EDEN_NX2_DLSS_AUTO_EXPOSURE", "EDEN_NX2_DLSS_HDR", "EDEN_NX2_DLSS_LOG",
++    "EDEN_NX2_DLSS_PRESET", "EDEN_NX2_DLSS_REPLACEMENT", "EDEN_NX2_DMA_SNAPSHOT",
++    "EDEN_NX2_DOWNLOAD_GUARDS", "EDEN_NX2_DRAW_TUNING", "EDEN_NX2_EXPERIMENTAL_GEOMETRY",
++    "EDEN_NX2_FENCE_BATCH", "EDEN_NX2_FENCE_FLUSH_US", "EDEN_NX2_FETCH_COUNT",
++    "EDEN_NX2_FETCH_RECHECK", "EDEN_NX2_FLUSH_DRAWS", "EDEN_NX2_FORCE_LOD0", "EDEN_NX2_FRAG_HOT",
++    "EDEN_NX2_FRAME_BREAKDOWN_EVERY", "EDEN_NX2_GPU_PROFILE", "EDEN_NX2_GPU_TIME_DIV",
++    "EDEN_NX2_GPU_TRANSCODE_MIB", "EDEN_NX2_HANG_WATCH", "EDEN_NX2_HELD_WRITES",
++    "EDEN_NX2_HMMA_NATIVE", "EDEN_NX2_IADD32_OVERFLOW", "EDEN_NX2_IMAGE_REFUSED_ENDS",
++    "EDEN_NX2_INDEX_REBIND", "EDEN_NX2_INLINE_DEFER", "EDEN_NX2_INLINE_PAGE_WRITES",
++    "EDEN_NX2_INVALIDATION_FILTER", "EDEN_NX2_IR_STATS", "EDEN_NX2_JUNK_GUARD",
++    "EDEN_NX2_JUNK_TRACE", "EDEN_NX2_KEEP_ASTC", "EDEN_NX2_LIST_ASYNC", "EDEN_NX2_LIST_COPY_FLUSH",
++    "EDEN_NX2_LIST_CPU_SYNC", "EDEN_NX2_LIST_DRAIN_FULL", "EDEN_NX2_LIST_FAST",
++    "EDEN_NX2_MACRO_COPY", "EDEN_NX2_MACRO_QUERY_FLUSH", "EDEN_NX2_MACRO_SINK",
++    "EDEN_NX2_MAP_ON_BACK", "EDEN_NX2_MASK_COMPONENTS", "EDEN_NX2_MASK_UNWRITTEN",
++    "EDEN_NX2_MESH_AS_COMPUTE", "EDEN_NX2_MESH_BOUNDS", "EDEN_NX2_MESH_CENSUS",
++    "EDEN_NX2_MESH_COMPUTE_LONE", "EDEN_NX2_MESH_COMPUTE_MIB", "EDEN_NX2_MESH_COMPUTE_ONLY",
++    "EDEN_NX2_MESH_GROUP_LIMIT", "EDEN_NX2_MESH_ONLY", "EDEN_NX2_MESH_POINTS", "EDEN_NX2_MESH_SKIP",
++    "EDEN_NX2_MESH_SKIP_BITS", "EDEN_NX2_MESH_SPIRV_DUMP", "EDEN_NX2_METHOD_TRACE",
++    "EDEN_NX2_MKW_MESH", "EDEN_NX2_MME_DUMP", "EDEN_NX2_MME_JIT", "EDEN_NX2_MME_LOG",
++    "EDEN_NX2_MME_MEMO", "EDEN_NX2_MME_MEMO_STATS", "EDEN_NX2_MME_RECORD",
++    "EDEN_NX2_MME_RECORD_SKIP", "EDEN_NX2_NATIVE_GRAPHICS_SIZE", "EDEN_NX2_NATIVE_TABLES",
++    "EDEN_NX2_NET_BARRIER", "EDEN_NX2_NO_MESH", "EDEN_NX2_NO_MESH_BUILD", "EDEN_NX2_NO_MESH_FILE",
++    "EDEN_NX2_NO_UPLOAD_REORDER", "EDEN_NX2_NO_UPLOAD_STORE", "EDEN_NX2_NULL_POINTER_HANDLE",
++    "EDEN_NX2_NULL_SLOTS", "EDEN_NX2_OOT_EXPOSURE_SCALE", "EDEN_NX2_OOT_FOG_SCALE",
++    "EDEN_NX2_OOT_FOG_SUN", "EDEN_NX2_OOT_SKIP_AA", "EDEN_NX2_OOT_VISUAL_WORKAROUND",
++    "EDEN_NX2_OVERWRITE_CHECK", "EDEN_NX2_PAIRED_POINTERS", "EDEN_NX2_PARK_SPLIT_METHODS",
++    "EDEN_NX2_PB_CHECK", "EDEN_NX2_PB_DUMP", "EDEN_NX2_PENDING_POLL_US",
++    "EDEN_NX2_PENDING_PROGRESS", "EDEN_NX2_PENDING_SPIN_US", "EDEN_NX2_PIPELINE_CACHE_RESET",
++    "EDEN_NX2_PIPELINE_CLEAN", "EDEN_NX2_PIPELINE_DIFF", "EDEN_NX2_PIPELINE_FAIL_SOFT",
++    "EDEN_NX2_PIPELINE_WORKERS", "EDEN_NX2_PLAIN_SAMPLER", "EDEN_NX2_PREFLUSH",
++    "EDEN_NX2_PRELOAD_ALL_PIPELINES", "EDEN_NX2_PULLER_TRACE", "EDEN_NX2_QMD_TRACE",
++    "EDEN_NX2_QUERY_DMA_SYNC", "EDEN_NX2_QUERY_DMA_TRACE", "EDEN_NX2_QUERY_FLIP_TRACE",
++    "EDEN_NX2_QUERY_KEEP_PENDING", "EDEN_NX2_QUERY_TRACE", "EDEN_NX2_QUERY_WAIT_ONCE",
++    "EDEN_NX2_RADV_MESH_COMPUTE", "EDEN_NX2_RANGE_PREFIX",
++    "EDEN_NX2_READBACK_DEPENDENCY_DIAGNOSTICS", "EDEN_NX2_READBACK_WAIT", "EDEN_NX2_REFUSAL_EVICT",
++    "EDEN_NX2_REJECT", "EDEN_NX2_REJECT_HASH", "EDEN_NX2_RENDER_ALWAYS", "EDEN_NX2_RESETFIX",
++    "EDEN_NX2_RESNAPSHOT", "EDEN_NX2_RT_TRACE", "EDEN_NX2_RUNTIME_PTP", "EDEN_NX2_SAMPLE_AT",
++    "EDEN_NX2_SEM_FAST", "EDEN_NX2_SEM_WATCH", "EDEN_NX2_SEM_WATCH_EMITS", "EDEN_NX2_SHADER_DUMP",
++    "EDEN_NX2_SHADER_FAST_SCAN", "EDEN_NX2_SKIP_OVERWRITTEN_UPLOADS", "EDEN_NX2_SKIP_SAME",
++    "EDEN_NX2_SKIP_VS", "EDEN_NX2_SLOW_FRAME_MS", "EDEN_NX2_SPARSE_ALIASED",
++    "EDEN_NX2_SPARSE_UNBACKED", "EDEN_NX2_SPLIT", "EDEN_NX2_SPLIT_CHECK",
++    "EDEN_NX2_SPLIT_PARSE_CHECK", "EDEN_NX2_SPLIT_SKIP", "EDEN_NX2_SPLIT_VERIFY",
++    "EDEN_NX2_SPLIT_WAITS", "EDEN_NX2_SSBO_WRITES_SIZED", "EDEN_NX2_TABLES_SPEED",
++    "EDEN_NX2_TABLE_POOL_MIB", "EDEN_NX2_TC_CRITICAL_MIB", "EDEN_NX2_TC_DOWNLOAD_MAX_MIB",
++    "EDEN_NX2_TC_EXPECTED_MIB", "EDEN_NX2_TC_KEEP_ASYNC", "EDEN_NX2_TC_LOG", "EDEN_NX2_TC_MIN_AGE",
++    "EDEN_NX2_TC_OLD_AGE", "EDEN_NX2_TC_STALE_SKIP", "EDEN_NX2_TC_TEMP_BUFFER_FRAMES",
++    "EDEN_NX2_TEMPORAL_CLIP", "EDEN_NX2_TEMPORAL_CLIP_MOTION", "EDEN_NX2_TEMPORAL_KERNEL",
++    "EDEN_NX2_TEMPORAL_KERNEL_MOTION", "EDEN_NX2_TEMPORAL_SHARPEN", "EDEN_NX2_TEMPORAL_UPSCALE",
++    "EDEN_NX2_TEMPORAL_WEIGHT", "EDEN_NX2_TENSOR", "EDEN_NX2_TENSOR_BACKGROUND",
++    "EDEN_NX2_TENSOR_ONLY", "EDEN_NX2_TENSOR_SYNC", "EDEN_NX2_TEXTURE_DUMP",
++    "EDEN_NX2_TEX_TRIM_LAYERS", "EDEN_NX2_TEX_TRIM_LEVELS", "EDEN_NX2_TEX_TRIM_MIB",
++    "EDEN_NX2_TIC_NULL_PAST_POOL", "EDEN_NX2_TIGHT_DESCRIPTOR_TABLES",
++    "EDEN_NX2_TRACE_AFTER_UPSCALE", "EDEN_NX2_TRACE_DST", "EDEN_NX2_TRACE_PS", "EDEN_NX2_TRACE_RT",
++    "EDEN_NX2_TRACE_VS", "EDEN_NX2_TRANSCODE_KEEP_MIB", "EDEN_NX2_TRANSCODE_THREADS",
++    "EDEN_NX2_TRANSCODE_WAIT", "EDEN_NX2_UBOREUSE", "EDEN_NX2_UBO_BANK_DIRECT",
++    "EDEN_NX2_UBO_INPLACE", "EDEN_NX2_UNBACKED_LIMIT", "EDEN_NX2_UNDEF_ZERO",
++    "EDEN_NX2_UNEVEN_MIPS_RGBA8", "EDEN_NX2_UPLOAD_CAP_MIB", "EDEN_NX2_UPSCALE_HANDLES_ONLY",
++    "EDEN_NX2_UPSCALE_KEEP_FRAME", "EDEN_NX2_UPSCALE_SAME_SIZE", "EDEN_NX2_UPSCALE_SOURCE",
++    "EDEN_NX2_UPSCALE_SOURCE_AS_DRAWN", "EDEN_NX2_UPSCALE_SOURCE_FORMAT",
++    "EDEN_NX2_UPSCALE_SOURCE_SIZE", "EDEN_NX2_UPSCALE_SQUARE", "EDEN_NX2_UPSCALE_STEADY",
++    "EDEN_NX2_UPSCALE_TRACE", "EDEN_NX2_VRAM_LIMIT_MIB", "EDEN_NX2_WFI_BARRIER",
++    "EDEN_NX2_WINDOW_TRACE", "EDEN_NX2_WINDOW_TRACE_SKIP", "EDEN_NX2_ZPASS_CUT_LOG",
++    "EDEN_NX2_ZPASS_FORCE", "EDEN_NX2_ZPASS_KEEP_WINDOW", "EDEN_NX2_ZPASS_PAUSE",
++    "EDEN_NX2_ZPASS_PAUSE_AB", "EDEN_PE_ASTC_BUSY_ASYNC", "EDEN_PE_CPU_READ_SKIP",
++    "EDEN_PE_CPU_WRITE_AHEAD", "EDEN_PE_DECODE_HANDOFF", "EDEN_PE_DESCRIPTOR_GROWTH",
++    "EDEN_PE_DMA_READ_AHEAD", "EDEN_PE_DMA_READ_TRUST", "EDEN_PE_GC_BLOCK_ORDER",
++    "EDEN_PE_GC_EVICTIONS", "EDEN_PE_IDLE_CACHE_TICK", "EDEN_PE_IMAGE_PAGES",
++    "EDEN_PE_MACRO_STATE_WRITES", "EDEN_PE_NO_EMPTY_SUBMITS", "EDEN_PE_PENDING_RELEASES",
++    "EDEN_PE_PIPELINE_CACHE_EXIT", "EDEN_PE_REG_BLOCKS", "EDEN_PE_STATIC_VERTEX_INPUT",
++    "EDEN_PE_TRANSCODE_BOUND", "EDEN_PE_UNIFORM_PREFETCH", "EDEN_PE_VMA_OWN_BUDGET",
++    "EDEN_PS5_LAZY_PRESENT", "EDEN_PS5_TRANSCODE_PENDING_MIB", "EDEN_STREAMLINE_DIR",
++    "EDEN_STREAM_RING_MIB", "EDEN_TC_SCRATCH_KEEP_MIB", "EDEN_UP_BACK_DRAW_CHEAP",
++    "EDEN_UP_BIND_ON_BACK", "EDEN_UP_BLIT_EDGE_CLAMP", "EDEN_UP_BUFFER_USE_MARKS",
++    "EDEN_UP_COMPUTE_INDIRECT_ORDER", "EDEN_UP_DEFERRED_CLEAR_PASS", "EDEN_UP_DJ_CHANNEL_IDS",
++    "EDEN_UP_DJ_FRAG_BARRIER", "EDEN_UP_DJ_GATHER_OWNERS", "EDEN_UP_DRAIN_SKIP_SAME",
++    "EDEN_UP_FAST_DRAW", "EDEN_UP_FAST_DRAW_OOT_EXEMPT", "EDEN_UP_FAST_DRAW_VERIFY",
++    "EDEN_UP_FAST_POLL", "EDEN_UP_FRITCHII_BLITSTATE", "EDEN_UP_FRITCHII_CHURN",
++    "EDEN_UP_FRITCHII_CLOCK", "EDEN_UP_FRITCHII_CLOCK_SYNCPT", "EDEN_UP_FRITCHII_COLD",
++    "EDEN_UP_FRITCHII_COLD_FRAMES", "EDEN_UP_FRITCHII_COLD_GUARDED",
++    "EDEN_UP_FRITCHII_COPY_BARRIER", "EDEN_UP_FRITCHII_DMALIST", "EDEN_UP_FRITCHII_DRIFT",
++    "EDEN_UP_FRITCHII_FBINDEX", "EDEN_UP_FRITCHII_FB_LIMITS", "EDEN_UP_FRITCHII_GFX64SSBO",
++    "EDEN_UP_FRITCHII_GRHAND", "EDEN_UP_FRITCHII_LISTSKIP", "EDEN_UP_FRITCHII_LISTSYNC",
++    "EDEN_UP_FRITCHII_NOPERSP", "EDEN_UP_FRITCHII_PR700", "EDEN_UP_FRITCHII_PROBECLAMP",
++    "EDEN_UP_FRITCHII_RELOCATE", "EDEN_UP_FRITCHII_RELOCATE_AREA_COUNT",
++    "EDEN_UP_FRITCHII_SHADOWMORE", "EDEN_UP_FRITCHII_TABLECHARGE", "EDEN_UP_FRITCHII_TOMBSTONE",
++    "EDEN_UP_FRITCHII_UNBACKED", "EDEN_UP_FRITCHII_WRITEMARK", "EDEN_UP_FRONT_BATCH",
++    "EDEN_UP_HANDLE_FALLBACK_TRACE", "EDEN_UP_HELD_VS_DOWNLOAD", "EDEN_UP_NO_STALE_UPLOAD",
++    "EDEN_UP_NULL_POINTER_SLOTS", "EDEN_UP_OOT_FRONT_WAIT", "EDEN_UP_OOT_FSR_SHARPNESS",
++    "EDEN_UP_OOT_FSR_SPATIAL", "EDEN_UP_OOT_MIST_DEPTH", "EDEN_UP_OOT_MIST_DEPTH_ULPS",
++    "EDEN_UP_OOT_MOVIE_COPY", "EDEN_UP_QUERY_LIGHT", "EDEN_UP_QUERY_STATS",
++    "EDEN_UP_SHADOW_REGISTERS", "EDEN_UP_SPLIT_FIRST_DRAIN", "EDEN_UP_STAGING_REUSE",
++    "EDEN_UP_SWAPCHAIN_RECREATE", "EDEN_UP_TC_BUDGET_CAP", "EDEN_UP_UBO_SNAPSHOT",
++    "EDEN_UP_UPLOAD_ALL_STAGES", "EDEN_UP_WIDE_COMPUTE_SSBOS", "EDEN_UP_ZPASS_QUERY_BANKS",
++    "EDEN_VMA_BLOCK_MIB",
++};
++
++[[nodiscard]] bool SwitchIs(const char* name, char wanted) {
++    const char* const value = std::getenv(name);
++    return value != nullptr && value[0] == wanted && value[1] == '\0';
++}
++
++[[nodiscard]] size_t SwitchNumber(const char* name, size_t fallback) {
++    const char* const value = std::getenv(name);
++    if (value == nullptr) {
++        return fallback;
++    }
++    char* end = nullptr;
++    const unsigned long long number = std::strtoull(value, &end, 10);
++    return end == value || number == 0 ? fallback : static_cast<size_t>(number);
++}
++
++/// Which build runs: the size and write time of the app's eboot (the folders the PS5 app looks
++/// for itself in, headless/storage_paths.h; EDEN_UP_SHADER_PREP_EXE names another file). A build
++/// that is installed again gets a new store even when it translates the same: it costs one
++/// preparation, and a build whose translation changed can never draw with the old one's. "?"
++/// when no eboot is found: then only the comparison at boot tells that the translation changed.
++[[nodiscard]] std::string BuildIdentity() {
++    std::vector<std::filesystem::path> candidates;
++    if (const char* const named = std::getenv("EDEN_UP_SHADER_PREP_EXE")) {
++        candidates.emplace_back(named);
++    }
++    for (const char* const folder : {"/app0", "/system_ex/app/PPSA98515",
++                                     "/data/homebrew/PPSA98515",
++                                     "/mnt/sandbox/PPSA98515_000/app0"}) {
++        candidates.emplace_back(std::filesystem::path{folder} / "eboot.bin");
++    }
++    for (const auto& candidate : candidates) {
++        std::error_code error;
++        const auto size = std::filesystem::file_size(candidate, error);
++        if (error) {
++            continue;
++        }
++        const auto written = std::filesystem::last_write_time(candidate, error);
++        if (error) {
++            continue;
++        }
++        return fmt::format("{}.{}", size,
++                           static_cast<long long>(written.time_since_epoch().count()));
++    }
++    return "?";
++}
++
++[[nodiscard]] u64 HashBytes(std::span<const u8> bytes) {
++    return Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
++}
++
++// --- Shader::Info -------------------------------------------------------------------------------
++
++// Every field of Info is listed in VisitInfo below. An info that grows a field has to be listed
++// there too: these size checks fail the PS5 build until it is (update the sizes and FormatVersion
++// with it). The descriptors are held in vectors, so a field they grow does not change
++// sizeof(Info): they are checked on their own.
++#if defined(__x86_64__) && defined(__LP64__) && !defined(_WIN32)
++static_assert(sizeof(Shader::Info) == 3120,
++              "Shader::Info changed: list the new fields in VisitInfo, then update this size");
++static_assert(sizeof(Shader::ConstantBufferDescriptor) == 8 &&
++                  sizeof(Shader::StorageBufferDescriptor) == 20 &&
++                  sizeof(Shader::TextureBufferDescriptor) == 40 &&
++                  sizeof(Shader::ImageBufferDescriptor) == 28 &&
++                  sizeof(Shader::TextureDescriptor) == 44 &&
++                  sizeof(Shader::ImageDescriptor) == 32 &&
++                  sizeof(Shader::StorageWriteExtent) == 60 &&
++                  sizeof(Shader::StorageWriteExtentEntry) == 72,
++              "A Shader::Info descriptor changed: list the new fields in its Visit function");
++#endif
++
++struct Writer {
++    std::vector<u8>& out;
++
++    template <typename T>
++        requires(std::is_arithmetic_v<T> || std::is_enum_v<T>)
++    void operator()(const T& value) {
++        const auto* const bytes = reinterpret_cast<const u8*>(&value);
++        out.insert(out.end(), bytes, bytes + sizeof(T));
++    }
++    void operator()(const bool& value) {
++        out.push_back(value ? u8{1} : u8{0});
++    }
++    template <typename T, size_t N>
++    void operator()(const std::array<T, N>& values) {
++        for (const T& value : values) {
++            (*this)(value);
++        }
++    }
++    template <size_t N>
++    void operator()(const std::bitset<N>& bits) {
++        for (size_t word = 0; word < (N + 63) / 64; ++word) {
++            u64 value = 0;
++            for (size_t bit = 0; bit < 64 && word * 64 + bit < N; ++bit) {
++                value |= u64{bits[word * 64 + bit]} << bit;
++            }
++            (*this)(value);
++        }
++    }
++    void operator()(const Shader::VaryingState& state) {
++        (*this)(state.mask);
++    }
++    template <typename K, typename V>
++    void operator()(const std::map<K, V>& map) {
++        (*this)(static_cast<u32>(map.size()));
++        for (const auto& [key, value] : map) {
++            (*this)(key);
++            (*this)(value);
++        }
++    }
++    void operator()(const std::vector<std::vector<u32>>& lists) {
++        (*this)(static_cast<u32>(lists.size()));
++        for (const auto& list : lists) {
++            (*this)(static_cast<u32>(list.size()));
++            for (const u32 value : list) {
++                (*this)(value);
++            }
++        }
++    }
++};
++
++struct Reader {
++    std::span<const u8>& in;
++
++    template <typename T>
++        requires(std::is_arithmetic_v<T> || std::is_enum_v<T>)
++    void operator()(T& value) {
++        if (in.size() < sizeof(T)) {
++            throw std::out_of_range{"shader info"};
++        }
++        std::memcpy(&value, in.data(), sizeof(T));
++        in = in.subspan(sizeof(T));
++    }
++    void operator()(bool& value) {
++        if (in.empty() || in[0] > 1) {
++            throw std::out_of_range{"shader info"};
++        }
++        value = in[0] != 0;
++        in = in.subspan(1);
++    }
++    template <typename T, size_t N>
++    void operator()(std::array<T, N>& values) {
++        for (T& value : values) {
++            (*this)(value);
++        }
++    }
++    template <size_t N>
++    void operator()(std::bitset<N>& bits) {
++        for (size_t word = 0; word < (N + 63) / 64; ++word) {
++            u64 value = 0;
++            (*this)(value);
++            for (size_t bit = 0; bit < 64 && word * 64 + bit < N; ++bit) {
++                bits[word * 64 + bit] = ((value >> bit) & 1) != 0;
++            }
++        }
++    }
++    void operator()(Shader::VaryingState& state) {
++        (*this)(state.mask);
++    }
++    template <typename K, typename V>
++    void operator()(std::map<K, V>& map) {
++        u32 count{};
++        (*this)(count);
++        if (count > in.size()) {
++            throw std::out_of_range{"shader info"};
++        }
++        map.clear();
++        for (u32 i = 0; i < count; ++i) {
++            K key{};
++            V value{};
++            (*this)(key);
++            (*this)(value);
++            map.emplace(key, value);
++        }
++    }
++    void operator()(std::vector<std::vector<u32>>& lists) {
++        u32 count{};
++        (*this)(count);
++        if (count > in.size()) {
++            throw std::out_of_range{"shader info"};
++        }
++        lists.assign(count, {});
++        for (auto& list : lists) {
++            u32 size{};
++            (*this)(size);
++            if (size > in.size() / sizeof(u32)) {
++                throw std::out_of_range{"shader info"};
++            }
++            list.resize(size);
++            for (u32& value : list) {
++                (*this)(value);
++            }
++        }
++    }
++};
++
++template <typename Io, typename D>
++void VisitConstantBuffer(Io& io, D& d) {
++    io(d.index);
++    io(d.count);
++}
++template <typename Io, typename D>
++void VisitStorageBuffer(Io& io, D& d) {
++    io(d.cbuf_index);
++    io(d.cbuf_offset);
++    io(d.count);
++    io(d.is_written);
++    io(d.indirect_offset);
++}
++/// EDEN_UP_FRITCHII_WRITEMARK's proven store extents (0475).
++template <typename Io, typename D>
++void VisitWriteExtentEntry(Io& io, D& d) {
++    io(d.cbuf_index);
++    io(d.cbuf_offset);
++    io(d.indirect_offset);
++    io(d.extent.bounded);
++    io(d.extent.guarded);
++    io(d.extent.const_end);
++    io(d.extent.local_stride);
++    io(d.extent.group_stride);
++    io(d.extent.guard_const);
++    io(d.extent.guard_local_stride);
++    io(d.extent.guard_group_stride);
++}
++template <typename Io, typename D>
++void VisitTextureBuffer(Io& io, D& d) {
++    io(d.has_secondary);
++    io(d.cbuf_index);
++    io(d.cbuf_offset);
++    io(d.shift_left);
++    io(d.secondary_cbuf_index);
++    io(d.secondary_cbuf_offset);
++    io(d.secondary_shift_left);
++    io(d.count);
++    io(d.size_shift);
++    io(d.handle_program);
++}
++template <typename Io, typename D>
++void VisitImageBuffer(Io& io, D& d) {
++    io(d.format);
++    io(d.is_written);
++    io(d.is_read);
++    io(d.is_integer);
++    io(d.cbuf_index);
++    io(d.cbuf_offset);
++    io(d.count);
++    io(d.size_shift);
++    io(d.handle_program);
++}
++template <typename Io, typename D>
++void VisitTexture(Io& io, D& d) {
++    io(d.type);
++    io(d.is_depth);
++    io(d.is_multisample);
++    io(d.is_integer);
++    io(d.has_secondary);
++    io(d.cbuf_index);
++    io(d.cbuf_offset);
++    io(d.shift_left);
++    io(d.secondary_cbuf_index);
++    io(d.secondary_cbuf_offset);
++    io(d.secondary_shift_left);
++    io(d.count);
++    io(d.size_shift);
++    io(d.handle_program);
++}
++template <typename Io, typename D>
++void VisitImage(Io& io, D& d) {
++    io(d.type);
++    io(d.format);
++    io(d.is_written);
++    io(d.is_read);
++    io(d.is_integer);
++    io(d.cbuf_index);
++    io(d.cbuf_offset);
++    io(d.count);
++    io(d.size_shift);
++    io(d.handle_program);
++}
++
++template <typename Io, typename D>
++void VisitAnyDescriptor(Io& io, D& d) {
++    using T = std::remove_const_t<D>;
++    if constexpr (std::is_same_v<T, Shader::ConstantBufferDescriptor>) {
++        VisitConstantBuffer(io, d);
++    } else if constexpr (std::is_same_v<T, Shader::StorageBufferDescriptor>) {
++        VisitStorageBuffer(io, d);
++    } else if constexpr (std::is_same_v<T, Shader::StorageWriteExtentEntry>) {
++        VisitWriteExtentEntry(io, d);
++    } else if constexpr (std::is_same_v<T, Shader::TextureBufferDescriptor>) {
++        VisitTextureBuffer(io, d);
++    } else if constexpr (std::is_same_v<T, Shader::ImageBufferDescriptor>) {
++        VisitImageBuffer(io, d);
++    } else if constexpr (std::is_same_v<T, Shader::TextureDescriptor>) {
++        VisitTexture(io, d);
++    } else {
++        static_assert(std::is_same_v<T, Shader::ImageDescriptor>);
++        VisitImage(io, d);
++    }
++}
++
++/// The descriptor lists (boost static_vector and small_vector, std::vector).
++template <typename Container>
++void VisitDescriptors(Writer& io, const Container& descriptors) {
++    io(static_cast<u32>(descriptors.size()));
++    for (const auto& descriptor : descriptors) {
++        VisitAnyDescriptor(io, descriptor);
++    }
++}
++template <typename Container>
++void VisitDescriptors(Reader& io, Container& descriptors) {
++    u32 count{};
++    io(count);
++    if (count > descriptors.max_size() || count > io.in.size()) {
++        throw std::out_of_range{"shader info"};
++    }
++    descriptors.clear();
++    for (u32 i = 0; i < count; ++i) {
++        auto& descriptor = descriptors.emplace_back();
++        VisitAnyDescriptor(io, descriptor);
++    }
++}
++
++template <typename Io, typename I>
++void VisitInfo(Io& io, I& info) {
++    io(info.is_task);
++    io(info.is_mesh);
++    io(info.uses_workgroup_id);
++    io(info.uses_local_invocation_id);
++    io(info.uses_invocation_id);
++    io(info.uses_invocation_info);
++    io(info.uses_sample_id);
++    io(info.uses_is_helper_invocation);
++    io(info.uses_subgroup_invocation_id);
++    io(info.uses_subgroup_shuffles);
++    io(info.uses_software_matrix);
++    io(info.uses_quad_shuffles);
++    io(info.uses_patches);
++    io(info.interpolation);
++    io(info.loads);
++    io(info.stores);
++    io(info.passthrough);
++    io(info.legacy_stores_mapping);
++    io(info.loads_indexed_attributes);
++    io(info.stores_frag_color);
++    io(info.frag_color_components);
++    io(info.stores_sample_mask);
++    io(info.stores_frag_depth);
++    io(info.stores_tess_level_outer);
++    io(info.stores_tess_level_inner);
++    io(info.stores_indexed_attributes);
++    io(info.stores_global_memory);
++    io(info.uses_local_memory);
++    io(info.uses_fp16);
++    io(info.uses_fp64);
++    io(info.uses_fp16_denorms_flush);
++    io(info.uses_fp16_denorms_preserve);
++    io(info.uses_fp32_denorms_flush);
++    io(info.uses_fp32_denorms_preserve);
++    io(info.uses_int8);
++    io(info.uses_int16);
++    io(info.uses_int64);
++    io(info.uses_image_1d);
++    io(info.uses_sampled_1d);
++    io(info.uses_sparse_residency);
++    io(info.uses_demote_to_helper_invocation);
++    io(info.uses_subgroup_vote);
++    io(info.uses_subgroup_mask);
++    io(info.uses_fswzadd);
++    io(info.uses_derivatives);
++    io(info.uses_typeless_image_reads);
++    io(info.uses_typeless_image_writes);
++    io(info.uses_image_buffers);
++    io(info.uses_shared_increment);
++    io(info.uses_shared_decrement);
++    io(info.uses_global_increment);
++    io(info.uses_global_decrement);
++    io(info.uses_atomic_f32_add);
++    io(info.uses_atomic_f16x2_add);
++    io(info.uses_atomic_f16x2_min);
++    io(info.uses_atomic_f16x2_max);
++    io(info.uses_atomic_f32x2_add);
++    io(info.uses_atomic_f32x2_min);
++    io(info.uses_atomic_f32x2_max);
++    io(info.uses_atomic_s32_min);
++    io(info.uses_atomic_s32_max);
++    io(info.uses_int64_bit_atomics);
++    io(info.uses_global_memory);
++    io(info.native_global_bounds);
++    io(info.uses_atomic_image_u32);
++    io(info.uses_shadow_lod);
++    io(info.uses_rescaling_uniform);
++    io(info.uses_cbuf_indirect);
++    io(info.uses_render_area);
++    io(info.used_constant_buffer_types);
++    io(info.used_storage_buffer_types);
++    io(info.used_indirect_cbuf_types);
++    io(info.constant_buffer_mask);
++    io(info.constant_buffer_used_sizes);
++    io(info.nvn_buffer_base);
++    io(info.nvn_buffer_used);
++    io(info.requires_layer_emulation);
++    io(info.emulated_layer);
++    io(info.used_clip_distances);
++    VisitDescriptors(io, info.constant_buffer_descriptors);
++    VisitDescriptors(io, info.storage_buffers_descriptors);
++    VisitDescriptors(io, info.texture_buffer_descriptors);
++    VisitDescriptors(io, info.image_buffer_descriptors);
++    VisitDescriptors(io, info.texture_descriptors);
++    io(info.handle_programs);
++    VisitDescriptors(io, info.image_descriptors);
++    VisitDescriptors(io, info.storage_write_extents);
++}
++
++// --- Files --------------------------------------------------------------------------------------
++
++template <typename T>
++void Put(std::vector<u8>& out, const T& value) {
++    const auto* const bytes = reinterpret_cast<const u8*>(&value);
++    out.insert(out.end(), bytes, bytes + sizeof(T));
++}
++
++template <typename T>
++[[nodiscard]] bool Get(std::span<const u8>& in, T& value) {
++    if (in.size() < sizeof(T)) {
++        return false;
++    }
++    std::memcpy(&value, in.data(), sizeof(T));
++    in = in.subspan(sizeof(T));
++    return true;
++}
++
++[[nodiscard]] bool ReadWholeFile(const std::filesystem::path& path, std::vector<u8>& bytes) try {
++    std::error_code error;
++    const auto size = std::filesystem::file_size(path, error);
++    // An index of 130,000 pipelines is about 16 MiB.
++    if (error || size > (u64{1} << 28)) {
++        return false;
++    }
++    std::ifstream file{path, std::ios::binary};
++    bytes.resize(static_cast<size_t>(size));
++    return static_cast<bool>(
++        file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)));
++} catch (const std::exception&) {
++    return false;
++}
++
++/// Written beside the file, then renamed over it: a kill mid-write keeps the previous one.
++[[nodiscard]] bool WriteWholeFile(const std::filesystem::path& path, std::span<const u8> bytes) {
++    auto partial = path;
++    partial += ".part";
++    std::error_code error;
++    {
++        std::ofstream file{partial, std::ios::binary | std::ios::trunc};
++        if (!file.write(reinterpret_cast<const char*>(bytes.data()),
++                        static_cast<std::streamsize>(bytes.size())) ||
++            !file.flush()) {
++            file.close();
++            std::filesystem::remove(partial, error);
++            return false;
++        }
++    }
++    std::filesystem::rename(partial, path, error);
++    if (error) {
++        std::filesystem::remove(partial, error);
++        return false;
++    }
++    return true;
++}
++
++/// prep_stores.txt lists the stores of this folder, the one used last first. Stores past the
++/// third are removed. (A list, since the console's file system is not walked from here.)
++void RememberStore(const std::filesystem::path& dir, const std::string& name) {
++    const auto list_path = dir / "prep_stores.txt";
++    std::vector<std::string> names{name};
++    {
++        std::ifstream list{list_path};
++        std::string line;
++        while (std::getline(list, line)) {
++            const bool plain = !line.empty() && line.size() < 64 &&
++                               line.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") ==
++                                   std::string::npos;
++            if (plain && std::ranges::find(names, line) == names.end()) {
++                names.push_back(line);
++            }
++        }
++    }
++    std::error_code error;
++    while (names.size() > StoresKept) {
++        for (const char* const extension : {".bin", ".idx", ".idx.part", ".inflight", ".strikes"}) {
++            std::filesystem::remove(dir / (names.back() + extension), error);
++        }
++        names.pop_back();
++    }
++    std::string text;
++    for (const std::string& entry : names) {
++        text += entry;
++        text += '\n';
++    }
++    (void)WriteWholeFile(list_path, std::span<const u8>{reinterpret_cast<const u8*>(text.data()),
++                                                        text.size()});
++}
++
++} // Anonymous namespace
++
++bool Enabled() {
++    static const bool enabled = SwitchIs("EDEN_UP_SHADER_PREP", '1');
++    return enabled;
++}
++
++bool FastPath() {
++    static const bool fast = !SwitchIs("EDEN_UP_SHADER_PREP_FAST", '0');
++    return fast;
++}
++
++bool Verify() {
++    static const bool verify = SwitchIs("EDEN_UP_SHADER_PREP_VERIFY", '1');
++    return verify;
++}
++
++u32 LogEvery() {
++    static const u32 every = static_cast<u32>(
++        std::clamp<size_t>(SwitchNumber("EDEN_UP_SHADER_PREP_LOG", 256), 1, 1U << 30));
++    return every;
++}
++
++size_t MaxPerBoot() {
++    // A cache that grew over many builds can hold tens of thousands of records (48,000 seen):
++    // the first boot does not sit through all of them.
++    static const size_t most = SwitchNumber("EDEN_UP_SHADER_PREP_MAX", 5000);
++    return most;
++}
++
++void SerializeInfo(const Shader::Info& info, std::vector<u8>& out) {
++    Writer writer{out};
++    VisitInfo(writer, info);
++}
++
++bool DeserializeInfo(std::span<const u8> in, Shader::Info& info) {
++    try {
++        Reader reader{in};
++        VisitInfo(reader, info);
++        return in.empty();
++    } catch (const std::out_of_range&) {
++        return false;
++    } catch (const std::bad_alloc&) {
++        return false;
++    } catch (const std::length_error&) {
++        return false;
++    }
++}
++
++u64 HashSpirv(std::span<const u32> words) {
++    return Common::CityHash64(reinterpret_cast<const char*>(words.data()),
++                              words.size() * sizeof(u32));
++}
++
++std::string MakeStamp(u32 cache_version, u32 driver_id, u32 driver_version) {
++    // FNV-1a over NAME=VALUE of the switches that are set.
++    u64 hash = 0xcbf29ce484222325ULL;
++    const auto mix = [&hash](std::string_view text) {
++        for (const char c : text) {
++            hash = (hash ^ static_cast<u8>(c)) * 0x100000001b3ULL;
++        }
++    };
++    u32 set = 0;
++    for (const char* const name : TranslationSwitches) {
++        if (const char* const value = std::getenv(name)) {
++            mix(name);
++            mix("=");
++            mix(value);
++            mix("\n");
++            ++set;
++        }
++    }
++    // The settings the translation reads (shader_recompiler: rescaling_pass.cpp,
++    // translate_program.cpp, emit_spirv.cpp, emit_spirv_image.cpp). A switch or setting that is
++    // missed here is still noticed by the comparison at boot when it changes a compared pipeline.
++    const auto& values = Settings::values;
++    const auto& scale = values.resolution_info;
++    const std::string settings =
++        fmt::format("{}.{}.{:08x}.{:08x}.{}{}{}{}{}", scale.up_scale, scale.down_shift,
++                    std::bit_cast<u32>(scale.up_factor), std::bit_cast<u32>(scale.down_factor),
++                    scale.active ? 1 : 0, scale.downscale ? 1 : 0,
++                    static_cast<bool>(values.fix_bloom_effects.GetValue()) ? 1 : 0,
++                    static_cast<bool>(values.disable_shader_loop_safety_checks) ? 1 : 0,
++                    static_cast<bool>(values.renderer_debug) ? 1 : 0);
++    return fmt::format("prep{} cache{} driver{:x}.{:x} info{} exe{} settings{} switches{}:{:016x}",
++                       FormatVersion, cache_version, driver_id, driver_version,
++                       sizeof(Shader::Info), BuildIdentity(), settings, set, hash);
++}
++
++std::string KeptStore::Header() const {
++    std::string header{DataMagic};
++    const u32 version = FormatVersion;
++    const u32 size = static_cast<u32>(stamp.size());
++    header.append(reinterpret_cast<const char*>(&version), sizeof(version));
++    header.append(reinterpret_cast<const char*>(&size), sizeof(size));
++    header += stamp;
++    return header;
++}
++
++bool KeptStore::StartEmpty() {
++    blobs.clear();
++    records.clear();
++    for (auto& map : by_hash) {
++        map.clear();
++    }
++    dedupe_ready = true;
++    uncommitted = 0;
++    std::error_code error;
++    std::filesystem::remove(index_path, error);
++    const std::string header = Header();
++    std::ofstream file{data_path, std::ios::binary | std::ios::trunc};
++    if (!file.write(header.data(), static_cast<std::streamsize>(header.size())) || !file.flush()) {
++        return false;
++    }
++    data_end = header.size();
++    return true;
++}
++
++bool KeptStore::LoadIndex() {
++    std::vector<u8> bytes;
++    if (!ReadWholeFile(index_path, bytes)) {
++        return false;
++    }
++    std::span<const u8> in{bytes};
++    if (in.size() < IndexMagic.size() ||
++        std::memcmp(in.data(), IndexMagic.data(), IndexMagic.size()) != 0) {
++        return false;
++    }
++    // The last eight bytes are the hash of everything before them.
++    if (in.size() < IndexMagic.size() + sizeof(u64)) {
++        return false;
++    }
++    {
++        u64 stored{};
++        std::memcpy(&stored, in.data() + in.size() - sizeof(u64), sizeof(u64));
++        in = in.first(in.size() - sizeof(u64));
++        if (HashBytes(in) != stored) {
++            return false;
++        }
++    }
++    in = in.subspan(IndexMagic.size());
++    u32 version{}, stamp_size{}, record_count{}, blob_count{};
++    u64 end{};
++    if (!Get(in, version) || version != FormatVersion || !Get(in, stamp_size) ||
++        stamp_size != stamp.size() || in.size() < stamp_size ||
++        std::memcmp(in.data(), stamp.data(), stamp_size) != 0) {
++        return false;
++    }
++    in = in.subspan(stamp_size);
++    if (!Get(in, end) || !Get(in, record_count) || !Get(in, blob_count)) {
++        return false;
++    }
++    constexpr size_t BlobBytes = 8 + 8 + 4 + 4 + 4 + 4;
++    constexpr size_t RecordBytes = 8 + 4 + 4 + 3 * NumStages * 4;
++    if (in.size() != u64{blob_count} * BlobBytes + u64{record_count} * RecordBytes) {
++        return false;
++    }
++    const std::string header = Header();
++    std::vector<Blob> loaded_blobs;
++    std::unordered_map<u64, Record> loaded_records;
++    try {
++        loaded_blobs.resize(blob_count);
++        for (Blob& blob : loaded_blobs) {
++            u32 pad{};
++            if (!Get(in, blob.offset) || !Get(in, blob.hash) || !Get(in, blob.size) ||
++                !Get(in, blob.raw_size) || !Get(in, blob.kind) || !Get(in, pad) ||
++                blob.kind >= KindCount || blob.offset < header.size() || blob.offset > end ||
++                blob.size > end - blob.offset) {
++                return false;
++            }
++        }
++        loaded_records.reserve(record_count);
++        for (u32 i = 0; i < record_count; ++i) {
++            u64 key_hash{};
++            Record record;
++            if (!Get(in, key_hash) || !Get(in, record.env_count) || !Get(in, record.flags) ||
++                !Get(in, record.infos) || !Get(in, record.spirv) || !Get(in, record.answers) ||
++                record.env_count > NumStages ||
++                (record.env_count == 0) != ((record.flags & FlagNotKeepable) != 0)) {
++                return false;
++            }
++            const auto listed = [&](u32 blob, u32 kind) {
++                return blob == NoBlob || (blob < blob_count && loaded_blobs[blob].kind == kind);
++            };
++            for (size_t stage = 0; stage < NumStages; ++stage) {
++                if (!listed(record.infos[stage], KindInfo) || !listed(record.spirv[stage], KindSpirv) ||
++                    !listed(record.answers[stage], KindAnswers)) {
++                    return false;
++                }
++            }
++            loaded_records.emplace(key_hash, record);
++        }
++    } catch (const std::bad_alloc&) {
++        return false;
++    } catch (const std::length_error&) {
++        return false;
++    }
++    // The blob file must be this stamp's and hold at least what the index lists. What it holds
++    // past that was written by a run that ended before its index: cut off.
++    std::error_code error;
++    const auto data_size = std::filesystem::file_size(data_path, error);
++    if (error || data_size < end || end < header.size()) {
++        return false;
++    }
++    {
++        std::ifstream file{data_path, std::ios::binary};
++        std::string found(header.size(), '\0');
++        if (!file.read(found.data(), static_cast<std::streamsize>(found.size())) ||
++            found != header) {
++            return false;
++        }
++    }
++    if (data_size > end) {
++        std::filesystem::resize_file(data_path, end, error);
++        if (error) {
++            return false;
++        }
++    }
++    blobs = std::move(loaded_blobs);
++    records = std::move(loaded_records);
++    for (auto& map : by_hash) {
++        map.clear();
++    }
++    dedupe_ready = false;
++    data_end = end;
++    uncommitted = 0;
++    return true;
++}
++
++void KeptStore::EnsureDedupe() {
++    if (dedupe_ready) {
++        return;
++    }
++    for (auto& map : by_hash) {
++        map.clear();
++    }
++    for (u32 id = 0; id < blobs.size(); ++id) {
++        const Blob& blob = blobs[id];
++        by_hash[blob.kind].emplace(blob.hash + u64{blob.raw_size} * 0x9E3779B97F4A7C15ULL, id);
++    }
++    dedupe_ready = true;
++}
++
++void KeptStore::Compact() {
++    std::scoped_lock lock{mutex};
++    for (auto& map : by_hash) {
++        std::unordered_map<u64, u32>{}.swap(map);
++    }
++    dedupe_ready = false;
++}
++
++bool KeptStore::Open(const std::filesystem::path& dir, const std::string& stamp_) {
++    std::scoped_lock lock{mutex};
++    open = false;
++    stamp = stamp_;
++    const u64 id = Common::CityHash64(stamp.data(), stamp.size());
++    const std::string name = fmt::format("prep_{:08x}", static_cast<u32>(id));
++    data_path = dir / (name + ".bin");
++    index_path = dir / (name + ".idx");
++    RememberStore(dir, name);
++    data.close();
++    data.clear();
++    reader.close();
++    reader.clear();
++    if (!LoadIndex() && !StartEmpty()) {
++        LOG_WARNING(Render_Vulkan, "Shader preparation: cannot write {}",
++                    Common::FS::PathToUTF8String(data_path));
++        return false;
++    }
++    data.open(data_path, std::ios::binary | std::ios::app);
++    if (!data) {
++        LOG_WARNING(Render_Vulkan, "Shader preparation: cannot open {}",
++                    Common::FS::PathToUTF8String(data_path));
++        return false;
++    }
++    open = true;
++    return true;
++}
++
++size_t KeptStore::Size() const {
++    std::scoped_lock lock{mutex};
++    return records.size();
++}
++
++u64 KeptStore::DataBytes() const {
++    std::scoped_lock lock{mutex};
++    return data_end;
++}
++
++size_t KeptStore::Uncommitted() const {
++    std::scoped_lock lock{mutex};
++    return uncommitted;
++}
++
++std::filesystem::path KeptStore::Sidecar(const char* extension) const {
++    std::scoped_lock lock{mutex};
++    auto path = data_path;
++    path.replace_extension(extension);
++    return path;
++}
++
++bool KeptStore::Contains(u64 key_hash) const {
++    std::scoped_lock lock{mutex};
++    return records.contains(key_hash);
++}
++
++bool KeptStore::IsKept(u64 key_hash) const {
++    std::scoped_lock lock{mutex};
++    const auto it = records.find(key_hash);
++    return it != records.end() && (it->second.flags & FlagNotKeepable) == 0;
++}
++
++bool KeptStore::IsPredicted(u64 key_hash) const {
++    std::scoped_lock lock{mutex};
++    const auto it = records.find(key_hash);
++    return it != records.end() && (it->second.flags & FlagPredicted) != 0;
++}
++
++void KeptStore::AddNotKeepable(u64 key_hash) {
++    std::scoped_lock lock{mutex};
++    if (!open || records.contains(key_hash)) {
++        return;
++    }
++    Record record;
++    record.flags = FlagNotKeepable;
++    records.emplace(key_hash, record);
++    ++uncommitted;
++}
++
++bool KeptStore::Find(u64 key_hash, Record& record) const {
++    std::scoped_lock lock{mutex};
++    const auto it = records.find(key_hash);
++    if (it == records.end()) {
++        return false;
++    }
++    record = it->second;
++    return true;
++}
++
++bool KeptStore::Read(u32 id, std::vector<u8>& out) {
++    std::scoped_lock lock{mutex};
++    if (!open || id >= blobs.size()) {
++        return false;
++    }
++    const Blob blob = blobs[id];
++    try {
++        if (uncommitted != 0) {
++            data.flush();
++        }
++        if (!reader.is_open()) {
++            reader.open(data_path, std::ios::binary);
++        }
++        reader.clear();
++        reader.seekg(static_cast<std::streamoff>(blob.offset));
++        std::vector<u8> stored(blob.size);
++        if (!reader.read(reinterpret_cast<char*>(stored.data()),
++                         static_cast<std::streamsize>(stored.size()))) {
++            reader.close();
++            return false;
++        }
++        if (blob.kind == KindSpirv) {
++            auto words = Common::Compression::TryDecompressDataZSTD(stored, blob.raw_size);
++            if (!words || words->size() != blob.raw_size || words->size() % sizeof(u32) != 0) {
++                return false;
++            }
++            out = std::move(*words);
++        } else {
++            out = std::move(stored);
++        }
++    } catch (const std::exception&) {
++        return false;
++    }
++    return HashBytes(out) == blob.hash;
++}
++
++bool KeptStore::SameSpirv(u64 key_hash, const Stages& stages) const {
++    std::scoped_lock lock{mutex};
++    const auto it = records.find(key_hash);
++    if (it == records.end() || (it->second.flags & FlagNotKeepable) != 0) {
++        return false;
++    }
++    for (size_t stage = 0; stage < NumStages; ++stage) {
++        const u32 id = it->second.spirv[stage];
++        if ((id != NoBlob) != stages.present[stage]) {
++            return false;
++        }
++        if (id == NoBlob) {
++            continue;
++        }
++        const Blob& blob = blobs[id];
++        if (blob.raw_size != stages.spirv[stage].size() * sizeof(u32) ||
++            blob.hash != HashSpirv(stages.spirv[stage])) {
++            return false;
++        }
++    }
++    return true;
++}
++
++u32 KeptStore::Keep(u32 kind, u64 hash, std::span<const u8> bytes, u32 raw_size) {
++    const u64 key = hash + u64{raw_size} * 0x9E3779B97F4A7C15ULL;
++    if (const auto it = by_hash[kind].find(key); it != by_hash[kind].end()) {
++        return it->second;
++    }
++    if (!data.write(reinterpret_cast<const char*>(bytes.data()),
++                    static_cast<std::streamsize>(bytes.size()))) {
++        // The disk is full or gone: nothing more is kept this session; what the index lists stays.
++        open = false;
++        LOG_WARNING(Render_Vulkan, "Shader preparation: write to {} failed, keeping stops",
++                    Common::FS::PathToUTF8String(data_path));
++        return NoBlob;
++    }
++    const u32 id = static_cast<u32>(blobs.size());
++    blobs.push_back(Blob{.offset = data_end,
++                         .hash = hash,
++                         .size = static_cast<u32>(bytes.size()),
++                         .raw_size = raw_size,
++                         .kind = kind});
++    data_end += bytes.size();
++    by_hash[kind].emplace(key, id);
++    return id;
++}
++
++void KeptStore::Add(u64 key_hash, const Stages& stages, std::span<const std::vector<u8>> answers,
++                    u32 flags) {
++    if (stages.unsuitable || answers.empty() || answers.size() > NumStages) {
++        return;
++    }
++    // Serialized and compressed outside the lock: the workers add in parallel.
++    std::array<std::vector<u8>, NumStages> infos;
++    std::array<std::vector<u8>, NumStages> packed;
++    std::array<u64, NumStages> info_hash{};
++    std::array<u64, NumStages> spirv_hash{};
++    bool any = false;
++    for (size_t stage = 0; stage < NumStages; ++stage) {
++        if (!stages.present[stage]) {
++            continue;
++        }
++        const auto& words = stages.spirv[stage];
++        if (words.empty() || words.size() > (u64{1} << 28)) {
++            return;
++        }
++        SerializeInfo(stages.infos[stage], infos[stage]);
++        info_hash[stage] = HashBytes(infos[stage]);
++        spirv_hash[stage] = HashSpirv(words);
++        packed[stage] = Common::Compression::CompressDataZSTD(
++            reinterpret_cast<const u8*>(words.data()), words.size() * sizeof(u32), 3);
++        if (packed[stage].empty()) {
++            return;
++        }
++        any = true;
++    }
++    if (!any) {
++        return;
++    }
++    std::scoped_lock lock{mutex};
++    if (!open || records.contains(key_hash)) {
++        return;
++    }
++    EnsureDedupe();
++    Record record;
++    record.flags = flags & ~FlagNotKeepable;
++    record.env_count = static_cast<u32>(answers.size());
++    for (size_t stage = 0; stage < NumStages; ++stage) {
++        if (!stages.present[stage]) {
++            continue;
++        }
++        record.infos[stage] = Keep(KindInfo, info_hash[stage], infos[stage],
++                                   static_cast<u32>(infos[stage].size()));
++        record.spirv[stage] =
++            Keep(KindSpirv, spirv_hash[stage], packed[stage],
++                 static_cast<u32>(stages.spirv[stage].size() * sizeof(u32)));
++        if (record.infos[stage] == NoBlob || record.spirv[stage] == NoBlob) {
++            return;
++        }
++    }
++    for (size_t i = 0; i < answers.size(); ++i) {
++        record.answers[i] = Keep(KindAnswers, HashBytes(answers[i]), answers[i],
++                                 static_cast<u32>(answers[i].size()));
++        if (record.answers[i] == NoBlob) {
++            return;
++        }
++    }
++    records.emplace(key_hash, record);
++    ++uncommitted;
++}
++
++void KeptStore::Forget(u64 key_hash) {
++    std::scoped_lock lock{mutex};
++    records.erase(key_hash);
++}
++
++bool KeptStore::Commit() {
++    std::scoped_lock lock{mutex};
++    if (!open) {
++        return false;
++    }
++    if (!data.flush()) {
++        open = false;
++        return false;
++    }
++    std::vector<u8> out;
++    out.reserve(64 + stamp.size() + blobs.size() * 32 + records.size() * 76);
++    out.insert(out.end(), IndexMagic.begin(), IndexMagic.end());
++    Put(out, FormatVersion);
++    Put(out, static_cast<u32>(stamp.size()));
++    out.insert(out.end(), stamp.begin(), stamp.end());
++    Put(out, data_end);
++    Put(out, static_cast<u32>(records.size()));
++    Put(out, static_cast<u32>(blobs.size()));
++    for (const Blob& blob : blobs) {
++        Put(out, blob.offset);
++        Put(out, blob.hash);
++        Put(out, blob.size);
++        Put(out, blob.raw_size);
++        Put(out, blob.kind);
++        Put(out, u32{0});
++    }
++    for (const auto& [key_hash, record] : records) {
++        Put(out, key_hash);
++        Put(out, record.env_count);
++        Put(out, record.flags);
++        Put(out, record.infos);
++        Put(out, record.spirv);
++        Put(out, record.answers);
++    }
++    Put(out, HashBytes(out));
++    if (!WriteWholeFile(index_path, out)) {
++        LOG_WARNING(Render_Vulkan, "Shader preparation: cannot write {}",
++                    Common::FS::PathToUTF8String(index_path));
++        return false;
++    }
++    uncommitted = 0;
++    return true;
++}
++
++void KeptStore::Reset() {
++    std::scoped_lock lock{mutex};
++    data.close();
++    data.clear();
++    reader.close();
++    reader.clear();
++    open = false;
++    if (!StartEmpty()) {
++        return;
++    }
++    {
++        auto strikes = data_path;
++        strikes.replace_extension(".strikes");
++        std::error_code error;
++        std::filesystem::remove(strikes, error);
++    }
++    data.open(data_path, std::ios::binary | std::ios::app);
++    open = static_cast<bool>(data);
++}
++
++} // namespace Vulkan::ShaderPrep
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.h b/src/video_core/renderer_vulkan/vk_pipeline_prep.h
+new file mode 100644
+index 0000000..32f700b
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.h
+@@ -0,0 +1,187 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// EDEN_UP_SHADER_PREP=1 (default off): shaders are prepared before play.
++//
++// The idea is Fritchii v5's "Preparing shaders" screen, built on zortos293/Lichii#895 (precompile
++// before play, zmckenney) and #896 (draw precompiled pipelines without translating them on the
++// GPU thread, zmckenney). On the PS5 the costly part of a pipeline's first use is not the driver:
++// RADV keeps what it compiled in its disk cache, and a pipeline it has seen builds in 2-3 ms on a
++// worker. It is the translation of the game's shaders to SPIR-V, which runs on the GPU thread
++// (8-18 ms a pipeline, up to 280 ms for a mesh pipeline) every time a pipeline this session has
++// not built is drawn: 255 of the 408 pipeline builds in an 8 minute play session were pipelines
++// the console had drawn before and that had aged out of the list built at boot.
++//
++// So, at boot, every graphics pipeline record of this console's own disk cache (vulkan.bin,
++// vulkan_mesh.bin, and prep_predicted.bin when a later step has made one from the game's files) is
++// translated once on the pipeline workers, built once so RADV's disk cache holds it, and dropped;
++// its SPIR-V, its shader infos and the answers its translation got from the game's state are kept
++// in a file beside the cache. When a draw later needs such a pipeline, the GPU thread checks that
++// the game's state still gives those answers (FileEnvironment answers, shader_environment.h) and
++// creates the pipeline from the kept SPIR-V and infos instead of translating. Anything that does
++// not hold, cannot be read or looks damaged falls back to the translation there was before.
++//
++// Nothing is shared between consoles: every byte comes from this console's own cache files, which
++// come from this player's own game.
++
++#pragma once
++
++#include <array>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <span>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "common/common_types.h"
++#include "shader_recompiler/shader_info.h"
++
++namespace Vulkan::ShaderPrep {
++
++/// Pipeline stages of a graphics pipeline (vertex B to fragment).
++inline constexpr size_t NumStages = 5;
++inline constexpr u32 NoBlob = ~0U;
++
++/// EDEN_UP_SHADER_PREP=1.
++[[nodiscard]] bool Enabled();
++/// EDEN_UP_SHADER_PREP_FAST=0: prepared, but draws translate as before (the control arm).
++[[nodiscard]] bool FastPath();
++/// EDEN_UP_SHADER_PREP_VERIFY=1: a pipeline made from kept SPIR-V is also translated from the
++/// game's state on the GPU thread and compared (slow; a first test, not play).
++[[nodiscard]] bool Verify();
++/// EDEN_UP_SHADER_PREP_LOG=<n>: a progress line every n pipelines while preparing (256).
++[[nodiscard]] u32 LogEvery();
++/// EDEN_UP_SHADER_PREP_MAX=<n>: at most n pipelines are prepared per boot (5000; the rest at
++/// later boots).
++[[nodiscard]] size_t MaxPerBoot();
++
++/// What one translation of a graphics pipeline gave.
++struct Stages {
++    std::array<bool, NumStages> present{};
++    std::array<std::vector<u32>, NumStages> spirv;
++    std::array<Shader::Info, NumStages> infos;
++    /// Its mesh programs run as compute in the emulator, or a stage needs layer emulation: more
++    /// than SPIR-V and infos makes this pipeline, so it is not kept.
++    bool unsuitable{};
++    /// In: build with the driver's own cache only, not the emulator's VkPipelineCache (every
++    /// pipeline that is only being prepared: no draw has asked for it yet).
++    bool driver_cache_only{};
++};
++
++/// Every field of Shader::Info, in a fixed order.
++void SerializeInfo(const Shader::Info& info, std::vector<u8>& out);
++/// False when `in` is not a whole info.
++[[nodiscard]] bool DeserializeInfo(std::span<const u8> in, Shader::Info& info);
++
++/// CityHash64 of SPIR-V words.
++[[nodiscard]] u64 HashSpirv(std::span<const u32> words);
++
++/// What the kept translations depend on besides the records themselves: the cache version, the
++/// driver, the layout of Shader::Info, the installed build (its eboot's size and write time), the
++/// settings the translation reads (resolution scaling, bloom fix, loop safety checks, renderer
++/// debug) and every EDEN_ switch the translation sources and the video core name. Another stamp is
++/// another store (the last three are kept, so test arms do not wipe each other's).
++[[nodiscard]] std::string MakeStamp(u32 cache_version, u32 driver_id, u32 driver_version);
++
++/// The kept translations of one stamp: prep_<stamp hash>.bin holds the blobs, back to back, and is
++/// only ever appended to; prep_<stamp hash>.idx lists the blobs and the pipelines and is written
++/// whole beside itself and renamed, so a kill at any moment leaves the last complete index and at
++/// worst some unlisted bytes at the end of the blob file, which the next start cuts off.
++class KeptStore {
++public:
++    /// Record::flags. Not keepable: the record was tried and cannot be kept (it has no blobs);
++    /// it is remembered so no later start translates it again for nothing.
++    static constexpr u32 FlagNotKeepable = 1;
++    /// From prep_predicted.bin: its answers were guessed, not recorded from a draw.
++    static constexpr u32 FlagPredicted = 2;
++
++    struct Record {
++        std::array<u32, NumStages> infos{NoBlob, NoBlob, NoBlob, NoBlob, NoBlob};
++        std::array<u32, NumStages> spirv{NoBlob, NoBlob, NoBlob, NoBlob, NoBlob};
++        /// Per shader environment of the record, in program order.
++        std::array<u32, NumStages> answers{NoBlob, NoBlob, NoBlob, NoBlob, NoBlob};
++        u32 env_count{};
++        u32 flags{};
++    };
++
++    /// Opens the store of `stamp` in `dir`, or starts an empty one. False: no store this session.
++    bool Open(const std::filesystem::path& dir, const std::string& stamp);
++
++    [[nodiscard]] bool IsOpen() const noexcept {
++        return open;
++    }
++    [[nodiscard]] size_t Size() const;
++    [[nodiscard]] u64 DataBytes() const;
++    /// Known: kept, or remembered as not keepable.
++    [[nodiscard]] bool Contains(u64 key_hash) const;
++    /// Kept with its SPIR-V, infos and answers.
++    [[nodiscard]] bool IsKept(u64 key_hash) const;
++    [[nodiscard]] bool IsPredicted(u64 key_hash) const;
++    [[nodiscard]] bool Find(u64 key_hash, Record& record) const;
++
++    /// One blob, checked against its hash. SPIR-V comes back as its words' bytes.
++    [[nodiscard]] bool Read(u32 blob, std::vector<u8>& out);
++
++    /// Whether the kept SPIR-V of `key_hash` is `stages`' (false also when it is not kept).
++    [[nodiscard]] bool SameSpirv(u64 key_hash, const Stages& stages) const;
++
++    /// Keeps a pipeline. `answers`: one blob per shader environment, in program order.
++    void Add(u64 key_hash, const Stages& stages, std::span<const std::vector<u8>> answers,
++             u32 flags = 0);
++
++    /// Remembers that this record cannot be kept.
++    void AddNotKeepable(u64 key_hash);
++
++    /// Drops a record (its blobs stay in the file); the next Commit writes the index without it.
++    void Forget(u64 key_hash);
++
++    /// The preparation is over: frees what only adding needs.
++    void Compact();
++
++    /// Writes the index. Returns false when it could not be written (the old one stays).
++    bool Commit();
++
++    /// Drops everything kept: the translation changed under the stamp.
++    void Reset();
++
++    /// Pipelines added since the last Commit.
++    [[nodiscard]] size_t Uncommitted() const;
++
++    /// A file beside this stamp's store (prep_<stamp hash><extension>), removed with it.
++    [[nodiscard]] std::filesystem::path Sidecar(const char* extension) const;
++
++private:
++    struct Blob {
++        u64 offset{};
++        u64 hash{};
++        u32 size{};
++        u32 raw_size{};
++        u32 kind{};
++    };
++    enum : u32 { KindInfo = 0, KindSpirv = 1, KindAnswers = 2, KindCount = 3 };
++
++    [[nodiscard]] u32 Keep(u32 kind, u64 hash, std::span<const u8> bytes, u32 raw_size);
++    void EnsureDedupe();
++    [[nodiscard]] bool StartEmpty();
++    [[nodiscard]] bool LoadIndex();
++    [[nodiscard]] std::string Header() const;
++
++    mutable std::mutex mutex;
++    bool open{};
++    std::string stamp;
++    std::filesystem::path data_path;
++    std::filesystem::path index_path;
++    std::ofstream data;
++    std::ifstream reader;
++    u64 data_end{};
++    size_t uncommitted{};
++    std::vector<Blob> blobs;
++    /// Blob by content hash, per kind: filled when the first pipeline is added, freed by Compact.
++    std::array<std::unordered_map<u64, u32>, KindCount> by_hash;
++    bool dedupe_ready{};
++    std::unordered_map<u64, Record> records;
++};
++
++} // namespace Vulkan::ShaderPrep
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index f6de9cc..d006f9b 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -4,6 +4,14 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <cstring>
++#include <exception>
++#include <functional>
++#include <span>
++#include <type_traits>
++#include <utility>
++#include <vector>
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -1120,6 +1128,329 @@ std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u3
+     return it->second;
+ }
+ 
++// EDEN_UP_SHADER_PREP (renderer_vulkan/vk_pipeline_prep.h): the answers a recorded environment
++// gave its translation, without the program's code, and the check that the game's state still
++// gives them. The check follows zortos293/Lichii#896's FileEnvironment::AnswersHoldFor
++// (zmckenney), for the questions this tree's translation asks, with one difference: upstream
++// takes a constant buffer word for a texture handle when its value is one the translation asked
++// a texture type for; here the caller names the handle words from the program's descriptors.
++namespace {
++constexpr u32 AnswersVersion = 1;
++
++template <typename T>
++void PutAnswer(std::vector<u8>& out, const T& value) {
++    static_assert(std::is_trivially_copyable_v<T>);
++    const auto* const bytes = reinterpret_cast<const u8*>(&value);
++    out.insert(out.end(), bytes, bytes + sizeof(T));
++}
++
++template <typename T>
++[[nodiscard]] bool GetAnswer(std::span<const u8>& in, T& value) {
++    static_assert(std::is_trivially_copyable_v<T>);
++    if (in.size() < sizeof(T)) {
++        return false;
++    }
++    std::memcpy(&value, in.data(), sizeof(T));
++    in = in.subspan(sizeof(T));
++    return true;
++}
++
++/// What translation uses of a sampled texture's pixel format (ir_opt/texture_pass.cpp): whether
++/// it is an integer format, and for buffer texel fetches on hosts without snorm render buffers
++/// which width of snorm it is.
++[[nodiscard]] u32 PixelFormatTraits(u32 format_word) {
++    using F = Shader::TexturePixelFormat;
++    const F format = static_cast<F>(format_word);
++    u32 snorm = 0;
++    switch (format) {
++    case F::A8B8G8R8_SNORM:
++    case F::R8G8_SNORM:
++    case F::R8_SNORM:
++        snorm = 1;
++        break;
++    case F::R16G16B16A16_SNORM:
++    case F::R16G16_SNORM:
++    case F::R16_SNORM:
++        snorm = 2;
++        break;
++    default:
++        break;
++    }
++    return (VideoCore::Surface::IsPixelFormatInteger(
++                static_cast<VideoCore::Surface::PixelFormat>(format))
++                ? 1U
++                : 0U) |
++           (snorm << 1);
++}
++
++template <typename Map>
++[[nodiscard]] std::vector<std::pair<u64, u32>> SortedAnswers(const Map& map) {
++    std::vector<std::pair<u64, u32>> sorted;
++    sorted.reserve(map.size());
++    for (const auto& [key, value] : map) {
++        sorted.emplace_back(static_cast<u64>(key), static_cast<u32>(value));
++    }
++    std::ranges::sort(sorted);
++    return sorted;
++}
++
++void PutAnswerMap(std::vector<u8>& out, const std::vector<std::pair<u64, u32>>& sorted) {
++    PutAnswer(out, static_cast<u32>(sorted.size()));
++    for (const auto& [key, value] : sorted) {
++        PutAnswer(out, key);
++        PutAnswer(out, value);
++    }
++}
++
++[[nodiscard]] bool GetAnswerMap(std::span<const u8>& in, std::vector<std::pair<u64, u32>>& map) {
++    u32 count{};
++    if (!GetAnswer(in, count) || count > in.size() / (sizeof(u64) + sizeof(u32))) {
++        return false;
++    }
++    map.resize(count);
++    for (auto& [key, value] : map) {
++        if (!GetAnswer(in, key) || !GetAnswer(in, value)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++/// `sorted` is sorted by key.
++[[nodiscard]] const u32* FindAnswer(const std::vector<std::pair<u64, u32>>& sorted, u64 key) {
++    const auto it = std::ranges::lower_bound(sorted, key, {}, &std::pair<u64, u32>::first);
++    return it != sorted.end() && it->first == key ? &it->second : nullptr;
++}
++} // Anonymous namespace
++
++void FileEnvironment::SerializeAnswers(std::vector<u8>& out) const {
++    PutAnswer(out, AnswersVersion);
++    PutAnswer(out, static_cast<u32>(stage));
++    PutAnswer(out, start_address);
++    PutAnswer(out, local_memory_size);
++    PutAnswer(out, texture_bound);
++    PutAnswer(out, viewport_transform_state);
++    PutAnswer(out, static_cast<u32>(cbuf_replacements.empty() ? 0 : 1));
++    PutAnswer(out, static_cast<u32>(is_proprietary_driver ? 1 : 0));
++    PutAnswer(out, shared_memory_size);
++    PutAnswer(out, workgroup_size);
++    PutAnswer(out, sph);
++    PutAnswer(out, gp_passthrough_mask);
++    PutAnswer(out, mesh_registers);
++    PutAnswer(out, mesh_primitive_header);
++    PutAnswerMap(out, SortedAnswers(texture_types));
++    PutAnswerMap(out, SortedAnswers(texture_pixel_formats));
++    PutAnswerMap(out, SortedAnswers(cbuf_values));
++    PutAnswerMap(out, SortedAnswers(storage_pointer_types));
++}
++
++bool FileEnvironment::AnswersHoldFor(std::span<const u8> in, Shader::Environment& live,
++                                     std::span<const AnswerHandle> handles, const char** why) {
++    const auto fail = [why](const char* reason) {
++        if (why) {
++            *why = reason;
++        }
++        return false;
++    };
++    u32 version{}, stage_word{}, start{}, local{}, bound{}, viewport{}, hle{}, proprietary{};
++    u32 shared{};
++    std::array<u32, 3> workgroup{};
++    Shader::ProgramHeader header{};
++    std::array<u32, 8> passthrough{};
++    std::array<u32, 3> mesh{};
++    Shader::ProgramHeader mesh_header{};
++    std::vector<std::pair<u64, u32>> types, formats, values, pointers;
++    if (!GetAnswer(in, version) || version != AnswersVersion || !GetAnswer(in, stage_word) ||
++        !GetAnswer(in, start) || !GetAnswer(in, local) || !GetAnswer(in, bound) ||
++        !GetAnswer(in, viewport) || !GetAnswer(in, hle) || !GetAnswer(in, proprietary) ||
++        !GetAnswer(in, shared) || !GetAnswer(in, workgroup) || !GetAnswer(in, header) ||
++        !GetAnswer(in, passthrough) || !GetAnswer(in, mesh) || !GetAnswer(in, mesh_header) ||
++        !GetAnswerMap(in, types) || !GetAnswerMap(in, formats) || !GetAnswerMap(in, values) ||
++        !GetAnswerMap(in, pointers) || !in.empty()) {
++        return fail("answers unreadable");
++    }
++    const Shader::Stage recorded_stage = static_cast<Shader::Stage>(stage_word);
++    if (live.ShaderStage() != recorded_stage || live.StartAddress() != start ||
++        live.LocalMemorySize() != local || live.TextureBoundBuffer() != bound ||
++        live.IsProprietaryDriver() != (proprietary != 0) ||
++        std::memcmp(&live.SPH(), &header, sizeof(header)) != 0) {
++        return fail("program");
++    }
++    if (recorded_stage == Shader::Stage::Compute &&
++        (live.SharedMemorySize() != shared || live.WorkgroupSize() != workgroup)) {
++        return fail("program");
++    }
++    if (recorded_stage == Shader::Stage::Geometry && live.GpPassthroughMask() != passthrough) {
++        return fail("geometry passthrough");
++    }
++    if ((recorded_stage == Shader::Stage::Task || recorded_stage == Shader::Stage::Mesh) &&
++        (live.MeshRegisters() != mesh ||
++         std::memcmp(&live.MeshPrimitiveHeader(), &mesh_header, sizeof(mesh_header)) != 0)) {
++        return fail("mesh state");
++    }
++    // Only a vertex program asks (ir_opt/position_pass.cpp).
++    if (recorded_stage == Shader::Stage::VertexB &&
++        live.ReadViewportTransformState() != viewport) {
++        return fail("viewport transform");
++    }
++    // HLE replacements are asked for every constant buffer read when there are any, and only
++    // the ones that were found are recorded.
++    if (hle != 0 || live.HasHLEMacroState()) {
++        return fail("HLE constant replacements");
++    }
++    // The words the program's descriptors read their texture handles from. Only these may hold
++    // another value now: which word is a handle is told by where it is, never by what it holds
++    // (a folded constant can hold the same number as a handle).
++    std::vector<u64> handle_words;
++    std::vector<u32> handles_asked;
++    for (const AnswerHandle& handle : handles) {
++        if (handle.shift_left >= 32 || handle.secondary_shift_left >= 32) {
++            return fail("texture handle");
++        }
++        const u64 first = MakeCbufKey(handle.index, handle.offset);
++        const u64 second = handle.has_secondary
++                               ? MakeCbufKey(handle.secondary_index, handle.secondary_offset)
++                               : first;
++        const u32* const recorded_first = FindAnswer(values, first);
++        const u32* const recorded_second = FindAnswer(values, second);
++        if (recorded_first == nullptr || recorded_second == nullptr) {
++            // The translation did not read this descriptor's handle: nothing to hold it to.
++            return fail("texture handle");
++        }
++        handle_words.push_back(first);
++        handle_words.push_back(second);
++        // As ir_opt/texture_pass.cpp makes a handle of its words.
++        const u32 recorded = (*recorded_first << handle.shift_left) |
++                             (*recorded_second << handle.secondary_shift_left);
++        const u32 live_first = live.ReadCbufValue(handle.index, handle.offset);
++        const u32 live_second =
++            handle.has_secondary
++                ? live.ReadCbufValue(handle.secondary_index, handle.secondary_offset)
++                : live_first;
++        const u32 now = (live_first << handle.shift_left) |
++                        (live_second << handle.secondary_shift_left);
++        // Asked of `live` even when it is the same handle, so `live` holds the answers its own
++        // translation would have asked for (they go to the disk cache with a new pipeline).
++        if (const u32* const type = FindAnswer(types, recorded);
++            type != nullptr && static_cast<u32>(live.ReadTextureType(now)) != *type) {
++            return fail("texture type");
++        }
++        if (const u32* const format = FindAnswer(formats, recorded);
++            format != nullptr &&
++            PixelFormatTraits(static_cast<u32>(live.ReadTexturePixelFormat(now))) !=
++                PixelFormatTraits(*format)) {
++            return fail("texture pixel format");
++        }
++        handles_asked.push_back(recorded);
++    }
++    std::ranges::sort(handle_words);
++    const auto is_pointer_word = [&pointers](u64 key) {
++        const u32 offset = static_cast<u32>(key);
++        return FindAnswer(pointers, key) != nullptr ||
++               (offset >= 4 && FindAnswer(pointers, key - 4) != nullptr);
++    };
++    for (const auto& [key, value] : values) {
++        if (std::ranges::binary_search(handle_words, key)) {
++            continue;
++        }
++        const u32 index = static_cast<u32>(key >> 32);
++        const u32 offset = static_cast<u32>(key);
++        if (live.ReadCbufValue(index, offset) != value && !is_pointer_word(key)) {
++            return fail("constant buffer value");
++        }
++    }
++    const auto asked = [&handles_asked](u32 handle) {
++        return std::ranges::find(handles_asked, handle) != handles_asked.end();
++    };
++    // Handles no descriptor's words gave (computed per draw, or read some other way): the
++    // words they came from were compared above, so they are asked as they are.
++    for (const auto& [handle, type] : types) {
++        const u32 raw = static_cast<u32>(handle);
++        if (!asked(raw) && static_cast<u32>(live.ReadTextureType(raw)) != type) {
++            return fail("texture type");
++        }
++    }
++    for (const auto& [handle, format] : formats) {
++        const u32 raw = static_cast<u32>(handle);
++        if (!asked(raw) &&
++            PixelFormatTraits(static_cast<u32>(live.ReadTexturePixelFormat(raw))) !=
++                PixelFormatTraits(format)) {
++            return fail("texture pixel format");
++        }
++    }
++    for (const auto& [key, mapped] : pointers) {
++        const bool table = (key >> 63) != 0;
++        const u32 index = static_cast<u32>((key >> 32) & (table ? 0xffU : 0xffffffffU));
++        const u32 offset = static_cast<u32>(key);
++        const bool live_mapped =
++            table ? live.IsCbufIndirectStorageBufferPointer(
++                        index, offset, static_cast<u32>((key >> 40) & 0x3fffff))
++                  : live.IsCbufStorageBufferPointer(index, offset);
++        if (live_mapped != (mapped != 0)) {
++            return fail("storage buffer pointer");
++        }
++    }
++    return true;
++}
++
++bool ReadPipelines(
++    const std::filesystem::path& filename, u32 expected_cache_version,
++    const std::function<void(std::ifstream&, FileEnvironment)>& on_compute,
++    const std::function<void(std::ifstream&, std::vector<FileEnvironment>)>& on_graphics,
++    bool with_mesh_state) {
++    // A pipeline has at most this many shaders.
++    constexpr u32 MostShaders = 6;
++    try {
++        std::ifstream file(filename, std::ios::binary | std::ios::ate);
++        if (!file.is_open()) {
++            return true;
++        }
++        file.exceptions(std::ifstream::failbit);
++        const std::streamoff end{file.tellg()};
++        file.seekg(0, std::ios::beg);
++        std::array<char, 8> magic_number{};
++        u32 cache_version{};
++        file.read(magic_number.data(), magic_number.size())
++            .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
++        if (magic_number != MAGIC_NUMBER || cache_version != expected_cache_version) {
++            return true; // another version's file: nothing of this build's to read
++        }
++        std::streamoff at{file.tellg()};
++        while (at != end) {
++            u32 num_envs{};
++            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
++            if (num_envs == 0 || num_envs > MostShaders) {
++                return false;
++            }
++            std::vector<FileEnvironment> envs(num_envs);
++            for (FileEnvironment& env : envs) {
++                // An environment begins with six counts; none can exceed what is left.
++                const std::streamoff start{file.tellg()};
++                std::array<u64, 6> sizes{};
++                file.read(reinterpret_cast<char*>(sizes.data()), sizeof(sizes));
++                for (const u64 size : sizes) {
++                    if (size > static_cast<u64>(end - start)) {
++                        return false;
++                    }
++                }
++                file.seekg(start);
++                env.Deserialize(file, with_mesh_state);
++            }
++            if (envs.front().ShaderStage() == Shader::Stage::Compute) {
++                on_compute(file, std::move(envs.front()));
++            } else {
++                on_graphics(file, std::move(envs));
++            }
++            at = file.tellg();
++        }
++        return true;
++    } catch (const std::exception&) {
++        // A read past the end, no memory, or whatever a callback threw: the reading stops here
++        // and the file stays as it is.
++        return false;
++    }
++}
++
+ void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
+                        const std::filesystem::path& filename, u32 cache_version,
+                        bool with_mesh_state) try {
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+index 938d1c3..b9dd176 100644
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -8,6 +8,7 @@
+ 
+ #include <array>
+ #include <filesystem>
++#include <functional>
+ #include <iosfwd>
+ #include <limits>
+ #include <memory>
+@@ -271,6 +272,35 @@ public:
+ 
+     void Dump(u64 pipeline_hash, u64 shader_hash) override;
+ 
++    /// EDEN_UP_SHADER_PREP: the answers this recorded environment gave its translation (the
++    /// program header, sizes, constant buffer values, texture types and pixel formats,
++    /// storage pointer classifications), without the program's code.
++    void SerializeAnswers(std::vector<u8>& out) const;
++
++    /// EDEN_UP_SHADER_PREP: where one of the program's descriptors reads its texture handle
++    /// (Shader::Info's texture and image descriptors without a handle program).
++    struct AnswerHandle {
++        u32 index;
++        u32 offset;
++        u32 shift_left;
++        u32 secondary_index;
++        u32 secondary_offset;
++        u32 secondary_shift_left;
++        bool has_secondary;
++    };
++
++    /// EDEN_UP_SHADER_PREP: whether translating `live`, the same program as the game draws
++    /// it now, gives what the translation that got `answers` gave (the same code is
++    /// assumed: the pipeline keys match). Each recorded question is asked of `live`: a
++    /// constant buffer value must be the same, unless it is one of `handles`' words (then
++    /// the texture the handle names now must have the same type and pixel format traits)
++    /// or a word of a storage buffer pointer (then its classification must be the same).
++    /// Sets `why` to the first answer that differs.
++    [[nodiscard]] static bool AnswersHoldFor(std::span<const u8> answers,
++                                             Shader::Environment& live,
++                                             std::span<const AnswerHandle> handles,
++                                             const char** why = nullptr);
++
+ private:
+     std::vector<u64> code;
+     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
+@@ -301,6 +331,16 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
+                       with_mesh_state);
+ }
+ 
++/// EDEN_UP_SHADER_PREP: reads a pipeline cache file like LoadPipelines, for a second look at
++/// it. It never changes the file: where LoadPipelines removes or cuts back a file it cannot
++/// read, this stops and returns false (true: read to its end, missing, or another version's).
++/// Whatever a callback throws also only ends the reading.
++[[nodiscard]] bool ReadPipelines(
++    const std::filesystem::path& filename, u32 expected_cache_version,
++    const std::function<void(std::ifstream&, FileEnvironment)>& on_compute,
++    const std::function<void(std::ifstream&, std::vector<FileEnvironment>)>& on_graphics,
++    bool with_mesh_state = false);
++
+ void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
+     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
+     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,

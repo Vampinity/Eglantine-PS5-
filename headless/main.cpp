@@ -88,6 +88,7 @@ extern "C" std::int64_t sceKernelGetDirectMemorySize();
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
+#include "common/pe_switch.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/cpu_manager.h"
@@ -812,6 +813,15 @@ int main(int argc, char** argv) {
                 std::printf("EDEN_ENV_TITLE %s\n", entry.c_str());
             }
         }
+#ifndef EDEN_DEV_PROFILE
+        // EDEN_UP_LEAN_DEV_TIMERS=1: the six timers only a development profile build reports
+        // (performance.h, DevTotals) stop reading the clock. Read here, with env.txt and this game's
+        // own env file in and before the core starts; unset, they count as before.
+        if (Common::PeSwitch("EDEN_UP_LEAN_DEV_TIMERS")) {
+            Eden::Performance::dev_timers = false;
+            std::printf("EDEN_UP_LEAN_DEV_TIMERS=1: draw, dispatch and guest-cache timers off\n");
+        }
+#endif
         const unsigned cycles = game ? 1 : 3;
         const bool devices = EDEN_DEVICE_FRONTEND;
         if (game) {

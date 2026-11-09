@@ -1,0 +1,161 @@
+From: GrowingBlackBeans <gbb@local>
+Subject: [PATCH] EDEN_GBB_DIFF_WORDS=1 (with EDEN_NX2_FETCH_COUNT=1): log each command word that differs from its submit copy with its role (header/data, method, subchannel); per-method totals
+
+---
+Rebased onto T84 (context only: 0481 Lichii #949 moved neighbouring lines in dma_pusher.cpp). From GrowingBlackBeans' gist e3676cf28960bc360f5a5e3cd23c2646, issue 21, 9 Nov.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 2431217..8d8bf52 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -5,6 +5,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "common/pe_switch.h"
++#include <functional>
++#include <tuple>
++#include <array>
+ #include <algorithm>
+ #include <atomic>
+ #include <bit>
+@@ -122,6 +125,79 @@ std::atomic<u64> fetch_total{};
+ std::atomic<u64> fetch_refreshed_lists{};
+ std::atomic<u64> fetch_dropped_words{};
+ 
++// EDEN_GBB_DIFF_WORDS=1 (GrowingBlackBeans, with EDEN_NX2_FETCH_COUNT): which words of a command
++// entry change after submit, by their role in the submitted words. Answers which methods the game
++// patches after submitting (issue 21: "which words legitimately change after submit?").
++bool DiffWordsOn() {
++    static const bool on = [] {
++        const char* value = std::getenv("EDEN_GBB_DIFF_WORDS");
++        return value != nullptr && value[0] == '1';
++    }();
++    return on;
++}
++// Per method (13 bits), the words that differed: [0] as data, [1] as the method's header.
++std::array<std::array<std::atomic<u32>, 2>, 8192> g_diff_by_method{};
++std::atomic<u32> g_diff_carried{0};   // data of a method opened in an earlier entry
++std::atomic<u32> g_diff_entries{0};
++std::atomic<u32> g_diff_logged{0};
++
++struct DiffRole {
++    u32 method;  // ~0: data carried in from an earlier entry
++    u32 subchannel;
++    bool header;
++};
++
++// The role of each word of `words` (n words; `carried` data words open at its start), walking the
++// way ProcessCommands parses: increasing, non-increasing, increase-once and inline headers.
++void DiffRoles(const CommandHeader* words, size_t n, u32 carried, std::vector<DiffRole>& roles) {
++    roles.assign(n, DiffRole{~0U, 0, false});
++    size_t i = (std::min)(static_cast<size_t>(carried), n);
++    while (i < n) {
++        const CommandHeader header = words[i];
++        const u32 method = header.method;
++        const u32 subchannel = header.subchannel;
++        roles[i] = DiffRole{method, subchannel, true};
++        ++i;
++        const auto mode = header.mode.Value();
++        if (mode == SubmissionMode::Inline) {
++            continue;
++        }
++        const u32 count = header.arg_count;
++        for (u32 k = 0; k < count && i < n; ++k, ++i) {
++            u32 m = method;
++            if (mode == SubmissionMode::Increasing || mode == SubmissionMode::IncreasingOld) {
++                m = method + k;
++            } else if (mode == SubmissionMode::IncreaseOnce) {
++                m = k == 0 ? method : method + 1;
++            }
++            roles[i] = DiffRole{m & 0x1fff, subchannel, false};
++        }
++    }
++}
++
++void ReportDiffWords() {
++    if (!DiffWordsOn()) {
++        return;
++    }
++    std::vector<std::tuple<u32, u32, u32>> top;  // total, method, header share
++    for (u32 m = 0; m < g_diff_by_method.size(); ++m) {
++        const u32 data = g_diff_by_method[m][0].load(std::memory_order_relaxed);
++        const u32 head = g_diff_by_method[m][1].load(std::memory_order_relaxed);
++        if (data + head != 0) {
++            top.emplace_back(data + head, m, head);
++        }
++    }
++    std::sort(top.begin(), top.end(), std::greater<>());
++    std::string line;
++    for (size_t k = 0; k < top.size() && k < 16; ++k) {
++        line += fmt::format(" | m{:#x} {} ({} hdr)", std::get<1>(top[k]), std::get<0>(top[k]),
++                            std::get<2>(top[k]));
++    }
++    LOG_WARNING(HW_GPU, "DIFF_WORDS totals: {} entries, carried data {}{}",
++                g_diff_entries.load(std::memory_order_relaxed),
++                g_diff_carried.load(std::memory_order_relaxed), line);
++}
++
+ void ReportFetchTotals() {
+     std::string totals;
+     for (size_t i = 0; i < fetch_reason_names.size(); ++i) {
+@@ -137,6 +213,7 @@ void ReportFetchTotals() {
+                 totals, fetch_refreshed_lists.load(std::memory_order_relaxed),
+                 fetch_dropped_words.load(std::memory_order_relaxed),
+                 Tegra::g_nx2_new_written_pages.load(std::memory_order_relaxed));
++    ReportDiffWords();
+ }
+ 
+ // How ProcessCommands would walk an entry's words from word `start` with `carry` words of an open
+@@ -1989,10 +2066,16 @@ void DmaPusher::CountFetchedEntry(const CommandListHeader& header,
+     u32 first = ~0U;
+     u32 words = 0;
+     bool compared = false;
++    const CommandHeader* diff_copy = nullptr;           // EDEN_GBB_DIFF_WORDS
++    std::vector<std::pair<u32, u32>> diff_words;        // index, value the parser got
+     const auto compare = [&](const CommandHeader* copy, size_t i, u32 value) {
+         if (copy[i].argument != value) {
+             first = (std::min)(first, static_cast<u32>(i));
+             ++words;
++            if (DiffWordsOn()) {
++                diff_copy = copy;
++                diff_words.emplace_back(static_cast<u32>(i), value);
++            }
+         }
+     };
+     if (has_copy) {
+@@ -2020,6 +2103,35 @@ void DmaPusher::CountFetchedEntry(const CommandListHeader& header,
+     if (compared) {
+         fetch_compared[reason].fetch_add(1, std::memory_order_relaxed);
+     }
++    if (words != 0 && diff_copy != nullptr) {
++        // Roles from the submit copy: what the game meant these words to be.
++        std::vector<DiffRole> roles;
++        DiffRoles(diff_copy, commands.size(), dma_state.method_count, roles);
++        g_diff_entries.fetch_add(1, std::memory_order_relaxed);
++        std::string detail;
++        for (size_t k = 0; k < diff_words.size(); ++k) {
++            const auto [i, value] = diff_words[k];
++            const DiffRole& role = roles[i];
++            if (role.method == ~0U) {
++                g_diff_carried.fetch_add(1, std::memory_order_relaxed);
++            } else {
++                g_diff_by_method[role.method][role.header ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
++            }
++            if (k < 24) {
++                detail += role.method == ~0U
++                              ? fmt::format(" | w{} carried {:08x}->{:08x}", i, diff_copy[i].argument, value)
++                              : fmt::format(" | w{} {}m{:#x}/s{} {:08x}->{:08x}", i,
++                                            role.header ? "hdr " : "", role.method, role.subchannel,
++                                            diff_copy[i].argument, value);
++            }
++        }
++        if (g_diff_logged.fetch_add(1, std::memory_order_relaxed) < 80) {
++            LOG_WARNING(HW_GPU, "DIFF_WORDS entry {:#x}+{:#x} ({}) index {} resumed at {} carried {} refreshes {}: {} of {} words differ{}",
++                        header.addr.Value(), header.size.Value(), fetch_reason_names[reason], index,
++                        command_resume_offset, dma_state.method_count, list.refreshes, words,
++                        commands.size(), detail);
++        }
++    }
+     if (words != 0 && fetch_differing[reason].fetch_add(1, std::memory_order_relaxed) < 4) {
+         LOG_WARNING(HW_GPU,
+                     "Entry at {:#x}+{:#x} ({}) differs from its words at submit in {} words, first "

@@ -1,0 +1,1057 @@
+Subject: [PATCH] EDEN_UP_LIVE_SWITCHES: seven switches can change while the game runs, from a control file the app reads twice a second (a schedule of phases it steps through itself, logging each phase's frames), so one start compares a switch on and off at one spot; off by default (v2 after review: phases of 1 s at least, no frame wait off without the load wait, nothing that only reports can throw)
+
+diff --git a/src/common/live_switch.h b/src/common/live_switch.h
+new file mode 100644
+index 0000000..96d2fab
+--- /dev/null
++++ b/src/common/live_switch.h
+@@ -0,0 +1,729 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <mutex>
++#include <new>
++#include <string>
++#include <string_view>
++#include <thread>
++#include <vector>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "common/thread.h"
++
++/// EDEN_UP_LIVE_SWITCHES=1 (exact "1"): a few switches can change while the game runs, so one
++/// start of the game compares a switch on and off at the same spot (A/B/A/B) instead of one
++/// setting per start. Off (the default): every switch below is read from the environment once at
++/// its first use and never changes, as before, and no thread or file is touched.
++///
++/// With it on, a thread ("LiveSwitches") reads a control file every
++/// EDEN_UP_LIVE_SWITCHES_POLL_MS (default 500, 100 to 5000): EDEN_UP_LIVE_SWITCHES_FILE, default
++/// /data/eglantineps5/live-switches.txt. A file whose bytes are the same as at the last read does
++/// nothing. A new one starts its schedule from the top:
++///
++///     # comment
++///     id=run600               optional, logged
++///     period_ms=20000         optional: with it the app steps through the phases by itself
++///     settle_ms=2000          optional: frames in the first 2 s of a phase are not counted
++///     order=A,B,B,A           optional: the phases of one round (default: as written)
++///     repeat=3                optional: rounds, then back to the start values (0: for ever)
++///     [A]
++///     EDEN_UP_FAST_DRAW=1
++///     [B]
++///     EDEN_UP_FAST_DRAW=0
++///     end
++///
++/// - "end" must be the last line: a file read while it is being written is ignored.
++/// - A switch a phase does not name has its start value (what the environment gave at boot).
++/// - Without period_ms the first phase applies and stays (lines before any [name] are a phase of
++///   their own): change a switch by hand by writing a new file.
++/// - A file that is gone for two reads in a row puts every switch back to its start value.
++///
++/// Changes are applied on the presenting thread at a present (AtPresent), or by the poll thread
++/// when the game has not presented for a second. They are not synchronised with the GPU threads:
++/// every switch here is read again at each decision it makes, and each of those decisions is
++/// valid on its own whatever the one before was (the notes at each switch say why). Switches for
++/// which that is not true are not in the table and cannot change.
++///
++/// Log (Common, Info): one "Live switch: NAME old -> new" line per change, a line when a phase
++/// starts, and a line when it ends with the game's presents in it: frames, fps, mean, 1% low
++/// (99th-percentile frame time), worst frame, frames over 100 ms.
++///
++/// A phase is at least a second long. A schedule cannot turn EDEN_UP_OOT_FRAME_WAIT off unless
++/// EDEN_UP_OOT_LOAD_WAIT=1 was set at boot (the change is refused and logged). When a schedule
++/// starts, a warning names every switch its phases turn on that cannot do anything in this run.
++///
++/// Four of the switches have to be on at boot to change at all, because the work that makes
++/// them possible is set up once (marked "armed" below): with them off at boot a phase that
++/// turns them on does nothing, and the change line says so.
++namespace Common::LiveSwitch {
++
++enum class Id : u8 {
++    /// EDEN_UP_FAST_DRAW, armed. Off: draws take the full path and no draw is kept as a
++    /// candidate; the serial, delta and table bookkeeping runs on (video_core/nx2_fast_draw.h).
++    FastDraw,
++    /// EDEN_UP_QUERY_LIGHT. Each "does this end reuse" answer stands alone.
++    QueryLight,
++    /// EDEN_NX2_DMA_SNAPSHOT, armed (the front's write notes). Off: every macro read drains.
++    DmaSnapshot,
++    /// EDEN_UP_OOT_POLL_BACKOFF, armed (the game patch). Off: the SVC returns at once.
++    PollBackoff,
++    /// EDEN_UP_OOT_NATIVE_ZSTD, armed (the game patch). Off: the game's own decoder runs.
++    NativeZstd,
++    /// EDEN_NX2_TC_KEEP_ASYNC=<frames>. The collectors read it for each image they look at.
++    TcKeepAsync,
++    /// EDEN_UP_OOT_FRAME_WAIT. Each present chooses its wait on its own, as it already does
++    /// for EDEN_UP_OOT_LOAD_WAIT, which changes the same choice from one present to the next.
++    /// Off while the game loads is where sessions ended (common/nx2_load_wait.h): keep
++    /// EDEN_UP_OOT_LOAD_WAIT=1 on at boot for any schedule that turns this off.
++    OotFrameWait,
++    Count,
++};
++
++inline constexpr size_t NumSwitches = static_cast<size_t>(Id::Count);
++
++/// Exact "1" is 1, anything else 0 (Common::PeSwitch).
++[[nodiscard]] inline s64 ParseExactOne(const char* text) noexcept {
++    return text != nullptr && text[0] == '1' && text[1] == '\0' ? 1 : 0;
++}
++
++/// EDEN_NX2_DMA_SNAPSHOT: unset or starting with '0' is 0, starting with '2' is 2, else 1.
++[[nodiscard]] inline s64 ParseSnapshotMode(const char* text) noexcept {
++    if (text == nullptr || text[0] == '0') {
++        return 0;
++    }
++    return text[0] == '2' ? 2 : 1;
++}
++
++/// EDEN_NX2_TC_KEEP_ASYNC: frames, 0 or unset is off, at least 60 otherwise.
++[[nodiscard]] inline s64 ParseKeepFrames(const char* text) noexcept {
++    const unsigned long long asked = text != nullptr ? std::strtoull(text, nullptr, 10) : 0;
++    if (asked == 0) {
++        return 0;
++    }
++    return static_cast<s64>((std::max)(asked, 60ULL)); // the same bits as before, read back as u64
++}
++
++struct Def {
++    const char* name;
++    s64 (*parse)(const char* text);
++    bool armed; ///< Only changes anything when it was on at boot
++    int needs;  ///< Index of a switch that has to be on at boot for this one to do anything, or -1
++};
++
++inline constexpr std::array<Def, NumSwitches> kDefs{{
++    {"EDEN_UP_FAST_DRAW", ParseExactOne, true, -1},
++    {"EDEN_UP_QUERY_LIGHT", ParseExactOne, false, 0},
++    {"EDEN_NX2_DMA_SNAPSHOT", ParseSnapshotMode, true, -1},
++    {"EDEN_UP_OOT_POLL_BACKOFF", ParseExactOne, true, -1},
++    {"EDEN_UP_OOT_NATIVE_ZSTD", ParseExactOne, true, -1},
++    {"EDEN_NX2_TC_KEEP_ASYNC", ParseKeepFrames, false, -1},
++    {"EDEN_UP_OOT_FRAME_WAIT", ParseExactOne, false, -1},
++}};
++
++/// EDEN_UP_LIVE_SWITCHES=1 (exact "1"), read once.
++[[nodiscard]] inline bool Mechanism() {
++    static const bool on = PeSwitch("EDEN_UP_LIVE_SWITCHES");
++    return on;
++}
++
++/// What the switches are now. Written under State::mutex, read anywhere.
++inline std::array<std::atomic<s64>, NumSwitches> g_values{};
++
++namespace Detail {
++
++using Clock = std::chrono::steady_clock;
++
++inline constexpr size_t MaxPhases = 16;
++inline constexpr size_t MaxOrder = 256;
++inline constexpr size_t MaxFileBytes = 16384;
++inline constexpr size_t MaxPhaseFrames = 1 << 16;
++
++struct Phase {
++    std::string name;
++    std::array<s64, NumSwitches> value{};
++    std::array<bool, NumSwitches> listed{};
++};
++
++struct Schedule {
++    std::string id;
++    std::vector<Phase> phases;
++    std::vector<u8> order; ///< Indexes into phases: one round
++    s64 period_ms{};       ///< 0: the first phase stays
++    s64 settle_ms{2000};
++    s64 repeat{}; ///< Rounds; 0: for ever
++    std::string unknown; ///< Names that are not live switches, for the log
++};
++
++[[nodiscard]] inline std::string_view Trim(std::string_view text) {
++    const auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
++    while (!text.empty() && blank(text.front())) {
++        text.remove_prefix(1);
++    }
++    while (!text.empty() && blank(text.back())) {
++        text.remove_suffix(1);
++    }
++    return text;
++}
++
++[[nodiscard]] inline s64 Number(std::string_view text, s64 low, s64 high) {
++    const std::string copy{text};
++    return (std::clamp)(static_cast<s64>(std::strtoll(copy.c_str(), nullptr, 10)), low, high);
++}
++
++/// False for a file without its "end" line or with something in it that cannot be meant.
++[[nodiscard]] inline bool Parse(std::string_view text, Schedule& out) {
++    out = Schedule{};
++    bool ended = false;
++    std::string order_text;
++    while (!text.empty() && !ended) {
++        const size_t newline = text.find('\n');
++        std::string_view raw = text.substr(0, newline);
++        raw = raw.substr(0, raw.find('#')); // "NAME=1 # why" is NAME=1
++        const std::string_view line = Trim(raw);
++        text = newline == std::string_view::npos ? std::string_view{} : text.substr(newline + 1);
++        if (line.empty()) {
++            continue;
++        }
++        if (line == "end") {
++            ended = true;
++            break;
++        }
++        if (line.front() == '[') {
++            if (line.back() != ']' || line.size() < 3 || line.size() > 26 ||
++                out.phases.size() >= MaxPhases) {
++                return false;
++            }
++            Phase phase;
++            phase.name = std::string{line.substr(1, line.size() - 2)};
++            out.phases.push_back(std::move(phase));
++            continue;
++        }
++        const size_t equals = line.find('=');
++        if (equals == std::string_view::npos || equals == 0) {
++            return false;
++        }
++        const std::string_view key = Trim(line.substr(0, equals));
++        const std::string_view value = Trim(line.substr(equals + 1));
++        // The schedule's own keys count wherever they stand: none is a switch's name.
++        if (key == "id") {
++            out.id = std::string{value.substr(0, 48)};
++            continue;
++        }
++        if (key == "period_ms") {
++            out.period_ms = Number(value, 0, 3'600'000);
++            continue;
++        }
++        if (key == "settle_ms") {
++            out.settle_ms = Number(value, 0, 600'000);
++            continue;
++        }
++        if (key == "repeat") {
++            out.repeat = Number(value, 0, 1'000'000);
++            continue;
++        }
++        if (key == "order") {
++            order_text = std::string{value};
++            continue;
++        }
++        size_t index = 0;
++        while (index < NumSwitches && key != kDefs[index].name) {
++            ++index;
++        }
++        if (index == NumSwitches) {
++            if (out.unknown.size() < 200) {
++                out.unknown += out.unknown.empty() ? "" : " ";
++                out.unknown += key;
++            }
++            continue;
++        }
++        if (out.phases.empty()) {
++            Phase phase;
++            phase.name = "now";
++            out.phases.push_back(std::move(phase));
++        }
++        const std::string copy{value};
++        out.phases.back().value[index] = kDefs[index].parse(copy.c_str());
++        out.phases.back().listed[index] = true;
++    }
++    if (!ended) {
++        return false;
++    }
++    // A phase is a second at least (a slip like period_ms=20 would change every switch and
++    // write two lines at every present), and some of it is counted.
++    if (out.period_ms > 0) {
++        out.period_ms = (std::max)(out.period_ms, s64{1000});
++        out.settle_ms = (std::min)(out.settle_ms, out.period_ms - 500);
++    }
++    const auto find_phase = [&](std::string_view name) -> int {
++        for (size_t i = 0; i < out.phases.size(); ++i) {
++            if (out.phases[i].name == name) {
++                return static_cast<int>(i);
++            }
++        }
++        return -1;
++    };
++    std::string_view rest = Trim(order_text);
++    // "ABBA" with one-letter phases is the same as "A,B,B,A".
++    const bool letters = !rest.empty() && rest.find_first_of(", \t") == std::string_view::npos &&
++                         find_phase(rest) < 0;
++    while (!rest.empty()) {
++        std::string_view token;
++        if (letters) {
++            token = rest.substr(0, 1);
++            rest.remove_prefix(1);
++        } else {
++            const size_t cut = rest.find_first_of(", \t");
++            token = rest.substr(0, cut);
++            rest = cut == std::string_view::npos ? std::string_view{} : Trim(rest.substr(cut + 1));
++            if (token.empty()) {
++                continue;
++            }
++        }
++        const int phase = find_phase(token);
++        if (phase < 0 || out.order.size() >= MaxOrder) {
++            return false;
++        }
++        out.order.push_back(static_cast<u8>(phase));
++    }
++    if (out.order.empty()) {
++        for (size_t i = 0; i < out.phases.size(); ++i) {
++            out.order.push_back(static_cast<u8>(i));
++        }
++    }
++    return true;
++}
++
++struct State {
++    std::mutex mutex;
++    // The switches.
++    std::array<bool, NumSwitches> ready{};    ///< Read from the environment (its first use came)
++    std::array<s64, NumSwitches> boot{};      ///< Its start value
++    std::array<bool, NumSwitches> wanted{};   ///< The running phase names it
++    std::array<s64, NumSwitches> want{};
++    // The schedule.
++    Schedule schedule;
++    bool active{};
++    size_t order_at{};
++    s64 rounds_done{};
++    u32 phase_number{};
++    Clock::time_point phase_start{};
++    Clock::time_point count_from{};
++    // A schedule the poll thread read, for the next present.
++    Schedule pending;
++    bool has_pending{};
++    bool pending_clear{};
++    Clock::time_point pending_since{};
++    // The presents of the running phase.
++    u64 presents{};
++    bool have_present{};
++    Clock::time_point last_present{};
++    std::vector<u32> frames_us;
++    u64 frames_dropped{}; ///< Past MaxPhaseFrames
++    u64 slow_frames{};
++    u64 phase_presents{};
++    bool refusal_logged{}; ///< Per schedule: the frame wait was not turned off
++};
++
++[[nodiscard]] inline State& Get() {
++    // Never destroyed: the poll thread is still running when the app's statics are torn down
++    // at exit, and would lock a mutex that no longer exists.
++    static State* const state = new State;
++    return *state;
++}
++
++/// A log line (or anything that only reports) must never end the app or leave a change half
++/// made: the console's allocator throws when memory is gone.
++template <typename F>
++inline void Quiet(F&& report) noexcept {
++    try {
++        report();
++    } catch (...) {
++    }
++}
++
++/// EDEN_UP_OOT_LOAD_WAIT=1 at boot: only then may a schedule turn the frame wait off, because
++/// without either wait the session ends while the game loads (common/nx2_load_wait.h).
++[[nodiscard]] inline bool LoadWaitAtBoot() {
++    static const bool on = PeSwitch("EDEN_UP_OOT_LOAD_WAIT");
++    return on;
++}
++
++/// Under the mutex. What switch `i` is to be now: the phase's value, else its start value.
++[[nodiscard]] inline s64 Target(State& state, size_t i) {
++    s64 target = state.wanted[i] ? state.want[i] : state.boot[i];
++    if (static_cast<Id>(i) == Id::OotFrameWait && target == 0 && state.boot[i] != 0 &&
++        !LoadWaitAtBoot()) {
++        target = state.boot[i];
++        if (!state.refusal_logged) {
++            state.refusal_logged = true;
++            Quiet([] {
++                LOG_WARNING(Common,
++                            "Live switches: EDEN_UP_OOT_FRAME_WAIT is NOT turned off: that needs "
++                            "EDEN_UP_OOT_LOAD_WAIT=1 at boot, or the session ends at the next load");
++            });
++        }
++    }
++    return target;
++}
++
++/// Under the mutex. Sets what the switches are for `phase` (nullptr: the start values).
++inline void Apply(State& state, const Phase* phase) {
++    for (size_t i = 0; i < NumSwitches; ++i) {
++        state.wanted[i] = phase != nullptr && phase->listed[i];
++        state.want[i] = state.wanted[i] ? phase->value[i] : 0;
++        if (!state.ready[i]) {
++            continue; // First() takes it from want
++        }
++        const s64 target = Target(state, i);
++        const s64 old = g_values[i].exchange(target, std::memory_order_relaxed);
++        if (old != target) {
++            Quiet([&] {
++                LOG_INFO(Common, "Live switch: {} {} -> {}{}", kDefs[i].name, old, target,
++                         kDefs[i].armed && state.boot[i] == 0
++                             ? " (it was off at boot, so this changes nothing in this run)"
++                             : "");
++            });
++        }
++    }
++}
++
++/// Under the mutex, for a schedule that starts: a line for each switch its phases turn on that
++/// cannot do anything in this run. A switch that was off at boot may never be asked for at all
++/// (its code does not run), so Apply's own note would never come.
++inline void WarnOfDeadSwitches(const Schedule& schedule) {
++    for (size_t i = 0; i < NumSwitches; ++i) {
++        bool turned_on = false;
++        for (const Phase& phase : schedule.phases) {
++            turned_on = turned_on || (phase.listed[i] && phase.value[i] != 0);
++        }
++        if (!turned_on) {
++            continue;
++        }
++        const int needs = kDefs[i].needs;
++        if (kDefs[i].armed && kDefs[i].parse(std::getenv(kDefs[i].name)) == 0) {
++            Quiet([&] {
++                LOG_WARNING(Common,
++                            "Live switches: {} was off at boot: a phase that turns it on changes "
++                            "nothing in this run",
++                            kDefs[i].name);
++            });
++        } else if (needs >= 0 && kDefs[needs].parse(std::getenv(kDefs[needs].name)) == 0) {
++            Quiet([&] {
++                LOG_WARNING(Common,
++                            "Live switches: {} needs {} on at boot, which it was not: its phases "
++                            "change nothing in this run",
++                            kDefs[i].name, kDefs[needs].name);
++            });
++        }
++    }
++}
++
++[[nodiscard]] inline std::string Describe(const State& state) {
++    std::string text;
++    for (size_t i = 0; i < NumSwitches; ++i) {
++        if (!state.ready[i] && !state.wanted[i]) {
++            continue;
++        }
++        const s64 value = state.wanted[i] ? state.want[i] : state.boot[i];
++        text += text.empty() ? "" : " ";
++        text += kDefs[i].name;
++        text += '=';
++        text += std::to_string(value);
++        if (!state.ready[i]) {
++            text += "(not used yet)";
++        }
++    }
++    return text.empty() ? std::string{"no live switch in use"} : text;
++}
++
++[[nodiscard]] inline const Phase* Current(const State& state) {
++    if (!state.active || state.schedule.order.empty()) {
++        return nullptr;
++    }
++    return &state.schedule.phases[state.schedule.order[state.order_at]];
++}
++
++/// Under the mutex. The line for the phase that ends now.
++inline void EndPhase(State& state, Clock::time_point now) {
++    if (state.phase_number == 0) {
++        return;
++    }
++    const Phase* const phase = Current(state);
++    auto& frames = state.frames_us;
++    const size_t n = frames.size();
++    const double length =
++        std::chrono::duration<double>(now - state.phase_start).count();
++    if (n == 0) {
++        LOG_INFO(Common,
++                 "Live switches: phase {} '{}' ended after {:.2f} s: no frames counted ({} "
++                 "presents) | {}",
++                 state.phase_number, phase != nullptr ? phase->name : "start values", length,
++                 state.phase_presents, Describe(state));
++        return;
++    }
++    u64 sum = 0;
++    for (const u32 frame : frames) {
++        sum += frame;
++    }
++    const u32 worst = *std::max_element(frames.begin(), frames.end());
++    const size_t p99_index = (std::min)((n * 99) / 100, n - 1);
++    std::nth_element(frames.begin(), frames.begin() + static_cast<std::ptrdiff_t>(p99_index),
++                     frames.end());
++    const u32 p99 = frames[p99_index];
++    const double seconds = static_cast<double>(sum) / 1e6;
++    LOG_INFO(Common,
++             "Live switches: phase {} '{}' ended after {:.2f} s: {} frames in {:.3f} s = {:.3f} "
++             "fps, mean {:.2f} ms, 1% low {:.1f} ms, worst {:.1f} ms, {} over 100 ms ({} more "
++             "not kept) | {}",
++             state.phase_number, phase != nullptr ? phase->name : "start values", length, n,
++             seconds, seconds > 0 ? static_cast<double>(n) / seconds : 0.0,
++             static_cast<double>(sum) / static_cast<double>(n) / 1000.0,
++             static_cast<double>(p99) / 1000.0, static_cast<double>(worst) / 1000.0,
++             state.slow_frames, state.frames_dropped, Describe(state));
++}
++
++/// Under the mutex. Starts counting for the phase at order_at (or the start values).
++inline void BeginPhase(State& state, Clock::time_point now) {
++    const Phase* const phase = Current(state);
++    Apply(state, phase);
++    ++state.phase_number;
++    state.phase_start = now;
++    state.count_from = now + std::chrono::milliseconds{state.active ? state.schedule.settle_ms : 0};
++    state.frames_us.clear();
++    // Once, all it will ever hold: AtPresent never makes it grow.
++    Quiet([&] { state.frames_us.reserve(MaxPhaseFrames); });
++    state.frames_dropped = 0;
++    state.slow_frames = 0;
++    state.phase_presents = 0;
++    Quiet([&] {
++        LOG_INFO(Common, "Live switches: phase {} '{}' started at present #{} (round {} of {}) | {}",
++                 state.phase_number, phase != nullptr ? phase->name : "start values",
++                 state.presents, state.rounds_done + (state.active ? 1 : 0),
++                 state.active ? state.schedule.repeat : 0, Describe(state));
++    });
++}
++
++/// Under the mutex. Takes a schedule the poll thread read, or steps the running one. Nothing in
++/// here throws: what only reports is wrapped, the rest moves or assigns.
++inline void Step(State& state, Clock::time_point now) {
++    if (state.has_pending) {
++        Quiet([&] { EndPhase(state, now); });
++        const bool clear = state.pending_clear || state.pending.phases.empty();
++        if (clear) {
++            state.active = false;
++            state.schedule = Schedule{};
++            Quiet([&] {
++                LOG_INFO(Common, "Live switches: {}, every switch back to its start value",
++                         state.pending_clear ? "the control file is gone" : "an empty schedule");
++            });
++        } else {
++            state.schedule = std::move(state.pending);
++            state.active = true;
++            Quiet([&] {
++                LOG_INFO(Common,
++                         "Live switches: new schedule '{}': {} phases, {} in a round, period {} "
++                         "ms, settle {} ms, {} rounds{}{}",
++                         state.schedule.id, state.schedule.phases.size(),
++                         state.schedule.order.size(), state.schedule.period_ms,
++                         state.schedule.settle_ms, state.schedule.repeat,
++                         state.schedule.unknown.empty() ? "" : "; NOT live switches, ignored: ",
++                         state.schedule.unknown);
++            });
++            WarnOfDeadSwitches(state.schedule);
++        }
++        state.pending = Schedule{};
++        state.pending_clear = false;
++        state.has_pending = false;
++        state.refusal_logged = false;
++        state.order_at = 0;
++        state.rounds_done = 0;
++        BeginPhase(state, now);
++        return;
++    }
++    if (!state.active || state.schedule.period_ms <= 0 ||
++        now - state.phase_start < std::chrono::milliseconds{state.schedule.period_ms}) {
++        return;
++    }
++    Quiet([&] { EndPhase(state, now); });
++    if (++state.order_at >= state.schedule.order.size()) {
++        state.order_at = 0;
++        ++state.rounds_done;
++        if (state.schedule.repeat != 0 && state.rounds_done >= state.schedule.repeat) {
++            Quiet([&] {
++                LOG_INFO(Common,
++                         "Live switches: schedule '{}' done after {} rounds, every switch back "
++                         "to its start value",
++                         state.schedule.id, state.rounds_done);
++            });
++            state.active = false;
++        }
++    }
++    BeginPhase(state, now);
++}
++
++/// One read of the control file by the poll thread.
++inline void PollOnce(const std::string& path, std::chrono::milliseconds pause, std::string& last,
++                     bool& have_last, u32& missing, u32& refused, std::string& buffer) {
++    bool found = false;
++    buffer.clear();
++    if (std::FILE* const file = std::fopen(path.c_str(), "rb")) {
++        buffer.resize(MaxFileBytes);
++        buffer.resize(std::fread(buffer.data(), 1, MaxFileBytes, file));
++        std::fclose(file);
++        found = true;
++    }
++    State& state = Get();
++    const auto now = Clock::now();
++    if (!found) {
++        // Twice in a row: one failed open must not put every switch back.
++        if (have_last && ++missing == 2) {
++            have_last = false;
++            last.clear();
++            std::scoped_lock lock{state.mutex};
++            state.pending = Schedule{};
++            state.pending_clear = true;
++            state.has_pending = true;
++            state.pending_since = now;
++        }
++    } else {
++        missing = 0;
++        if (!have_last || buffer != last) {
++            Schedule schedule;
++            if (Parse(buffer, schedule)) {
++                last = buffer;
++                have_last = true;
++                refused = 0;
++                std::scoped_lock lock{state.mutex};
++                state.pending = std::move(schedule);
++                state.pending_clear = false;
++                state.has_pending = true;
++                state.pending_since = now;
++                } else if (++refused == 4) {
++                // Four reads, two seconds: not a file caught half written.
++                LOG_WARNING(Common,
++                            "Live switches: {} is not a schedule (no \"end\" line, a line "
++                            "without =, an unknown phase in order, or too many phases): "
++                            "ignored",
++                            path);
++            }
++        }
++    }
++    // No present for a second (loading, a menu that does not present): step here.
++    std::scoped_lock lock{state.mutex};
++    if (!state.have_present || now - state.last_present > std::chrono::seconds{1}) {
++        if (!state.has_pending || now - state.pending_since >= pause) {
++            Step(state, now);
++        }
++    }
++}
++
++/// The poll thread: never returns.
++inline void Poll() {
++    Common::SetCurrentThreadName("LiveSwitches");
++    const char* const named = std::getenv("EDEN_UP_LIVE_SWITCHES_FILE");
++    const std::string path{named != nullptr && named[0] != '\0'
++                               ? named
++                               : "/data/eglantineps5/live-switches.txt"};
++    const char* const poll_text = std::getenv("EDEN_UP_LIVE_SWITCHES_POLL_MS");
++    const auto pause = std::chrono::milliseconds{
++        poll_text != nullptr && poll_text[0] != '\0' ? Number(poll_text, 100, 5000) : 500};
++    LOG_INFO(Common, "EDEN_UP_LIVE_SWITCHES=1: reading {} every {} ms", path, pause.count());
++    std::string last;
++    bool have_last = false;
++    u32 missing = 0;
++    u32 refused = 0;
++    std::string buffer;
++    while (true) {
++        std::this_thread::sleep_for(pause);
++        // The console's allocator throws when memory is gone: skip this read, never end the app.
++        try {
++            PollOnce(path, pause, last, have_last, missing, refused, buffer);
++        } catch (const std::bad_alloc&) {
++        }
++    }
++}
++
++/// A switch's first use: reads its start value. Starts the poll thread at the first of them.
++inline void First(Id id) {
++    const size_t index = static_cast<size_t>(id);
++    const s64 boot = kDefs[index].parse(std::getenv(kDefs[index].name));
++    g_values[index].store(boot, std::memory_order_relaxed);
++    if (!Mechanism()) {
++        return;
++    }
++    // Out of memory here (the state, the thread): the switch keeps its start value, as with
++    // live switching off, and the caller goes on.
++    try {
++        State& state = Get();
++        {
++            std::scoped_lock lock{state.mutex};
++            state.boot[index] = boot;
++            state.ready[index] = true;
++            const s64 value = Target(state, index);
++            g_values[index].store(value, std::memory_order_relaxed);
++            if (value != boot) {
++                Quiet([&] {
++                    LOG_INFO(Common,
++                             "Live switch: {} {} -> {} (its first use came during a phase)",
++                             kDefs[index].name, boot, value);
++                });
++            }
++        }
++        static std::once_flag started;
++        std::call_once(started, [] { std::thread{Poll}.detach(); });
++    } catch (const std::exception&) {
++    }
++}
++
++} // namespace Detail
++
++/// What switch `id` is now. Without EDEN_UP_LIVE_SWITCHES=1 that is what the environment gave at
++/// this switch's first use, for ever.
++template <Id id>
++[[nodiscard]] inline s64 Value() {
++    static const bool first = (Detail::First(id), true);
++    static_cast<void>(first);
++    return g_values[static_cast<size_t>(id)].load(std::memory_order_relaxed);
++}
++
++/// The presenting thread, once per present of the game. Off: one cached check.
++inline void AtPresent(std::chrono::steady_clock::time_point now) {
++    if (!Mechanism()) {
++        return;
++    }
++    Detail::State& state = Detail::Get();
++    std::scoped_lock lock{state.mutex};
++    ++state.presents;
++    ++state.phase_presents;
++    if (state.have_present && state.phase_number != 0 && state.last_present >= state.count_from) {
++        const auto frame =
++            std::chrono::duration_cast<std::chrono::microseconds>(now - state.last_present)
++                .count();
++        // Within what BeginPhase reserved: this never allocates.
++        if (state.frames_us.size() < state.frames_us.capacity()) {
++            state.frames_us.push_back(
++                static_cast<u32>((std::clamp<long long>)(frame, 0, 0xffff'ffffLL)));
++        } else {
++            ++state.frames_dropped;
++        }
++        state.slow_frames += frame > 100'000 ? 1 : 0;
++    }
++    state.have_present = true;
++    state.last_present = now;
++    Detail::Step(state, now);
++}
++
++} // namespace Common::LiveSwitch
+diff --git a/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp b/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp
+index e3bdbb8..83690d4 100644
+--- a/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp
++++ b/src/core/hle/kernel/svc/svc_nx2_oot_poll.cpp
+@@ -7,6 +7,7 @@
+ #include <cstdlib>
+ #include <mutex>
+ 
++#include "common/live_switch.h"
+ #include "common/logging.h"
+ #include "core/arm/arm_interface.h"
+ #include "core/core.h"
+@@ -111,6 +112,7 @@ enum class Outcome : u8 {
+     State,       // state is no longer 3
+     Exit,        // the loop top will stop the thread
+     Frame,       // not the expected code or frame; behave as the original branch
++    LiveOff,     // EDEN_UP_LIVE_SWITCHES has the backoff off for this phase: no sleep
+     Count,
+ };
+ 
+@@ -233,6 +235,13 @@ void LogStats(const Stats& stats, s64 interval_ns) {
+              stats.longest_sleep_ns / 1000,
+              n(Outcome::Progress), n(Outcome::ListChanged), n(Outcome::State), n(Outcome::Exit),
+              n(Outcome::Frame));
++    // Its own line, so the line above reads as it always did.
++    if (n(Outcome::LiveOff) != 0) {
++        LOG_INFO(Kernel_SVC,
++                 "OoT resource poll backoff: {} of those walks returned at once with the live "
++                 "switch off",
++                 n(Outcome::LiveOff));
++    }
+ }
+ 
+ } // Anonymous namespace
+@@ -256,6 +265,14 @@ bool CallNx2OotPollBackoff(Core::System& system, u32 imm) {
+         view = ReadWalk(memory, ctx);
+     }
+ 
++    // EDEN_UP_LIVE_SWITCHES (common/live_switch.h): a walk that would sleep returns at once
++    // in an off phase, as one that issued loads does. The slot below is kept up to date, so
++    // the next walk is measured from here either way.
++    if (view.outcome == Outcome::Sleep &&
++        Common::LiveSwitch::Value<Common::LiveSwitch::Id::PollBackoff>() == 0) {
++        view.outcome = Outcome::LiveOff;
++    }
++
+     const s64 now = NowNs();
+     const s64 max_sleep = MaxSleepNs();
+     const s64 min_sleep = std::min(kMinSleepNs, max_sleep);
+diff --git a/src/core/hle/kernel/svc/svc_nx2_zstd.cpp b/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
+index 615b1ce..637ec66 100644
+--- a/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
++++ b/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
+@@ -15,6 +15,7 @@
+ #define ZSTD_STATIC_LINKING_ONLY
+ #include <zstd.h>
+ 
++#include "common/live_switch.h"
+ #include "common/logging.h"
+ #include "common/scratch_buffer.h"
+ #include "core/arm/arm_interface.h"
+@@ -110,6 +111,7 @@ struct Stats {
+     // Port:
+     std::atomic<u64> over_limit{};     ///< Of fallbacks: larger than kHostMaxBytes
+     std::atomic<u64> alloc_failures{}; ///< Of fallbacks: a host allocation failed
++    std::atomic<u64> live_off{}; ///< EDEN_UP_LIVE_SWITCHES had it off: the game decoded (no fallback)
+     std::atomic<s64> host_ns{};        ///< In calls the host decoded, copies in and out included
+     std::atomic<s64> longest_ns{};     ///< The longest of those since the last counters line
+ };
+@@ -442,6 +444,11 @@ void MaybeLogCounters(s64 now) {
+              g_stats.fallbacks.load(std::memory_order_relaxed),
+              g_stats.over_limit.load(std::memory_order_relaxed), kHostMaxBytes >> 20,
+              g_stats.alloc_failures.load(std::memory_order_relaxed));
++    // Its own line, so the line above reads as it always did.
++    if (const u64 live_off = g_stats.live_off.load(std::memory_order_relaxed); live_off != 0) {
++        LOG_INFO(Kernel_SVC, "Native zstd: {} more calls decoded by the game with the live switch off",
++                 live_off);
++    }
+ }
+ 
+ } // Anonymous namespace
+@@ -462,8 +469,14 @@ bool CallNx2OotZstd(Core::System& system, u32 imm, std::span<uint64_t, 8> args)
+     // Port: a failed host allocation (the PS5's new handler reports it and throws) must not end
+     // the emulator. Nothing has been returned to the game at that point, and the game's decoder
+     // writes the whole output itself.
++    // EDEN_UP_LIVE_SWITCHES (common/live_switch.h): in an off phase the game's own decoder
++    // runs, as for any call the host cannot serve. Each call is one whole buffer.
++    const bool live_off = Common::LiveSwitch::Value<Common::LiveSwitch::Id::NativeZstd>() == 0;
+     const char* reason;
+-    try {
++    if (live_off) {
++        g_stats.live_off.fetch_add(1, std::memory_order_relaxed);
++        reason = "live switch off";
++    } else try {
+         reason = HostDecompress(process.GetMemory(), args, now);
+     } catch (const std::bad_alloc&) {
+         TrimBuffers(0);
+@@ -482,7 +495,7 @@ bool CallNx2OotZstd(Core::System& system, u32 imm, std::span<uint64_t, 8> args)
+         }
+     } else {
+         // Port: the log lines allocate too; with no memory left they are dropped, not fatal.
+-        if (g_stats.fallbacks.fetch_add(1, std::memory_order_relaxed) < 16) {
++        if (!live_off && g_stats.fallbacks.fetch_add(1, std::memory_order_relaxed) < 16) {
+             try {
+                 LOG_WARNING(Kernel_SVC,
+                             "Native zstd (svc {:#x}): src={:#x} size={:#x} dst={:#x} cap={:#x} "
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index 80cd150..88be8ee 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -29,6 +29,7 @@
+ #include "common/alignment.h"
+ #include "common/div_ceil.h"
+ #include "common/game_presets.h"
++#include "common/live_switch.h"
+ #include "common/nx2_load_wait.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+@@ -1890,7 +1891,10 @@ private:
+         // Ocarina of Time a frame ahead rewrote data the GPU thread still read for this frame, and
+         // the frame rendered with the next one's (one-frame white or overexposed flashes).
+         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
+-        static const bool oot_wait = Common::PeSwitch("EDEN_UP_OOT_FRAME_WAIT");
++        // EDEN_UP_LIVE_SWITCHES (common/live_switch.h) can change it from one present to the
++        // next, as EDEN_UP_OOT_LOAD_WAIT below already does with the same wait.
++        const bool oot_wait =
++            Common::LiveSwitch::Value<Common::LiveSwitch::Id::OotFrameWait>() != 0;
+         // EDEN_UP_OOT_FRAME_SLACK=1 (Ocarina only; overrides EDEN_UP_OOT_FRAME_WAIT): wait for this
+         // frame's fence minus EDEN_UP_OOT_FRAME_SLACK_N increments (default 2), never below the
+         // previous frame's, so the game starts the next frame while the GPU thread still records
+@@ -2011,6 +2015,9 @@ private:
+                 !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
+                 ++m_stats.ran_ahead;
+             }
++            // EDEN_UP_LIVE_SWITCHES=1 (common/live_switch.h): a live schedule changes its
++            // switches here, between two presents, and counts this present for the phase.
++            Common::LiveSwitch::AtPresent(entered);
+             // EDEN_GBB_FPS_5S=1 (after GrowingBlackBeans' 9997): one "nx2:vi2 5 s:" line per 5 s
+             // with the game's fps, mean frame, 1% low (99th-percentile frame time), worst frame
+             // and the mean wait on the GPU fence per present. Log only; unset = no line.
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index a01f1c2..b6860c8 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -383,10 +383,14 @@ bool IsQueuedCounterReport(u32 method, u32 argument) {
+ /// only when it flushes. With a query DMA sync or trace mode the call can wait for the host GPU
+ /// or write reports out, and ends reuse as before.
+ bool DmaReadCallIsNeutral() {
+-    static const bool neutral = VideoCommon::QueryLight::Enabled() &&
+-                                VideoCommon::QueryDma::SyncMode() == 0 &&
+-                                !VideoCommon::QueryDma::TraceEnabled();
+-    return neutral;
++    // QueryLight::Enabled() can change while the game runs (EDEN_UP_LIVE_SWITCHES); the two
++    // trace modes are read once, as before.
++    if (!VideoCommon::QueryLight::Enabled()) {
++        return false;
++    }
++    static const bool plain = VideoCommon::QueryDma::SyncMode() == 0 &&
++                              !VideoCommon::QueryDma::TraceEnabled();
++    return plain;
+ }
+ 
+ /// EDEN_UP_QUERY_STATS (nx2_query_light.h): counts the report ProcessQueryGet just ran.
+@@ -1994,7 +1998,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     // later reads of those pages skip the drain while nothing sent since may write them
+     // (GpuSplit::MayBeWrittenSince) and the query cache lists no report there. 2 also drains,
+     // reads again and logs differences.
+-    const int snapshot_mode = DmaSnapshotMode();
++    // EDEN_UP_LIVE_SWITCHES (common/live_switch.h): in an off phase every read takes the
++    // drained path below. The front's write notes run on (FrontMemoryNotesEnabled), so a
++    // snapshot from before the phase is judged by everything sent since, as always.
++    const int snapshot_mode =
++        Common::LiveSwitch::Value<Common::LiveSwitch::Id::DmaSnapshot>() != 0 ? DmaSnapshotMode()
++                                                                              : 0;
+     if (snapshot_mode != 0 && method == 0x158 && words != 0 &&
+         !VideoCommon::QueryDma::TraceEnabled() && !VideoCommon::QueryDma::FlipTraceEnabled()) {
+         const auto device = memory_manager.GpuToCpuAddress(source);
+diff --git a/src/video_core/nx2_fast_draw.h b/src/video_core/nx2_fast_draw.h
+index 72c7abf..668bce5 100644
+--- a/src/video_core/nx2_fast_draw.h
++++ b/src/video_core/nx2_fast_draw.h
+@@ -9,6 +9,7 @@
+ #include <vector>
+ 
+ #include "common/common_types.h"
++#include "common/live_switch.h"
+ #include "common/pe_switch.h"
+ 
+ namespace Tegra {
+@@ -81,6 +82,17 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
+     return enabled;
+ }
+ 
++/// EDEN_UP_LIVE_SWITCHES (common/live_switch.h): whether draws may reuse right now. The same
++/// as Enabled() unless a live schedule has EDEN_UP_FAST_DRAW off for this phase. Only the two
++/// places that take a shortcut ask this (the rasterizer's delta path, the pipeline's texture
++/// memo); everything that keeps the books (Break, the delta, the descriptor table counters)
++/// asks Enabled() and so runs through an off phase. That is what makes the change safe at any
++/// draw: a draw that takes no shortcut is always right, and a shortcut is only taken on books
++/// that were kept all along.
++[[nodiscard]] inline bool UseNow() {
++    return Enabled() && Common::LiveSwitch::Value<Common::LiveSwitch::Id::FastDraw>() != 0;
++}
++
+ /// EDEN_UP_FAST_DRAW_VERIFY=1 with EDEN_UP_FAST_DRAW=1, read once.
+ [[nodiscard]] inline bool VerifyEnabled() {
+     static const bool verify = Enabled() && Common::PeSwitch("EDEN_UP_FAST_DRAW_VERIFY");
+diff --git a/src/video_core/nx2_query_light.h b/src/video_core/nx2_query_light.h
+index a56d708..adb4a43 100644
+--- a/src/video_core/nx2_query_light.h
++++ b/src/video_core/nx2_query_light.h
+@@ -62,10 +62,12 @@
+ /// all and draws every object.
+ namespace VideoCommon::QueryLight {
+ 
+-/// EDEN_UP_QUERY_LIGHT=1 (exact "1") with EDEN_UP_FAST_DRAW=1, read once.
++/// EDEN_UP_QUERY_LIGHT=1 (exact "1") with EDEN_UP_FAST_DRAW=1, read at its first use.
++/// EDEN_UP_LIVE_SWITCHES (common/live_switch.h) can change it while the game runs: every use
++/// is one "does this end fast draw reuse" answer, and ending reuse more often is always right.
+ [[nodiscard]] inline bool Enabled() {
+-    static const bool enabled = Nx2FastDraw::Enabled() && Common::PeSwitch("EDEN_UP_QUERY_LIGHT");
+-    return enabled;
++    return Nx2FastDraw::Enabled() &&
++           Common::LiveSwitch::Value<Common::LiveSwitch::Id::QueryLight>() != 0;
+ }
+ 
+ /// EDEN_UP_QUERY_STATS=1 (exact "1"), read once.
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index a5c85c0..526215a 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -542,7 +542,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+                                                             : 0};
+     // EDEN_UP_FAST_DRAW texture memo: textures resolved from the pipeline's memo while the handle
+     // words, descriptors, tables and mappings they came from are the same.
+-    const bool use_memo{fast_draw_on && texture_memo_eligible};
++    // EDEN_UP_LIVE_SWITCHES (common/live_switch.h): no memo in an off phase. A memo left
++    // alone is checked against the bytes and table counters it came from at its next use, as
++    // one of a pipeline that was not drawn for a while is.
++    const bool use_memo{fast_draw_on && texture_memo_eligible &&
++                        VideoCommon::Nx2FastDraw::UseNow()};
+     const bool verify_memo{use_memo && VideoCommon::Nx2FastDraw::VerifyEnabled()};
+     small_vector<GPUVAddr, 32> handle_addresses;
+     small_vector<VideoCommon::TextureHandleRead, 32> handle_reads;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 9914fdf..8eecbc0 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -945,6 +945,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     };
+     namespace FastDraw = VideoCommon::Nx2FastDraw;
+     const bool fast_draw_on = FastDraw::Enabled();
++    // EDEN_UP_LIVE_SWITCHES (common/live_switch.h), asked once per draw. In an off phase the
++    // draw resolves in full, captures nothing for a delta draw and leaves no candidate, as a
++    // draw that is not eligible does. A delta draw therefore always follows a draw that
++    // captured for it, on whichever side of a change that draw fell.
++    const bool fast_draw_use = fast_draw_on && FastDraw::UseNow();
+     const u64 fast_draw_start = fast_draw_on ? VideoCommon::Nx2Profile::Now() : 0;
+     namespace Profile = VideoCommon::Nx2Profile;
+     {
+@@ -961,8 +966,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     // are locked (Lichii #921).
+     const u64 fast_draw_serial = fast_draw_on ? FastDraw::Serial() : 0;
+     GraphicsPipeline* const delta_pipeline =
+-        fast_draw_on ? TakeReusableDraw(is_indexed, fast_draw_indirect, fast_draw_serial)
+-                     : nullptr;
++        fast_draw_use ? TakeReusableDraw(is_indexed, fast_draw_indirect, fast_draw_serial)
++                      : nullptr;
++    if (fast_draw_on && !fast_draw_use) {
++        // What TakeReusableDraw does on its way out: the candidate and the delta are used up.
++        reusable_draw = ReusableDraw{};
++        FastDraw::g_delta.Clear();
++    }
+     GraphicsPipeline* const verify_pipeline = fast_draw_verify ? delta_pipeline : nullptr;
+ 
+     // EDEN_NX2_NO_MESH drops a task/mesh draw further down, after its pipeline was translated on
+@@ -1090,7 +1100,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         verify_draw ? buffer_cache.KeptGraphicsBindingsHash(false, false, true) : 0;
+     if (delta_draw) {
+         pipeline->ConfigureNextAsDelta();
+-    } else if (fast_draw_on) {
++    } else if (fast_draw_use) {
+         pipeline->CaptureNextDelta(verify_draw);
+     }
+     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+@@ -1124,7 +1134,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     }
+     submitted = true;
+     if (fast_draw_on) {
+-        NoteResolvedDraw(pipeline, is_indexed, fast_draw_indirect, draw_serial, draw_map_serial);
++        if (fast_draw_use) {
++            NoteResolvedDraw(pipeline, is_indexed, fast_draw_indirect, draw_serial,
++                             draw_map_serial);
++        }
+         const size_t index = static_cast<size_t>(delta_draw ? DrawPath::Delta : DrawPath::Full);
+         fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
+         ++fast_draw_stats.prepare_draws[index];
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index e9cc8f5..7699dc6 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -57,13 +57,12 @@ namespace VideoCommon {
+ /// until it has gone unused for EDEN_NX2_TC_OLD_AGE frames, in every mode; on the console the
+ /// pool-pressure collector made each of them new 5 to 7 times a walk. A decode that failed for
+ /// memory is tried again this many frames later (at least 60) instead of leaving the texture black.
++/// EDEN_UP_LIVE_SWITCHES (common/live_switch.h) can change it while the game runs: each
++/// collector asks per image, and a failed decode waiting for its retry is dropped the way it is
++/// with the switch off.
+ [[nodiscard]] inline u64 KeepAsyncDecodedFrames() {
+-    static const u64 frames = [] {
+-        const char* const value = std::getenv("EDEN_NX2_TC_KEEP_ASYNC");
+-        const u64 asked = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+-        return asked == 0 ? 0 : (std::max)(asked, u64{60});
+-    }();
+-    return frames;
++    return static_cast<u64>(
++        Common::LiveSwitch::Value<Common::LiveSwitch::Id::TcKeepAsync>());
+ }
+ 
+ /// EDEN_NX2_TC_LOG, read once: also a line when an asynchronous decode is queued and when it lands.

@@ -50,6 +50,17 @@ void SampleCpu(unsigned core, unsigned long long thread, unsigned long long pc, 
 struct alignas(64) Totals {
     std::atomic<unsigned long long> calls{}, nanoseconds{}, requested_bytes{};
 };
+// Totals only a development profile build prints (ReportGpuThread and the EDEN_DEV_ lines in
+// graphics.cpp, both under EDEN_DEV_PROFILE). A Timer on one of these reads the clock and adds to
+// it only while dev_timers is on. It is on from the start, so every build counts them as before.
+// EDEN_UP_LEAN_DEV_TIMERS=1 (env.txt, read in main.cpp once the environment is complete) turns it
+// off in a build without EDEN_DEV_PROFILE, where nothing reads them: each Timer there is two clock
+// reads (lfence, rdtsc, lfence) and two locked adds on every draw (rasterizer_draw), every
+// dispatch (the three gpu_ phases of Scheduler::Push) and every guest entry into the GPU caches
+// (guest_cpu_*). A flag and not an #ifdef, as draw_marks below: this header must read the same in
+// every library that includes it.
+inline std::atomic<bool> dev_timers{true};
+struct alignas(64) DevTotals : Totals {};
 inline std::array<Totals, 6> compilation;
 // Temporary MKW timing probes.
 inline Totals mkw_transcode, mkw_transcode_finish;
@@ -115,7 +126,7 @@ inline void MkwRecordRunExit(unsigned long long tid, unsigned long long pc,
 inline std::array<std::atomic<unsigned long long>, 6> evacuations{};
 inline Totals storage;
 inline Totals jit_protection;
-inline Totals rasterizer_draw;
+inline DevTotals rasterizer_draw;
 // The six phases of that draw path (RasterizerVulkan::PrepareDraw) in order: flushing the pending
 // work, taking the current pipeline, waiting for the two cache mutexes (and binding the pipeline
 // to the engine), configuring it, applying dynamic state, and recording. Calls count each phase's
@@ -146,7 +157,7 @@ inline Totals gpu_queue_wait, gpu_dispatch;
 // the channel lock and binding it, queueing the submit list, and then executing the guest's
 // methods - the O(draws) part. gpu_dispatch is their sum plus the loop's own overhead, so these
 // say whether the time is the lock, the queueing, or the methods themselves.
-inline Totals gpu_sched_lock, gpu_dma_push, gpu_dma_dispatch;
+inline DevTotals gpu_sched_lock, gpu_dma_push, gpu_dma_dispatch;
 // Producer-side waits outside the dispatch timer: forced fence drains on the GPU
 // thread, free presentation-frame waits, and guest pushes into a full GPU queue.
 inline Totals gpu_fence_drain, gpu_present_wait, gpu_queue_full;
@@ -158,7 +169,7 @@ inline Totals gpu_fence_drain, gpu_present_wait, gpu_queue_full;
 // unbatched case is the stall to drive out.
 inline Totals gc_batched_drain, gc_unbatched_drain;
 // Guest threads entering the GPU caches: CPU writes to tracked pages and flush-area lookups.
-inline Totals guest_cpu_write, guest_cpu_read;
+inline DevTotals guest_cpu_write, guest_cpu_read;
 // Those entries take the buffer and texture cache locks, which the GPU thread holds for one draw at
 // a time. A guest core that sleeps in the kernel for each wait loses more than most holds last
 // (a large open-world game: 1.5-3.2 ms per frame at 8-12 us per write), so it first retries try_lock for a bounded
@@ -520,9 +531,14 @@ class Timer {
 public:
     explicit Timer(Totals& target, unsigned long long bytes = 0)
         : totals(target), requested_bytes(bytes), start(Common::g_wall_clock.GetTimeNS()) {}
+    // A development-report total (DevTotals): measured only while dev_timers is on.
+    explicit Timer(DevTotals& target, unsigned long long bytes = 0)
+        : totals(target), requested_bytes(bytes), active(dev_timers.load(std::memory_order_relaxed)),
+          start(active ? Common::g_wall_clock.GetTimeNS() : std::chrono::nanoseconds{}) {}
     Timer(const Timer&) = delete;
     Timer& operator=(const Timer&) = delete;
     ~Timer() {
+        if (!active) return;
         const auto elapsed = (Common::g_wall_clock.GetTimeNS() - start).count();
         totals.nanoseconds.fetch_add(static_cast<unsigned long long>(elapsed), std::memory_order_relaxed);
         if (requested_bytes) totals.requested_bytes.fetch_add(requested_bytes, std::memory_order_relaxed);
@@ -531,6 +547,7 @@ public:
 private:
     Totals& totals;
     unsigned long long requested_bytes;
+    bool active = true;
     std::chrono::nanoseconds start;
 };
 

@@ -65,7 +65,7 @@ ir_opt/global_memory_to_storage_buffer_pass.cpp, frontend/maxwell/translate_prog
 video_core buffer_cache.h, buffer_cache_base.h, renderer_vulkan/vk_compute_pipeline.cpp (the
 generated vk_compute_pipeline_cost.cpp carries the change, no anchor touched).
 
-T83: rebased onto the T83 stack (context only: fritchii-churn and fritchii2-lastaddr changed neighbouring lines).
+T83: rebased onto the T83 stack (context only: other T83 patches changed neighbouring lines).
 
 diff --git a/src/shader_recompiler/CMakeLists.txt b/src/shader_recompiler/CMakeLists.txt
 index 13c0c06..cb92bba 100644

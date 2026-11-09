@@ -1,0 +1,454 @@
+Subject: [PATCH] EDEN_UP_SHADER_PREP stats: every disk cache record counted by what shader preparation did with it (records for another dynamic state by flag, prepared / kept / not kept / failed, ms a pipeline), and predicted records made for another dynamic state left out (the lesson of Fritchii v5.4 and v5.5); folded into EDEN_UP_SHADER_PREP, no new switch, off by default
+
+Follow-up to 0480 (EDEN_UP_SHADER_PREP). Upstream read: Frizti/Fritchii pre-releases
+fritchii-v5.4 (oot-gather-fix 8ce6c1e0d4; the fix is 9ea66c8273 "vulkan: precompiled pipelines
+recorded with a dynamic logic op build where it is static (AMD)", by Frizti, found with a log
+from koriko) and fritchii-v5.5 (4012e5271e; bd59d18c6a "EDS2 and dynamic vertex input in the
+tuned settings", d64f34764a "frame generation never runs", 4012e5271e NVIDIA cache size).
+v5.4: on AMD's Windows driver their preparation skipped 116,373 of 120,461 Ocarina records as
+"for another device": the shipped recipe was recorded on NVIDIA with a dynamic logic op, AMD has
+none, so the keys never matched; v5.4 clears the logic operation in keys while logic op is off
+and converts such records. v5.5: players with Extended Dynamic State at Disabled or EDS3 had
+preparation skip almost everything (the recipe is EDS2); it sets EDS2 and dynamic vertex input
+back once.
+
+Does our preparation have the same skip problem on RADV? No. What was checked:
+- Where our records come from: only this console's own cache (vulkan.bin, vulkan_mesh.bin),
+  recorded by draws on this console; prep_predicted.bin is read but nothing writes it yet
+  (vk_pipeline_cache.cpp:2820-2828, vk_pipeline_prep.h header comment). Nothing is shipped.
+- Which key fields must match: the boot takes a record only when its key's dynamic state flags
+  equal this device's (mask components, EDS1, EDS2, EDS2 logic op, EDS3 blend, EDS3 enables,
+  color write enable, dynamic vertex input, provoking vertex; vk_pipeline_cache.cpp:1649-1680),
+  and 0480 prepares only records the boot took (disk_pipelines, :1682, :2852). Records failing
+  that check are dropped silently: no count anywhere, the v5.4 symptom.
+- Logic op on this device: dynamic. has_extended_dynamic_state_2_logic_op comes from
+  extendedDynamicState2LogicOp (vk_pipeline_cache.cpp:680-681, vulkan_device.h:843-844), which
+  dyna_state=2 keeps (vulkan_device.cpp:706-712 removes only EDS3 at level 2) and RADV
+  exposes: every record of the console's cache carries the EDS2 logic op flag (below).
+  With it, the logic operation never enters the key (fixed_pipeline_state.cpp:264-266) and the
+  enable is static (:408-409, no EDS3 at level 2): our keys look like Fritchii's NVIDIA keys, and
+  are made and matched on the same device.
+- EDS level: dyna_state defaults to EDS2 off Android/Apple (settings.h:699-708) and dynamic vertex
+  input to on (:718-724); the only overrides are EDEN_DEV_SETTINGS dyna_state=N and
+  vertex_input_dynamic=off (headless/main.cpp:1032-1033, :1099-1102), which the play env does not
+  set. The 9 Nov hand session log: "DynamicState setting value: 2", "Driver: radv 26.2.0",
+  "Total Pipeline Count: 824", "1072 cached graphics pipelines are built when first needed".
+- The console's own cache, read record by record (backup of 6 Nov, CACHE_VERSION 23, layout from
+  the build's own headers): 1,597 graphics records (and 209 compute), every one recorded with
+  EDS1, EDS2, EDS2 logic op, color write enable and dynamic vertex input, without EDS3 blend or
+  enables, mask components 0, driver RADV 26.2.0, logic op 0 and its enable 0, no HLE macro, no
+  vertex A, all vertex B + fragment. Two older backups (5 Nov, version 21, 819 and 860 records):
+  the same. With this device's features 0 of 1,597 (0%) are for another dynamic state; v5.4's
+  canonical rule (clear the operation while logic op is off) merges 0 keys.
+So v5.4's conversion and v5.5's forced EDS2 change nothing here. What can skip silently on the
+PS5 is a record written while EDEN_DEV_SETTINGS dyna_state= / vertex_input_dynamic=off,
+EDEN_NX2_MASK_COMPONENTS=1 or EDEN_PE_STATIC_VERTEX_INPUT=1 was set in some test arm: the play
+env's boot drops it without a count, and preparation never sees it. This diff makes that visible.
+
+What changes (all inside PipelineCache::PrepareKept, which only runs with EDEN_UP_SHADER_PREP=1):
+- other_device(key): the boot's own check, as a bit per differing dynamic state (the host test
+  below checks it equals the boot's check in every case).
+- First pass: an own record the boot did not take is classified (task or mesh record of vulkan.bin,
+  another dynamic state by flag, or no reason found) instead of skipped without a trace; known
+  records are counted as kept or not keepable; a key read twice is counted.
+- Predicted records (prep_predicted.bin, the planned next step) made for another dynamic state are
+  left out ("another dynamic state" in the left-out list) instead of being prepared for a key no
+  draw here makes. Folded into EDEN_UP_SHADER_PREP, not a switch of its own: it only fixes the
+  off-by-default path, and changes nothing until something writes that file.
+- Log, after the existing "N pipelines known ..." line (which gains "another dynamic state N" in
+  its left-out list):
+  "Shader preparation stats: R records read (O own, P predicted): N not taken by the boot (a for
+  another dynamic state, b task or mesh in vulkan.bin, c for no reason found), L left out, K kept
+  already, U not keepable, S struck out, T to prepare, D read twice" (the buckets add up to R);
+  "Shader preparation stats: M records for another dynamic state (own, predicted), never asked
+  for here; recorded otherwise: EDS1 .., EDS2 .., EDS2 logic op .., EDS3 blend .., EDS3 enables
+  .., color write enable .., dynamic vertex input .., mask components .., provoking vertex ..;
+  this device: EDS1 1, EDS2 1, EDS2 logic op 1, EDS3 blend 0, ..." (as Fritchii's "Precompiled
+  pipelines for another device: 116373 (EDS2 logic op: 116373 recorded dynamic, 0 dynamic here)");
+  and at the end of preparation "Shader preparation stats: N prepared: K kept, U built but not
+  kept, F failed; L left for the next start; X ms a pipeline on W workers" (wall clock of the
+  build pass, for the whole-game estimate). K is read back from the store after each job:
+  KeptStore::Add returns nothing and can refuse (a failed write ends keeping for the session),
+  so a refusal counts as "built but not kept", never as kept. X ends when the last job does
+  (the index commit and compaction after it are not in it). W is the builder pool's count
+  (1 where parallel builds are broken), taken once with max_in_flight: GetTotalPipelineWorkers
+  logs "Pipeline builders" at each call when EDEN_NX2_PIPELINE_WORKERS is set (play env).
+
+Unset (EDEN_UP_SHADER_PREP not "1"): T84, byte for byte in behaviour: PrepareKept is called only
+when prep is on (vk_pipeline_cache.cpp:1747-1748), and every line of this diff is inside it (checked).
+With the switch on, what is prepared and kept is the same as 0480 for own records; only predicted
+records for another dynamic state change (left out), and no file of those exists yet.
+
+Risks: low. Extra work per boot with prep on: a few integer compares for each own record the boot
+did not take (0 on the 6 Nov cache) and three more log lines. The classifier is a second copy of
+the boot's check: a later patch that changes load_graphics' test must change other_device too,
+or the stats call records "another dynamic state" (or "no reason found") wrongly; preparation
+itself does not depend on it for own records. "No reason found" > 0 means the boot's reader
+(headless shader_cache_reader.inc) and preparation's reader saw different records.
+
+Not ported, and why:
+- 9ea66c8273 CanonicalizeKeyState (logic op cleared while off): no-op here, the operation is never
+  in our keys with a dynamic logic op; our tree has no canonical keys (#895 not ported).
+- 9ea66c8273 RecordedKeyForThisDevice conversion (recorded dynamic, static here): no foreign
+  records exist; ours are recorded on this device. Not in our tree.
+- 9ea66c8273 EDEN_NX2_NO_DYNAMIC_LOGIC_OP: only tests that conversion.
+- bd59d18c6a EDS2 and dynamic vertex input set once: already the PS5's values, set by default
+  each start; there is no per-user config with a stale value. If the stats ever show many records
+  for another dynamic state, the port to make is a conversion of records recorded with less
+  dynamic state than this device (clear what is dynamic here), not a forced setting.
+- d64f34764a frame generation: a stale Qt per-game value upstream; headless sets frame_gen from
+  its own video config and framegen.txt at every start (headless/main.cpp:1182-1189). Unrelated
+  to shader preparation.
+- 4012e5271e NVIDIA shader cache size: NVIDIA only; the RADV counterpart
+  (MESA_SHADER_CACHE_MAX_SIZE, 1 GB by default) is far above ~13 MB for our ~1,900 pipelines.
+- Driver rekey of records from an older driver (Fritchii's RecordedKeyForThisDevice, before
+  v5.4): 0 of 1,597 records are from another driver today. After the build's next Mesa update
+  every own record is "another driver" in 0480's left-out list and nothing is prepared until
+  draws record them again; that line shows when this port is needed.
+
+Expected effect: none on fps and none on what is prepared from today's cache (0 of 1,597 records
+lost to a device mismatch: v5.4's gain, 4k -> 120k prepared on AMD, has no counterpart here).
+0480's own effect stands: about 1,072 own records left to prepare at the first boot with the
+switch (1,896 the 9 Nov boot took, 824 of them built at boot), so the walk's "on disk" builds
+(554 of 1,387 runtime builds, 21.0 s on the GPU thread in the 12 minute 9 Nov session; about
+15 ms each) should cost about 1 ms each. The stats give the numbers to check that: records for
+another dynamic state (expected 0), to prepare (about 1,072 on the first boot, near 0 after),
+prepared kept vs not kept vs failed, and ms a pipeline (expected 3 to 6 ms warm on 8 workers).
+
+Test arm: no arm of its own; the lines come with every EDEN_UP_SHADER_PREP=1 run of the shader
+preparation test plan. Read them in A1 (EDEN_UP_SHADER_PREP=1 EDEN_UP_SHADER_PREP_FAST=0, first
+boot) and A2 (second boot), then B1/B2 (cold, EDEN_UP_SHADER_PREP=1):
+- "not taken by the boot": 0 expected; any "for another dynamic state" with this device's line
+  shows which setting wrote them. "no reason found" > 0: report.
+- A1 "to prepare" about 1,072 and the end line's "kept" close to it; "built but not kept" =
+  layer emulation / mesh as compute / no memory / the store refused (then a "keeping stops"
+  warning is in the log); "failed" > 0: report with the log.
+- A1 "ms a pipeline" for the whole-game estimate (warm driver cache).
+- A2: "to prepare" near 0, "kept already" about 1,900.
+- A0 (switch unset): no "Shader preparation" line at all, as before.
+
+Checks (VM scratch /tmp/sp54-chk-6m2q; fv54/fv54_checks.sh, fv54_extract.py, fv54_inject.py,
+fv54_test.cpp in the ports folder; log fritchii-v54-shader-prep.checks.log): git apply --check on
+the T84 tree, patch and reverse dry run; every changed line is inside PrepareKept, whose only call
+is under `if (prep && ...)`; no new switch name, no getenv or PeSwitch added;
+prepare-vulkan-port.py anchor skips the same before and after (6), only vk_pipeline_cache_cost.cpp
+changes, by exactly the diff's lines, and the baseline copy equals the build's; -fsyntax-only with
+the build's flags (compile_commands.json) rc=0 on the generated vk_pipeline_cache_cost.cpp before
+and after and on vk_pipeline_prep.cpp; no new warning with the build's flags (control: a planted
+unused comparison is reported) nor with -Wshadow-all -Wunused-variable added; 16 injected errors
+in the new code all reported, no other error. Host test (the classifier and the boot's own check
+cut from the patched source, built with host clang against the tree's headers): 12,582,912 cases
+(every combination of 9 device features, the 2 switches the check reads and 11 key flags, on 3
+real keys), 0 mismatches. The 1,597 real keys of the 6 Nov cache: 0 for another dynamic state with
+this console's features; all 1,597, each under the right reason, with dyna_state=3, =1 or =0, a
+static logic op (v5.4's AMD case), vertex_input_dynamic=off or EDEN_NX2_MASK_COMPONENTS=1. The
+cache was read with fv54/cache_scan.py, its layout from fv54/probe.cpp compiled to assembly with
+the build's flags (key 1056 bytes, state at 48, as the PS5 build). Not checked: linking, a run.
+Review (adversarial, VM scratch /tmp/fv54rev-k3x9; fv54-review/ in the ports folder): three
+fixes in the stats only (K read back from the store; X over the build pass; W taken once),
+all inside PrepareKept; every check above run again on this diff (18 injected errors, the
+fixes' lines included, all reported), and it applies with lichii-1056 in either order (no
+shared file, same generated copy).
+
+Files: src/video_core/renderer_vulkan/vk_pipeline_cache.cpp.
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index f9a177f..5f97bb0 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -2710,7 +2710,8 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+     // Beside this stamp's store, and removed with it: another build starts without strikes.
+     const auto journal_filename = prep_store.Sidecar(".inflight");
+     const auto strikes_filename = prep_store.Sidecar(".strikes");
+-    const size_t max_in_flight = std::max<size_t>(GetTotalPipelineWorkers() * 2, 8);
++    const size_t worker_count = GetTotalPipelineWorkers();
++    const size_t max_in_flight = std::max<size_t>(worker_count * 2, 8);
+ 
+     // A pipeline whose build took the app down twice is left to the draw that needs it. The
+     // journal holds the key hashes being built; what it still holds at the next start was in
+@@ -2754,6 +2755,11 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+         size_t finished{};
+         size_t failed{};
+         size_t total{};
++        // Of the finished ones: kept (what the store holds after the job), and built but not
++        // kept (more than SPIR-V and infos makes it, no memory, or the store refused it: a
++        // failed write ends keeping for the session). The rest failed.
++        size_t kept{};
++        size_t not_kept{};
+         std::vector<u32> free_slots;
+         std::fstream journal;
+     } state;
+@@ -2810,6 +2816,58 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+         });
+         return mesh && !mesh_file ? 1 : 0;
+     };
++    // The boot's check of a record against this device (load_graphics in LoadDiskResources, the
++    // same tests): a bit per dynamic state the key was made with and this device has not, or the
++    // other way round. 0: a draw here can make this key. Fritchii v5.4 and v5.5 (Frizti/Fritchii
++    // 9ea66c8, bd59d18c6a) found their preparation skipping 116,373 of 120,461 Ocarina records on
++    // AMD for this (logic op recorded dynamic, static there; or another dynamic state level), and
++    // silently: here such a record is counted by the stats lines instead.
++    enum : u32 {
++        OtherMaskComponents,
++        OtherEds1,
++        OtherEds2,
++        OtherEds2LogicOp,
++        OtherEds3Blend,
++        OtherEds3Enables,
++        OtherColorWriteEnable,
++        OtherVertexInput,
++        OtherProvokingVertex,
++        OtherCount,
++    };
++    const auto other_device = [this](const GraphicsPipelineCacheKey& key) -> u32 {
++        const FixedPipelineState& recorded = key.state;
++        const DynamicFeatures& here = dynamic_features;
++        u32 bits = 0;
++        const auto differs = [&bits](u32 bit, bool was, bool is) {
++            if (was != is) {
++                bits |= 1U << bit;
++            }
++        };
++        differs(OtherMaskComponents, recorded.mask_components != 0,
++                MaskComponentsEnabled() && !here.has_extended_dynamic_state_3_blend);
++        differs(OtherEds1, recorded.extended_dynamic_state != 0, here.has_extended_dynamic_state);
++        differs(OtherEds2, recorded.extended_dynamic_state_2 != 0,
++                here.has_extended_dynamic_state_2);
++        differs(OtherEds2LogicOp, recorded.extended_dynamic_state_2_logic_op != 0,
++                here.has_extended_dynamic_state_2_logic_op);
++        differs(OtherEds3Blend, recorded.extended_dynamic_state_3_blend != 0,
++                here.has_extended_dynamic_state_3_blend);
++        differs(OtherEds3Enables, recorded.extended_dynamic_state_3_enables != 0,
++                here.has_extended_dynamic_state_3_enables);
++        differs(OtherColorWriteEnable, recorded.color_write_enable_dynamic != 0,
++                here.has_color_write_enable);
++        if ((recorded.dynamic_vertex_input != 0) != here.has_dynamic_vertex_input &&
++            !(StaticVertexInputEnabled() && here.has_dynamic_vertex_input &&
++              EdenAttributelessStaticKey(recorded))) {
++            bits |= 1U << OtherVertexInput;
++        }
++        if (recorded.provoking_vertex_last != 0 &&
++            (!here.has_provoking_vertex_last_mode ||
++             (recorded.xfb_enabled != 0 && !here.has_provoking_vertex_tf_preserve))) {
++            bits |= 1U << OtherProvokingVertex;
++        }
++        return bits;
++    };
+     // The files are read with a reader of our own: the boot's reader cuts a file back when
+     // anything in its loop runs out of memory, and these passes would be two more chances.
+     const auto read_files = [&](const auto& graphics_for) {
+@@ -2830,7 +2888,7 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+ 
+     // First pass: which records are left to prepare. Own records are the ones the boot above took
+     // from the disk cache (disk_pipelines: they passed its checks for this device); the records
+-    // of prep_predicted.bin are taken as they are.
++    // of prep_predicted.bin pass the same check here (another dynamic state: left out).
+     // A sample of the records kept already is translated again and compared, another sample at
+     // each boot: the boot above only compared the pipelines it built, and a translation that
+     // changed without the stamp noticing may have changed only others.
+@@ -2840,25 +2898,74 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+     std::atomic<size_t> probed{};
+     std::atomic<size_t> probe_differed{};
+     std::unordered_set<u64> todo;
+-    std::array<size_t, 4> left_out{};
++    // 1 stages, 2 another driver, 3 an HLE macro, 4 another dynamic state (predicted records).
++    std::array<size_t, 5> left_out{};
+     size_t struck = 0;
+     size_t own_left = 0;
+     size_t probes_queued = 0;
++    // For the stats lines: what the first pass did with every graphics record it read.
++    struct {
++        size_t own{};          // read from vulkan.bin and vulkan_mesh.bin
++        size_t predicted{};    // read from prep_predicted.bin
++        size_t not_taken{};    // own, but not taken by the boot (not in disk_pipelines)
++        size_t mesh_in_main{}; // ... of them task or mesh records of vulkan.bin
++        size_t other_own{};    // ... of them for another dynamic state
++        size_t no_reason{};    // ... of them for none of these
++        size_t other_predicted{};
++        std::array<size_t, OtherCount> differs{}; // per dynamic state, own and predicted
++        size_t kept{};         // known: kept by an earlier start
++        size_t not_keepable{}; // known: remembered as not keepable
++        size_t again{};        // a key read a second time
++    } seen;
++    const auto count_other = [&seen](u32 bits) {
++        for (u32 bit = 0; bit < OtherCount; ++bit) {
++            if ((bits >> bit) & 1U) {
++                ++seen.differs[bit];
++            }
++        }
++    };
+     const auto scan_graphics = [&](bool own, bool mesh_file) {
+         return [&, own, mesh_file](std::ifstream& file, std::vector<FileEnvironment> envs) {
+             GraphicsPipelineCacheKey key;
+             file.read(reinterpret_cast<char*>(&key), sizeof(key));
+             const u64 hash = key.Hash();
+-            if (stop_loading.stop_requested() || (own && !disk_pipelines.contains(hash))) {
++            if (stop_loading.stop_requested()) {
++                return;
++            }
++            ++(own ? seen.own : seen.predicted);
++            if (own && !disk_pipelines.contains(hash)) {
++                // Never asked for by a draw here: why, as the boot's check decided it.
++                ++seen.not_taken;
++                if (!mesh_file && std::ranges::any_of(envs, [](const FileEnvironment& env) {
++                        return env.ShaderStage() == Shader::Stage::Task ||
++                               env.ShaderStage() == Shader::Stage::Mesh;
++                    })) {
++                    ++seen.mesh_in_main;
++                } else if (const u32 bits = other_device(key); bits != 0) {
++                    ++seen.other_own;
++                    count_other(bits);
++                } else {
++                    ++seen.no_reason;
++                }
+                 return;
+             }
+             if (const u32 why_not = preparable(key, envs, mesh_file); why_not != 0) {
+                 ++left_out[why_not];
+                 return;
+             }
++            if (!own) {
++                // A predicted record made for another dynamic state is never asked for here.
++                if (const u32 bits = other_device(key); bits != 0) {
++                    ++left_out[4];
++                    ++seen.other_predicted;
++                    count_other(bits);
++                    return;
++                }
++            }
+             if (prep_store.Contains(hash)) {
+-                if (probes_queued >= MaxProbes || ((hash ^ salt) & 7) != 0 ||
+-                    !prep_store.IsKept(hash)) {
++                const bool kept = prep_store.IsKept(hash);
++                ++(kept ? seen.kept : seen.not_keepable);
++                if (probes_queued >= MaxProbes || ((hash ^ salt) & 7) != 0 || !kept) {
+                     return;
+                 }
+                 ++probes_queued;
+@@ -2903,7 +3010,9 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+                 ++struck;
+                 return;
+             }
+-            todo.insert(hash);
++            if (!todo.insert(hash).second) {
++                ++seen.again;
++            }
+         };
+     };
+     for (int attempt = 0; attempt < 2; ++attempt) {
+@@ -2911,6 +3020,7 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+         left_out = {};
+         struck = 0;
+         own_left = 0;
++        seen = {};
+         size_t own_seen = 0;
+         const bool whole = read_files([&](bool own, bool mesh_file) {
+             return [&, own, scan = scan_graphics(own, mesh_file)](
+@@ -2948,10 +3058,41 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+     LOG_INFO(Render_Vulkan,
+              "Shader preparation: {} pipelines known, {} left to prepare ({} of this console's own "
+              "records, {} predicted), {} struck out, {} left out (stages {}, another driver {}, "
+-             "HLE macro {}), {} compared at boot and {} more now; {} now",
++             "HLE macro {}, another dynamic state {}), {} compared at boot and {} more now; {} now",
+              prep_store.Size(), left, own_left, left - own_left, struck,
+-             left_out[1] + left_out[2] + left_out[3], left_out[1], left_out[2], left_out[3],
+-             compared, probed.load(), limit);
++             left_out[1] + left_out[2] + left_out[3] + left_out[4], left_out[1], left_out[2],
++             left_out[3], left_out[4], compared, probed.load(), limit);
++    // Every record read, by what became of it (the buckets add up to own + predicted).
++    LOG_INFO(Render_Vulkan,
++             "Shader preparation stats: {} records read ({} own, {} predicted): {} not taken by the "
++             "boot ({} for another dynamic state, {} task or mesh in vulkan.bin, {} for no reason "
++             "found), {} left out, {} kept already, {} not keepable, {} struck out, {} to prepare, "
++             "{} read twice",
++             seen.own + seen.predicted, seen.own, seen.predicted, seen.not_taken, seen.other_own,
++             seen.mesh_in_main, seen.no_reason,
++             left_out[1] + left_out[2] + left_out[3] + left_out[4], seen.kept, seen.not_keepable,
++             struck, left, seen.again);
++    {
++        const DynamicFeatures& here = dynamic_features;
++        const auto& d = seen.differs;
++        LOG_INFO(Render_Vulkan,
++                 "Shader preparation stats: {} records for another dynamic state ({} own, {} "
++                 "predicted), never asked for here; recorded otherwise: EDS1 {}, EDS2 {}, EDS2 "
++                 "logic op {}, EDS3 blend {}, EDS3 enables {}, color write enable {}, dynamic "
++                 "vertex input {}, mask components {}, provoking vertex {}; this device: EDS1 {}, "
++                 "EDS2 {}, EDS2 logic op {}, EDS3 blend {}, EDS3 enables {}, color write enable "
++                 "{}, dynamic vertex input {}, mask components {}",
++                 seen.other_own + seen.other_predicted, seen.other_own, seen.other_predicted,
++                 d[OtherEds1], d[OtherEds2], d[OtherEds2LogicOp], d[OtherEds3Blend],
++                 d[OtherEds3Enables], d[OtherColorWriteEnable], d[OtherVertexInput],
++                 d[OtherMaskComponents], d[OtherProvokingVertex],
++                 u32{here.has_extended_dynamic_state}, u32{here.has_extended_dynamic_state_2},
++                 u32{here.has_extended_dynamic_state_2_logic_op},
++                 u32{here.has_extended_dynamic_state_3_blend},
++                 u32{here.has_extended_dynamic_state_3_enables}, u32{here.has_color_write_enable},
++                 u32{here.has_dynamic_vertex_input},
++                 u32{MaskComponentsEnabled() && !here.has_extended_dynamic_state_3_blend});
++    }
+     if (limit == 0) {
+         state.journal.close();
+         std::error_code error;
+@@ -2963,6 +3104,7 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+         return;
+     }
+     callback(VideoCore::LoadCallbackStage::Build, 0, limit);
++    const auto prepare_begin = std::chrono::steady_clock::now();
+ 
+     // Second pass: each record left is translated and built once on a worker, kept, and dropped.
+     // Built with the driver's own cache only: the emulator's VkPipelineCache is held in memory
+@@ -2995,6 +3137,7 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+                 workers.QueueWork([this, key, hash, slot, flags, envs_ = std::move(envs), &state,
+                                    &note_slot, &callback, begin]() mutable {
+                     bool ok = false;
++                    bool kept = false;
+                     try {
+                         ShaderPrep::Stages stages;
+                         stages.driver_cache_only = true;
+@@ -3009,6 +3152,9 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+                         ok = pipeline != nullptr;
+                         if (ok && !stages.unsuitable) {
+                             KeepPrepared(key, stages, envs_, flags);
++                            // Add returns nothing and can refuse (a failed write, an empty
++                            // stage): kept is what the store holds now.
++                            kept = prep_store.IsKept(hash);
+                         } else {
+                             // Not translated, or more than SPIR-V and infos makes it: remembered,
+                             // so no later start of this build tries again.
+@@ -3024,6 +3170,11 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+                     if (!ok) {
+                         ++state.failed;
+                     }
++                    if (kept) {
++                        ++state.kept;
++                    } else if (ok) {
++                        ++state.not_kept;
++                    }
+                     state.free_slots.push_back(slot); // room reserved: cannot throw
+                     note_slot(slot, 0);
+                     try {
+@@ -3058,6 +3209,7 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+     };
+     const bool whole = read_files(build_graphics);
+     wait_for_jobs();
++    const double build_seconds = seconds_since(prepare_begin);
+     {
+         std::scoped_lock lock{state.mutex};
+         state.journal.close();
+@@ -3073,6 +3225,16 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+              prep_store.Size(), prep_store.DataBytes() >> 20,
+              committed ? "" : "; the index was NOT written",
+              whole ? "" : "; a cache file could not be read to its end");
++    // The cost of one, for the estimate of preparing the whole game (wall clock of the build
++    // pass, all workers; the commit and compaction after it are not counted).
++    LOG_INFO(Render_Vulkan,
++             "Shader preparation stats: {} prepared: {} kept, {} built but not kept, {} failed; "
++             "{} left for the next start; {:.1f} ms a pipeline on {} workers",
++             state.finished, state.kept, state.not_kept, state.failed,
++             left - std::min(left, queued),
++             state.finished == 0 ? 0.0
++                                 : build_seconds * 1000.0 / static_cast<double>(state.finished),
++             device.HasBrokenParallelShaderCompiling() ? size_t{1} : worker_count);
+ }
+ 
+ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateKeptGraphicsPipeline(

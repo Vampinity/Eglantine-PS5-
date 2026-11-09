@@ -1,0 +1,2824 @@
+Subject: [PATCH] Lichii #1028: async read-back (the reading thread waits for its own buffer downloads), early downloads of read-back pages, and a narrower wait for DMA snapshot misses (EDEN_UP_L1028_ASYNC_READBACK, EDEN_UP_L1028_EARLY, EDEN_UP_L1028_DMA_WAIT, EDEN_UP_L1028_VERIFY, EDEN_UP_L1028_DMA_WAIT_VERIFY, EDEN_UP_L1028_STATS; all off by default)
+
+Port of zortos293/Lichii #1028 (egla91/async-readback-nx2, merged into nx2 as 0b83798bf6 on 9 Nov;
+"video_core: async read-back: the reading thread waits for its downloads (port of #805's
+read-back)"). Commits by jpkto and zortos293 (Zortos); capy-ai co-authored most of them, claude
+co-authored df7e7da097, d020b62d91 and 027514b2c3. Measured upstream (5900X + RTX 3080, EGLA-91
+round 4, no profiler, fresh launch per run): Ocarina of Time at Kokiri 28.2 -> 32.9 fps (+17%,
+p90 38.0 -> 32.8 ms), Donkey Kong Bananza unchanged; with the GPU profile (round 2) the back
+thread's fence waits went 117 -> 0 ms/s in Ocarina; the narrower macro DMA wait alone did not
+shorten Ocarina's front wait there (235 -> 250 ms/s).
+To be numbered 0482 (after 0481 lichii-949-drain-free-acquire; T84 = 0001..0481).
+
+Commit by commit (have = in T84 already; file:line on T84):
+- fb1845900c reading thread waits for its downloads (jpkto): missing. GPU::OnCPURead
+  (gpu.cpp:378-400) queues InvalidateGPUCache + FlushRegion as a sync request and waits for it;
+  in the split the back runs it (gpu_thread.cpp:192 TickWork, or PrepareDraw's TickWork), and
+  RasterizerVulkan::FlushRegion (vk_rasterizer.cpp:2200) -> BufferCache::DownloadMemory
+  (buffer_cache.h:434) -> DownloadBufferMemory/DownloadRangesMemory end in runtime.Finish()
+  (buffer_cache.h:3936, :513; Scheduler::Finish) with the buffer cache's lock held. Ported:
+  EDEN_UP_L1028_ASYNC_READBACK.
+- d402148081, df7e7da097, bdaf4ae1c5, ac740d6ae8, 122b049db5 (EDEN_NX2_READ_CHECK and its early /
+  landed-bytes refinements): missing. Ported reduced, as EDEN_UP_L1028_VERIFY (see below); the
+  early-landed bytes (EarlyLanded, ForgetUploadedEarlyLanded) are not ported.
+- 1c2f37dd7a land read downloads under query results, outdate them for query copies: missing
+  (query_cache.h:256 CounterReport, :653 SemiFlushQueryDirty write reports straight to guest
+  memory; vk_query_cache.cpp:1712 SyncValues copies results into buffers unrecorded). Ported,
+  inside ASYNC_READBACK.
+- 1a3e8bcbe0 early downloads of read-back pages: missing. Ported: EDEN_UP_L1028_EARLY.
+- df0b5f6bde DownloadLanding (guest writes wait for a landing under them): missing
+  (core/memory.cpp:957 Collect, then the store). Ported, inside ASYNC_READBACK (upstream had it
+  under the switch in a846b27fc3, always on from 30eefa7dc6).
+- d020b62d91 the check copy marks its bytes used: ported (VERIFY).
+- 027514b2c3 applied writes leave applying_writes on every exit: ported (SCOPE_EXIT).
+- a846b27fc3 one switch EDEN_NX2_ASYNC_READBACK + nx2_async_readback.h counters: ported as the
+  switches and the 10 s line below; 30eefa7dc6 (always on, switch dropped) and d06c15a457
+  ([[likely]] removal) not followed: everything stays behind switches.
+- 55601ecbbe wait only for the work that writes what a macro DMA reads: partly have. Our
+  EDEN_NX2_DMA_SNAPSHOT (Frizti/Fritchii 8ac3666f7b, EvilOOT's fix; play env =1) has the front's
+  write notes (gpu_split.h:549 NoteWriter, :562 NoteUnrangedWriter, :568 NoteMemoryWrite, :593
+  MayBeWrittenSince; maxwell_3d.cpp:1366 FrontWritesGuestMemory) and the report check
+  (rasterizer_interface.h:147 HasCachedReports = upstream's HoldsQueries/HoldsReports): a hit
+  skips the drain, but a miss drains the whole split (maxwell_3d.cpp:2111, "dma snapshot miss").
+  Missing: the narrower wait. Ported on the snapshot misses only, on our notes:
+  EDEN_UP_L1028_DMA_WAIT. Not ported: upstream's GpuSplit::Writes on every send and
+  FrontNoteWrites (draws count as writers anywhere there; DMA_SNAPSHOT trusts that draws don't
+  write the pages its hits read, and this keeps that trust), and the narrower wait on the
+  non-snapshot path (MacroDmaRead/MacroDmaReadRam, 0-2 drains/s in T84 walks).
+- f99baf1336 EDEN_NX2_DMA_READ_VERIFY: ported for the narrowed reads as
+  EDEN_UP_L1028_DMA_WAIT_VERIFY (EDEN_NX2_DMA_SNAPSHOT=2 already checks the hits).
+- b41488e16e narrow wait under the switch: folded into DMA_WAIT.
+- 4c43a2f9ad nx2.h out of rasterizer_download_area.h: ported (MayHoldGpuWrites in gpu.cpp).
+- 8d096867b4 land read downloads before writes guest memory doesn't hold (DMA copy, clear,
+  discard, inline): ported (ClearDownload lands, ClearReplacedDownload where guest memory has the
+  newer bytes). Deviation below for early downloads on the recording thread.
+- b3047aff8a keep GPU writes after a query report GPU-modified: ported, inside EARLY
+  (NoteReportPending/FinishReport, only pages with early downloads).
+- fff4de3caf end only the results the buffer cache kept, 17e3ad1e07 count ClearDownload's
+  landings and keep PrepareRegionWrite from waiting: ported.
+- 2b50b2f2e7 merge of nx2 (spin mutex, dma_pusher, profile): not part of this port.
+- Tests (buffer_cache_ports, maxwell_fast_method) and AGENTS.md: not ported, our tests are not
+  built.
+
+Against what we already have:
+- 0477 EDEN_UP_FRITCHII_GRHAND (Frizti/Fritchii EXP60, vk_rasterizer.cpp:2327-2410): complements,
+  does not supersede, no conflict. GRHAND acts before the flush, on the reading thread's lock
+  taking in RasterizerVulkan::GetFlushArea: if texture_cache.mutex/buffer_cache.mutex stay taken
+  for 256 tries it hands the caches' GetFlushArea to the back and returns the read's pages as
+  non-preemptive; the flush itself is unchanged (sync request, the back's Scheduler::Finish under
+  the buffer lock, the reader waiting on the sync fence). #1028 acts in the flush: the back
+  submits the copies and goes on, the reader waits for the host GPU and lands the bytes. With both
+  on: a handed read's queued GetFlushArea answer (in_flight or not) is dropped as before; the
+  FlushRegionForRead queued next records no copies for bytes already on their way, and FinishRead
+  waits for the download that brings them (one extra request, same result). FinishRead takes
+  buffer_cache.mutex on the reading thread once more after the host GPU wait (upstream does too):
+  the lock GRHAND avoids, so in GRHAND's convoy scenario a reader can still queue there. No
+  textual overlap (this diff adds FlushRegionForRead/FinishRead after FlushRegion and changes
+  PrepareRegionWrite).
+- 0471 lichii-805-copy-barrier: a transfer-to-later-transfer barrier; #1028's HostReadBarrier is
+  a separate memory-write -> host-read barrier on the read downloads only. No overlap.
+- 0474 FRITCHII_LISTSYNC (#805's list waits) and 0475 FRITCHII_WRITEMARK: command list waits and
+  write marks; #1028 touches neither (MarkWrittenBuffer's new calls take whatever range is marked).
+- DMA_SNAPSHOT: see 55601ecbbe above. SEM_FAST: semaphore acquires, not touched.
+
+What each switch does (Common::PeSwitch, exactly "1"; read once):
+EDEN_UP_L1028_ASYNC_READBACK=1: GPU::OnCPURead's flush request runs
+  RasterizerVulkan::FlushRegionForRead: images download as before (synchronously, as upstream),
+  the buffer cache records the downloads of the read's GPU-modified bytes (and, with
+  EDEN_NX2_PREFLUSH=0, of the other ranges the guest read before) into a deferred staging buffer,
+  records a memory-write -> host-read barrier and submits (BufferCacheRuntime::SubmitForHostRead)
+  without waiting. The reading thread then waits for that tick (WaitForHostRead) and writes the
+  bytes to guest memory under the buffer lock (BufferCache::FinishReadDownloads); downloads land
+  oldest first. Until then the bytes stay GPU-modified; another read of them waits for the same
+  download (GetFlushArea: in_flight, also on Preflushable areas) instead of copying again. A GPU
+  write recorded over them (MarkWrittenBuffer, SyncValues' copies) keeps them GPU-modified after
+  the landing (the read still gets the bytes of its time). Writes to guest memory from the GPU's
+  side land the read downloads under them first: MemoryManager::Write/WriteBlock (semaphores,
+  inline uploads, DMA, CB data), query results (fence and immediate ones, SemiFlushQueryDirty);
+  DMA copies, clears, discarded and inline writes land them (ClearDownload) while guest CPU
+  writes and synchronous downloads take their bytes out (ClearReplacedDownload). Fence downloads
+  land completed read downloads first (PopAsyncBuffers), older fence downloads drop the bytes a
+  read download brings (ClearFenceDownloads), and TickFrame lands those no thread waited for.
+  Guest CPU writes collected in a landing's range store their bytes after it
+  (DownloadLanding::Await in core/memory.cpp), the buffer cache's downloads (also the synchronous
+  ones and the fences') land inside a DownloadLanding, and writes being applied stay listed as
+  pending while they are (GPU::GatherAndApply). No staging buffer free: the synchronous path for
+  that read.
+EDEN_UP_L1028_EARLY=1 (with ASYNC_READBACK): pages whose GPU writes the guest read twice in a row
+  get a download recorded right behind each later write (after the dispatch; draws' at
+  TickFrame), queued with the next submission (QueueForHostRead), landed when the host GPU ran it
+  (after each dispatch, every 32 draws, TickFrame). The read finds the bytes in guest memory or
+  waits for that download. Bounded: 64 pages, 1 MiB a frame, 32 pending. Only pages that are not
+  Preflushable learn this (a Preflushable read returns before NoteReadBack), so it acts with
+  EDEN_NX2_PREFLUSH=0, upstream's mode for Switch 2 titles; with our default preflush it is
+  inert. Deferred query results on such pages are noted (NoteReportPending): a GPU write over one
+  stays GPU-modified when a download lands it.
+EDEN_UP_L1028_DMA_WAIT=1 (needs EDEN_NX2_DMA_SNAPSHOT, the play env has it; not with
+  EDEN_NX2_QUERY_DMA_SYNC): a macro DMA read no snapshot covers waits until the back ran the last
+  queued entry that may write its pages by the snapshot's notes (compute or copy, unranged
+  writer, noted write over the pages; GpuSplit::WaitForNotedWriters, drain site "dma snapshot
+  writes"), not the whole ring. If then the buffer cache holds no GPU writes on those pages
+  (lock-free skip for pages never GPU-written, else MustFlushRegion under the buffer lock) and the
+  query cache lists no report on the words, the words are read from guest memory and the
+  snapshot is recorded as after a drain; else the drained read as before.
+Diagnostics, no behaviour change unless named:
+EDEN_UP_L1028_STATS=1: every 10 s "Lichii #1028 read-back per second (10.0 s; async on|off,
+  early on|off, dma wait on|off): guest reads of GPU-written memory S synced on the GPU thread
+  (ms), A async (ms), I only waited for a download on its way (ms), longest ms | GPU thread in
+  their flushes F ms, buffer cache part B ms | buffer cache host GPU waits under its lock: R for
+  reads (ms), O other (ms) | read downloads, early, KiB, fallbacks | readers waited on the host GPU
+  N times (ms) | GPU-side writes landed downloads, waited (ms) | landings before writes guest
+  memory doesn't hold, waited (ms) | DMA snapshot misses M: narrower wait (ms), drained (ms),
+  verify differences | verify: downloads, bytes compared, differ (reader, GPU-side write,
+  completed), uncovered, kept not compared". Give it to the control too: there it counts the
+  synchronous reads, the back's time in their flushes, its Scheduler::Finish waits under the
+  buffer lock split into read flushes and other sync downloads, and the DMA snapshot misses' drain
+  time: the basis this port removes.
+EDEN_UP_L1028_VERIFY=1 (with ASYNC_READBACK, slow): each read download also copies the read's
+  own GPU-modified bytes in the same submission (what a synchronous flush copies) and compares
+  guest memory with it as the download lands, leaving out bytes replaced since, guest writes
+  still collected, and bytes an earlier download landed in an earlier pass (counted "kept not
+  compared"; upstream compares those as they landed, not ported). A read that would only wait for
+  a download on its way flushes instead (upstream's check_early): its check, alone when other
+  downloads bring all its bytes, lands with them and compares them. First 16 differences logged.
+EDEN_UP_L1028_DMA_WAIT_VERIFY=1 (with DMA_WAIT, slow): a narrowed read drains anyway, the macro
+  gets the drained words, differences are counted and the first 32 logged.
+
+Deviations from upstream: all behind switches (upstream: always on); counters only with
+EDEN_UP_L1028_STATS (upstream: EDEN_NX2_GPU_PROFILE); a read download keeps the bytes of every
+collected guest write whatever EDEN_NX2_DOWNLOAD_GUARDS says (the play env sets 0, where our
+other downloads skip nothing: a read download lands later than a synchronous flush did, and the
+apply of a write it overlaps can land it through CachedWriteMemory -> ClearDownload); an early
+download not submitted yet leaves the range a GPU-side write or ClearDownload asks to land
+(only a reading thread waits for it): on the split's back the wait would need a submission in the
+middle of the work being recorded (e.g. DispatchCompute's indirect DiscardWrite after Configure),
+and the fencing thread could wait for a back that waits for it; those bytes stay GPU-modified,
+as without early downloads; no staging buffer falls back to the
+synchronous flush (TryDownloadStagingBuffer); MayHoldGpuWrites uses our
+Tegra::Nx2IsGpuWritten table; the DMA wait is on our snapshot notes (above); VERIFY reduced;
+(review) a guest write's landing check (DownloadLanding::Await, a seq_cst fence and a load) runs
+only when Core::GPUDirtyMemoryManager::Collect stored new bits, not on every collected write
+(reasoning at the call in core/memory.cpp); BufferCacheRuntime::WaitForHostRead, which runs on
+reading guest threads, asks GpuSplit::BackRunning rather than the front's own Active flag.
+
+Unset (all switches): T84 behaviour. What still runs: OnCPURead's flush lambda stores a
+thread_local bool twice and tests a captured one; one relaxed load of g_read_downloads (always
+0) per MemoryManager::Write/WriteBlock page and per query result written; empty-container tests in
+ClearDownload/ClearReplacedDownload, GetFlushArea, TickFrame, PopAsyncBuffers, MarkWrittenBuffer
+(OutdateReadDownloads, NoteReadBackWrite) and DMACopy; a switch test in NoteWorkRecorded per draw
+and dispatch, NoteReadBack per non-preemptive GetFlushArea, GatherAndApply,
+ForEachPendingCpuWrite, HandleRasterizerWrite per collected write, SyncValues and the
+synchronous downloads' FinishForDownload/landing blocks; early_bytes_this_frame = 0 per frame; new
+struct members (RasterizerDownloadArea::in_flight, the buffer cache's read-download state, GPU's
+applying_writes). ClearDownload's old body is now ClearFenceDownloads, called by both.
+Core::GPUDirtyMemoryManager::Collect returns whether it stored (the result is unused unset). The
+generated vk_buffer_cache_cost.cpp gets one more VulkanTimer(7) wait site (WaitForHostRead's
+scheduler.Wait), so that anchor message reads 5 instead of 4 wait sites (still skipped as before).
+
+Risks: (1) a write to guest memory from the GPU's side that does not go through MemoryManager or
+the query cache (a direct device_memory write) between a read download's record and its landing
+loses to the older downloaded bytes (in T84 the synchronous flush landed before such a write);
+VERIFY catches what the read itself compares. (2) FinishRead from MemoryManager on the back can
+wait for the host GPU (counted "GPU-side writes ... waited"); ClearDownload can too, with the
+buffer lock held. (3) SemiFlushQueryDirty lands read downloads with the query cache's mutex held:
+a thread holding the buffer lock that then takes the query cache's mutex would deadlock with it
+(none found; upstream states the same for its tree). (4) A reading thread waiting for an early
+download still queued asks the back to submit (Scheduler::WaitSubmitted, as guest fence waits
+do); it holds no cache lock then (EARLY only). (5) FinishRead takes the buffer lock on the reading
+thread (GRHAND's convoy).
+(6) DMA_WAIT inherits DMA_SNAPSHOT's trust that draws (shader stores) don't write the pages its
+reads read, now also for misses, and asks MustFlushRegion under the buffer lock from the front for
+pages ever GPU-written (contention with the back). (7) EARLY changes which data reaches guest
+memory when (and with EDEN_NX2_PREFLUSH=0 our fence downloads of read ranges stop): upstream's
+configuration; on our tree EDEN_NX2_PREFLUSH=0 ran only in a group (t72-q A3, T72: same fps, no
+crash), never with EARLY. (8) As upstream, recording a read download cancels the older fence
+downloads of its runs (ClearFenceDownloads): from that fence's pop until the read download lands,
+another thread that waited for that fence and reads a Preflushable range (no trap there) finds
+the bytes from before that fence's writes, where T84's synchronous flush had landed newer ones at
+once. Needs two threads on one range within a host GPU round trip; VERIFY does not see it (it
+checks the reading thread's own bytes): watch flashes. (9) With ASYNC_READBACK every guest write
+that sets new bits in a collected page now pays a seq_cst fence (DownloadLanding::Await), and
+every gather a mutex: a cost on the game's threads for a gain that is ~0 with our preflush, so arm
+r is the cost check. Never built, never run: syntax-checked only.
+
+Expected (Ocarina, docked full res, full frame wait):
+- ASYNC_READBACK alone: -0.2 to +0.1 fps, best guess 0 (the landing checks' cost, risk 9, against
+  <= ~3-18 ms/s of back time). Basis: OnCPURead's flush path
+  ("CPU read of GPU-written memory ... (N so far)", logged every 64th) runs 2.6-3.6 times/s from
+  94 s on in the T83/T84 walk runs (385-449 reads by 115-147 s in every run of batches t83-w to
+  t84-d; the pause runs log no 513th read up to their end at 210-230 s: < 1/s in steady play).
+  With our default EDEN_NX2_PREFLUSH a range's first read marks it Preflushable and later GPU
+  writes there land at fences (T72 profile run430: 2.4-9.6 MB/s in 175-790 copies/s of buffer
+  downloads on the back), so only first reads of newly written ranges get here, and
+  image pages keep their synchronous texture download. Each such read is at most one
+  Scheduler::Finish under the buffer lock on the back (~0.2-5 ms of host GPU, not logged): <= ~3-18
+  ms/s of back time, while the back idles 280-390 ms/s (SPLIT_WAITS) and the reading game thread
+  waits for the same host GPU work either way (the copies queue behind it). Upstream's +17% came
+  from preflush off on Switch 2 titles (every read flushed: 117 ms/s of back fence waits) and no
+  frame wait. The control's STATS line gives the real figure: "buffer cache host GPU waits under
+  its lock: R for reads (ms)" is what this removes from the back.
+- DMA_WAIT: -0.3 to +0.4 fps, best guess 0 to +0.1 (review; was +0.1 to +0.2). Basis: T84 controls
+  (a2, a5, b1, b5) show
+  "dma snapshot miss" 70-230 ms/s of the front's 400-490 ms/s of waits at 1,100-2,000 misses/s
+  (60-150 us each); miss reasons over the run: 67% compute/copy sent since, 17% unranged writer,
+  15% noted write, 0.5% new page. A miss now waits only up to its last possible writer, then drains
+  anyway if its pages hold GPU writes (unknown share: the drained path flushes whole pages because
+  they often do; then it costs the narrower wait, a look under the buffer lock from the front and
+  the drain). Upstream's version (draws as writers) did not shorten Ocarina's front wait (235 ->
+  250 ms/s). Our own DMA_SNAPSHOT is the warning: t74-d cut the drains 17,137/s -> 6,385/s and the
+  total drain time stayed (497 -> 479 ms/s), fps unchanged; LISTSYNC moved list-writer waits into
+  acquire waits (+0.6 fps), #949 halved the acquire-check wait (-0.7 fps). Under the full frame
+  wait a shorter front wait counts only if back idle falls with it.
+- EARLY with EDEN_NX2_PREFLUSH=0 (upstream's shape): -0.5 to +0.5 fps, unknown sign: removes the
+  fence downloads of read ranges, adds async flushes for reads early downloads don't cover.
+
+Test arm (T84 + this diff; play env v2.1 docked with the full frame wait, the T84 batch env, walk
+script; every arm EDEN_UP_L1028_STATS=1 EDEN_NX2_SPLIT_WAITS=1; at most 5 tests a batch, each batch
+with its own controls, ~3 valid runs per arm; none with EDEN_UP_L1056_BACK_MACROS, GRHAND, the
+#949 switches or LISTSYNC):
+- c (control): nothing else.
+- v (1 run, correctness gate, not for fps): EDEN_UP_L1028_ASYNC_READBACK=1 EDEN_UP_L1028_EARLY=1
+  EDEN_NX2_PREFLUSH=0 EDEN_UP_L1028_DMA_WAIT=1 EDEN_UP_L1028_VERIFY=1 EDEN_UP_L1028_DMA_WAIT_VERIFY=1.
+- r: EDEN_UP_L1028_ASYNC_READBACK=1.
+- d: EDEN_UP_L1028_DMA_WAIT=1.
+- u (upstream's shape): EDEN_UP_L1028_ASYNC_READBACK=1 EDEN_UP_L1028_EARLY=1 EDEN_NX2_PREFLUSH=0
+  EDEN_UP_L1028_DMA_WAIT=1.
+Batch 1: c, v, r, d, c. Stop there if v logs a "Lichii #1028 verify:" or "Lichii #1028 DMA wait
+check:" line, its 10 s line shows "differ" or "GPU-modified bytes no download brought" above 0 or
+"DMA wait ... verify differences" above 0, any run hangs ("GPU split wait on the back thread",
+"Waited ... s for the GPU thread to submit tick") or crashes. Batch 2: c, u, r, d, c. Batch 3: c, u,
+u, then d or r (whichever is still open), c. A p arm (EDEN_NX2_PREFLUSH=0 alone) only if u is
+clearly off c: it tells EARLY's share from preflush's.
+Proof the switch acted: r/u: the 10 s line says "async on", synced reads 0, async reads ~ c's synced
+reads (2.6-3.6/s), "fell back" 0; u: "early on", early downloads > 0, "only waited for a download
+on its way" > 0; d/u: "dma wait on", the narrower-wait count > 0 and SPLIT_WAITS shows the "dma
+snapshot writes" site. Calls: d wins only if it beats its same-batch controls in two batches with
+back idle down; retire d if the narrower waits are under ~25% of the misses (the rest drain
+anyway). r is the cost check (expected = c): if r runs > 0.3 fps under c in two batches, read u
+against r, not c.
+Readouts: walk fps mean and 1% low, flashes/min, pond load OK; "Lichii #1028 read-back per
+second": c: synced reads/s and ms, GPU thread in their flushes, host GPU waits under the buffer
+lock for reads vs other (the basis); r/u: async reads and their ms, readers' host GPU waits,
+GPU-side and clear landings (both small), fallbacks 0; u: early downloads/s and KiB, in-flight
+reads; d/u: DMA snapshot misses after a narrower wait vs drained and their ms against c's drained
+ms; "GPU split per second": front waited, "dma snapshot miss" vs the new "dma snapshot writes"
+site, back idle; v: verify differ = 0 and uncovered = 0 ("kept not compared" may be > 0), DMA wait
+check differences = 0. Optional, later: GRHAND with r (EDEN_UP_FRITCHII_GRHAND=1) only if GRHAND's
+own gate (lock convoy evidence) is met.
+
+Checks (VM scratch /tmp/l1028-chk-5c1d, lichii-1028_checks.sh + lichii-1028_inject.py, log
+lichii-1028.checks.log): git apply --check on $R/Eglantine (T84); prepare-vulkan-port.py anchor
+skips identical before and after (6) except the vk_buffer_cache wait-site count 4 -> 5 (the new
+wait gets the same VulkanTimer(7)); the generated vulkan_rasterizer.cpp, vk_buffer_cache_cost.cpp,
+vulkan_query_cache.cpp and vulkan-cache buffer_cache.h carry the change; the derived gpu.cpp,
+memory.cpp (core) and maxwell_3d.cpp take the same hunks and the CMake anchors are unchanged;
+-fsyntax-only with the build's flags (compile_commands.json) rc=0 on the touched TUs incl. the
+generated and derived copies, both buffer cache instantiations (Vulkan, OpenGL) and the OpenGL
+query cache and rasterizer; injected errors in every new block and touched header reported by the
+TUs that compile them.
+
+Stacked with the parallel ports (all on T84): fritchii-v54-shader-prep.diff applies with this diff
+in either order (no shared file). lichii-1056.diff shares maxwell_3d.cpp and gpu_split.h (those
+hunks apply together in either order, with offsets) and conflicts only in gpu_split_sites.h, where
+both append drain sites after MapOnBack: whichever lands second takes the two-line merge
+(DmaSnapshotWrites, then BackRegister and BackCode; the names likewise). With
+EDEN_UP_L1056_BACK_MACROS=1 the 0x142 macro's DMA reads run on the back: EDEN_UP_L1028_DMA_WAIT
+then narrows only the other macros' snapshot misses, so do not judge d with it.
+
+Review (9 Nov, adversarial pass; original kept as lichii-1028.diff.pre-review). Fixed: (a) the
+landing check after every collected guest write (a seq_cst fence each, upstream's choice) now runs
+only when Collect stored new bits; a run of writes into one 64-byte block fences once (deviation
+above; unset unchanged). (b) WaitForHostRead read the split front's own Active flag from guest
+threads; it asks BackRunning now (EARLY only reaches it). Header: risks 8 and 9, the expectations
+(ASYNC_READBACK's cost, DMA_WAIT tempered by t74-d and upstream), PREFLUSH=0's history, the batch
+plan (at most 5 a batch, v as the gate), the stacking. Checked, no change needed: unset = T84 (every
+new path behind a static false test, an empty container or g_read_downloads 0; the seven
+ClearDownload -> ClearReplacedDownload sites run the old body when no read download exists); lock
+order (the query cache takes the buffer lock, never the reverse; GatherAndApply holds its mutex
+only around the gather, whose callback takes no cache lock; a guest thread in Await holds no lock a
+landing needs); landings serialise under the buffer lock (the fence pops hold it); no thread waits
+on the host GPU for an unsubmitted tick except a reader (EARLY), which asks the back; the DMA wait's
+positions and pages are the notes' (device addresses, write position after the entry), its
+QueryDma calls are no-ops at SyncMode 0, which it requires; every gpu_modified_ranges add marks the
+Nx2 table (MayHoldGpuWrites). Re-run: lichii-1028_review_checks.sh + lichii-1028_review_inject.py
+(VM scratch /tmp/l1028-rev-9q4k, log lichii-1028.review-checks.log).
+
+T85: the drain-site list hunk is rebased onto 0485 (Lichii #1056 adds BackRegister/BackCode first); DmaSnapshotWrites goes after them.
+
+diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
+--- a/src/core/gpu_dirty_memory_manager.h
++++ b/src/core/gpu_dirty_memory_manager.h
+@@ -106,7 +106,9 @@
+         return on;
+     }
+ 
+-    void Collect(PAddr address, size_t size) {
++    /// Returns whether it stored anything: false when the write's bits were already collected
++    /// (EDEN_UP_L1028_ASYNC_READBACK skips its landing check then, see Core::Memory).
++    bool Collect(PAddr address, size_t size) {
+         if (BankFlagPages()) {
+             // Set before the write's bytes land: a bank bind that takes the flag marks the page
+             // again at the bank's next bind (BufferCache::Nx2BankFlagPages).
+@@ -122,13 +124,13 @@
+                     std::scoped_lock lk(guard);
+                     back_buffer.emplace_back(tmp);
+                     current.exchange(t, std::memory_order_relaxed);
+-                    return;
++                    return true;
+                 }
+                 tmp.address = t.address;
+                 tmp.mask = 0;
+             }
+             if ((tmp.mask | t.mask) == tmp.mask) {
+-                return;
++                return false;
+             }
+             tmp.mask |= t.mask;
+         } while (HeldVsDownload()
+@@ -136,6 +138,7 @@
+                                                       std::memory_order_relaxed)
+                      : !current.compare_exchange_weak(original, tmp, std::memory_order_release,
+                                                       std::memory_order_relaxed));
++        return true;
+     }
+ 
+     /// EDEN_UP_HELD_VS_DOWNLOAD: moves on with each Gather. A page the core reported to the GPU
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -38,6 +38,7 @@
+ #include "video_core/gpu.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/host1x/host1x.h"
++#include "video_core/nx2_async_readback.h"
+ #include "video_core/rasterizer_download_area.h"
+ 
+ namespace Core::Memory {
+@@ -921,6 +922,10 @@
+                     address, size, address >> YUZU_PAGEBITS, rasterizer_reported_pages[core], [&] {
+                         return address != 0 && size != 0 && system.GPU().OnCPUWrite(address, size);
+                     });
++                // EDEN_UP_L1028_ASYNC_READBACK: as below.
++                if (VideoCore::AsyncReadback::Enabled()) {
++                    VideoCore::DownloadLanding::Await(address, size);
++                }
+             });
+             return;
+         }
+@@ -954,7 +959,20 @@
+                     return;
+                 }
+             }
+-            gpu_dirty_managers[core].Collect(address, size);
++            const bool stored = gpu_dirty_managers[core].Collect(address, size);
++            // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): a download writing to guest
++            // memory here may have looked at the collected writes before this one: its bytes
++            // would land over the ones stored after this returns. Only when Collect stored
++            // anything (a deviation from upstream, which fences every write): bits already set
++            // were set by this core's earlier write (other threads share sys_core under
++            // sys_core_guard), whose own Await fenced after setting them. A landing that fenced
++            // after that one sees them (or, gathered since, in GPU::ForEachPendingCpuWrite's
++            // applying list, or applied, which took the range out of the read downloads under
++            // the buffer cache's lock); one that fenced before it was waited for there. Saves the
++            // seq_cst fence on most writes of a run into the same 64-byte blocks. Off: nothing.
++            if (stored && VideoCore::AsyncReadback::Enabled()) {
++                VideoCore::DownloadLanding::Await(address, size);
++            }
+         });
+     }
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -69,7 +69,13 @@
+ }
+ 
+ template <class P>
+-BufferCache<P>::~BufferCache() = default;
++BufferCache<P>::~BufferCache() {
++    // EDEN_UP_L1028_ASYNC_READBACK: downloads that never landed. Always empty without it.
++    if (!read_downloads.empty()) {
++        VideoCore::g_read_downloads.fetch_sub(static_cast<u32>(read_downloads.size()),
++                                              std::memory_order_relaxed);
++    }
++}
+ 
+ template <class P>
+ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
+@@ -236,6 +242,19 @@
+     ++frame_tick;
+     delayed_destruction_ring.Tick();
+ 
++    // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): pages draws wrote get their early
++    // downloads now that the frame's work is recorded (EDEN_UP_L1028_EARLY), and read downloads
++    // no thread waited for land. Both empty without the switches.
++    if (!read_downloads.empty() || !early_pages.empty()) {
++        RecordEarlyDownloads();
++        if constexpr (!IS_OPENGL) {
++            if (!read_downloads.empty()) {
++                static_cast<void>(runtime.IsFreeNow(read_downloads.front().tick));
++            }
++        }
++        WriteCompletedReadDownloads();
++    }
++    early_bytes_this_frame = 0;
+     for (auto& buffer : async_buffers_death_ring) {
+         runtime.FreeDeferredStagingBuffer(buffer);
+     }
+@@ -254,7 +273,9 @@
+     Nx2NoteListHostWrite(device_addr, size);
+     NoteUniformWrite(device_addr, size); // EDEN_UP_L949_UBO_KEEP; nothing unless set
+     if (IsRegionGpuModified(device_addr, size)) {
+-        ClearDownload(device_addr, size);
++        // A guest CPU write: guest memory holds the newer bytes (Lichii #1028: read downloads
++        // leave the range rather than land; without them, ClearDownload's old body).
++        ClearReplacedDownload(device_addr, size);
+         gpu_modified_ranges.Subtract(device_addr, size);
+     }
+     // The tracker marks whole pages CPU-modified, which drops their GPU-modified state: GPU-written
+@@ -393,6 +414,16 @@
+         !HasGpuWritesNotDownloadedAtFence(device_addr_start_aligned,
+                                           device_addr_end_aligned - device_addr_start_aligned)) {
+         area->preemtive = true;
++        // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): fence downloads keep it once the first
++        // read's download is in guest memory; until then a read waits for that download
++        // (EDEN_UP_L1028_VERIFY: flushes, which checks it).
++        if (!read_downloads.empty()) {
++            area->preemtive = std::ranges::none_of(read_downloads, [&](const ReadDownload& download) {
++                return download.write_ranges.Intersects(
++                    device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
++            });
++            area->in_flight = !area->preemtive && !VideoCore::AsyncReadback::VerifyEnabled();
++        }
+         // The core keeps this area: a later GPU write to its unmarked pages must arm them again.
+         read_trapped_ranges.Subtract(device_addr_start_aligned,
+                                      device_addr_end_aligned - device_addr_start_aligned);
+@@ -400,6 +431,29 @@
+     };
+     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
+                                            device_addr_end_aligned - device_addr_start_aligned);
++    // EDEN_UP_L1028_EARLY: learns the pages the guest reads after each GPU write. Off: returns.
++    NoteReadBack(device_addr_start_aligned, device_addr_end_aligned, !area->preemtive);
++    if (!area->preemtive && !read_downloads.empty() &&
++        !VideoCore::AsyncReadback::VerifyEnabled() &&
++        ReadDownloadsCover(device_addr_start_aligned,
++                           device_addr_end_aligned - device_addr_start_aligned)) {
++        // EDEN_UP_L1028_ASYNC_READBACK: all of it on its way, for an earlier read or right behind
++        // its GPU write: no new copies. The core took the trap, as below. EDEN_UP_L1028_VERIFY:
++        // the read flushes instead, which records a check of its own (as upstream's check_early).
++        read_trapped_ranges.Subtract(device_addr_start_aligned,
++                                     device_addr_end_aligned - device_addr_start_aligned);
++        if (!WriteFinishedReadDownloads(device_addr_start_aligned,
++                                        device_addr_end_aligned - device_addr_start_aligned)) {
++            area->in_flight = true;
++            return area;
++        }
++        // The host GPU had run them: in guest memory now, nothing is left to wait for.
++        area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
++                                               device_addr_end_aligned - device_addr_start_aligned);
++        if (area->preemtive) {
++            return area;
++        }
++    }
+     // Mark only data that the GPU wrote. A mark stays for the session and sends later GPU writes
+     // in the range to a download at each fence. EDEN_NX2_PREFLUSH=0 keeps the read traps instead:
+     // a read flushes on demand, with the ranges read before it in one wait (DownloadMemory).
+@@ -482,7 +536,9 @@
+                                                             }});
+                             total_size_bytes += Common::AlignUp(upper - lower, 64);
+                         });
+-                    ClearDownload(device_addr_out, out_size);
++                    // A synchronous download, landing under `mutex`: read downloads leave the
++                    // range (Lichii #1028; without them, ClearDownload's old body).
++                    ClearReplacedDownload(device_addr_out, out_size);
+                     gpu_modified_ranges.Subtract(device_addr_out, out_size);
+                 });
+         });
+@@ -510,8 +566,22 @@
+         buffer.MarkUsage(download.copy.src_offset, download.copy.size);
+         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
+     }
+-    runtime.Finish();
++    FinishForDownload();
+     const u8* const mapped_memory = download_staging.mapped_span.data();
++    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): the CPU writes collected from here on store
++    // their bytes once these are in guest memory (VideoCore::DownloadLanding).
++    std::optional<VideoCore::DownloadLanding> landing;
++    if (VideoCore::AsyncReadback::Enabled()) {
++        DAddr landing_begin = ~DAddr{0};
++        DAddr landing_end = 0;
++        for (const Download& download : downloads) {
++            const DAddr address =
++                slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
++            landing_begin = (std::min)(landing_begin, address);
++            landing_end = (std::max)(landing_end, address + download.copy.size);
++        }
++        landing.emplace(landing_begin, landing_end);
++    }
+     const Common::RangeSet<DAddr> cpu_written = GuardedCpuWriteRanges();
+     for (const Download& download : downloads) {
+         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+@@ -522,7 +592,664 @@
+ }
+ 
+ template <class P>
++void BufferCache<P>::FinishForDownload() {
++    if (!VideoCore::AsyncReadback::StatsEnabled()) {
++        runtime.Finish();
++        return;
++    }
++    const u64 start = VideoCore::AsyncReadback::Now();
++    runtime.Finish();
++    VideoCore::AsyncReadback::CountHostWait(VideoCore::AsyncReadback::Now() - start);
++}
++
++template <class P>
++void BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
++    if constexpr (IS_OPENGL || !USE_MEMORY_MAPS) {
++        DownloadMemory(device_addr, size);
++    } else {
++        WriteCompletedReadDownloads();
++        // Early downloads still to record are of older writes: they go first.
++        RecordEarlyDownloads();
++        // The ranges DownloadMemory takes: the guest CPU soon reads those it read before too
++        // (EDEN_NX2_PREFLUSH=0).
++        boost::container::small_vector<std::pair<DAddr, u64>, 16> ranges{{device_addr, size}};
++        const bool read_ranges = download_cpu_read_ranges;
++        if (download_cpu_read_ranges) {
++            download_cpu_read_ranges = false;
++            cpu_read_ranges.ForEach([&](DAddr lower, DAddr upper) {
++                gpu_modified_ranges.ForEachInRange(
++                    lower, upper - lower,
++                    [&](DAddr start, DAddr end) { ranges.emplace_back(start, end - start); });
++            });
++        }
++        const std::array own{std::pair<DAddr, u64>{device_addr, size}};
++        if (!RecordReadDownload(ranges, own, false)) {
++            // No staging buffer free: the synchronous flush, as without the switch.
++            VideoCore::AsyncReadback::Add(
++                VideoCore::AsyncReadback::g_counters.download_fallbacks, 1);
++            download_cpu_read_ranges = read_ranges;
++            DownloadMemory(device_addr, size);
++        }
++    }
++}
++
++template <class P>
++bool BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> ranges,
++                                        std::span<const std::pair<DAddr, u64>> own, bool early) {
++    if constexpr (IS_OPENGL || !USE_MEMORY_MAPS) {
++        return false;
++    } else {
++        struct Copy {
++            BufferId buffer_id;
++            BufferCopy copy; ///< src_offset in the buffer, dst_offset in the staging buffer
++        };
++        boost::container::small_vector<Copy, 16> copies;
++        u64 total_size_bytes = 0;
++        // The bytes this download brings, and the download runs it looked at: older fence
++        // downloads must not land over them.
++        Common::RangeSet<DAddr> taken;
++        boost::container::small_vector<std::pair<DAddr, u64>, 16> runs;
++        for (const auto& [range_addr, range_size] : ranges) {
++            ForEachBufferInRange(range_addr, range_size, [&](BufferId buffer_id, Buffer& buffer) {
++                const DAddr buffer_addr = buffer.CpuAddr();
++                const DAddr begin = (std::max)(range_addr, buffer_addr);
++                const DAddr end =
++                    (std::min)(range_addr + range_size, buffer_addr + buffer.SizeBytes());
++                if (begin >= end) {
++                    return;
++                }
++                // The bytes DownloadRangesMemory takes, but they stay GPU-modified until they
++                // are in guest memory (WriteReadDownloads).
++                Common::RangeSet<DAddr> wanted;
++                memory_tracker.ForEachDownloadRange(
++                    begin, end - begin, false, [&](u64 run_addr, u64 run_size) {
++                        runs.emplace_back(run_addr, run_size);
++                        gpu_modified_ranges.ForEachInRange(
++                            run_addr, run_size,
++                            [&](DAddr start, DAddr stop) { wanted.Add(start, stop - start); });
++                    });
++                // Without the bytes a read download already brings (an earlier one, or this one:
++                // the ranges can overlap).
++                read_download_ranges.ForEachInRange(begin, end - begin, [&](DAddr lower, DAddr upper) {
++                    wanted.Subtract(lower, upper - lower);
++                });
++                taken.ForEachInRange(begin, end - begin, [&](DAddr lower, DAddr upper) {
++                    wanted.Subtract(lower, upper - lower);
++                });
++                wanted.ForEach([&](DAddr start, DAddr stop) {
++                    copies.push_back({buffer_id, BufferCopy{
++                                                     .src_offset = start - buffer_addr,
++                                                     .dst_offset = total_size_bytes,
++                                                     .size = stop - start,
++                                                 }});
++                    total_size_bytes += Common::AlignUp(stop - start, 64);
++                    taken.Add(start, stop - start);
++                });
++            });
++        }
++        // EDEN_UP_L1028_VERIFY: what a synchronous flush (DownloadRangesMemory) copies for the
++        // read itself, and where each of those bytes comes from.
++        std::unique_ptr<ReadCheck> check;
++        boost::container::small_vector<Copy, 16> check_copies;
++        u64 check_size = 0;
++        if (!early && VideoCore::AsyncReadback::VerifyEnabled()) {
++            check = std::make_unique<ReadCheck>();
++            check->read_begin = ~DAddr{0};
++            for (const auto& [own_addr, own_size] : own) {
++                check->read_begin = (std::min)(check->read_begin, own_addr);
++                check->read_end = (std::max)(check->read_end, own_addr + own_size);
++                ForEachBufferInRange(own_addr, own_size, [&](BufferId buffer_id, Buffer& buffer) {
++                    const DAddr buffer_addr = buffer.CpuAddr();
++                    const DAddr begin = (std::max)(own_addr, buffer_addr);
++                    const DAddr end =
++                        (std::min)(own_addr + own_size, buffer_addr + buffer.SizeBytes());
++                    if (begin >= end) {
++                        return;
++                    }
++                    memory_tracker.ForEachDownloadRange(
++                        begin, end - begin, false, [&](u64 run_addr, u64 run_size) {
++                            gpu_modified_ranges.ForEachInRange(
++                                run_addr, run_size, [&](DAddr start, DAddr stop) {
++                                    check_copies.push_back(
++                                        {buffer_id, BufferCopy{
++                                                        .src_offset = start - buffer_addr,
++                                                        .dst_offset = check_size,
++                                                        .size = stop - start,
++                                                    }});
++                                    check_size += Common::AlignUp(stop - start, 64);
++                                });
++                        });
++                });
++            }
++            for (const Copy& entry : check_copies) {
++                const DAddr start = slot_buffers[entry.buffer_id].CpuAddr() + entry.copy.src_offset;
++                Common::RangeSet<DAddr> rest;
++                rest.Add(start, entry.copy.size);
++                taken.ForEachInRange(start, entry.copy.size, [&](DAddr lower, DAddr upper) {
++                    rest.Subtract(lower, upper - lower);
++                });
++                // The read download whose clean bytes they are brings them (clean_ranges don't
++                // overlap, and are what read_download_ranges left out of this one).
++                for (const ReadDownload& earlier : read_downloads) {
++                    earlier.clean_ranges.ForEachInRange(
++                        start, entry.copy.size, [&](DAddr lower, DAddr upper) {
++                            rest.ForEachInRange(lower, upper - lower, [&](DAddr from, DAddr to) {
++                                check->kept.push_back({earlier.sequence, {from, to}});
++                            });
++                            rest.Subtract(lower, upper - lower);
++                        });
++                }
++                rest.ForEach([&](DAddr lower, DAddr upper) {
++                    VideoCore::AsyncReadback::Add(
++                        VideoCore::AsyncReadback::g_counters.verify_uncovered, upper - lower);
++                });
++            }
++        }
++        // EDEN_UP_L1028_VERIFY: a check whose read's bytes other downloads bring is a download of
++        // its own, which its read waits for.
++        const bool check_alone = check && copies.empty() && !check_copies.empty();
++        std::optional<Async_Buffer> staging;
++        if (!copies.empty()) {
++            staging = runtime.TryDownloadStagingBuffer(total_size_bytes, true);
++            if (!staging) {
++                return false; // Nothing changed: the caller flushes synchronously.
++            }
++        }
++        std::optional<Async_Buffer> check_staging;
++        if (check && !check_copies.empty()) {
++            check_staging = runtime.TryDownloadStagingBuffer(check_size, true);
++        }
++        // Committed from here on. The download runs' bytes come from read downloads now: older
++        // fence downloads must not land over them.
++        for (const auto& [run_addr, run_size] : runs) {
++            ClearFenceDownloads(run_addr, run_size);
++        }
++        if (copies.empty() && !(check_alone && check_staging)) {
++            // All of it on its way already (or nothing GPU-modified): nothing to submit.
++            return true;
++        }
++        ReadDownload download;
++        download.early = early;
++        if (staging) {
++            for (Copy& entry : copies) {
++                Buffer& buffer = slot_buffers[entry.buffer_id];
++                entry.copy.dst_offset += staging->offset;
++                buffer.MarkUsage(entry.copy.src_offset, entry.copy.size);
++                // Mapped buffers too: the GPU thread's later work may write them before the copy
++                // is read.
++                runtime.CopyBuffer(staging->buffer, buffer, std::span{&entry.copy, 1}, true);
++                download.copies.push_back(BufferCopy{
++                    .src_offset = buffer.CpuAddr() + entry.copy.src_offset,
++                    .dst_offset = entry.copy.dst_offset,
++                    .size = entry.copy.size,
++                });
++            }
++            download.staging = *staging;
++            download.has_staging = true;
++            taken.ForEach([&](DAddr start, DAddr stop) {
++                download.write_ranges.Add(start, stop - start);
++                download.clean_ranges.Add(start, stop - start);
++                read_download_ranges.Add(start, stop - start);
++            });
++        }
++        if (check && check_staging) {
++            // The same bytes again, from the same point of the GPU's work: what a synchronous
++            // flush would have written.
++            check->staging = *check_staging;
++            check->alone = check_alone;
++            for (Copy& entry : check_copies) {
++                Buffer& buffer = slot_buffers[entry.buffer_id];
++                entry.copy.dst_offset += check_staging->offset;
++                buffer.MarkUsage(entry.copy.src_offset, entry.copy.size);
++                runtime.CopyBuffer(check_staging->buffer, buffer, std::span{&entry.copy, 1}, true);
++                check->copies.push_back(BufferCopy{
++                    .src_offset = buffer.CpuAddr() + entry.copy.src_offset,
++                    .dst_offset = entry.copy.dst_offset,
++                    .size = entry.copy.size,
++                });
++            }
++            download.check = std::move(check);
++        }
++        // A read waits for its copies; an early download's go with the next submission.
++        download.tick = early ? runtime.QueueForHostRead() : runtime.SubmitForHostRead();
++        download.sequence = ++read_download_sequence;
++        namespace AsyncReadback = VideoCore::AsyncReadback;
++        AsyncReadback::Add(early ? AsyncReadback::g_counters.early_downloads
++                                 : AsyncReadback::g_counters.read_downloads,
++                           1);
++        AsyncReadback::Add(AsyncReadback::g_counters.download_bytes, total_size_bytes);
++        if (early) {
++            ++pending_early_downloads;
++            early_bytes_this_frame += total_size_bytes;
++        }
++        read_downloads.push_back(std::move(download));
++        VideoCore::g_read_downloads.fetch_add(1, std::memory_order_release);
++        return true;
++    }
++}
++
++template <class P>
++std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 size) {
++    if constexpr (IS_OPENGL) {
++        return std::nullopt;
++    } else {
++        std::unique_lock lock{mutex};
++        // The newest one over the range: those before it are written first. Only a reading
++        // thread waits for an early download not submitted yet (the back submits it when asked).
++        // A write from the GPU's side leaves its range instead, which then stays GPU-modified, as
++        // without early downloads: on the thread that records (the split's back) the wait would
++        // need a submission in the middle of whatever it records, and the fencing thread may hold
++        // up a back that waits for it.
++        const bool reading = VideoCore::AsyncReadback::t_reading;
++        bool dropped = false;
++        std::optional<u64> tick;
++        for (ReadDownload& download : read_downloads) {
++            const bool over = download.write_ranges.Intersects(device_addr, size) ||
++                              (download.check && download.check->alone &&
++                               download.check->read_begin < device_addr + size &&
++                               device_addr < download.check->read_end);
++            if (!over) {
++                continue;
++            }
++            if (!reading && download.early && !runtime.IsSubmittedForHostRead(download.tick)) {
++                download.write_ranges.Subtract(device_addr, size);
++                download.clean_ranges.Subtract(device_addr, size);
++                read_download_ranges.Subtract(device_addr, size);
++                dropped = true;
++                continue;
++            }
++            tick = download.tick;
++        }
++        if (dropped) {
++            // EDEN_UP_L1028_VERIFY: the caller writes guest memory there next.
++            for (ReadDownload& download : read_downloads) {
++                if (download.check) {
++                    download.check->changed.Add(device_addr, size);
++                }
++            }
++        }
++        if (!tick) {
++            return std::nullopt;
++        }
++        u64 waited = 0;
++        if (!runtime.IsFree(*tick)) {
++            lock.unlock();
++            const u64 wait_start = VideoCore::AsyncReadback::Now();
++            runtime.WaitForHostRead(*tick);
++            waited = (std::max)(VideoCore::AsyncReadback::Now() - wait_start, u64{1});
++            lock.lock();
++        }
++        WriteReadDownloads(*tick, VideoCore::AsyncReadback::t_reading
++                                      ? VideoCore::AsyncReadback::Landing::Reader
++                                      : VideoCore::AsyncReadback::Landing::GpuSideWrite);
++        return waited;
++    }
++}
++
++template <class P>
++void BufferCache<P>::OutdateReadDownloads(DAddr device_addr, u64 size) {
++    // The bytes stay GPU-modified when the downloads land, so a later read downloads them.
++    if (!read_downloads.empty()) {
++        for (ReadDownload& download : read_downloads) {
++            download.clean_ranges.Subtract(device_addr, size);
++        }
++        read_download_ranges.Subtract(device_addr, size);
++    }
++}
++
++template <class P>
++bool BufferCache<P>::WriteFinishedReadDownloads(DAddr device_addr, u64 size) {
++    if constexpr (!IS_OPENGL) {
++        std::optional<u64> tick;
++        for (const ReadDownload& download : read_downloads) {
++            if (download.write_ranges.Intersects(device_addr, size)) {
++                tick = download.tick;
++            }
++        }
++        if (!tick || !runtime.IsFreeNow(*tick)) {
++            return false;
++        }
++        WriteReadDownloads(*tick);
++        return true;
++    } else {
++        return false;
++    }
++}
++
++template <class P>
++void BufferCache<P>::NoteWorkRecorded(bool dispatch) {
++    if constexpr (!IS_OPENGL && USE_MEMORY_MAPS) {
++        if (!VideoCore::AsyncReadback::EarlyEnabled()) {
++            return;
++        }
++        if (dispatch) {
++            // Outside any render pass: the copies go right behind the dispatch.
++            RecordEarlyDownloads();
++        }
++        // Early downloads the host GPU ran go to guest memory, where their reads then find them.
++        // Asking the host GPU is a call: after each dispatch, and every 32 draws.
++        if (pending_early_downloads != 0 && (dispatch || ++early_landing_checks % 32 == 0) &&
++            !read_downloads.empty() && runtime.IsFreeNow(read_downloads.front().tick)) {
++            WriteCompletedReadDownloads();
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::NoteReadBack(DAddr begin, DAddr end, bool gpu_modified) {
++    if constexpr (!IS_OPENGL && USE_MEMORY_MAPS) {
++        if (!VideoCore::AsyncReadback::EarlyEnabled() ||
++            (!gpu_modified && read_back_pages.empty())) {
++            return;
++        }
++        for (DAddr page = begin; page < end; page += DEVICE_PAGESIZE) {
++            auto it = std::ranges::lower_bound(read_back_pages, page, {}, &ReadBackPage::page);
++            if (it == read_back_pages.end() || it->page != page) {
++                // Learned from reads that find GPU writes.
++                if (!gpu_modified) {
++                    continue;
++                }
++                if (read_back_pages.size() >= MaxReadBackPages) {
++                    // The page whose writes were read longest ago makes room.
++                    read_back_pages.erase(
++                        std::ranges::min_element(read_back_pages, {}, &ReadBackPage::last_read));
++                    it = std::ranges::lower_bound(read_back_pages, page, {}, &ReadBackPage::page);
++                }
++                it = read_back_pages.insert(it, ReadBackPage{.page = page, .written = true});
++            }
++            if (!it->written) {
++                // Nothing new since its last read.
++                continue;
++            }
++            it->written = false;
++            it->unread_writes = 0;
++            it->reads = (std::min)(static_cast<u16>(it->reads + 1), EarlyAfterReads);
++            it->last_read = ++read_back_reads;
++        }
++    }
++}
++
++template <class P>
++bool BufferCache<P>::NoteReportPending(DAddr device_addr, u64 size) {
++    if constexpr (!IS_OPENGL && USE_MEMORY_MAPS) {
++        const DAddr page = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
++        if (std::ranges::binary_search(read_back_pages, page, {}, &ReadBackPage::page)) {
++            pending_reports.push_back({device_addr, size, false});
++            return true;
++        }
++    }
++    return false;
++}
++
++template <class P>
++void BufferCache<P>::FinishReport(DAddr device_addr, u64 size) {
++    const auto it = std::ranges::find_if(pending_reports, [&](const PendingReport& report) {
++        return report.addr == device_addr && report.size == size;
++    });
++    if (it != pending_reports.end()) {
++        pending_reports.erase(it);
++    }
++}
++
++template <class P>
++void BufferCache<P>::NoteReadBackWrite(DAddr device_addr, u64 size) {
++    if constexpr (!IS_OPENGL && USE_MEMORY_MAPS) {
++        // Both stay empty without EDEN_UP_L1028_EARLY.
++        for (PendingReport& report : pending_reports) {
++            if (report.addr < device_addr + size && device_addr < report.addr + report.size) {
++                report.rewritten = true;
++            }
++        }
++        if (read_back_pages.empty()) {
++            return;
++        }
++        const DAddr end = device_addr + size;
++        for (auto it = std::ranges::lower_bound(read_back_pages,
++                                                Common::AlignDown(device_addr, DEVICE_PAGESIZE), {},
++                                                &ReadBackPage::page);
++             it != read_back_pages.end() && it->page < end; ++it) {
++            it->written = true;
++            if (it->unread_writes < MaxUnreadWrites) {
++                ++it->unread_writes;
++            } else {
++                // The guest no longer reads it after its writes.
++                it->reads = 0;
++            }
++            if (it->reads >= EarlyAfterReads &&
++                std::ranges::find(early_pages, it->page) == early_pages.end()) {
++                early_pages.push_back(it->page);
++            }
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::RecordEarlyDownloads() {
++    if constexpr (!IS_OPENGL && USE_MEMORY_MAPS) {
++        if (early_pages.empty()) {
++            return;
++        }
++        boost::container::small_vector<std::pair<DAddr, u64>, 8> pages;
++        for (const DAddr page : early_pages) {
++            pages.emplace_back(page, DEVICE_PAGESIZE);
++        }
++        early_pages.clear();
++        // Bounded: past it, the reads of these pages flush on demand.
++        if (pending_early_downloads >= MaxPendingEarlyDownloads ||
++            early_bytes_this_frame >= EarlyBytesPerFrame) {
++            return;
++        }
++        // No staging buffer: the reads of these pages flush on demand.
++        static_cast<void>(RecordReadDownload(pages, pages, true));
++    }
++}
++
++template <class P>
++void BufferCache<P>::WriteReadDownloads(u64 tick, VideoCore::AsyncReadback::Landing landed_by) {
++    if constexpr (!IS_OPENGL) {
++        // EDEN_UP_L1028_VERIFY: bytes earlier downloads of this pass bring are compared too.
++        const u64 pass_first = read_downloads.empty() ? 0 : read_downloads.front().sequence;
++        while (!read_downloads.empty() && read_downloads.front().tick <= tick) {
++            ReadDownload& download = read_downloads.front();
++            {
++                // Guest memory this writes, and what its check reads. The guest CPU writes
++                // collected from now on store their bytes once this download is in guest memory.
++                DAddr landing_begin = ~DAddr{0};
++                DAddr landing_end = 0;
++                const auto cover = [&](const BufferCopy& copy) {
++                    landing_begin = (std::min)(landing_begin, static_cast<DAddr>(copy.src_offset));
++                    landing_end =
++                        (std::max)(landing_end, static_cast<DAddr>(copy.src_offset + copy.size));
++                };
++                std::ranges::for_each(download.copies, cover);
++                if (download.check) {
++                    std::ranges::for_each(download.check->copies, cover);
++                }
++                const VideoCore::DownloadLanding landing{landing_begin, landing_end};
++                // CPU writes are collected before they reach guest memory, and stay pending until
++                // applied (GPU::GatherAndApply keeps them listed while it applies them), which
++                // takes them out of write_ranges (ClaimCpuWrites): either way they keep their
++                // bytes. Whatever EDEN_NX2_DOWNLOAD_GUARDS says (upstream has no such switch): a
++                // read download lands later than a synchronous flush did, while the apply of a
++                // write it overlaps can land it (CachedWriteMemory's ClearDownload).
++                const Common::RangeSet<DAddr> cpu_written = CollectedCpuWriteRanges();
++                if (download.has_staging) {
++                    const u8* const base = download.staging.mapped_span.data();
++                    for (const BufferCopy& copy : download.copies) {
++                        const DAddr copy_addr = static_cast<DAddr>(copy.src_offset);
++                        const u8* const data = base + (copy.dst_offset - download.staging.offset);
++                        download.write_ranges.ForEachInRange(
++                            copy_addr, copy.size, [&](DAddr start, DAddr end) {
++                                WriteDownloadedMemory(cpu_written, start,
++                                                      data + (start - copy_addr), end - start);
++                            });
++                    }
++                }
++                if (download.check) {
++                    CheckReadDownload(*download.check, pass_first, landed_by);
++                    async_buffers_death_ring.push_back(download.check->staging);
++                }
++            }
++            // EDEN_UP_L1028_EARLY: a query result older than these bytes lands over them later:
++            // they stay GPU-modified, for a later read to download again.
++            for (const PendingReport& report : pending_reports) {
++                if (report.rewritten) {
++                    download.clean_ranges.Subtract(report.addr, report.size);
++                    read_download_ranges.Subtract(report.addr, report.size);
++                }
++            }
++            download.clean_ranges.ForEach([&](DAddr start, DAddr end) {
++                gpu_modified_ranges.Subtract(start, end - start);
++                read_download_ranges.Subtract(start, end - start);
++            });
++            // As a synchronous download leaves them: pages without GPU-modified bytes left are
++            // clean in the tracker too.
++            download.clean_ranges.ForEach([&](DAddr start, DAddr end) {
++                const DAddr last = Common::AlignUp(end, DEVICE_PAGESIZE);
++                for (DAddr page = Common::AlignDown(start, DEVICE_PAGESIZE); page < last;
++                     page += DEVICE_PAGESIZE) {
++                    if (!gpu_modified_ranges.Intersects(page, DEVICE_PAGESIZE)) {
++                        memory_tracker.UnmarkRegionAsGpuModified(page, DEVICE_PAGESIZE);
++                    }
++                }
++            });
++            // Freed by the GPU thread (TickFrame, CommitAsyncFlushes). A check alone has none.
++            if (download.has_staging) {
++                async_buffers_death_ring.push_back(download.staging);
++            }
++            if (download.early) {
++                --pending_early_downloads;
++            }
++            read_downloads.pop_front();
++            VideoCore::g_read_downloads.fetch_sub(1, std::memory_order_release);
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::WriteCompletedReadDownloads() {
++    if constexpr (!IS_OPENGL) {
++        while (!read_downloads.empty() && runtime.IsFree(read_downloads.front().tick)) {
++            WriteReadDownloads(read_downloads.front().tick);
++        }
++    }
++}
++
++template <class P>
++bool BufferCache<P>::ReadDownloadsCover(DAddr device_addr, u64 size) const {
++    bool covered = true;
++    gpu_modified_ranges.ForEachInRange(device_addr, size, [&](DAddr start, DAddr end) {
++        DAddr next = start;
++        read_download_ranges.ForEachInRange(start, end - start, [&](DAddr lower, DAddr upper) {
++            covered = covered && lower <= next;
++            next = (std::max)(next, upper);
++        });
++        covered = covered && next >= end;
++    });
++    return covered;
++}
++
++template <class P>
++void BufferCache<P>::CheckReadDownload(const ReadCheck& check, u64 pass_first_sequence,
++                                       VideoCore::AsyncReadback::Landing landing) {
++    // Guest memory now holds this download and the earlier ones: compare it with the synchronous
++    // copy, except where a newer value replaced it since (ClearReplacedDownload) or a guest CPU
++    // write is still collected (whatever EDEN_NX2_DOWNLOAD_GUARDS says), and except bytes an
++    // earlier download landed in an earlier pass (guest memory may hold newer bytes there by now,
++    // as after synchronous flushes: upstream compares those as they landed, not ported).
++    namespace AsyncReadback = VideoCore::AsyncReadback;
++    Common::RangeSet<DAddr> skipped = CollectedCpuWriteRanges();
++    for (const auto& [sequence, range] : check.kept) {
++        if (sequence < pass_first_sequence) {
++            skipped.Add(range.first, range.second - range.first);
++            AsyncReadback::Add(AsyncReadback::g_counters.verify_not_compared,
++                               range.second - range.first);
++        }
++    }
++    static std::atomic<u32> logged{};
++    const u8* const base = check.staging.mapped_span.data();
++    std::vector<u8> guest;
++    u64 compared = 0;
++    u64 differing = 0;
++    for (const BufferCopy& copy : check.copies) {
++        const DAddr copy_addr = static_cast<DAddr>(copy.src_offset);
++        const u8* const expected = base + (copy.dst_offset - check.staging.offset);
++        Common::RangeSet<DAddr> parts;
++        parts.Add(copy_addr, copy.size);
++        const auto take_out = [&](const Common::RangeSet<DAddr>& taken) {
++            taken.ForEachInRange(copy_addr, copy.size, [&](DAddr lower, DAddr upper) {
++                parts.Subtract(lower, upper - lower);
++            });
++        };
++        take_out(check.changed);
++        take_out(skipped);
++        parts.ForEach([&](DAddr start, DAddr end) {
++            const u64 length = end - start;
++            guest.resize(length);
++            device_memory.ReadBlockUnsafe(start, guest.data(), length);
++            const u8* const wanted = expected + (start - copy_addr);
++            compared += length;
++            for (u64 i = 0; i < length;) {
++                if (guest[i] == wanted[i]) {
++                    ++i;
++                    continue;
++                }
++                u64 run_end = i + 1;
++                while (run_end < length && guest[run_end] != wanted[run_end]) {
++                    ++run_end;
++                }
++                differing += run_end - i;
++                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
++                    LOG_ERROR(HW_GPU,
++                              "Lichii #1028 verify: guest memory {:#x}+{:#x} differs from a "
++                              "synchronous flush ({:#04x} for {:#04x} at its start); download of "
++                              "the read [{:#x}, {:#x}){}, landed by {}",
++                              start + i, run_end - i, guest[i], wanted[i], check.read_begin,
++                              check.read_end, check.alone ? " (its bytes from other downloads)" : "",
++                              landing == AsyncReadback::Landing::Reader ? "the reading thread"
++                              : landing == AsyncReadback::Landing::GpuSideWrite
++                                  ? "a GPU-side write over it"
++                                  : "a thread that found it run by the host GPU");
++                }
++                i = run_end;
++            }
++        });
++    }
++    AsyncReadback::Add(AsyncReadback::g_counters.verify_checked, 1);
++    AsyncReadback::Add(AsyncReadback::g_counters.verify_bytes, compared);
++    AsyncReadback::Add(AsyncReadback::g_counters.verify_differing[static_cast<size_t>(landing)],
++                       differing);
++}
++
++template <class P>
+ void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
++    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): the newer bytes reach guest memory later if at
++    // all, so read downloads already taken land first. Without read downloads: the old body.
++    if (!read_downloads.empty()) {
++        if (const std::optional<u64> waited = FinishReadDownloads(device_addr, size)) {
++            VideoCore::AsyncReadback::CountClearLanding(*waited);
++        }
++    }
++    ClearReplacedDownload(device_addr, size);
++}
++
++template <class P>
++void BufferCache<P>::ClearReplacedDownload(DAddr device_addr, u64 size) {
++    ClearFenceDownloads(device_addr, size);
++    if (!read_downloads.empty()) {
++        for (ReadDownload& download : read_downloads) {
++            download.write_ranges.Subtract(device_addr, size);
++            download.clean_ranges.Subtract(device_addr, size);
++            if (download.check) {
++                download.check->changed.Add(device_addr, size);
++            }
++        }
++        read_download_ranges.Subtract(device_addr, size);
++    }
++}
++
++template <class P>
++void BufferCache<P>::ClearFenceDownloads(DAddr device_addr, u64 size) {
+     for (auto& ranges : pending_download_ranges) {
+         ranges.Subtract(device_addr, size);
+     }
+@@ -597,6 +1324,7 @@
+     const bool has_new_downloads = tmp_intervals.size() != 0;
+     for (const auto& pair : tmp_intervals) {
+         gpu_modified_ranges.Add(pair.first, pair.second);
++        NoteReadBackWrite(pair.first, pair.second); // EDEN_UP_L1028_EARLY; off: nothing
+         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+             Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
+             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
+@@ -1372,13 +2100,27 @@
+                                 "GPU and copied through the small buffer",
+                         times);
+         }
+-        runtime.Finish();
++        FinishForDownload();
+         const u8* const mapped = runtime.ReservedDownloadBuffer().mapped_span.data();
++        // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): CPU writes collected from here on store
++        // their bytes once these are in guest memory.
++        std::optional<VideoCore::DownloadLanding> landing;
++        if (VideoCore::AsyncReadback::Enabled()) {
++            DAddr landing_begin = ~DAddr{0};
++            DAddr landing_end = 0;
++            for (const DownloadPiece& piece : download_pieces) {
++                landing_begin = (std::min)(landing_begin, piece.device_addr);
++                landing_end = (std::max)(landing_end, piece.device_addr + piece.size);
++            }
++            landing.emplace(landing_begin, landing_end);
++        }
+         const Common::RangeSet<DAddr> cpu_written = GuardedCpuWriteRanges();
+         for (const DownloadPiece& piece : download_pieces) {
+             WriteDownloadedMemory(cpu_written, piece.device_addr, mapped + piece.offset, piece.size);
+-            // Older downloads of these bytes must not land over them when their fences pop.
+-            ClearDownload(piece.device_addr, piece.size);
++            // Older downloads of these bytes must not land over them when their fences pop. A
++            // synchronous download: read downloads leave the range rather than land over it
++            // (Lichii #1028; without them, ClearDownload's old body).
++            ClearReplacedDownload(piece.device_addr, piece.size);
+             gpu_modified_ranges.Subtract(piece.device_addr, piece.size);
+         }
+         download_pieces.clear();
+@@ -1400,7 +2142,8 @@
+ void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges) {
+     for (const auto& [device_addr, size] : ranges) {
+         if (IsRegionGpuModified(device_addr, size)) {
+-            ClearDownload(device_addr, size);
++            // Guest CPU writes (Lichii #1028: read downloads leave the range).
++            ClearReplacedDownload(device_addr, size);
+             gpu_modified_ranges.Subtract(device_addr, size);
+         }
+     }
+@@ -1502,6 +2245,16 @@
+     Common::RangeSet<DAddr> ranges;
+     // EDEN_NX2_DOWNLOAD_GUARDS=0: no download skips anything, as T34 and T37 ran.
+     if (pending_cpu_writes && DownloadGuards() != 0) {
++        pending_cpu_writes(
++            [&ranges](DAddr device_addr, size_t size) { ranges.Add(device_addr, size); });
++    }
++    return ranges;
++}
++
++template <class P>
++Common::RangeSet<DAddr> BufferCache<P>::CollectedCpuWriteRanges() {
++    Common::RangeSet<DAddr> ranges;
++    if (pending_cpu_writes) {
+         pending_cpu_writes(
+             [&ranges](DAddr device_addr, size_t size) { ranges.Add(device_addr, size); });
+     }
+@@ -1563,6 +2316,12 @@
+ 
+ template <class P>
+ void BufferCache<P>::PopAsyncBuffers() {
++    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): the host GPU is past this fence, so the read
++    // downloads taken before its copies are complete, and go to guest memory first. Those taken
++    // after took their bytes out of its copies (ClearFenceDownloads). Always empty without it.
++    if (!read_downloads.empty()) {
++        WriteCompletedReadDownloads();
++    }
+     if (async_buffers.empty()) {
+         return;
+     }
+@@ -1575,6 +2334,16 @@
+     auto& async_buffer = async_buffers.front();
+     u8* base = async_buffer->mapped_span.data();
+     const size_t base_offset = async_buffer->offset;
++    std::optional<VideoCore::DownloadLanding> landing;
++    if (VideoCore::AsyncReadback::Enabled()) {
++        DAddr landing_begin = ~DAddr{0};
++        DAddr landing_end = 0;
++        for (const auto& copy : downloads) {
++            landing_begin = (std::min)(landing_begin, static_cast<DAddr>(copy.src_offset));
++            landing_end = (std::max)(landing_end, static_cast<DAddr>(copy.src_offset + copy.size));
++        }
++        landing.emplace(landing_begin, landing_end);
++    }
+     // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since the
+     // copy was taken are newer than it, and the GPU thread hasn't dropped them from `ranges` yet.
+     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+@@ -2962,6 +3731,11 @@
+             ranges.Subtract(device_addr, size);
+         }
+     }
++    // EDEN_UP_L1028_ASYNC_READBACK / _EARLY (Lichii #1028): read downloads taken before this
++    // write still land their older bytes (their reads came first), but the range stays
++    // GPU-modified; pages read after each write get their early download. Off: nothing.
++    OutdateReadDownloads(device_addr, size);
++    NoteReadBackWrite(device_addr, size);
+     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+     NoteUniformWrite(device_addr, size); // EDEN_UP_L949_UBO_KEEP; nothing unless set
+     MarkVertexBuffersStale(device_addr, size);
+@@ -3830,7 +4604,8 @@
+                                                     }});
+                     total_size_bytes += Common::AlignUp(end - start, 64);
+                 });
+-                ClearDownload(device_addr_out, range_size);
++                // A synchronous download (Lichii #1028: read downloads leave the range).
++                ClearReplacedDownload(device_addr_out, range_size);
+                 gpu_modified_ranges.Subtract(device_addr_out, range_size);
+             });
+     }
+@@ -3857,8 +4632,22 @@
+         buffer.MarkUsage(download.copy.src_offset, download.copy.size);
+         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
+     }
+-    runtime.Finish();
++    FinishForDownload();
+     const u8* const mapped_memory = download_staging.mapped_span.data();
++    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): CPU writes collected from here on store their
++    // bytes once these are in guest memory.
++    std::optional<VideoCore::DownloadLanding> landing;
++    if (VideoCore::AsyncReadback::Enabled()) {
++        DAddr landing_begin = ~DAddr{0};
++        DAddr landing_end = 0;
++        for (const Download& download : downloads) {
++            const DAddr address =
++                slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
++            landing_begin = (std::min)(landing_begin, address);
++            landing_end = (std::max)(landing_end, address + download.copy.size);
++        }
++        landing.emplace(landing_begin, landing_end);
++    }
+     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+     for (const Download& download : downloads) {
+         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+@@ -3892,17 +4681,43 @@
+             };
+ 
+             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
+-            ClearDownload(device_addr_out, range_size);
++            // A synchronous download (Lichii #1028: read downloads leave the range).
++            ClearReplacedDownload(device_addr_out, range_size);
+             gpu_modified_ranges.Subtract(device_addr_out, range_size);
+         });
+     if (total_size_bytes == 0) {
+         return;
+     }
+     Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
++    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): guest memory is written once the host GPU ran
++    // the copies; the CPU writes collected meanwhile keep their bytes too, and those collected
++    // from then on store theirs once these are in guest memory. Off: nothing.
++    std::optional<VideoCore::DownloadLanding> landing;
++    const auto begin_landing = [&] {
++        if (!VideoCore::AsyncReadback::Enabled()) {
++            return;
++        }
++        DAddr landing_begin = ~DAddr{0};
++        DAddr landing_end = 0;
++        for (const BufferCopy& copy : copies) {
++            landing_begin = (std::min)(landing_begin, buffer.CpuAddr() + copy.src_offset);
++            landing_end = (std::max)(landing_end, buffer.CpuAddr() + copy.src_offset + copy.size);
++        }
++        landing.emplace(landing_begin, landing_end);
++        PendingCpuWriteRanges().ForEach(
++            [&](DAddr start, DAddr end) { cpu_written.Add(start, end - start); });
++    };
+ 
+     if constexpr (requires { buffer.Mapped(); }) {
+         if (const auto mapped = buffer.Mapped(); !mapped.empty()) {
+-            runtime.Wait(buffer.LastUsageTick());
++            if (VideoCore::AsyncReadback::StatsEnabled()) {
++                const u64 start = VideoCore::AsyncReadback::Now();
++                runtime.Wait(buffer.LastUsageTick());
++                VideoCore::AsyncReadback::CountHostWait(VideoCore::AsyncReadback::Now() - start);
++            } else {
++                runtime.Wait(buffer.LastUsageTick());
++            }
++            begin_landing();
+             for (const BufferCopy& copy : copies) {
+                 WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
+                                       mapped.data() + copy.src_offset, copy.size);
+@@ -3933,7 +4748,8 @@
+             buffer.MarkUsage(copy.src_offset, copy.size);
+         }
+         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+-        runtime.Finish();
++        FinishForDownload();
++        begin_landing();
+         // EDEN_NX2_DOWNLOAD_GUARDS=2: writes collected during that wait are newer than this copy.
+         // Same test as GPUDirtyMemoryManager::KeepHandedOut, which this file doesn't include.
+         static const bool after_wait = [] {
+@@ -3953,6 +4769,7 @@
+         }
+     } else {
+         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
++        begin_landing();
+         for (const BufferCopy& copy : copies) {
+             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
+             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -46,7 +46,9 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/nx2_async_readback.h"
+ #include "video_core/nx2_fast_draw.h"
++#include "video_core/rasterizer_download_area.h"
+ #include "video_core/surface.h"
+ #include "video_core/texture_cache/types.h"
+ 
+@@ -286,14 +288,59 @@
+     /// EDEN_UP_HELD_VS_DOWNLOAD=1 (MythosOfs/Orchid f2eb04babd), read once.
+     [[nodiscard]] static bool HeldVsDownload();
+ 
++    /// Cancels pending downloads over the range (fences' and, with EDEN_UP_L1028_ASYNC_READBACK,
++    /// reads'), so none writes them over newer bytes. Those bytes reach guest memory later if at
++    /// all (a GPU copy, a clear, an inline or a discarded write), so read downloads already taken
++    /// land first: their reads get what a synchronous flush would have written.
+     void ClearDownload(DAddr base_addr, u64 size);
++
++    /// ClearDownload where guest memory gets the newer bytes before a read can find the range: a
++    /// guest CPU write, a synchronous download landing under `mutex`, or a GPU-side write whose
++    /// read downloads MemoryManager landed first. Read downloads leave the range rather than
++    /// land, so this never waits for the host GPU. Without read downloads: ClearDownload.
++    void ClearReplacedDownload(DAddr device_addr, u64 size);
+ 
+     /// hold_back (EDEN_UP_HELD_VS_DOWNLOAD only): false for a page no write was made to (the
+     /// rasterizer's write-ahead marking), which must not be held back from downloads.
+     bool OnCPUWrite(DAddr device_addr, u64 size, bool hold_back = true);
+ 
+     void DownloadMemory(DAddr device_addr, u64 size);
++
++    /// EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): DownloadMemory for a guest CPU
++    /// read. Submits the copies without waiting for the host GPU, for FinishReadDownloads to
++    /// write to guest memory. Their ranges stay GPU-modified until then, and another read of them
++    /// waits for these copies (GetFlushArea: in_flight). Without a staging buffer: DownloadMemory.
++    void DownloadMemoryForRead(DAddr device_addr, u64 size);
++
++    /// Writes the DownloadMemoryForRead copies over [device_addr, device_addr + size), and those
++    /// submitted before them, to guest memory, waiting for the host GPU if it must. Any thread:
++    /// the reading one before it reads, the GPU's side before it writes guest memory there. Takes
++    /// `mutex` itself (a caller holding it keeps it held while the host GPU finishes). Returns how
++    /// long it waited for the host GPU (0 if it did not), or nothing when no download was over
++    /// the range.
++    std::optional<u64> FinishReadDownloads(DAddr device_addr, u64 size);
+ 
++    /// A GPU write into the buffers over [device_addr, device_addr + size), after the read
++    /// downloads taken so far: they still write their older bytes to guest memory, as synchronous
++    /// ones would have, but a later read takes the range again. MarkWrittenBuffer does this for
++    /// the writes it records; the query cache's copies of its results call it themselves.
++    void OutdateReadDownloads(DAddr device_addr, u64 size);
++
++    /// EDEN_UP_L1028_EARLY: a query result over [device_addr, device_addr + size) that the query
++    /// cache writes to guest memory later (QueryCacheBase::CounterReport). On a page that gets
++    /// early downloads, a GPU write over it after the report stays GPU-modified when a download
++    /// lands it: the older result lands over it, and a later read downloads it again. True when
++    /// it keeps the result, which FinishReport then ends.
++    [[nodiscard]] bool NoteReportPending(DAddr device_addr, u64 size);
++
++    /// The query cache wrote a result NoteReportPending kept to guest memory, or dropped it.
++    void FinishReport(DAddr device_addr, u64 size);
++
++    /// EDEN_UP_L1028_EARLY: the GPU thread recorded a draw or dispatch (`mutex` held). After a
++    /// dispatch, the downloads of the pages written since that the guest reads after each write
++    /// go right behind it (RecordEarlyDownloads). Those the host GPU has run land in guest memory.
++    void NoteWorkRecorded(bool dispatch);
++
+     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+ 
+     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
+@@ -730,6 +777,50 @@
+     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
+ 
+     void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
++
++    /// The host GPU wait of a synchronous download (runtime.Finish), timed for
++    /// EDEN_UP_L1028_STATS (the read flushes' share of them is what async read-back removes).
++    void FinishForDownload();
++
++    /// ClearDownload, for the downloads taken at fences only.
++    void ClearFenceDownloads(DAddr device_addr, u64 size);
++
++    /// EDEN_UP_L1028_ASYNC_READBACK: whether every GPU-modified byte in the range is in a read
++    /// download's clean_ranges.
++    [[nodiscard]] bool ReadDownloadsCover(DAddr device_addr, u64 size) const;
++
++    /// Writes the read downloads up to `tick` to guest memory, oldest first (`mutex` held, the
++    /// host GPU past `tick`). `landed_by`: who does, for EDEN_UP_L1028_VERIFY.
++    void WriteReadDownloads(
++        u64 tick,
++        VideoCore::AsyncReadback::Landing landed_by = VideoCore::AsyncReadback::Landing::Completed);
++
++    /// WriteReadDownloads for those the host GPU has completed: nothing waits.
++    void WriteCompletedReadDownloads();
++
++    /// WriteReadDownloads up to the newest read download over the range, if the host GPU ran it.
++    /// Returns whether it did.
++    bool WriteFinishedReadDownloads(DAddr device_addr, u64 size);
++
++    /// Records a read download of the GPU-modified bytes over `ranges` that no read download
++    /// brings yet. `own`: the bytes the read itself asked for (EDEN_UP_L1028_VERIFY compares
++    /// them). A read's download is submitted at once; an early one goes with the GPU thread's next
++    /// submission. False, with nothing changed, when no staging buffer was free.
++    bool RecordReadDownload(std::span<const std::pair<DAddr, u64>> ranges,
++                            std::span<const std::pair<DAddr, u64>> own, bool early);
++
++    /// EDEN_UP_L1028_EARLY: a guest read of the pages [begin, end): learns which pages the guest
++    /// reads after the GPU writes them. `gpu_modified`: the read found GPU writes not yet in guest
++    /// memory.
++    void NoteReadBack(DAddr begin, DAddr end, bool gpu_modified);
++
++    /// EDEN_UP_L1028_EARLY: a GPU write: the pages under it that the guest reads after each write
++    /// get an early download once the writing work is recorded.
++    void NoteReadBackWrite(DAddr device_addr, u64 size);
++
++    /// EDEN_UP_L1028_EARLY: records the early downloads of the pages written since their last one
++    /// (`mutex` held).
++    void RecordEarlyDownloads();
+ 
+     /// A copy of a download that found no staging buffer goes through the pool's small buffer of
+     /// its own. FinishDownloadPieces waits for the GPU once for all that buffer holds, then guest
+@@ -779,6 +870,9 @@
+     /// CPU writes collected but not yet applied (SetPendingCpuWrites). Empty at DownloadGuards 0.
+     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
+ 
++    /// EDEN_UP_L1028_ASYNC_READBACK: the same whatever DownloadGuards says (read downloads).
++    [[nodiscard]] Common::RangeSet<DAddr> CollectedCpuWriteRanges();
++
+     /// The same for DownloadRangesMemory and FinishDownloadPieces, the two download sites the move
+     /// to v1.219.020 left writing everything: empty unless DownloadGuards is 1 or more.
+     [[nodiscard]] Common::RangeSet<DAddr> GuardedCpuWriteRanges();
+@@ -1017,7 +1111,91 @@
+     OverwriteSummary overwrite_summary{};
+     PendingCpuWrites pending_cpu_writes;
+     std::optional<Async_Buffer> current_buffer;
++
++    /// EDEN_UP_L1028_VERIFY: what a synchronous flush of the read would have copied, copied again
++    /// in the same submission, compared with guest memory once the download lands.
++    struct ReadCheck {
++        Async_Buffer staging{};
++        /// src_offset: the device address copied; dst_offset: where it is in `staging`.
++        boost::container::small_vector<BufferCopy, 4> copies;
++        /// Replaced in guest memory since (ClearReplacedDownload): not compared.
++        Common::RangeSet<DAddr> changed;
++        /// Bytes earlier read downloads bring, by their sequence number: compared only when those
++        /// land in the same pass (WriteReadDownloads) as this one. Landed in an earlier pass,
++        /// guest memory may hold newer bytes there by now, as after synchronous flushes.
++        boost::container::small_vector<std::pair<u64, std::pair<DAddr, DAddr>>, 8> kept;
++        DAddr read_begin{};
++        DAddr read_end{};
++        bool alone{}; ///< Its read's bytes all come from other downloads: a check of its own
++    };
++    /// Compares a landed read download's check (`mutex` held, inside its landing).
++    void CheckReadDownload(const ReadCheck& check, u64 pass_first_sequence,
++                           VideoCore::AsyncReadback::Landing landing);
++
++    /// EDEN_UP_L1028_ASYNC_READBACK: a DownloadMemoryForRead (or an early download): its copies,
++    /// and what is left of them to do once the host GPU has run them.
++    struct ReadDownload {
++        u64 tick{};     ///< The submission with the copies
++        u64 sequence{}; ///< Its place among all read downloads
++        Async_Buffer staging{};
++        bool has_staging{}; ///< A check alone has none
++        /// src_offset: the device address copied; dst_offset: where it is in `staging`.
++        boost::container::small_vector<BufferCopy, 4> copies;
++        /// Still to write to guest memory: a newer value there (ClearReplacedDownload) takes its
++        /// bytes out. A newer GPU write doesn't: until a download of its own lands, guest memory
++        /// is to hold what a synchronous flush would have left.
++        Common::RangeSet<DAddr> write_ranges;
++        /// No longer GPU-modified once written: a newer GPU write (OutdateReadDownloads) or value
++        /// in guest memory takes its bytes out.
++        Common::RangeSet<DAddr> clean_ranges;
++        std::unique_ptr<ReadCheck> check; ///< EDEN_UP_L1028_VERIFY
++        /// Recorded right after a GPU write, before any read (EDEN_UP_L1028_EARLY)
++        bool early{};
++    };
++    /// Oldest first, and written to guest memory in that order: none lands over newer bytes.
++    /// Always empty without EDEN_UP_L1028_ASYNC_READBACK.
++    std::deque<ReadDownload> read_downloads;
++    /// All the read downloads' clean_ranges (they don't overlap): GPU-modified bytes already on
++    /// their way, which later reads wait for rather than download again.
++    Common::RangeSet<DAddr> read_download_ranges;
++    u64 read_download_sequence{};
+ 
++    /// EDEN_UP_L1028_EARLY: a page the guest CPU read GPU writes from. Switch 2 titles read
++    /// compute results back every frame, milliseconds after the dispatch that wrote them: a
++    /// download recorded at the read waits for all the GPU work recorded in between. Pages read
++    /// after each of their writes get their download recorded right behind the write instead
++    /// (RecordEarlyDownloads), which the read finds landed or on its way (GetFlushArea: in_flight).
++    struct ReadBackPage {
++        DAddr page{};
++        u64 last_read{};     ///< read_back_reads at its last read of a write (eviction)
++        u16 reads{};         ///< Writes in a row the guest read, up to EarlyAfterReads
++        u16 unread_writes{}; ///< GPU writes since its last read
++        bool written{};      ///< A GPU write since its last read
++    };
++    /// Reads of a page's writes in a row before its writes get early downloads.
++    static constexpr u16 EarlyAfterReads = 2;
++    /// Writes in a row without a read that stop them.
++    static constexpr u16 MaxUnreadWrites = 4;
++    static constexpr size_t MaxReadBackPages = 64;
++    /// Early download bytes a frame, and early downloads not yet in guest memory: past them, reads
++    /// flush on demand.
++    static constexpr u64 EarlyBytesPerFrame = 1_MiB;
++    static constexpr u32 MaxPendingEarlyDownloads = 32;
++    std::vector<ReadBackPage> read_back_pages; ///< Sorted by page
++    /// NoteReportPending's results not yet written, oldest first.
++    struct PendingReport {
++        DAddr addr;
++        u64 size;
++        bool rewritten; ///< A GPU write over it since the report
++    };
++    std::vector<PendingReport> pending_reports;
++    /// Pages to download once the work writing them is recorded.
++    boost::container::small_vector<DAddr, 8> early_pages;
++    u64 read_back_reads{};
++    u64 early_bytes_this_frame{};
++    u32 pending_early_downloads{};
++    u32 early_landing_checks{};
++
+     std::deque<Async_Buffer> async_buffers_death_ring;
+ 
+     struct DownloadPiece {
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -27,6 +27,8 @@
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/nx2.h"
++#include "video_core/nx2_async_readback.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/nx2_query_light.h"
+@@ -2108,7 +2110,72 @@
+                     }
+                 } else {
+                     ++misses;
+-                    drained_read(snap_words.data(), VideoCommon::DrainSite::DmaSnapshotMiss);
++                    // EDEN_UP_L1028_DMA_WAIT (zortos293/Lichii #1028's FrontDmaRead and
++                    // GpuSplit::WaitForWrites, on the snapshot's write notes): only the queued
++                    // work that may write these pages runs first. Past it nothing sent can write
++                    // them (the notes snapshot hits trust), so unless the buffer cache holds GPU
++                    // writes there or the query cache lists a report, guest memory has the words:
++                    // no drain, no flush. Else, and without the switch: the drained read.
++                    namespace AsyncReadback = VideoCore::AsyncReadback;
++                    const bool narrow_on = AsyncReadback::DmaWaitEnabled() &&
++                                           VideoCommon::QueryDma::SyncMode() == 0;
++                    const bool count_misses = narrow_on || AsyncReadback::StatsEnabled();
++                    const u64 miss_start = count_misses ? AsyncReadback::Now() : 0;
++                    bool narrowed = false;
++                    if (narrow_on) {
++                        split.WaitForNotedWriters(first_page << 12,
++                                                  (last_page - first_page + 1) << 12);
++                        const GPUVAddr page_begin = source & ~GPUVAddr{0xfff};
++                        const GPUVAddr page_end = (source + read_bytes + 0xfff) & ~GPUVAddr{0xfff};
++                        // Pages the GPU never wrote through the caches need no look under the
++                        // buffer cache's lock (Tegra::Nx2IsGpuWritten, Switch 2 titles).
++                        bool may_be_written = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
++                        for (u64 page = first_page; page <= last_page && !may_be_written; ++page) {
++                            may_be_written = Tegra::Nx2IsGpuWritten(page << 12);
++                        }
++                        narrowed =
++                            !(may_be_written &&
++                              memory_manager.IsMemoryDirty(page_begin,
++                                                           static_cast<size_t>(page_end - page_begin),
++                                                           VideoCommon::CacheType::BufferCache)) &&
++                            !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12);
++                    }
++                    if (narrowed) {
++                        memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
++                        AsyncReadback::Add(AsyncReadback::g_counters.dma_narrow, 1);
++                        AsyncReadback::Add(AsyncReadback::g_counters.dma_narrow_ns,
++                                           AsyncReadback::Now() - miss_start);
++                        if (AsyncReadback::DmaWaitVerify()) {
++                            // EDEN_UP_L1028_DMA_WAIT_VERIFY: drain anyway and compare; the macro
++                            // gets the drained words.
++                            std::vector<u32> exact(words);
++                            drained_read(exact.data(), VideoCommon::DrainSite::DmaSnapshotCheck);
++                            if (exact != snap_words) {
++                                const u64 differing = AsyncReadback::g_counters
++                                                          .dma_verify_differences.fetch_add(
++                                                              1, std::memory_order_relaxed);
++                                if (differing < 32) {
++                                    LOG_WARNING(HW_GPU,
++                                                "Lichii #1028 DMA wait check: macro {:#x} read of "
++                                                "{} words at {:#x} after a narrower wait differs "
++                                                "from the drained read ({:#x} vs {:#x})",
++                                                macro, words, source, snap_words[0], exact[0]);
++                                }
++                                snap_words = std::move(exact);
++                            }
++                        }
++                    } else {
++                        drained_read(snap_words.data(), VideoCommon::DrainSite::DmaSnapshotMiss);
++                        if (count_misses) {
++                            AsyncReadback::Add(AsyncReadback::g_counters.dma_drained, 1);
++                            AsyncReadback::Add(AsyncReadback::g_counters.dma_drained_ns,
++                                               AsyncReadback::Now() - miss_start);
++                        }
++                    }
++                    if (count_misses) {
++                        AsyncReadback::Add(AsyncReadback::g_counters.dma_misses, 1);
++                        AsyncReadback::MaybeReportIfEnabled();
++                    }
+                     if (fs.dma_snapshots.size() > 8192) {
+                         fs.dma_snapshots.clear();
+                     }
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include "common/assert.h"
+ #include "common/pe_switch.h"
++#include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/settings_enums.h"
+ #include "core/core.h"
+@@ -43,7 +44,9 @@
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
++#include "video_core/nx2_async_readback.h"
+ #include "video_core/nx2_fast_draw.h"
++#include "video_core/rasterizer_download_area.h"
+ #include "video_core/renderer_base.h"
+ #include "video_core/shader_notify.h"
+ 
+@@ -173,14 +176,42 @@
+         if (held_vs_download) {
+             renderer->ReadRasterizer()->BeginCachedWrites();
+         }
+-        system.GatherGPUDirtyMemory(callback_writes);
+-        if (!writes.empty()) {
+-            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+-            ForgetHandedOutWrites();
+-        }
++        GatherAndApply(writes, callback_writes);
+         if (held_vs_download) {
+             renderer->ReadRasterizer()->EndCachedWrites();
+         }
++    }
++
++    /// Gathers the collected guest writes and applies them. EDEN_UP_L1028_ASYNC_READBACK
++    /// (zortos293/Lichii #1028): they stay pending (ForEachPendingCpuWrite) until applied, so a
++    /// read download written to guest memory meanwhile, on another thread or by the apply itself
++    /// (BufferCache::ClearDownload), keeps their bytes. Off: as before.
++    void GatherAndApply(std::vector<std::pair<DAddr, u64>>& writes,
++                        std::function<void(PAddr, size_t)>& callback_writes) {
++        if (!VideoCore::AsyncReadback::Enabled()) {
++            system.GatherGPUDirtyMemory(callback_writes);
++            if (!writes.empty()) {
++                renderer->ReadRasterizer()->OnCacheInvalidations(writes);
++                ForgetHandedOutWrites();
++            }
++            return;
++        }
++        {
++            std::scoped_lock lock{applying_writes_mutex};
++            system.GatherGPUDirtyMemory(callback_writes);
++            if (writes.empty()) {
++                return;
++            }
++            applying_writes.push_back(&writes);
++        }
++        // Also if OnCacheInvalidations throws: ForEachPendingCpuWrite must not reach `writes`
++        // once it is gone.
++        SCOPE_EXIT {
++            std::scoped_lock lock{applying_writes_mutex};
++            std::erase(applying_writes, &writes);
++        };
++        renderer->ReadRasterizer()->OnCacheInvalidations(writes);
++        ForgetHandedOutWrites();
+     }
+ 
+     /// EDEN_NX2_DOWNLOAD_GUARDS=2: the gathered writes are applied, downloads may land there again.
+@@ -213,11 +244,7 @@
+         if (held_vs_download) {
+             renderer->ReadRasterizer()->BeginCachedWrites();
+         }
+-        system.GatherGPUDirtyMemory(callback_writes);
+-        if (!writes.empty()) {
+-            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+-            ForgetHandedOutWrites();
+-        }
++        GatherAndApply(writes, callback_writes);
+         if (held_vs_download) {
+             renderer->ReadRasterizer()->EndCachedWrites();
+         }
+@@ -232,6 +259,15 @@
+         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+             manager.ForEachPending(callback);
+         }
++        // EDEN_UP_L1028_ASYNC_READBACK: the gathered writes being applied (GatherAndApply).
++        if (VideoCore::AsyncReadback::Enabled()) {
++            std::scoped_lock lock{applying_writes_mutex};
++            for (const auto* writes : applying_writes) {
++                for (const auto& [address, size] : *writes) {
++                    callback(address, size);
++                }
++            }
++        }
+     }
+ 
+     /// Signal the ending of command list.
+@@ -388,16 +424,68 @@
+                      raster_area.start_address, raster_area.end_address,
+                      reads.load(std::memory_order_relaxed));
+         }
+-        const u64 fence = RequestSyncOperation([this, raster_area]() {
++        namespace AsyncReadback = VideoCore::AsyncReadback;
++        if (AsyncReadback::Enabled()) {
++            return ReadAsync(raster_area);
++        }
++        // EDEN_UP_L1028_STATS: the reads' waits and the GPU thread's time in their flushes, for
++        // the arms without async read-back. Off: as before.
++        const bool stats = AsyncReadback::StatsEnabled();
++        const u64 request = stats ? AsyncReadback::Now() : 0;
++        const u64 fence = RequestSyncOperation([this, raster_area, stats]() {
++            const u64 start = stats ? AsyncReadback::Now() : 0;
++            AsyncReadback::t_read_flush = stats;
+             // Apply collected guest writes before downloading GPU data over guest memory.
+             InvalidateGPUCache();
+             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
++            AsyncReadback::t_read_flush = false;
++            if (stats) {
++                AsyncReadback::Add(AsyncReadback::g_counters.flush_ns, AsyncReadback::Now() - start);
++            }
+         });
+         gpu_thread.TickGPU(is_async);
+         WaitForSyncOperation(fence);
++        if (stats) {
++            AsyncReadback::CountRead(AsyncReadback::Read::Sync, AsyncReadback::Now() - request);
++            AsyncReadback::MaybeReport();
++        }
+         return raster_area;
+     }
+ 
++    /// EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): OnCPURead's flush. The GPU thread
++    /// submits the buffer downloads without waiting for the host GPU (FlushRegionForRead), and
++    /// this thread waits for them and writes them to guest memory (FinishRead) while the GPU
++    /// thread goes on. In flight: an earlier read's or an early download covers the area, only
++    /// the wait is left.
++    VideoCore::RasterizerDownloadArea ReadAsync(VideoCore::RasterizerDownloadArea raster_area) {
++        namespace AsyncReadback = VideoCore::AsyncReadback;
++        const u64 request = AsyncReadback::Now();
++        const u64 area_size = raster_area.end_address - raster_area.start_address;
++        if (!raster_area.in_flight) {
++            const u64 fence = RequestSyncOperation([this, raster_area, area_size]() {
++                const u64 start = AsyncReadback::Now();
++                AsyncReadback::t_read_flush = true;
++                // Apply collected guest writes before downloading GPU data over guest memory.
++                InvalidateGPUCache();
++                renderer->ReadRasterizer()->FlushRegionForRead(raster_area.start_address,
++                                                               area_size);
++                AsyncReadback::t_read_flush = false;
++                AsyncReadback::Add(AsyncReadback::g_counters.flush_ns,
++                                   AsyncReadback::Now() - start);
++            });
++            gpu_thread.TickGPU(is_async);
++            WaitForSyncOperation(fence);
++        }
++        AsyncReadback::t_reading = true;
++        renderer->ReadRasterizer()->FinishRead(raster_area.start_address, area_size);
++        AsyncReadback::t_reading = false;
++        AsyncReadback::CountRead(raster_area.in_flight ? AsyncReadback::Read::InFlight
++                                                       : AsyncReadback::Read::Async,
++                                 AsyncReadback::Now() - request);
++        AsyncReadback::MaybeReportIfEnabled();
++        return raster_area;
++    }
++
+     /// Notify rasterizer that any caches of the specified region should be invalidated
+     void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {
+         if (preserve_gpu_writes) {
+@@ -529,6 +617,11 @@
+     std::mutex sync_request_mutex;
+     std::condition_variable sync_request_cv;
+ 
++    /// EDEN_UP_L1028_ASYNC_READBACK: the writes GatherAndApply gathered and is applying, on each
++    /// thread doing so.
++    std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
++    std::mutex applying_writes_mutex;
++
+     const bool is_async;
+ 
+     std::unique_ptr<Core::Frontend::GraphicsContext> cpu_context;
+@@ -760,3 +853,28 @@
+ }
+ 
+ } // namespace Tegra
++
++namespace VideoCore {
++
++// EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): only pages the GPU wrote through the
++// caches can hold a read download (Switch 2 titles mark them, Tegra::Nx2MarkGpuWritten); a range
++// past the page table, or any range of other titles, may.
++bool MayHoldGpuWrites(DAddr addr, u64 size) {
++    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
++        return true;
++    }
++    const u64 table_pages = u64{Tegra::g_nx2_gpu_written_pages.size()} * 64;
++    const u64 first = addr >> Tegra::Nx2WrittenPageBits;
++    const u64 last = (addr + size - 1) >> Tegra::Nx2WrittenPageBits;
++    if (last < first || last >= table_pages) {
++        return true;
++    }
++    for (u64 page = first; page <= last; ++page) {
++        if (Tegra::Nx2IsGpuWritten(page << Tegra::Nx2WrittenPageBits)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++} // namespace VideoCore
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -619,6 +619,37 @@
+         }
+         return remembered == pending_writes.size();
+     }
++    /// EDEN_UP_L1028_DMA_WAIT (zortos293/Lichii #1028's GpuSplit::WaitForWrites, on these notes):
++    /// waits until the back executed every entry sent so far that may write device bytes
++    /// [begin, begin + size) by the notes above (compute and copies, unranged writers, noted
++    /// writes over the range), not the ones after it. All of them when more writes were noted
++    /// since than are remembered. Returns whether one was still queued.
++    bool WaitForNotedWriters(u64 begin, u64 size) {
++        CloseRegs();
++        u64 target = (std::max)(last_writer_position, last_unranged_position);
++        if (last_memory_writer_position > target) {
++            const u64 end = begin + size;
++            const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
++            bool settled = false;
++            for (u64 scanned = 0; scanned < remembered; ++scanned) {
++                const PendingWrite& write =
++                    pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
++                if (write.position <= target) {
++                    settled = true; // Older ones are waited for anyway.
++                    break;
++                }
++                if (write.begin < end && begin < write.end) {
++                    target = write.position;
++                    settled = true;
++                    break;
++                }
++            }
++            if (!settled && remembered == pending_writes.size()) {
++                target = write_position;
++            }
++        }
++        return WaitFor((std::min)(target, write_position), DrainSite::DmaSnapshotWrites);
++    }
+ 
+ private:
+     enum class Kind : u64 {
+diff --git a/src/video_core/gpu_split_sites.h b/src/video_core/gpu_split_sites.h
+--- a/src/video_core/gpu_split_sites.h
++++ b/src/video_core/gpu_split_sites.h
+@@ -36,6 +36,7 @@
+     MapOnBack,     ///< EDEN_NX2_MAP_ON_BACK: the map's own drain
+     BackRegister,  ///< EDEN_UP_L1056_BACK_MACROS: a register a macro the back ran may have written
+     BackCode,      ///< EDEN_UP_L1056_BACK_MACROS: the macro code changes under queued back macros
++    DmaSnapshotWrites, ///< EDEN_UP_L1028_DMA_WAIT: a snapshot miss waits for its words' writers
+     Count,
+ };
+ 
+@@ -46,6 +47,6 @@
+     "acquire recheck", "acquire poll",   "list gpu-written", "list first drain",
+     "macro dma read ram", "dma snapshot miss", "dma snapshot check", "dma read ahead",
+-    "map on back",    "back register",   "back code",
++    "map on back",    "back register",   "back code",        "dma snapshot writes",
+ };
+ static_assert(drain_site_names.back() != nullptr, "a drain site without a name");
+ 
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -22,6 +22,7 @@
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/invalidation_accumulator.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/rasterizer_download_area.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/renderer_base.h"
+ #include "video_core/texture_cache/util.h"
+@@ -329,6 +330,15 @@
+ 
+ template <typename T>
+ void MemoryManager::Write(GPUVAddr addr, T data) {
++    // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): a download for a guest read not yet
++    // in guest memory would land over this write later. Always 0 without the switch.
++    if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) {
++        if (const auto address = GpuToCpuAddress(addr);
++            address && rasterizer != nullptr &&
++            VideoCore::ReadDownloadsMayCover(*address, sizeof(T))) {
++            rasterizer->FinishRead(*address, sizeof(T));
++        }
++    }
+     Common::WritePagedScalar(addr, data, [&](GPUVAddr address) {
+         u8* page_pointer = GetPointer(address);
+         if (!page_pointer) {
+@@ -542,9 +552,18 @@
+     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
+     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
+         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
++    };
++    // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): a download for a guest read not yet
++    // in guest memory would land over this write later. Always 0 without the switch.
++    const auto finish_reads = [this](DAddr dev_addr, std::size_t amount) {
++        if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0 &&
++            rasterizer != nullptr && VideoCore::ReadDownloadsMayCover(dev_addr, amount)) {
++            rasterizer->FinishRead(dev_addr, amount);
++        }
+     };
+     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
++        finish_reads(dev_addr_base, copy_amount);
+         if (!unsafe) {
+             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
+         }
+@@ -561,6 +580,7 @@
+     };
+     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
++        finish_reads(dev_addr_base, copy_amount);
+         if (!unsafe) {
+             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
+         }
+diff --git a/src/video_core/nx2_async_readback.h b/src/video_core/nx2_async_readback.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/nx2_async_readback.h
+@@ -0,0 +1,304 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <chrono>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++
++// Port of zortos293/Lichii #1028 (merged into nx2 as 0b83798bf6; jpkto and zortos293, a port of
++// #805's read-back). Every part is off unless its switch is exactly "1" (Common::PeSwitch, read
++// once):
++// - EDEN_UP_L1028_ASYNC_READBACK: a guest CPU read of GPU-written buffer memory (GPU::OnCPURead)
++//   has the GPU thread submit the buffer downloads and go on (BufferCache::DownloadMemoryForRead)
++//   instead of waiting for the host GPU (Scheduler::Finish) with the buffer cache's lock held.
++//   The reading thread waits for that submission and writes the bytes to guest memory
++//   (BufferCache::FinishReadDownloads). Writes to guest memory from the GPU's side land the read
++//   downloads under them first (MemoryManager, query results, ClearDownload).
++// - EDEN_UP_L1028_EARLY (with ASYNC_READBACK): pages the guest reads after each GPU write get
++//   their download right behind the write (BufferCache::RecordEarlyDownloads). Only pages that
++//   are not Preflushable learn this, so it acts with EDEN_NX2_PREFLUSH=0 (upstream's mode).
++// - EDEN_UP_L1028_VERIFY (with ASYNC_READBACK): every read download is compared, as it lands, with
++//   a synchronous copy taken in the same submission (a reduced EDEN_NX2_READ_CHECK).
++// - EDEN_UP_L1028_DMA_WAIT: a macro DMA read EDEN_NX2_DMA_SNAPSHOT can't answer waits only for
++//   the queued work that may write its words, and drains only if the caches hold them then
++//   (upstream's FrontDmaRead/GpuSplit::WaitForWrites on our snapshot misses).
++//   EDEN_UP_L1028_DMA_WAIT_VERIFY: such reads drain anyway and are compared.
++// - EDEN_UP_L1028_STATS: the counters below, one line every 10 s. No behaviour change: control
++//   arms carry it to count the synchronous reads and the back's host GPU waits for them.
++namespace VideoCore::AsyncReadback {
++
++/// EDEN_UP_L1028_ASYNC_READBACK=1
++[[nodiscard]] inline bool Enabled() {
++    static const bool on = Common::PeSwitch("EDEN_UP_L1028_ASYNC_READBACK");
++    return on;
++}
++
++/// EDEN_UP_L1028_EARLY=1, only with ASYNC_READBACK
++[[nodiscard]] inline bool EarlyEnabled() {
++    static const bool on = Enabled() && Common::PeSwitch("EDEN_UP_L1028_EARLY");
++    return on;
++}
++
++/// EDEN_UP_L1028_VERIFY=1, only with ASYNC_READBACK
++[[nodiscard]] inline bool VerifyEnabled() {
++    static const bool on = Enabled() && Common::PeSwitch("EDEN_UP_L1028_VERIFY");
++    return on;
++}
++
++/// EDEN_UP_L1028_DMA_WAIT=1
++[[nodiscard]] inline bool DmaWaitEnabled() {
++    static const bool on = Common::PeSwitch("EDEN_UP_L1028_DMA_WAIT");
++    return on;
++}
++
++/// EDEN_UP_L1028_DMA_WAIT_VERIFY=1, only with DMA_WAIT
++[[nodiscard]] inline bool DmaWaitVerify() {
++    static const bool on = DmaWaitEnabled() && Common::PeSwitch("EDEN_UP_L1028_DMA_WAIT_VERIFY");
++    return on;
++}
++
++/// EDEN_UP_L1028_STATS=1
++[[nodiscard]] inline bool StatsEnabled() {
++    static const bool on = Common::PeSwitch("EDEN_UP_L1028_STATS");
++    return on;
++}
++
++/// Who wrote a read download to guest memory (EDEN_UP_L1028_VERIFY's differences).
++enum class Landing : u8 {
++    Reader,       ///< The guest thread whose read waited for it (GPU::OnCPURead)
++    GpuSideWrite, ///< A write to guest memory from the GPU's side over its bytes
++    Completed,    ///< Whichever thread found the host GPU had run it, before a read waited
++    Count,
++};
++
++/// Set on a guest thread while GPU::OnCPURead writes its downloads to guest memory.
++inline thread_local bool t_reading{};
++/// Set on the thread running a read's flush request (GPU::OnCPURead), for the stats only.
++inline thread_local bool t_read_flush{};
++
++[[nodiscard]] inline u64 Now() {
++    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                std::chrono::steady_clock::now().time_since_epoch())
++                                .count());
++}
++
++enum class Read : u8 {
++    Sync,     ///< ASYNC_READBACK off: the GPU thread flushed and waited, as before
++    Async,    ///< The GPU thread submitted the downloads, the reading thread waited for them
++    InFlight, ///< An earlier read's or an early download covered it: no flush, only the wait
++    Count,
++};
++
++enum class HostWait : u8 {
++    ReadFlush, ///< The buffer cache's synchronous download for a read's flush (GPU::OnCPURead)
++    Other,     ///< Its other synchronous downloads (CPU writes on GPU-written pages, macro DMA)
++    Count,
++};
++
++/// Totals for the 10 s line, from every thread.
++struct Counters {
++    std::array<std::atomic<u64>, static_cast<size_t>(Read::Count)> reads{};
++    /// From the read's request to its bytes in guest memory
++    std::array<std::atomic<u64>, static_cast<size_t>(Read::Count)> read_ns{};
++    std::atomic<u64> read_max_ns{};
++    /// The GPU thread's time in the reads' flush requests, and in their buffer cache part
++    std::atomic<u64> flush_ns{};
++    std::atomic<u64> flush_buffer_ns{};
++    /// The buffer cache waiting for the host GPU under its lock (Scheduler::Finish), by caller
++    std::array<std::atomic<u64>, static_cast<size_t>(HostWait::Count)> host_waits{};
++    std::array<std::atomic<u64>, static_cast<size_t>(HostWait::Count)> host_wait_ns{};
++    /// Read downloads recorded (read ones, early ones), their copies and bytes, and those that
++    /// fell back to the synchronous path (no staging buffer)
++    std::atomic<u64> read_downloads{};
++    std::atomic<u64> early_downloads{};
++    std::atomic<u64> download_bytes{};
++    std::atomic<u64> download_fallbacks{};
++    /// Reading threads whose download the host GPU had not run yet
++    std::atomic<u64> reader_waits{};
++    std::atomic<u64> reader_wait_ns{};
++    /// Writes from the GPU's side that landed read downloads, and those that waited for the host GPU
++    std::atomic<u64> gpu_side_landings{};
++    std::atomic<u64> gpu_side_waits{};
++    std::atomic<u64> gpu_side_wait_ns{};
++    /// Landings ClearDownload forced before a write guest memory doesn't hold yet (a DMA copy, a
++    /// clear, a discarded or inline write), those that waited, and the time
++    std::atomic<u64> clear_landings{};
++    std::atomic<u64> clear_waits{};
++    std::atomic<u64> clear_wait_ns{};
++    /// EDEN_UP_L1028_DMA_WAIT: snapshot misses, those answered after a narrower wait (and its
++    /// time), those drained (and their time), and verify differences
++    std::atomic<u64> dma_misses{};
++    std::atomic<u64> dma_narrow{};
++    std::atomic<u64> dma_narrow_ns{};
++    std::atomic<u64> dma_drained{};
++    std::atomic<u64> dma_drained_ns{};
++    std::atomic<u64> dma_verify_differences{};
++    /// EDEN_UP_L1028_VERIFY
++    std::atomic<u64> verify_checked{};
++    std::atomic<u64> verify_bytes{};
++    std::array<std::atomic<u64>, static_cast<size_t>(Landing::Count)> verify_differing{};
++    std::atomic<u64> verify_uncovered{};
++    std::atomic<u64> verify_not_compared{};
++    std::atomic<u64> window_start{};
++};
++
++inline Counters g_counters;
++
++inline void Add(std::atomic<u64>& counter, u64 amount) {
++    counter.fetch_add(amount, std::memory_order_relaxed);
++}
++
++inline void Max(std::atomic<u64>& counter, u64 value) {
++    u64 max = counter.load(std::memory_order_relaxed);
++    while (value > max &&
++           !counter.compare_exchange_weak(max, value, std::memory_order_relaxed)) {
++    }
++}
++
++inline void CountRead(Read kind, u64 ns) {
++    Add(g_counters.reads[static_cast<size_t>(kind)], 1);
++    Add(g_counters.read_ns[static_cast<size_t>(kind)], ns);
++    Max(g_counters.read_max_ns, ns);
++}
++
++/// The buffer cache waited ns for the host GPU under its lock (synchronous downloads).
++inline void CountHostWait(u64 ns) {
++    const auto site = static_cast<size_t>(t_read_flush ? HostWait::ReadFlush : HostWait::Other);
++    Add(g_counters.host_waits[site], 1);
++    Add(g_counters.host_wait_ns[site], ns);
++}
++
++/// BufferCache::FinishReadDownloads landed downloads after waiting ns for the host GPU (0: no
++/// wait), for a reading thread or for a write from the GPU's side.
++inline void CountLanding(u64 ns) {
++    if (t_reading) {
++        Add(g_counters.reader_waits, ns != 0 ? 1 : 0);
++        Add(g_counters.reader_wait_ns, ns);
++        return;
++    }
++    Add(g_counters.gpu_side_landings, 1);
++    Add(g_counters.gpu_side_waits, ns != 0 ? 1 : 0);
++    Add(g_counters.gpu_side_wait_ns, ns);
++}
++
++/// BufferCache::ClearDownload landed read downloads, waiting ns for the host GPU (0: none).
++inline void CountClearLanding(u64 ns) {
++    Add(g_counters.clear_landings, 1);
++    Add(g_counters.clear_waits, ns != 0 ? 1 : 0);
++    Add(g_counters.clear_wait_ns, ns);
++}
++
++/// Logs the totals every 10 s and resets them, on whichever thread counts first after that.
++inline void MaybeReport() {
++    auto& c = g_counters;
++    const u64 now = Now();
++    u64 start = c.window_start.load(std::memory_order_relaxed);
++    if (start == 0) {
++        c.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
++        return;
++    }
++    if (now - start < 10'000'000'000ULL ||
++        !c.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
++        return;
++    }
++    const double window = static_cast<double>(now - start);
++    const auto take = [](std::atomic<u64>& counter) {
++        return counter.exchange(0, std::memory_order_relaxed);
++    };
++    const auto per_second = [window](u64 value) {
++        return static_cast<double>(value) * 1e9 / window;
++    };
++    const auto ms_per_second = [window](u64 ns) { return static_cast<double>(ns) * 1e3 / window; };
++    constexpr auto sync = static_cast<size_t>(Read::Sync);
++    constexpr auto async = static_cast<size_t>(Read::Async);
++    constexpr auto in_flight = static_cast<size_t>(Read::InFlight);
++    constexpr auto read_flush = static_cast<size_t>(HostWait::ReadFlush);
++    constexpr auto other = static_cast<size_t>(HostWait::Other);
++    std::array<u64, static_cast<size_t>(Read::Count)> reads{};
++    std::array<u64, static_cast<size_t>(Read::Count)> read_ns{};
++    for (size_t i = 0; i < reads.size(); ++i) {
++        reads[i] = take(c.reads[i]);
++        read_ns[i] = take(c.read_ns[i]);
++    }
++    std::array<u64, static_cast<size_t>(HostWait::Count)> host_waits{};
++    std::array<u64, static_cast<size_t>(HostWait::Count)> host_wait_ns{};
++    for (size_t i = 0; i < host_waits.size(); ++i) {
++        host_waits[i] = take(c.host_waits[i]);
++        host_wait_ns[i] = take(c.host_wait_ns[i]);
++    }
++    std::array<u64, static_cast<size_t>(Landing::Count)> differing{};
++    for (size_t i = 0; i < differing.size(); ++i) {
++        differing[i] = take(c.verify_differing[i]);
++    }
++    const u64 read_max_ns = take(c.read_max_ns);
++    const u64 flush_ns = take(c.flush_ns);
++    const u64 flush_buffer_ns = take(c.flush_buffer_ns);
++    const u64 read_downloads = take(c.read_downloads);
++    const u64 early_downloads = take(c.early_downloads);
++    const u64 download_bytes = take(c.download_bytes);
++    const u64 download_fallbacks = take(c.download_fallbacks);
++    const u64 reader_waits = take(c.reader_waits);
++    const u64 reader_wait_ns = take(c.reader_wait_ns);
++    const u64 gpu_side_landings = take(c.gpu_side_landings);
++    const u64 gpu_side_waits = take(c.gpu_side_waits);
++    const u64 gpu_side_wait_ns = take(c.gpu_side_wait_ns);
++    const u64 clear_landings = take(c.clear_landings);
++    const u64 clear_waits = take(c.clear_waits);
++    const u64 clear_wait_ns = take(c.clear_wait_ns);
++    const u64 dma_misses = take(c.dma_misses);
++    const u64 dma_narrow = take(c.dma_narrow);
++    const u64 dma_narrow_ns = take(c.dma_narrow_ns);
++    const u64 dma_drained = take(c.dma_drained);
++    const u64 dma_drained_ns = take(c.dma_drained_ns);
++    const u64 dma_verify_differences = take(c.dma_verify_differences);
++    const u64 verify_checked = take(c.verify_checked);
++    const u64 verify_bytes = take(c.verify_bytes);
++    const u64 verify_uncovered = take(c.verify_uncovered);
++    const u64 verify_not_compared = take(c.verify_not_compared);
++    LOG_INFO(HW_GPU,
++             "Lichii #1028 read-back per second ({:.1f} s; async {}, early {}, dma wait {}): guest "
++             "reads of GPU-written memory {:.1f} synced on the GPU thread ({:.1f} ms), {:.1f} "
++             "async ({:.1f} ms), {:.1f} only waited for a download on its way ({:.1f} ms), "
++             "longest {:.2f} ms | GPU thread in their flushes {:.1f} ms, buffer cache part {:.1f} "
++             "ms | buffer cache host GPU waits under its lock: {:.1f} for reads ({:.1f} ms), {:.1f} "
++             "other ({:.1f} ms) | read downloads {:.1f}, early {:.1f}, {:.0f} KiB, {:.1f} fell "
++             "back to a synchronous flush | readers waited on the host GPU {:.1f} times ({:.1f} "
++             "ms) | GPU-side writes landed downloads {:.1f} times, {:.1f} waited ({:.1f} ms) | "
++             "landings before writes guest memory doesn't hold {:.1f}, {:.1f} waited ({:.1f} ms) | "
++             "DMA snapshot misses {:.1f}: {:.1f} after a narrower wait ({:.1f} ms), {:.1f} drained "
++             "({:.1f} ms), {} verify differences | verify: {} downloads, {} bytes compared, {} "
++             "differ (reader {}, GPU-side write {}, completed {}), {} GPU-modified bytes no "
++             "download brought, {} kept bytes not compared",
++             window / 1e9, Enabled() ? "on" : "off", EarlyEnabled() ? "on" : "off",
++             DmaWaitEnabled() ? "on" : "off", per_second(reads[sync]), ms_per_second(read_ns[sync]),
++             per_second(reads[async]), ms_per_second(read_ns[async]), per_second(reads[in_flight]),
++             ms_per_second(read_ns[in_flight]), static_cast<double>(read_max_ns) / 1e6,
++             ms_per_second(flush_ns), ms_per_second(flush_buffer_ns),
++             per_second(host_waits[read_flush]), ms_per_second(host_wait_ns[read_flush]),
++             per_second(host_waits[other]), ms_per_second(host_wait_ns[other]),
++             per_second(read_downloads), per_second(early_downloads),
++             per_second(download_bytes) / 1024.0, per_second(download_fallbacks),
++             per_second(reader_waits), ms_per_second(reader_wait_ns),
++             per_second(gpu_side_landings), per_second(gpu_side_waits),
++             ms_per_second(gpu_side_wait_ns), per_second(clear_landings), per_second(clear_waits),
++             ms_per_second(clear_wait_ns), per_second(dma_misses), per_second(dma_narrow),
++             ms_per_second(dma_narrow_ns), per_second(dma_drained), ms_per_second(dma_drained_ns),
++             dma_verify_differences, verify_checked, verify_bytes,
++             differing[0] + differing[1] + differing[2], differing[0], differing[1], differing[2],
++             verify_uncovered, verify_not_compared);
++}
++
++/// Counting sites call this after counting: with EDEN_UP_L1028_STATS, logs every 10 s.
++inline void MaybeReportIfEnabled() {
++    if (StatsEnabled()) {
++        MaybeReport();
++    }
++}
++
++} // namespace VideoCore::AsyncReadback
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -25,6 +25,7 @@
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
++#include "video_core/nx2_async_readback.h"
+ #include "video_core/nx2_query_light.h"
+ #include "video_core/query_cache/bank_base.h"
+ #include "video_core/query_cache/query_base.h"
+@@ -309,8 +310,22 @@
+     // EDEN_UP_QUERY_STATS (nx2_query_light.h): Maxwell3D counted this report as pending.
+     const bool stats_settle = QueryLight::StatsEnabled() && !is_fence &&
+                               counter_type == QueryType::ZPassPixelCount64;
++    // EDEN_UP_L1028_EARLY (zortos293/Lichii #1028): a result written later, at a fence or sync
++    // point, on a page that gets early downloads: the buffer cache keeps GPU writes over it after
++    // this GPU-modified until then (NoteReportPending). Off: false, nothing noted.
++    const u64 report_size = has_timestamp ? 16 : 4;
++    const bool immediate = !(is_fence || hold_release) && !Settings::IsGPULevelHigh() &&
++                           counter_type == QueryType::Payload;
++    const bool report_noted = !immediate && VideoCore::AsyncReadback::EarlyEnabled() &&
++                              impl->rasterizer.NoteReportPending(cpu_addr, report_size);
+     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+-                                     pointer, pointer_timestamp, cpu_addr, stats_settle] {
++                                     pointer, pointer_timestamp, cpu_addr, stats_settle,
++                                     report_size, report_noted] {
++        SCOPE_EXIT {
++            if (report_noted) {
++                impl->rasterizer.FinishReport(cpu_addr, report_size);
++            }
++        };
+         if (stats_settle) [[unlikely]] {
+             QueryLight::NoteReportSettled(cpu_addr);
+         }
+@@ -339,6 +354,7 @@
+             static std::atomic<u64> forced{};
+             query_base->value = forced.fetch_add(0x10000, std::memory_order_relaxed) + 0x10000;
+         }
++        FinishReads(cpu_addr, True(query_base->flags & QueryFlagBits::HasTimestamp) ? 16 : 4);
+         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+             u64 timestamp = impl->gpu.GetTicks();
+             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+@@ -364,6 +380,7 @@
+         VideoCore::g_signaling_query_report_fence = false;
+     } else {
+         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
++            FinishReads(cpu_addr, has_timestamp ? 16 : 4);
+             if (has_timestamp) {
+                 u64 timestamp = impl->gpu.GetTicks();
+                 u64 value = static_cast<u64>(payload);
+@@ -661,6 +678,8 @@
+             location.stream_id.Value() == static_cast<u32>(QueryType::ZPassPixelCount64)) {
+             return false;
+         }
++        FinishReads(query_base->guest_address,
++                    True(query_base->flags & QueryFlagBits::HasTimestamp) ? 8 : 4);
+         auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
+         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+             std::memcpy(ptr, &query_base->value, sizeof(query_base->value));
+@@ -678,6 +697,17 @@
+ }
+ 
+ template <typename Traits>
++void QueryCacheBase<Traits>::FinishReads(DAddr address, size_t size) {
++    // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): a download for a guest read still on
++    // its way would write the GPU's older copy over the report later. Always false without it.
++    // SemiFlushQueryDirty asks with cache_mutex held, which no holder of the buffer cache's lock
++    // takes.
++    if (VideoCore::ReadDownloadsMayCover(address, size)) {
++        impl->rasterizer.FinishRead(address, size);
++    }
++}
++
++template <typename Traits>
+ void QueryCacheBase<Traits>::RequestGuestHostSync() {
+     impl->rasterizer.ReleaseFences();
+ }
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -200,6 +200,9 @@
+     void InvalidateQuery(QueryLocation location);
+     bool IsQueryDirty(QueryLocation location);
+     bool SemiFlushQueryDirty(QueryLocation location);
++    /// Before a report's bytes go to guest memory: a download for a guest read still on its way
++    /// would write the GPU's older copy over them later (as MemoryManager::Write).
++    void FinishReads(DAddr address, size_t size);
+     void RequestGuestHostSync();
+     void UnregisterPending();
+ 
+diff --git a/src/video_core/rasterizer_download_area.h b/src/video_core/rasterizer_download_area.h
+--- a/src/video_core/rasterizer_download_area.h
++++ b/src/video_core/rasterizer_download_area.h
+@@ -3,6 +3,9 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++#include <thread>
++
+ #include "common/common_types.h"
+ 
+ namespace VideoCore {
+@@ -11,6 +14,97 @@
+     VAddr start_address;
+     VAddr end_address;
+     bool preemtive;
++    /// EDEN_UP_L1028_ASYNC_READBACK: what guest memory lacks there is on its way for an earlier
++    /// read: nothing to flush, only to wait for (RasterizerInterface::FinishRead).
++    bool in_flight{};
+ };
+ 
++/// EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): downloads for guest CPU reads that are
++/// submitted but not yet written to guest memory (RasterizerInterface::FlushRegionForRead). While
++/// there are any, a write to guest memory from the GPU's side first finishes those it overlaps
++/// (FinishRead), so none lands over it later. Always 0 without the switch.
++inline std::atomic<u32> g_read_downloads{};
++
++/// Tegra::Nx2IsGpuWritten on Switch 2 titles, true otherwise. Defined in gpu.cpp (nx2.h stays out
++/// of this header, as upstream).
++[[nodiscard]] bool MayHoldGpuWrites(DAddr addr, u64 size);
++
++/// Whether such a download may still land over [addr, addr + size): what a write to guest memory
++/// from the GPU's side asks before FinishRead, on any thread, without the buffer cache's lock.
++/// The downloads take only GPU-modified bytes, and Switch 2 titles mark their pages: writes to
++/// other pages skip the lock, which the GPU thread holds for nearly every command.
++[[nodiscard]] inline bool ReadDownloadsMayCover(DAddr addr, u64 size) {
++    return g_read_downloads.load(std::memory_order_acquire) != 0 && MayHoldGpuWrites(addr, size);
++}
++
++/// What DownloadLanding publishes.
++struct DownloadLandingState {
++    /// Odd while a landing is published.
++    std::atomic<u64> sequence{};
++    std::atomic<DAddr> begin{};
++    std::atomic<DAddr> end{};
++    std::atomic<u64> waits{};
++};
++
++/// EDEN_UP_L1028_ASYNC_READBACK: the buffer cache writing downloaded GPU bytes to guest memory
++/// [begin, end). A download keeps the bytes of the guest CPU writes collected and not yet applied
++/// when it looks at them (BufferCache::PendingCpuWriteRanges). A guest core collects a write
++/// (Core::GPUDirtyMemoryManager::Collect) and stores its bytes right after, without the buffer
++/// cache's lock: a write collected after the download looked had its bytes written over with the
++/// GPU's older ones. Downloads look only inside a landing, and a write collected in the landing's
++/// range stores its bytes once the landing has ended (Await, from Core::Memory's
++/// HandleRasterizerWrite, only with the switch).
++///
++/// Each side fences between its store (the landing, the collected write) and its load (the
++/// collected writes, the landing): either the download finds the write, or the write finds the
++/// landing. Downloads land under the buffer cache's lock, so one landing is published at a time.
++class DownloadLanding {
++public:
++    explicit DownloadLanding(DAddr begin, DAddr end) noexcept {
++        state.begin.store(begin, std::memory_order_relaxed);
++        state.end.store(end, std::memory_order_relaxed);
++        state.sequence.fetch_add(1, std::memory_order_seq_cst);
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++    }
++    ~DownloadLanding() {
++        state.sequence.fetch_add(1, std::memory_order_release);
++    }
++    DownloadLanding(const DownloadLanding&) = delete;
++    DownloadLanding& operator=(const DownloadLanding&) = delete;
++
++    /// A guest CPU write of [addr, addr + size) was collected: returns once its bytes may be
++    /// stored.
++    static void Await(DAddr addr, u64 size) noexcept {
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++        const u64 sequence = state.sequence.load(std::memory_order_acquire);
++        if ((sequence & 1) != 0) {
++            Wait(sequence, addr, size);
++        }
++    }
++
++    /// Writes that waited for a landing so far.
++    [[nodiscard]] static u64 Waits() noexcept {
++        return state.waits.load(std::memory_order_relaxed);
++    }
++
++private:
++    static void Wait(u64 sequence, DAddr addr, u64 size) noexcept {
++        const DAddr begin = state.begin.load(std::memory_order_relaxed);
++        const DAddr end = state.end.load(std::memory_order_relaxed);
++        std::atomic_thread_fence(std::memory_order_acquire);
++        // Ended (its writes come first, and the landings after it found this write), or it
++        // writes elsewhere.
++        if (state.sequence.load(std::memory_order_acquire) != sequence || addr >= end ||
++            addr + size <= begin) {
++            return;
++        }
++        state.waits.fetch_add(1, std::memory_order_relaxed);
++        while (state.sequence.load(std::memory_order_acquire) == sequence) {
++            std::this_thread::yield();
++        }
++    }
++
++    static inline DownloadLandingState state;
++};
++
+ } // namespace VideoCore
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -103,6 +103,25 @@
+     virtual void FlushRegion(DAddr addr, u64 size,
+                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+ 
++    /// EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): FlushRegion for a guest CPU read of
++    /// the region (GPU::OnCPURead), on the GPU thread. A cache may submit its downloads without
++    /// waiting for the host GPU, for FinishRead to write.
++    virtual void FlushRegionForRead(DAddr addr, u64 size) {
++        FlushRegion(addr, size);
++    }
++
++    /// Writes to guest memory what FlushRegionForRead submitted over the region (and anything
++    /// submitted before it), waiting for the host GPU if it must. Any thread: the reading one
++    /// before it reads, and the GPU's side before it writes guest memory there.
++    virtual void FinishRead([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
++
++    /// EDEN_UP_L1028_EARLY: a query result the query cache writes to guest memory later, at a
++    /// fence or sync point. When this returns true, FinishReport once it wrote or dropped it.
++    virtual bool NoteReportPending([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {
++        return false;
++    }
++    virtual void FinishReport([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
++
+     /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
+     enum class GpuWrittenList {
+         Unknown, ///< Neither: the caller drains, flushes the page and notes it synced
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -41,6 +41,19 @@
+                          : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE;
+ }
+ 
++// EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): the downloads' writes are made visible
++// to host reads before the submission signals (SubmitForHostRead, QueueForHostRead).
++void HostReadBarrier(vk::CommandBuffer cmdbuf) {
++    const VkMemoryBarrier barrier{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++    };
++    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
++                           barrier);
++}
++
+ VkBufferCopy MakeBufferCopy(const VideoCommon::BufferCopy& copy) {
+     return VkBufferCopy{
+         .srcOffset = copy.src_offset,
+@@ -568,8 +581,55 @@
+ 
+ void BufferCacheRuntime::Finish() {
+     scheduler.Finish();
++}
++
++u64 BufferCacheRuntime::SubmitForHostRead() {
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record(HostReadBarrier);
++    return scheduler.Flush();
++}
++
++u64 BufferCacheRuntime::QueueForHostRead() {
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record(HostReadBarrier);
++    const u64 tick = scheduler.CurrentTick();
++    if (!scheduler.DeferFlush()) {
++        scheduler.Flush();
++    }
++    return tick;
++}
++
++void BufferCacheRuntime::WaitForHostRead(u64 tick) {
++    if (scheduler.IsFree(tick)) {
++        return;
++    }
++    // A queued tick may not be submitted yet. Only the split's back submits: other threads ask it
++    // to, as for fences (WaitSubmittedTick). On the back, and once it has stopped, Wait submits it.
++    // BackRunning, not Active (upstream): this runs on reading guest threads, and Active is the
++    // front's own flag (as Tegra::GPU::InitChannel notes).
++    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().BackRunning() &&
++        !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(tick)) {
++        scheduler.GetMasterSemaphore().Wait(tick);
++        return;
++    }
++    scheduler.Wait(tick);
+ }
+ 
++bool BufferCacheRuntime::IsSubmittedForHostRead(u64 tick) const {
++    return scheduler.IsSubmitted(tick);
++}
++
++bool BufferCacheRuntime::IsFreeNow(u64 tick) {
++    if (scheduler.IsFree(tick)) {
++        return true;
++    }
++    if (!scheduler.IsSubmitted(tick)) {
++        return false;
++    }
++    scheduler.GetMasterSemaphore().Refresh();
++    return scheduler.IsFree(tick);
++}
++
+ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
+                                           std::span<const VideoCommon::BufferCopy> copies) {
+     // EDEN_NX2_NO_UPLOAD_REORDER=1 (a debug aid): as the disable_buffer_reorder setting, which no
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -159,6 +159,25 @@
+ 
+     void Finish();
+ 
++    /// EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): Finish without the wait, for
++    /// downloads the host reads: submits, and returns the tick to wait for.
++    u64 SubmitForHostRead();
++
++    /// SubmitForHostRead without the submission: the copies go with the GPU thread's next one, as
++    /// a fence's do (Scheduler::DeferFlush). Returns the tick they go in.
++    u64 QueueForHostRead();
++
++    /// Waits for a SubmitForHostRead or QueueForHostRead tick, on any thread.
++    void WaitForHostRead(u64 tick);
++
++    /// Whether `tick` was handed over for submission (a QueueForHostRead one may wait for the
++    /// GPU thread's next submission).
++    [[nodiscard]] bool IsSubmittedForHostRead(u64 tick) const;
++
++    /// Whether the host GPU completed `tick`, asking it when the tick is submitted but not known
++    /// to be done.
++    [[nodiscard]] bool IsFreeNow(u64 tick);
++
+     u64 GetDeviceLocalMemory() const;
+ 
+     u64 GetDeviceMemoryUsage() const;
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -1769,6 +1769,14 @@
+                 buffer->SizeBytes() != 0 ? buffer->Handle() : VkBuffer{}, offset);
+         }
+     });
++    // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): the copies below are GPU writes the
++    // buffer cache doesn't record: reads taken before them must not keep the bytes they
++    // downloaded as the newest. Off: nothing.
++    if (VideoCore::AsyncReadback::Enabled()) {
++        for (const auto& value : values) {
++            impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
++        }
++    }
+ 
+     VkBuffer src_buffer;
+     [[maybe_unused]] StagingBufferRef ref;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -67,6 +67,7 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/nx2.h"
++#include "video_core/nx2_async_readback.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/query_dma.h"
+@@ -1148,6 +1149,8 @@
+         draw_func();
+     }
+     submitted = true;
++    // EDEN_UP_L1028_EARLY: lands early downloads the host GPU ran (every 32 draws). Off: returns.
++    buffer_cache.NoteWorkRecorded(false);
+     if (fast_draw_on) {
+         if (fast_draw_use) {
+             NoteResolvedDraw(pipeline, is_indexed, fast_draw_indirect, draw_serial,
+@@ -2051,6 +2054,9 @@
+             }
+             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+         });
++        // EDEN_UP_L1028_EARLY: the early downloads of the pages written since go right behind
++        // the dispatch. Off: returns.
++        buffer_cache.NoteWorkRecorded(true);
+         SubmitNx2ListCopies();
+         return;
+     }
+@@ -2067,6 +2073,7 @@
+         }
+         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+     });
++    buffer_cache.NoteWorkRecorded(true); // EDEN_UP_L1028_EARLY; off: returns
+     SubmitNx2ListCopies();
+     // EDEN_NX2_TENSOR_SYNC=<n> (unset or 0: off): the first n dispatches of a software matrix
+     // program (Ocarina of Time's network, EDEN_NX2_TENSOR=compact) each run alone. The command
+@@ -2206,14 +2213,67 @@
+         texture_cache.DownloadMemory(addr, size);
+     }
+     if ((True(which & VideoCommon::CacheType::BufferCache))) {
++        // EDEN_UP_L1028_STATS: a read's flush (GPU::OnCPURead) times its buffer cache part.
++        const u64 stats_start =
++            VideoCore::AsyncReadback::t_read_flush ? VideoCore::AsyncReadback::Now() : 0;
+         std::scoped_lock lock{buffer_cache.mutex};
+         buffer_cache.DownloadMemory(addr, size);
++        if (stats_start != 0) {
++            VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.flush_buffer_ns,
++                                          VideoCore::AsyncReadback::Now() - stats_start);
++        }
+     }
+     if ((True(which & VideoCommon::CacheType::QueryCache))) {
+         query_cache.FlushRegion(addr, size);
+     }
+ }
+ 
++void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
++    if (addr == 0 || size == 0) {
++        return;
++    }
++    // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): as FlushRegion, but the buffer cache
++    // doesn't wait for the host GPU here (Scheduler::Finish, with its lock held): the reading
++    // thread does, in FinishRead. Image downloads stay synchronous, as upstream. GPU::OnCPURead
++    // applied the collected guest writes right before.
++    {
++        std::scoped_lock lock{texture_cache.mutex};
++        texture_cache.DownloadMemory(addr, size);
++    }
++    {
++        const u64 start = VideoCore::AsyncReadback::Now();
++        std::scoped_lock lock{buffer_cache.mutex};
++        buffer_cache.DownloadMemoryForRead(addr, size);
++        VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.flush_buffer_ns,
++                                      VideoCore::AsyncReadback::Now() - start);
++    }
++    query_cache.FlushRegion(addr, size);
++}
++
++void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
++    // Nothing on its way: no lock. A read's own download was recorded before its flush request
++    // was signalled done, so its reading thread sees it here.
++    if (VideoCore::g_read_downloads.load(std::memory_order_acquire) == 0) {
++        return;
++    }
++    if (const std::optional<u64> waited = buffer_cache.FinishReadDownloads(addr, size)) {
++        VideoCore::AsyncReadback::CountLanding(*waited);
++    }
++}
++
++bool RasterizerVulkan::NoteReportPending(DAddr addr, u64 size) {
++    if (!VideoCore::AsyncReadback::EarlyEnabled()) {
++        return false;
++    }
++    std::scoped_lock lock{buffer_cache.mutex};
++    return buffer_cache.NoteReportPending(addr, size);
++}
++
++void RasterizerVulkan::FinishReport(DAddr addr, u64 size) {
++    std::scoped_lock lock{buffer_cache.mutex};
++    buffer_cache.FinishReport(addr, size);
++}
++
+ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+     if ((True(which & VideoCommon::CacheType::BufferCache)) && MayBeGpuModified(addr, size)) {
+         std::scoped_lock lock{buffer_cache.mutex};
+@@ -2432,7 +2492,10 @@
+         return;
+     }
+     std::scoped_lock lock{buffer_cache.mutex};
+-    buffer_cache.ClearDownload(addr, size);
++    // EDEN_UP_L1028_ASYNC_READBACK: MemoryManager landed the read downloads here just before
++    // (FinishRead) and writes guest memory next. Landing a newer one would wait for the host GPU
++    // with the lock held, from any thread. Without read downloads both are ClearDownload's old body.
++    buffer_cache.ClearReplacedDownload(addr, size);
+ }
+ 
+ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -102,6 +102,10 @@
+     void FlushAll() override;
+     void FlushRegion(DAddr addr, u64 size,
+                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
++    void FlushRegionForRead(DAddr addr, u64 size) override;
++    void FinishRead(DAddr addr, u64 size) override;
++    bool NoteReportPending(DAddr addr, u64 size) override;
++    void FinishReport(DAddr addr, u64 size) override;
+     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
+                                              u64* pending_tick = nullptr) override;
+     bool IsGpuTickDone(u64 tick) override;

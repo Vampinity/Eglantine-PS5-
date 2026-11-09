@@ -1,0 +1,1944 @@
+Subject: [PATCH] Lichii #949: drain-free semaphore acquires with a 1 ms valve, feed and settle of an idle split back, uniform keeps and image descriptor replay on fast draw delta draws (EDEN_UP_L949_ACQUIRE, EDEN_UP_L949_DRAIN_VALVE, EDEN_UP_SHIP2_FEED, EDEN_UP_L949_UBO_KEEP, EDEN_UP_L949_DESC_REPLAY; all off by default)
+
+Port of zortos293/Lichii #949 (capy/egla66-ship2 by zortos293 / Zortos, merged into nx2 as
+a4f6287327 on 9 Nov; "video_core: drain-free semaphore acquires, uniform keeps and descriptor
+replay on delta draws"). It carries jpkto's drain-free acquire checks and early publish
+(fb4d4e47a7 and 62db242b34, PR #805), PantACRO4life's 1 ms drain valve (b837e742c4) and rdenno's
+#639 (23457ccf7b). capy-ai co-authored cf42f364f7, 3e86407514 and b2375cff7f.
+Replaces ship2-feed.diff (EDEN_UP_SHIP2_FEED, written on T80, never built): its feed and settle
+are in here, rebased onto T83. Do not apply both.
+
+Commit by commit (have = in T83 already):
+- d46e17e760 #639 (rdenno): have (merge 7d9823a601; gpu_split.h:66-73 OwnsScheduler,
+  gpu_split.cpp:387-407 Drain waits for the idle hook, :779-808 back_quiet, gpu_thread.cpp:112,
+  buffer_cache.h:260). Not in this diff.
+- cf42f364f7 drain-free acquire checks (jpkto): partly. EDEN_NX2_SEM_FAST (0287) reads the word
+  without a drain (puller.cpp:57-102, :264-273, :510-529) but drains whenever any write to the
+  16-byte line is queued (puller.cpp:98, 0286 ranges), never passes on a queued release, has no
+  per-word write record and does not need front macros. The 3D report notes (maxwell_3d.cpp:1590)
+  only feed the off-by-default TrackReleases/DmaReadAhead paths; compute 0x6c3 and copy engine
+  semaphores are not noted. Ported: EDEN_UP_L949_ACQUIRE.
+- a20471e48c gate + feed + settle: feed and settle missing in T83 (Commit gpu_split.h:573 publishes
+  only at publish_every; the pending loop gpu_thread.cpp:151 settles nothing). Ported:
+  EDEN_UP_SHIP2_FEED. The gate itself is the switches here.
+- 8056420f5b lock-free waiter latches: missing (nx2.h:392-467, Latched takes the mutex at :420).
+  Not ported, see below.
+- 53bd961ab4 1 ms drain valve: missing (SEM_FAST drains once after 2 s, then never,
+  puller.cpp:264-273). Ported: inside EDEN_UP_L949_ACQUIRE, and as EDEN_UP_L949_DRAIN_VALVE for
+  SEM_FAST's polls.
+- ea4340a5b4 always on + drain-reason counters + ACQUIRE_VERIFY: missing (0436 counts drains per
+  site, not why). Ported behind the switches: EDEN_UP_L949_STATS, EDEN_UP_L949_ACQUIRE_VERIFY.
+- 6b38851501 uniform keeps: missing (the fast draw delta path rebinds every uniform buffer from
+  guest memory, buffer_cache.h:1975-1993; uniform_stream_reuse.h:74 slots keep no address). Its
+  prerequisite, the delta's device ranges (43264c31b3), is in 0435 (nx2_fast_draw.h:138-160,
+  maxwell_3d.cpp:1167). Ported: EDEN_UP_L949_UBO_KEEP.
+- ee98215f14 descriptor replay: missing (ConfigureDelta pushes every view and sampler again,
+  vk_graphics_pipeline.cpp:927-982; no ScaleEpoch, no UpdateCount/AddEntries). Ported:
+  EDEN_UP_L949_DESC_REPLAY.
+- 3e86407514 end keeps at CPU writes: missing; ported inside EDEN_UP_L949_UBO_KEEP.
+- b2375cff7f and the test hunks (buffer_cache_ports, maxwell_fast_method, semaphore_waiters):
+  not ported, our tests are not built.
+
+What each switch does (Common::PeSwitch, exactly "1"; read once):
+EDEN_UP_L949_ACQUIRE=1: a greater-or-equal Switch 2 acquire (ProcessSemaphoreTriggerMethod) and
+  the polls of a suspended one (CanResumeAcquire) are decided without draining the back
+  (CheckWithoutDrain): met by the word in memory, or by the last release the front queued to that
+  word while the back has not run it (GpuSplit::QueuedSemaphoreWriteAt; it then NoteSyncs). The
+  front records each semaphore write as it sends it (GpuSplit::NoteSemaphoreWrite, by device
+  address, payload or "unknown"): puller releases (WriteLong and its Switch 2 mirror, legacy
+  release, SEM_EXECUTE release), 3D report_semaphore releases/report-only (FrontWrite,
+  FrontCallMultiMethod; counters and reductions are "unknown"), compute SET_REPORT_SEMAPHORE_D
+  (FrontCallMethod, FrontCallMultiMethod, FrontRunMacro), copy engine LAUNCH_DMA releases
+  (DmaPusher::NoteDmaSemaphore). Left to the T83 path (drain, or SEM_FAST's read if set): equal and
+  mask acquires, an unmapped word or one on a GPU-written page, an unknown or unmatched queued
+  write, macros on the back, delayed fences or High GPU accuracy. With fence-flagged releases held
+  until their host fence (EDEN_NX2_QUERY_KEEP_PENDING=1, or EDEN_NX2_READBACK_WAIT=2/3; the play
+  env sets KEEP_PENDING=0 and has no READBACK_WAIT) a queued release never passes an acquire: it
+  counts as not met until it lands (review fix, see Review below). An unmet first check drains as
+  before (as upstream); an unmet poll keeps waiting without a drain, resumes on a latch, and drains
+  once per 1 ms (the valve; it also logs waits over 2 s as before). Basis: Switch 2 sync words only
+  advance, so a value met now stays met once the back ran the queued work.
+EDEN_UP_L949_DRAIN_VALVE=1: the same 1 ms valve for EDEN_NX2_SEM_FAST's drain-free polls (SEM_FAST
+  drains once after 2 s, then never: the shape that hung Mario Kart World upstream). Nothing
+  without SEM_FAST; L949_ACQUIRE has the valve built in.
+EDEN_UP_SHIP2_FEED=1: the back stores where it ran dry (back_idle_at); Commit publishes once the
+  front holds 8 unpublished words while the back waits there, instead of at publish_every (up to
+  256 between drains). The GPU thread's pending-channel loop asks a back that ran everything and
+  has not run its idle hook for it (SettleIdleBack), as a poll's drain did, without waiting.
+  Changed from ship2-feed.diff: "=2" (feed without settle) dropped, its counter line moved to
+  EDEN_UP_L949_STATS, switch read with PeSwitch.
+EDEN_UP_L949_UBO_KEEP=1 (needs EDEN_UP_FAST_DRAW=1, else inert): a delta draw binds a small
+  streamed uniform buffer (BindSmallUniformReusing path, <= 4 KiB) from the stream allocation the
+  previous draw made for the same stage, slot, address and size in the same command buffer,
+  without reading guest memory, when nothing between the two draws wrote its range: no rebind of
+  the slot or inline constant data over it (the delta's binds and device ranges), no CPU write the
+  cache was told about (WriteMemory, CachedWriteMemory), no GPU-modified mark (MarkWrittenBuffer,
+  DMACopy), no buffer deleted, at most 8 such writes. Only delta draws keep, so it acts on ~11-13%
+  of Ocarina's draws with FAST_DRAW_OOT_EXEMPT (t78-x: 2,250-2,643 of ~20,500 draws/s).
+EDEN_UP_L949_DESC_REPLAY=1 (needs EDEN_UP_FAST_DRAW=1, else inert): the resolve that captures
+  delta_views keeps the image descriptor entries it pushed per stage and its rescaling words;
+  delta draws copy them into the descriptor queue (UpdateDescriptorQueue::AddEntries) instead of
+  looking up every view, sampler, handle and rescale bit again. Dropped on a new capture or when
+  any image changed scale (TextureCache::ScaleEpoch, counted in InvalidateScale). Same delta-draw
+  share as above. Both fast draw pieces do nothing under EDEN_UP_FAST_DRAW_VERIFY (no draw takes
+  the delta path there).
+Diagnostics: EDEN_UP_L949_STATS=1 logs every 10 s "Lichii #949 in 10 s (...): acquires P passed
+  without a drain (Q by a queued release), K met by a queued release held until its fence (not
+  passed), L resumed by a latch, O left to the old path (reasons),
+  V valve drains, W polls waited without a drain, S SEM_FAST valve drains; polls: ...; back: B
+  waits for work, X ms spinning, H idle hooks (ms), Z sleeps (ms); E early publishes, T idle hooks
+  asked by polls", plus "uniform keeps in 600 frames" and "delta descriptors in 10 s" when those
+  are on. No behaviour change, so give it to the control too. EDEN_UP_L949_ACQUIRE_VERIFY=1,
+  EDEN_UP_L949_UBO_KEEP_VERIFY=1, EDEN_UP_L949_DESC_REPLAY_VERIFY=1: drain/bind/resolve the old
+  way as well and count differences (verify runs only, slow).
+
+Deviations from upstream: everything is behind the switches above (upstream is always on); its
+counters ran with EDEN_NX2_GPU_PROFILE, here only with EDEN_UP_L949_STATS (a GPU_PROFILE run with
+the switches unset stays as T83); counter "drained" is "left to the old path" (SEM_FAST may
+answer those without a drain); the Switch 2 mirror release is noted too; our TakeReusableDraw reads
+the delta in place, so only its binds and device ranges are copied (taken_delta), and only with
+UBO_KEEP; the keep check comes after the EDEN_UP_UBO_SNAPSHOT path (which keeps precedence) and
+there are no keeps with EDEN_UP_FRITCHII_BANKFLAG=1 (that switch exists for guest CPU writes the
+caches don't know yet); with EDEN_UP_FAST_DRAW an acquire passed without a drain sends an empty
+deferred call, which ends delta reuse at the acquire in stream order as the drained path's flush
+did (not upstream: the CPU may have rewritten what the next draws read before its release);
+UpdateDescriptorQueue::UpdateCount added (upstream had it); a queued release does not pass an
+acquire while releases are held until their fence (ReleasesHeldUntilFence, our tree's
+QUERY_KEEP_PENDING and READBACK_WAIT; upstream's ReleasesLandAtOnce only knows the fence
+settings). Not ported: the 64-slot lock-free
+waiter table (8056420f5b): upstream's reason was MKW's ~85k polls/s; Latched's mutex is held for
+a few ns and the back's OnWrite takes it only while a channel waits, so no measurable cost here.
+
+Unset (all switches): T83 behaviour. What still runs: one false test in Commit, SettleIdleBack's
+early return, BackLoop's two false tests per wait, the note helpers' switch checks, the slot's
+device_addr store in BindSmallUniformReusing and BindSmallUniformFromSource (read only by the
+keep), ++scale_epoch in InvalidateScale, a buffer deletion
+counter, and new struct members (PendingAcquire::last_drain, Slot::device_addr, ...).
+
+Risks: L949_ACQUIRE passes an acquire early if a queued write the front does not record lowers a
+word (inline uploads, 2D/inline-to-memory, a compute engine run on the back, guest-memory QMD
+releases), i.e. if the "sync words only advance" basis fails; the front's record only knows the
+payload word and the zero high word of a timed release, not its timestamp words (+8, +12). Without
+held releases a fence-flagged queued release meets an acquire before its value lands (upstream's
+verify counts ~820 per 10 s at the Bananza gate as "met by a queued release not in memory after
+it", by design; the play env's case); with them (KEEP_PENDING=1, READBACK_WAIT=2/3) it does not.
+The valve adds up to 1,000 drains/s
+per waiting channel. SHIP2_FEED publishes more often (a seq_cst store each) while the back keeps
+pace, and the settle runs the deferred submit earlier. L949_ACQUIRE without SHIP2_FEED: polls stop
+draining, so a back that ran dry spins its 8192 PAUSEs (~0.2-0.3 ms) before its deferred submit:
+test them together (upstream ships them together). UBO_KEEP misses a guest CPU write the caches
+were not told about between two draws of one delta chain (upstream's stated assumption; with the
+full frame wait the game is blocked while those draws run). DESC_REPLAY reuses VkImageView and
+VkSampler handles within a delta chain; deletions, texture cache writes and unmaps end the chain,
+and ScaleEpoch catches rescales. Not stacked-checked with lichii-956.diff (EDEN_UP_ACQUIRE_NO_DRAIN,
+parked, not in T83): both replace SEM_FAST's read at the same sites; don't enable both.
+
+Expected (Ocarina, docked full res, full frame wait): +0 to +0.3 fps (0 to +2%) for the whole set,
+best guess ~+0.1 fps, below the ~0.5 fps run noise. Upstream measured +1.2-1.4 fps (+8-9%) at the
+Bananza gate (5900X, back thread 56.0 -> 52.2 ms per frame): acquire+feed alone +0.7 (+5%), uniform
+keeps +0.4 (+3%), descriptor replay +0.2 (noise), with ~85-109k delta draws/s. Here: t74-d cut
+front drains 17.1k -> 3.5k/s (SEM_FAST + DMA_SNAPSHOT + DRAIN_SKIP_SAME) with drain time ~unchanged
+(497 -> 464 ms/s), back idle 262-349 vs 262-401 ms/s and fps the same: the back is the limit while
+the frame wait holds the game 46 of 73 ms per frame, so drains saved move to other waits. The
+acquire part removes ~1-2.4k acquire drains/s (~92-128 ms/s of front waiting in profiled T75 walks) on
+top of DMA_SNAPSHOT: 0 to +1%. Feed and settle can only take the publish and idle-hook latency off
+the back's path (<= ~0.1-0.3 ms per frame): 0 to +0.5%. Uniform keeps and descriptor replay act on
+~2.5k delta draws/s, ~40x fewer than at the Bananza gate: < +0.3%, and fast draw itself measured
+11.6-11.8 vs 12.0-12.2 fps (t78-x).
+
+Test arm (T83 + this diff; play env v2.1 docked with the full frame wait, same batch, ~3 valid
+runs each; every arm EDEN_UP_L949_STATS=1 and EDEN_NX2_SPLIT_WAITS=1):
+- c (control): nothing else.
+- a: EDEN_UP_L949_ACQUIRE=1 EDEN_UP_SHIP2_FEED=1 (the merged acquire/feed part).
+- f: EDEN_UP_FAST_DRAW=1 EDEN_UP_FAST_DRAW_OOT_EXEMPT=1 (fast draw reference).
+- w: a + f + EDEN_UP_L949_UBO_KEEP=1 EDEN_UP_L949_DESC_REPLAY=1 (all of #949).
+- v (1 run, correctness, not for fps): w + EDEN_UP_L949_ACQUIRE_VERIFY=1
+  EDEN_UP_L949_UBO_KEEP_VERIFY=1 EDEN_UP_L949_DESC_REPLAY_VERIFY=1.
+Readouts: walk fps mean and 1% low, flashes/min, pond load OK; "Lichii #949 in 10 s": passed vs
+left to the old path (a, w: most greater-or-equal acquires pass; "held until its fence" stays 0 in
+the play env, KEEP_PENDING=0; c counts no acquire decisions at
+all, only its polls and back lines, the baseline for back waits / spinning / idle hooks / sleeps),
+valve drains, early publishes, idle hooks asked by polls. A met poll is decided twice (the
+scheduler's look, then ResumeAcquire), so passed/latched/acquire polls count resumed polls twice;
+compare arms, not absolute numbers. "GPU split per second" (SPLIT_WAITS): front waited and the
+acquire / acquire poll / acquire recheck sites, back idle; w: "uniform keeps in 600 frames" kept
+vs streamed, "delta descriptors in 10 s" replayed vs pushed; v: "acquire verify" passed-but-not-met
+= 0 (met by a queued release not in memory may be > 0, by design; 0 with QUERY_KEEP_PENDING=1),
+uniform keep verify mismatches = 0, delta descriptors verify mismatches = 0.
+Optional, only with a SEM_FAST retest: EDEN_NX2_SEM_FAST=1 vs EDEN_NX2_SEM_FAST=1
+EDEN_UP_L949_DRAIN_VALVE=1 ("SEM_FAST valve drains" > 0, no hang).
+
+Review (9 Nov, adversarial pass; original kept as lichii-949.diff.pre-review): fixed one defect,
+latent in the current play env (it sets QUERY_KEEP_PENDING=0), live in any arm that sets it to 1.
+EDEN_NX2_QUERY_KEEP_PENDING=1 and EDEN_NX2_READBACK_WAIT=2/3 make fence-flagged
+releases land only when their host fence pops (FenceManager::SignalFenceImpl delays them through
+g_signaling_query_report_fence), which ReleasesLandAtOnce (fence settings only) did not know: a
+queued release passed the acquire (MetByQueued) where T83 waits until it landed, so timed releases
+(written at once) after the acquire could reach the CPU before the held one, the order
+KEEP_PENDING exists to keep. Now such an acquire is met by memory if memory already meets it, else
+not met ("held" count): the first check drains as T83, polls wait for the query cache's latch or the
+1 ms valve. Hardening: BindSmallUniformFromSource (EDEN_UP_UBO_SNAPSHOT) marks its slot as from no
+address, so a keep never rebinds a snapshot copy as a guest-memory read (it shares the slots and
+left device_addr stale). Header: control arm readouts and the double-counted polls corrected.
+Checked, no change
+needed: unset = T83 (all new code behind false switch tests), PendingAcquire/Slot member order,
+static_vector bounds (8 + 64 <= 72), descriptor replay counts equal the pipeline's pushes, no new
+lock order, CB data reaches memory_writes through InnerInvalidation (more than 8 ranges between two
+draws turn keeps off for that draw: an effect limit, not a defect).
+
+Checks (VM scratch /tmp/l949-chk-9d3f, lichii-949_checks.sh + lichii-949_inject.py, log
+lichii-949.checks.log): git apply --check on $R/Eglantine (T83); prepare-vulkan-port.py anchor
+skips identical before and after (6), configure cost marks once each; generated
+vulkan_rasterizer.cpp, vk_graphics_pipeline_cost.cpp, vulkan-cache buffer_cache.h and
+texture_cache.h and include/.../pipeline_helper.h carry the change; the derived gpu_thread.cpp,
+engines_puller.cpp, dma_pusher.cpp and maxwell_3d.cpp take the same hunks and the CMake anchors
+are unchanged; -fsyntax-only with the build's flags (compile_commands.json) rc=0 on 29 TUs incl.
+the generated and derived copies and the OpenGL buffer/texture cache instantiations; injected
+errors in every new block and touched header reported by the TUs that compile them.
+Re-run on this reviewed diff: VM scratch /tmp/l949-rev2-4c8d, ports/l949-review/checks.sh and
+inject.py (the same checks plus markers in the review's new lines), log
+ports/l949-review/checks.log.
+
+Files: src/video_core/gpu_split.h, gpu_split.cpp, gpu_thread.cpp, engines/puller.h, puller.cpp,
+engines/maxwell_3d.h, maxwell_3d.cpp, engines/kepler_compute.h, kepler_compute.cpp,
+engines/maxwell_dma.h, dma_pusher.h, dma_pusher.cpp, nx2_fast_draw.h,
+buffer_cache/uniform_stream_reuse.h, buffer_cache_base.h, buffer_cache.h,
+renderer_vulkan/vk_rasterizer.h, vk_rasterizer.cpp, vk_graphics_pipeline.h,
+vk_graphics_pipeline.cpp, vk_update_descriptor.h, pipeline_helper.h,
+texture_cache/texture_cache_base.h, texture_cache.h.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -154,6 +154,17 @@ void BufferCache<P>::TickFrame() {
+     }
+     runtime.TickFrame(slot_buffers);
+     native_indirect_uniforms_this_frame.clear();
++    if (Nx2FastDraw::UboKeepEnabled() && frame_tick % 600 == 0) [[unlikely]] {
++        // EDEN_UP_L949_UBO_KEEP (Lichii #949).
++        UniformKeep& keep = uniform_keep;
++        if (Nx2FastDraw::L949StatsEnabled() || Nx2FastDraw::UboKeepVerify()) {
++            LOG_INFO(HW_GPU,
++                     "Lichii #949 uniform keeps in 600 frames: {} kept, {} streamed, {} verified, "
++                     "{} verify mismatches",
++                     keep.kept, keep.streamed_binds, keep.verified, keep.mismatches);
++        }
++        keep.kept = keep.streamed_binds = keep.verified = keep.mismatches = 0;
++    }
+     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
+         for (const auto& [address, size] : uploaded_buffer_ranges) {
+             device_memory.HintCold(address, size);
+@@ -241,6 +252,7 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
+ template <class P>
+ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
+     Nx2NoteListHostWrite(device_addr, size);
++    NoteUniformWrite(device_addr, size); // EDEN_UP_L949_UBO_KEEP; nothing unless set
+     if (IsRegionGpuModified(device_addr, size)) {
+         ClearDownload(device_addr, size);
+         gpu_modified_ranges.Subtract(device_addr, size);
+@@ -304,6 +316,7 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+     }
+ 
+     Nx2NoteListHostWrite(device_addr, size);
++    NoteUniformWrite(device_addr, size); // EDEN_UP_L949_UBO_KEEP; nothing unless set
+     tmp_buffer.resize_destructive(size);
+     device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
+ 
+@@ -595,6 +608,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+     if (has_new_downloads) {
+         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
++        NoteUniformWrite(*cpu_dest_address, amount); // EDEN_UP_L949_UBO_KEEP
+         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+         if (should_sync) {
+             runtime.Finish();
+@@ -826,6 +840,53 @@ void BufferCache<P>::BindHostComputeBuffers() {
+     }
+ }
+ 
++template <class P>
++void BufferCache<P>::BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta) {
++    // EDEN_UP_L949_UBO_KEEP (zortos293/Lichii #949, 6b38851501): what this draw may keep of the
++    // previous draw's streamed uniform buffers. Every draw's binds are recorded (streamed), only
++    // a delta draw keeps.
++    UniformKeep& keep = uniform_keep;
++    const bool unwritten = !keep.memory_writes_lost && keep.draw_deletions == keep.deletions;
++    keep.draw_deletions = keep.deletions;
++    keep.candidates = {};
++    keep.writes.clear();
++    const std::array<u32, NUM_STAGES> streamed = std::exchange(keep.streamed, {});
++    // EDEN_UP_FRITCHII_BANKFLAG exists to catch guest CPU writes the caches were not told about
++    // yet: no keeps while it is on.
++    const bool usable = delta != nullptr && unwritten && !Core::BankFlagPages();
++    if (usable) {
++        keep.writes.insert(keep.writes.end(), keep.memory_writes.begin(),
++                           keep.memory_writes.end());
++    }
++    keep.memory_writes.clear();
++    keep.memory_writes_lost = false;
++    if (!usable) {
++        return;
++    }
++    // The device memory inline constant data landed on (writes to unmapped addresses land
++    // nowhere).
++    for (u32 write = 0; write < delta->num_device_writes; ++write) {
++        keep.writes.emplace_back(delta->device_begin[write], delta->device_end[write]);
++    }
++    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
++        keep.candidates[stage] = streamed[stage] & ~delta->binds[stage];
++    }
++}
++
++template <class P>
++bool BufferCache<P>::UniformRangeKept(size_t stage, u32 index, DAddr device_addr,
++                                      u32 size) const noexcept {
++    const UniformKeep& keep = uniform_keep;
++    if (((keep.candidates[stage] >> index) & 1) == 0) {
++        return false;
++    }
++    const auto overlaps = [&](const std::pair<DAddr, DAddr>& write) {
++        return write.first < device_addr + size && device_addr < write.second;
++    };
++    return !keep.memory_writes_lost && std::ranges::none_of(keep.writes, overlaps) &&
++           std::ranges::none_of(keep.memory_writes, overlaps);
++}
++
+ template <class P>
+ void BufferCache<P>::SetUniformBuffersState(const std::array<u32, NUM_STAGES>& mask,
+                                             const UniformBufferSizes* sizes) {
+@@ -1887,6 +1948,33 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+             return;
+         }
+     }
++    // EDEN_UP_L949_UBO_KEEP (zortos293/Lichii #949, 6b38851501): the stream allocation the
++    // previous draw made for this slot, when nothing between the two draws wrote its range
++    // (BeginGraphicsUniforms, UniformRangeKept). With _VERIFY: compared, then bound as before.
++    bool verify_kept = false;
++    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
++        if (Nx2FastDraw::UboKeepEnabled() && UniformRangeKept(stage, index, device_addr, size)) {
++            if (Nx2FastDraw::UboKeepVerify()) {
++                ++uniform_keep.verified;
++                verify_kept = true;
++                if (!VideoCommon::KeptUniformHolds<Runtime>(device_memory, stage, index,
++                                                             device_addr, size)) {
++                    if (uniform_keep.mismatches++ < 16) {
++                        LOG_ERROR(HW_GPU,
++                                  "Lichii #949 uniform keep verify: stage {} slot {} at "
++                                  "{:#x}+{:#x} changed since the previous draw",
++                                  stage, index, device_addr, size);
++                    }
++                }
++            } else if (VideoCommon::RebindKeptUniform(runtime, stage, index, device_addr, size)) {
++                channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
++                channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
++                uniform_keep.streamed[stage] |= 1u << index;
++                ++uniform_keep.kept;
++                return;
++            }
++        }
++    }
+     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
+     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
+     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+@@ -1983,6 +2071,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+             if (VideoCommon::UniformStreamReuseEnabled()) {
+                 streamed = VideoCommon::BindSmallUniformReusing(
+                     runtime, device_memory, stage, index, binding_index, device_addr, size);
++                if (streamed && Nx2FastDraw::UboKeepEnabled()) {
++                    // EDEN_UP_L949_UBO_KEEP: the next delta draw may bind this allocation again.
++                    uniform_keep.streamed[stage] |= 1u << index;
++                    ++uniform_keep.streamed_binds;
++                }
+             }
+         }
+         if (!streamed) {
+@@ -1992,6 +2085,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         return;
+     }
+     // Classic cached path
++    if (verify_kept && uniform_keep.mismatches++ < 16) {
++        LOG_ERROR(HW_GPU,
++                  "Lichii #949 uniform keep verify: stage {} slot {} at {:#x}+{:#x} is no longer "
++                  "streamed",
++                  stage, index, device_addr, size);
++    }
+     if (SynchronizeBuffer(buffer, device_addr, size)) {
+         ++channel_state->uniform_cache_hits[0];
+     }
+@@ -2617,6 +2716,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
+         }
+         if (inline_buffer_id != NULL_BUFFER_ID &&
+             slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
++            ++uniform_keep.deletions; // EDEN_UP_L949_UBO_KEEP
+             slot_buffers.erase(inline_buffer_id);
+             inline_buffer_id = CreateBuffer(0, buffer_size, false);
+         }
+@@ -2863,6 +2963,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+         }
+     }
+     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
++    NoteUniformWrite(device_addr, size); // EDEN_UP_L949_UBO_KEEP; nothing unless set
+     MarkVertexBuffersStale(device_addr, size);
+     Nx2AddRangeOnce(gpu_modified_ranges, nx2_recent_gpu_ranges, nx2_recent_gpu_next, device_addr,
+                     size);
+@@ -3863,6 +3964,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+ template <class P>
+ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+     Churn::Add(Churn::BuffersDeleted);
++    ++uniform_keep.deletions; // EDEN_UP_L949_UBO_KEEP
+     nx2_synced_ranges.fill({});
+     nx2_synced_vertex_buffers.fill({});
+     if (buffer_id == inline_buffer_id) {
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -46,6 +46,7 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/nx2_fast_draw.h"
+ #include "video_core/surface.h"
+ #include "video_core/texture_cache/types.h"
+ 
+@@ -457,6 +458,11 @@ public:
+         } while (channel_state->has_deleted_buffers);
+     }
+ 
++    /// EDEN_UP_L949_UBO_KEEP: called before each graphics draw binds its buffers. `delta`: the
++    /// constant buffer binds and data since the previous draw when it is a fast draw delta draw,
++    /// else nullptr.
++    void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta);
++
+     Common::SpinRecursiveMutex mutex;
+     Runtime& runtime;
+     bool any_buffer_uploaded = false;
+@@ -803,6 +809,41 @@ private:
+     u64 vertex_buffers_serial = 0;
+     std::array<Binding, 32> v_buffer{};
+ 
++    /// EDEN_UP_L949_UBO_KEEP (zortos293/Lichii #949, 6b38851501 + 3e86407514): a delta draw binds
++    /// a small uniform buffer from the stream allocation the previous draw made for it, without
++    /// reading guest memory, when nothing ordered between the two draws wrote its range: no inline
++    /// constant data, no rebind, no CPU write the caches were told about, no GPU write and no
++    /// buffer deletion. Anything else in between ends the delta chain.
++    [[nodiscard]] bool UniformRangeKept(size_t stage, u32 index, DAddr device_addr,
++                                        u32 size) const noexcept;
++    void NoteUniformWrite(DAddr device_addr, u64 size) {
++        if (!Nx2FastDraw::UboKeepEnabled()) {
++            return;
++        }
++        UniformKeep& keep = uniform_keep;
++        if (keep.memory_writes.size() == keep.memory_writes.capacity()) {
++            keep.memory_writes_lost = true;
++            return;
++        }
++        keep.memory_writes.emplace_back(device_addr, device_addr + size);
++    }
++    struct UniformKeep {
++        std::array<u32, NUM_STAGES> candidates{}; ///< Streamed by the previous draw, not rebound
++        std::array<u32, NUM_STAGES> streamed{};   ///< Streamed by this draw
++        /// Device ranges written since the previous draw began: inline constant data, then the
++        /// CPU writes and GPU-modified marks.
++        boost::container::static_vector<std::pair<DAddr, DAddr>, Nx2FastDraw::Delta::MaxWrites + 8>
++            writes;
++        boost::container::static_vector<std::pair<DAddr, DAddr>, 8> memory_writes;
++        bool memory_writes_lost{}; ///< More writes than memory_writes holds
++        u64 deletions{};           ///< Buffers deleted (DeleteBuffer, the inline index buffer)
++        u64 draw_deletions{};      ///< deletions when the previous draw began
++        u64 kept{};
++        u64 streamed_binds{};
++        u64 verified{};
++        u64 mismatches{};
++    } uniform_keep;
++
+     boost::container::small_vector<BufferCopy, 4> upload_copies;
+ 
+     MemoryTracker memory_tracker;
+diff --git a/src/video_core/buffer_cache/uniform_stream_reuse.h b/src/video_core/buffer_cache/uniform_stream_reuse.h
+--- a/src/video_core/buffer_cache/uniform_stream_reuse.h
++++ b/src/video_core/buffer_cache/uniform_stream_reuse.h
+@@ -74,7 +74,8 @@ public:
+     struct Slot {
+         Ref ref{};
+         u64 tick{};
+-        u32 size{}; // 0: nothing streamed yet
++        u64 device_addr{}; ///< Where BindSmallUniformReusing last read (EDEN_UP_L949_UBO_KEEP)
++        u32 size{};        // 0: nothing streamed yet
+         std::array<u8, MaxBytes> bytes{};
+     };
+ 
+@@ -121,6 +122,8 @@ template <class Runtime, class DeviceMemory>
+     }
+     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+     typename Reuse::Slot& slot = reuse.slots[stage][index];
++    // EDEN_UP_L949_UBO_KEEP (RebindKeptUniform): every path below binds what it read here.
++    slot.device_addr = device_addr;
+     // Test memories have no GetSpan.
+     if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
+         const u8* const guest =
+@@ -163,6 +166,47 @@ template <class Runtime, class DeviceMemory>
+     return true;
+ }
+ 
++/// EDEN_UP_L949_UBO_KEEP (zortos293/Lichii #949, 6b38851501): binds the slot's last allocation
++/// again without reading guest memory, when BindSmallUniformReusing made it for the same range in
++/// this command buffer. The caller guarantees that nothing ordered before this draw wrote the
++/// range since that bind (the previous draw's). Returns false (nothing bound) otherwise.
++template <class Runtime>
++[[nodiscard]] bool RebindKeptUniform(Runtime& runtime, size_t stage, u32 index, u64 device_addr,
++                                     u32 size) {
++    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
++    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
++        index >= Reuse::NumSlots) {
++        return false;
++    }
++    const typename Reuse::Slot& slot =
++        UniformStreamReuseState<typename Runtime::StreamUniformRef>().slots[stage][index];
++    if (slot.size != size || slot.device_addr != device_addr ||
++        slot.tick != runtime.CurrentTick()) {
++        return false;
++    }
++    runtime.RebindStreamUniform(slot.ref, size);
++    return true;
++}
++
++/// EDEN_UP_L949_UBO_KEEP_VERIFY: whether guest memory still holds the bytes the slot's last bind
++/// read from the range RebindKeptUniform would reuse.
++template <class Runtime, class DeviceMemory>
++[[nodiscard]] bool KeptUniformHolds(DeviceMemory& device_memory, size_t stage, u32 index,
++                                    u64 device_addr, u32 size) {
++    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
++    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
++        index >= Reuse::NumSlots) {
++        return false;
++    }
++    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
++    const typename Reuse::Slot& slot = reuse.slots[stage][index];
++    if (slot.size != size || slot.device_addr != device_addr) {
++        return false;
++    }
++    device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
++    return std::memcmp(slot.bytes.data(), reuse.scratch.data(), size) == 0;
++}
++
+ /// As BindSmallUniformReusing, with the bytes read from `source` instead of guest memory
+ /// (EDEN_UP_UBO_SNAPSHOT: this frame's copy, ubo_snapshot.h). Shares the slots with it: a slot's
+ /// bytes are whatever was streamed for it last, from either.
+@@ -176,6 +220,9 @@ template <class Runtime>
+     }
+     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+     typename Reuse::Slot& slot = reuse.slots[stage][index];
++    // EDEN_UP_L949_UBO_KEEP (RebindKeptUniform): the bytes are not guest memory's at any address,
++    // so no keep may bind this allocation (review hardening).
++    slot.device_addr = ~u64{0};
+     const bool same_bytes = slot.size == size && std::memcmp(slot.bytes.data(), source, size) == 0;
+     if (same_bytes && slot.tick == runtime.CurrentTick()) {
+         runtime.RebindStreamUniform(slot.ref, size);
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -7,6 +7,7 @@
+ #include "common/pe_switch.h"
+ #include <algorithm>
+ #include <atomic>
++#include <bit>
+ #include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+@@ -23,6 +24,7 @@
+ #include "video_core/control/channel_state.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/engines/maxwell_dma.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/guest_memory.h"
+@@ -351,8 +353,10 @@ static bool ListAsync() {
+ 
+ bool DmaPusher::CanResumeAcquire() {
+     if (pending_list_tick) {
++        VideoCommon::L949Count(VideoCommon::g_l949_stats.list_polls); // EDEN_UP_L949_STATS
+         return rasterizer == nullptr || rasterizer->IsGpuTickDone(*pending_list_tick);
+     }
++    VideoCommon::L949Count(VideoCommon::g_l949_stats.acquire_polls);
+     return puller.CanResumeAcquire(*this);
+ }
+ 
+@@ -1299,6 +1303,9 @@ void DmaPusher::CallMethod(u32 argument) {
+             }
+             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
+                          WantsSegment() ? &segment : nullptr);
++            if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::MaxwellDMA) {
++                NoteDmaSemaphore(dma_state.method, argument); // EDEN_UP_L949_ACQUIRE
++            }
+             return;
+         }
+         if (!subchannel->execution_mask[dma_state.method]) {
+@@ -1368,6 +1375,12 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+             }
+             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
+                               dma_state.method_count, WantsSegment() ? &segment : nullptr);
++            if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::MaxwellDMA &&
++                VideoCommon::GpuSplit::L949Acquire()) {
++                for (u32 i = 0; i < num_methods; ++i) { // non-incrementing: one method
++                    NoteDmaSemaphore(dma_state.method, base_start[i]);
++                }
++            }
+             return;
+         }
+         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
+@@ -1377,6 +1390,39 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+     }
+ }
+ 
++void DmaPusher::NoteDmaSemaphore(u32 method, u32 argument) {
++    // EDEN_UP_L949_ACQUIRE (zortos293/Lichii #949, fb4d4e47a7): as MaxwellDMA::ReleaseSemaphore
++    // writes it on the back.
++    using Engines::MaxwellDMA;
++    if (!VideoCommon::GpuSplit::L949Acquire()) {
++        return;
++    }
++    if (method >= MaxwellDMA::SemaphoreMethod && method < MaxwellDMA::SemaphoreMethod + 3) {
++        dma_semaphore[method - MaxwellDMA::SemaphoreMethod] = argument;
++        return;
++    }
++    if (method != MaxwellDMA::LaunchDmaMethod) {
++        return;
++    }
++    using SemaphoreType = MaxwellDMA::LaunchDMA::SemaphoreType;
++    const auto type = std::bit_cast<MaxwellDMA::LaunchDMA>(argument).semaphore_type.Value();
++    if (type != SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE &&
++        type != SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
++        return;
++    }
++    const GPUVAddr address = MaxwellDMA::PackedGPUVAddr{dma_semaphore[0], dma_semaphore[1]};
++    const auto device = memory_manager.GpuToCpuAddress(address);
++    if (!device) {
++        return;
++    }
++    auto& split = VideoCommon::GpuSplit::Get();
++    split.NoteSemaphoreWrite(*device, dma_semaphore[2], true);
++    if (type == SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
++        // The payload as 64 bits (a timestamp follows).
++        split.NoteSemaphoreWrite(*device + 4, 0, true);
++    }
++}
++
+ // The entries' sizes were fixed when the list was submitted, and so were the commands they hold:
+ // memory can differ by now for three reasons. The game patched words in place before it released
+ // an acquire (data words: the stream keeps its header words; Hyrule Warriors: Age of
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -225,6 +225,9 @@ public:
+     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+     /// Whether the entry lies on device pages the GPU has written (NX2).
+     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
++    /// EDEN_UP_L949_ACQUIRE: a copy engine method sent to the split's back; a launch that releases
++    /// its semaphore tells the front what it writes (GpuSplit::NoteSemaphoreWrite).
++    void NoteDmaSemaphore(u32 method, u32 argument);
+     /// EDEN_NX2_LIST_FAST: whether no page was newly marked GPU-written for 2 s.
+     bool WrittenPagesSettled();
+     void NoteListFastCheck(GPUVAddr address, bool written);
+@@ -426,6 +429,8 @@ public:
+ 
+     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
+     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
++    /// EDEN_UP_L949_ACQUIRE: the copy engine's semaphore address (high, low) and payload as sent.
++    std::array<u32, 3> dma_semaphore{};
+ 
+     Engines::Puller puller;
+     std::mutex sync_mutex;
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -2356,6 +2356,35 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
+     FrontApply(fs, method, argument);
+     split.Method(this, method, argument, is_last_call, segment);
+     FrontQmd(split, fs, method, argument);
++    if (method == 0x6c3) {
++        FrontNoteReport(split, fs, argument); // EDEN_UP_L949_ACQUIRE; nothing unless set
++    }
++}
++
++void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs,
++                                    u32 control) {
++    // EDEN_UP_L949_ACQUIRE (zortos293/Lichii #949, fb4d4e47a7): SET_REPORT_SEMAPHORE_D was sent,
++    // what ProcessNativeReportSemaphore will write on the back.
++    if (!VideoCommon::GpuSplit::L949Acquire()) {
++        return;
++    }
++    const u32 operation = control & 3;
++    if (operation != 0 && operation != 2) {
++        return;
++    }
++    const GPUVAddr address =
++        (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
++    const auto device = memory_manager.GpuToCpuAddress(address);
++    if (!device) {
++        return;
++    }
++    // A reduction combines the payload with the word's value then (at a fence).
++    const bool reduction = ((control >> 3) & 1) != 0;
++    split.NoteSemaphoreWrite(*device, fs.registers[0x6c2], !reduction);
++    if (!reduction && ((control >> 28) & 1) == 0) {
++        // 64 bits (a timestamp follows).
++        split.NoteSemaphoreWrite(*device + 4, 0, true);
++    }
+ }
+ 
+ bool KeplerCompute::FrontDropsWrite(FrontState& fs, u32 method, u32 argument) {
+@@ -2420,6 +2449,11 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
+             FrontQmd(split, fs, method, base_start[i]);
+         }
+     }
++    if (method == 0x6c3) {
++        for (u32 i = 0; i < amount; ++i) {
++            FrontNoteReport(split, fs, base_start[i]); // EDEN_UP_L949_ACQUIRE
++        }
++    }
+ }
+ 
+ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
+@@ -2452,6 +2486,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
+             FrontApply(fs, address, value);
+             split.MacroWrite(this, address, value);
+             FrontQmd(split, fs, address, value);
++            if (address == 0x6c3) {
++                FrontNoteReport(split, fs, value); // EDEN_UP_L949_ACQUIRE
++            }
+             return true;
+         });
+     if (!result.success) {
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -288,6 +288,8 @@ private:
+     FrontState& Front(VideoCommon::GpuSplit& split);
+     void FrontApply(FrontState& state, u32 method, u32 argument);
+     void FrontQmd(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
++    /// EDEN_UP_L949_ACQUIRE: notes the semaphore write a SET_REPORT_SEMAPHORE_D just sent makes.
++    void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control);
+     MacroEngine& FrontMacroEngine(FrontState& state);
+     std::span<u32> FrontMacroPositions(FrontState& state);
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1596,6 +1596,33 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+         if (payload_release) {
+             split.NoteRelease(key, report.payload);
+         }
++        FrontNoteSemaphoreWrite(split, fs); // EDEN_UP_L949_ACQUIRE; nothing unless set
++    }
++}
++
++void Maxwell3D::FrontNoteSemaphoreWrite(VideoCommon::GpuSplit& split, const FrontState& fs) {
++    // EDEN_UP_L949_ACQUIRE (zortos293/Lichii #949, fb4d4e47a7): what ProcessQueryGet will write
++    // on the back for a release or report-only: a payload report writes the payload, a counter
++    // what the GPU counted (a value the front can't tell).
++    if (!VideoCommon::GpuSplit::L949Acquire()) {
++        return;
++    }
++    Regs::ReportSemaphore report;
++    std::memcpy(&report, &fs.regs[MAXWELL3D_REG_INDEX(report_semaphore)], sizeof(report));
++    if (report.query.operation != Regs::ReportSemaphore::Operation::Release &&
++        report.query.operation != Regs::ReportSemaphore::Operation::ReportOnly) {
++        return;
++    }
++    const auto device = memory_manager.GpuToCpuAddress(report.Address());
++    if (!device) {
++        return;
++    }
++    const bool payload = static_cast<VideoCommon::QueryType>(report.query.report.Value()) ==
++                         VideoCommon::QueryType::Payload;
++    split.NoteSemaphoreWrite(*device, report.payload, payload);
++    if (report.query.short_query == 0) {
++        // 64 bits (a timestamp follows).
++        split.NoteSemaphoreWrite(*device + 4, 0, payload);
+     }
+ }
+ 
+@@ -1729,6 +1756,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+     if (FrontMemoryNotesEnabled() && amount != 0 && FrontWritesGuestMemory(method)) {
+         FrontNoteMemoryWrite(split, fs, method, base_start, amount);
+     }
++    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount != 0) {
++        FrontNoteSemaphoreWrite(split, fs); // EDEN_UP_L949_ACQUIRE; nothing unless set
++    }
+ }
+ 
+ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3445,6 +3445,9 @@ private:
+     /// just sent to the back may change (GpuSplit::NoteMemoryWrite).
+     void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                               const u32* words, u32 count);
++    /// EDEN_UP_L949_ACQUIRE: notes the semaphore write a report just sent makes
++    /// (GpuSplit::NoteSemaphoreWrite).
++    void FrontNoteSemaphoreWrite(VideoCommon::GpuSplit& split, const FrontState& state);
+     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+     void FinishFrontMacro(Core::System& system);
+     std::unique_ptr<FrontState> front;
+diff --git a/src/video_core/engines/maxwell_dma.h b/src/video_core/engines/maxwell_dma.h
+--- a/src/video_core/engines/maxwell_dma.h
++++ b/src/video_core/engines/maxwell_dma.h
+@@ -114,6 +114,9 @@ public:
+         u32 payload;
+     };
+     static_assert(sizeof(Semaphore) == 12);
++    /// The methods of Regs::semaphore (address high and low, payload) and Regs::launch_dma.
++    static constexpr u32 SemaphoreMethod = 0x240 / sizeof(u32);
++    static constexpr u32 LaunchDmaMethod = 0x300 / sizeof(u32);
+ 
+     struct RenderEnable {
+         enum class Mode : u32 {
+@@ -328,6 +331,8 @@ private:
+     ASSERT_REG_POSITION(src_params, 0x728);
+     ASSERT_REG_POSITION(pm_trigger_end, 0x1114);
+ #undef ASSERT_REG_POSITION
++    static_assert(SemaphoreMethod * sizeof(u32) == offsetof(Regs, semaphore));
++    static_assert(LaunchDmaMethod * sizeof(u32) == offsetof(Regs, launch_dma));
+ };
+ 
+ } // namespace Tegra::Engines
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -186,6 +186,167 @@ void NoteRelease(const DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+     if (split.Active()) split.NoteRelease(ReleaseKey(dma_pusher, address), value);
+ }
+ 
++// zortos293/Lichii #949 (merged into nx2 as a4f6287327; zortos293, carrying jpkto's fb4d4e47a7
++// from PR #805 and PantACRO4life's drain valve b837e742c4). EDEN_UP_L949_ACQUIRE=1: a
++// greater-or-equal acquire is checked without draining the split. The words Switch 2 syncs on
++// only advance (NVN2 even releases QMD completions as maxima), so a value that meets one now still
++// does once the back ran the queued work. Only the last release the front sent to the word decides
++// instead, while the back may not have run it (GpuSplit::QueuedSemaphoreWriteAt: the puller's
++// releases, the 3D and compute report semaphores and the copy engine's, noted as they are sent).
++// A counter report or a reduction, whose value the front can't tell, leaves the acquire to the
++// old path. Unlike EDEN_NX2_SEM_FAST there is no 16-byte line test (a release queued to a packed
++// neighbour word does not stop it) and a queued release that meets the acquire passes it.
++enum class AcquireCheck {
++    Met,         ///< By the word in memory
++    MetByQueued, ///< By a release sent to the word that the back has not run yet
++    NotMet,      ///< Nothing sent to the word can meet it yet
++    OldPath,     ///< Leave it to the T83 path (a drain, or EDEN_NX2_SEM_FAST's read)
++};
++
++// EDEN_UP_L949_ACQUIRE: a release just sent to the back writes `payload` to the u32 at `address`;
++// a four-word release writes it as 64 bits (0 in the next word; a timestamp follows).
++void NoteSemaphoreRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload, bool four_words) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    if (!VideoCommon::GpuSplit::L949Acquire() || !split.Active()) {
++        return;
++    }
++    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
++    if (!device) {
++        return;
++    }
++    split.NoteSemaphoreWrite(*device, payload, true);
++    if (four_words) {
++        split.NoteSemaphoreWrite(*device + 4, 0, true);
++    }
++}
++
++// Whether the back writes a payload release to memory when it runs it: below High GPU accuracy,
++// with fences that run their operations at once (FenceManager::SignalFence).
++bool ReleasesLandAtOnce() {
++    const bool delay_fence =
++        Settings::IsGPUFenceBehaviorDefault()
++            ? Settings::IsGPULevelHigh()
++            : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
++    return !delay_fence && !Settings::IsGPULevelHigh();
++}
++
++// Whether fence-flagged releases wait for their host fence before they reach memory even below
++// High accuracy: EDEN_NX2_QUERY_KEEP_PENDING (query_cache.h, read the same way) and
++// EDEN_NX2_READBACK_WAIT=2 or 3 (readback_wait.h HoldRelease). There T83 makes an
++// acquire wait until the release landed, i.e. until the host GPU ran the work before it, and a
++// release written at once (a timed one) that follows the acquire lands after it. A queued release
++// that meets the acquire then does not pass it (review fix; upstream excludes "land later"
++// configurations through ReleasesLandAtOnce, which does not know these two).
++bool ReleasesHeldUntilFence() {
++    static const bool held = [] {
++        const char* const keep_pending = std::getenv("EDEN_NX2_QUERY_KEEP_PENDING");
++        return (keep_pending != nullptr && keep_pending[0] != '0') ||
++               VideoCore::Readback::Mode() >= 2;
++    }();
++    return held;
++}
++
++AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    auto& stats = VideoCommon::g_l949_stats;
++    if (!acquire.WaitsToReach()) {
++        VideoCommon::L949Count(stats.old_operation);
++        return AcquireCheck::OldPath;
++    }
++    // Macros run on the back write reports the front never sees.
++    if (!split.Active() || !split.FrontMacros() || !ReleasesLandAtOnce()) {
++        VideoCommon::L949Count(stats.old_settings);
++        return AcquireCheck::OldPath;
++    }
++    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
++    // A word the buffer cache may hold newer than memory is read through the back (a page past
++    // the bitmap counts as GPU-written, as upstream's Nx2MayBeGpuWritten).
++    if (!device || (*device >> Nx2WrittenPageBits) >= g_nx2_gpu_written_pages.size() * 64 ||
++        Nx2IsGpuWritten(*device)) {
++        VideoCommon::L949Count(stats.old_word);
++        return AcquireCheck::OldPath;
++    }
++    if (const auto queued = split.QueuedSemaphoreWriteAt(*device)) {
++        if (queued->known && acquire.Matches(queued->payload)) {
++            if (!ReleasesHeldUntilFence()) {
++                return AcquireCheck::MetByQueued;
++            }
++            // Held until its fence: met once it landed. The first check drains as T83, a poll
++            // waits for the latch (the query cache's OnWrite) or the valve.
++            if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
++                return AcquireCheck::Met;
++            }
++            VideoCommon::L949Count(stats.held);
++            return AcquireCheck::NotMet;
++        }
++        VideoCommon::L949Count(stats.old_queued);
++        return AcquireCheck::OldPath;
++    }
++    return acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))
++               ? AcquireCheck::Met
++               : AcquireCheck::NotMet;
++}
++
++// EDEN_UP_L949_ACQUIRE_VERIFY=1: drains anyway and counts where the word after the drain
++// disagrees with what CheckWithoutDrain decided.
++void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
++                        AcquireCheck decided) {
++    if (!VideoCommon::GpuSplit::L949AcquireVerify()) {
++        return;
++    }
++    const u32 word =
++        ReadSemaphoreWord(dma_pusher, acquire.address, VideoCommon::DrainSite::AcquireCheck);
++    auto& stats = VideoCommon::g_l949_stats;
++    if (acquire.Matches(word)) {
++        if (decided == AcquireCheck::NotMet) {
++            VideoCommon::L949Count(stats.late);
++        }
++        return;
++    }
++    if (decided == AcquireCheck::MetByQueued) {
++        // A fence-flagged release writes memory once the host GPU passed it.
++        VideoCommon::L949Count(stats.unlanded);
++        return;
++    }
++    if (decided != AcquireCheck::Met) {
++        return;
++    }
++    VideoCommon::L949Count(stats.mismatches);
++    if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 16) {
++        LOG_WARNING(HW_GPU,
++                    "Lichii #949 acquire verify: channel {} passed semaphore {:#x} (>= {:#x}) "
++                    "without a drain, the word is {:#x} after it",
++                    dma_pusher.channel_state.bind_id, acquire.address, acquire.value, word);
++    }
++}
++
++// The 1 ms valve (PantACRO4life's b837e742c4, Lichii #949 53bd961ab4): a waiting acquire whose
++// polls are answered without a drain still drains when its last drain is 1 ms old, so work only a
++// drain finishes (the flush ReadSemaphoreWord queues, the deferred submit of the back's idle hook)
++// still lands. Before it, upstream drained once after 2 s and Mario Kart World hung (Wario
++// Stadium ghost replay, 63 s); EDEN_NX2_SEM_FAST has that shape too.
++bool ValveDue(Puller::PendingAcquire& acquire) {
++    const auto now = std::chrono::steady_clock::now();
++    const auto last = acquire.last_drain == std::chrono::steady_clock::time_point{}
++                          ? acquire.since
++                          : acquire.last_drain;
++    if (now - last < std::chrono::milliseconds{1}) {
++        return false;
++    }
++    acquire.last_drain = now;
++    return true;
++}
++
++// EDEN_UP_L949_ACQUIRE with EDEN_UP_FAST_DRAW: an acquire passed without a drain sends nothing to
++// the back, where the drained one sent its flush (a deferred call, which ends draw reuse there,
++// in order). The CPU may have rewritten what the next draws read before the release this waited
++// for (writes the caches learn about later): end reuse at the same place. Not in upstream.
++void EndFastDrawAtAcquire() {
++    if (VideoCommon::Nx2FastDraw::Enabled()) {
++        VideoCommon::GpuSplit::Get().Defer([] {});
++    }
++}
++
+ // Whether a release the split's back has not run yet meets an acquire: the back runs it before
+ // whatever the front sends after the acquire, so the acquire needs no Drain (and no wait for the
+ // host GPU to reach a fenced release). Never for the CPU's releases: those the front can't see.
+@@ -248,6 +409,10 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
+     }
+ }
+ 
++bool Puller::PendingAcquire::WaitsToReach() const {
++    return static_cast<GpuSemaphoreOperation>(operation) == GpuSemaphoreOperation::AcquireGequal;
++}
++
+ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+     if (!pending_acquire) {
+         return true;
+@@ -259,16 +424,59 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+         MetAfterPendingRelease(dma_pusher, pending_acquire->address, matches)) {
+         return true;
+     }
++    // EDEN_UP_L949_ACQUIRE (Lichii #949): a poll decided without a drain. Unmet, it keeps
++    // waiting without one: until the back runs a release, nothing sent to the word meets it, and
++    // the back's release latches the waiter or reaches memory on its own; the 1 ms valve drains
++    // anyway now and then (the drained path below, which also reports waits over 2 s).
++    bool valve_drain = false;
++    if (VideoCommon::GpuSplit::L949Acquire()) {
++        auto& stats = VideoCommon::g_l949_stats;
++        switch (const AcquireCheck check = CheckWithoutDrain(dma_pusher, *pending_acquire); check) {
++        case AcquireCheck::MetByQueued:
++            // What the front reads after the acquire waits for the work sent before the release.
++            VideoCommon::GpuSplit::Get().NoteSync();
++            VideoCommon::L949Count(stats.by_queued);
++            [[fallthrough]];
++        case AcquireCheck::Met:
++            VideoCommon::L949Count(stats.passed);
++            VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
++            EndFastDrawAtAcquire();
++            return true;
++        case AcquireCheck::NotMet:
++            if (Nx2SemaphoreWaiters::Get().Latched(this)) {
++                VideoCommon::L949Count(stats.latched);
++                EndFastDrawAtAcquire();
++                return true;
++            }
++            if (!ValveDue(*pending_acquire)) {
++                VideoCommon::L949Count(stats.polls);
++                VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
++                return false;
++            }
++            VideoCommon::L949Count(stats.valve_drains);
++            valve_drain = true;
++            break;
++        case AcquireCheck::OldPath:
++            VideoCommon::L949Count(stats.old_path);
++            break;
++        }
++    }
+     // EDEN_NX2_SEM_FAST: a poll answered from the word itself, without a drain. A poll that is
+     // not met for 2 s takes the drained path below, which reports it.
+-    if (SemFastMode() != 0) {
++    // EDEN_UP_L949_DRAIN_VALVE=1: an unmet one also takes it when its last drain is 1 ms old.
++    if (SemFastMode() != 0 && !valve_drain) {
+         if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+             return true;
+         }
+         if (pending_acquire->reported ||
+             std::chrono::steady_clock::now() - pending_acquire->since < std::chrono::seconds{2}) {
+             if (u32 word{}; SemaphoreReadableNow(dma_pusher, pending_acquire->address, word)) {
+-                return pending_acquire->Matches(word);
++                const bool met = pending_acquire->Matches(word);
++                if (met || !VideoCommon::GpuSplit::L949DrainValve() ||
++                    !ValveDue(*pending_acquire)) {
++                    return met;
++                }
++                VideoCommon::L949Count(VideoCommon::g_l949_stats.sem_fast_valve);
+             }
+         }
+     }
+@@ -475,6 +683,12 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+         NoteRelease(dma_pusher, sequence_address, payload);
+         if (mirror != 0) NoteRelease(dma_pusher, mirror, payload);
+         NoteReleaseWrite(dma_pusher, sequence_address, mirror);
++        // EDEN_UP_L949_ACQUIRE: nothing unless set.
++        const bool four_words = properties == VideoCommon::QueryPropertiesFlags::HasTimeout;
++        NoteSemaphoreRelease(dma_pusher, sequence_address, payload, four_words);
++        if (mirror != 0) {
++            NoteSemaphoreRelease(dma_pusher, mirror, payload, four_words);
++        }
+     } else if (g_nx2_ampere) {
+         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
+         // written the commands this channel runs next: suspend the channel until the value is
+@@ -503,6 +717,28 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+             MetAfterPendingRelease(dma_pusher, acquire.address, matches)) {
+             return;
+         }
++        // EDEN_UP_L949_ACQUIRE (Lichii #949): met without a drain, by the word or by a release
++        // still queued. Anything else takes the path below, as upstream (an unmet one drains).
++        if (VideoCommon::GpuSplit::L949Acquire()) {
++            auto& stats = VideoCommon::g_l949_stats;
++            const AcquireCheck check = CheckWithoutDrain(dma_pusher, acquire);
++            if (check == AcquireCheck::Met || check == AcquireCheck::MetByQueued) {
++                if (check == AcquireCheck::MetByQueued) {
++                    // What the front reads after the acquire waits for the work sent before the
++                    // release (GpuSplit::NoteSync).
++                    VideoCommon::GpuSplit::Get().NoteSync();
++                    VideoCommon::L949Count(stats.by_queued);
++                }
++                VideoCommon::L949Count(stats.passed);
++                VerifyWithoutDrain(dma_pusher, acquire, check);
++                EndFastDrawAtAcquire();
++                return;
++            }
++            if (check == AcquireCheck::NotMet) {
++                VideoCommon::L949Count(stats.old_unmet);
++            }
++            VideoCommon::L949Count(stats.old_path);
++        }
+         // EDEN_NX2_SEM_FAST: the word is current (no queued or listed write the front knows of
+         // can change it): the value comes from the CPU or another channel later, and the polls
+         // in CanResumeAcquire pick it up without a drain.
+@@ -575,6 +811,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
+     });
+     NoteRelease(dma_pusher, sequence_address, payload);
+     NoteReleaseWrite(dma_pusher, sequence_address);
++    NoteSemaphoreRelease(dma_pusher, sequence_address, payload, false); // EDEN_UP_L949_ACQUIRE
+ }
+ 
+ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+@@ -609,6 +846,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+         });
+         NoteRelease(dma_pusher, address, payload);
+         NoteReleaseWrite(dma_pusher, address);
++        NoteSemaphoreRelease(dma_pusher, address, payload, false); // EDEN_UP_L949_ACQUIRE
+         return;
+     }
+     // EDEN_UP_FRITCHII_LISTSYNC: an acquire, met or not below (nothing unless set).
+diff --git a/src/video_core/engines/puller.h b/src/video_core/engines/puller.h
+--- a/src/video_core/engines/puller.h
++++ b/src/video_core/engines/puller.h
+@@ -82,8 +82,13 @@ public:
+         bool reported;
+         /// Split GPU thread: the last check that drained the back (CanResumeAcquire).
+         std::chrono::steady_clock::time_point checked{};
++        /// EDEN_UP_L949_ACQUIRE, EDEN_UP_L949_DRAIN_VALVE: when an unmet poll last drained (the
++        /// 1 ms valve); unset means since the acquire began.
++        std::chrono::steady_clock::time_point last_drain{};
+ 
+         [[nodiscard]] bool Matches(u32 current) const;
++        /// Whether it waits for the word to reach `value` (greater or equal).
++        [[nodiscard]] bool WaitsToReach() const;
+     };
+ 
+     [[nodiscard]] bool HasPendingAcquire() const {
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -141,6 +141,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
+     if (active && SplitWaitsEnabled()) [[unlikely]] {
+         ReportWaits();
+     }
++    if (active && g_l949_counting) [[unlikely]] {
++        ReportL949();
++    }
+     if (active && !allowed) {
+         Drain();
+         Stop();
+@@ -152,6 +155,16 @@ void GpuSplit::MaybeStart(Core::System& system_) {
+     }
+     system = &system_;
+     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
++    // zortos293/Lichii #949: set before the back starts (BackLoop copies them).
++    feed = Ship2Feed();
++    g_l949_counting = L949StatsSwitch() || L949AcquireVerify();
++    if (feed || L949Acquire() || L949DrainValve()) {
++        LOG_INFO(HW_GPU,
++                 "Lichii #949: EDEN_UP_SHIP2_FEED={} (publish to a waiting back after {} words, "
++                 "polls settle an idle back), EDEN_UP_L949_ACQUIRE={} (greater-or-equal acquires "
++                 "without a drain when met, polls drain once per 1 ms), EDEN_UP_L949_DRAIN_VALVE={}",
++                 feed ? 1 : 0, PublishAfterWait, L949Acquire() ? 1 : 0, L949DrainValve() ? 1 : 0);
++    }
+     ring = std::make_unique<u64[]>(RingWords);
+     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
+     ++session_generation;
+@@ -201,6 +214,14 @@ void GpuSplit::Stop() {
+     last_copy_writer_position = 0;
+     same_read_count = 0;
+     same_read_position = 0;
++    // zortos293/Lichii #949: set again by the next start; the positions restart at 0.
++    feed = false;
++    g_l949_counting = false;
++    l949_report_calls = 0;
++    l949_window_start = 0;
++    semaphore_writes.clear();
++    semaphore_writes_limit = 1024;
++    back_idle_at.store(~u64{0}, std::memory_order_relaxed);
+     back_engine_now.store(nullptr, std::memory_order_relaxed);
+     hang_reports = 0;
+     hang_dumped_position = ~u64{0};
+@@ -362,6 +383,29 @@ std::optional<u32> GpuSplit::PendingRelease(u64 key) {
+     return notes->writes.front().value;
+ }
+ 
++// EDEN_UP_L949_ACQUIRE (Lichii #949, fb4d4e47a7): the words of releases the back ran hold their
++// values in memory (or the query cache lists them); only the queued ones are kept.
++void GpuSplit::RecordSemaphoreWrite(u64 device_address, u32 payload, bool known) {
++    if (semaphore_writes.size() >= semaphore_writes_limit) {
++        const u64 done = consumed.load(std::memory_order_acquire);
++        std::erase_if(semaphore_writes,
++                      [done](const auto& entry) { return entry.second.position <= done; });
++        semaphore_writes_limit = std::max<size_t>(1024, semaphore_writes.size() * 2);
++    }
++    semaphore_writes.insert_or_assign(device_address & ~u64{3},
++                                      SemaphoreWrite{write_position, payload, known});
++}
++
++std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
++    u64 device_address) const {
++    const auto it = semaphore_writes.find(device_address & ~u64{3});
++    if (it == semaphore_writes.end() ||
++        it->second.position <= consumed.load(std::memory_order_acquire)) {
++        return std::nullopt;
++    }
++    return QueuedSemaphoreWrite{it->second.payload, it->second.known};
++}
++
+ bool GpuSplit::WritePending(u64 key) {
+     const u64 done = consumed.load(std::memory_order_acquire);
+     if (front_reports.size() > 4096) {
+@@ -595,6 +639,73 @@ void GpuSplit::ReportWaits() {
+     waits_window_words = write_position;
+ }
+ 
++void GpuSplit::ReportL949() {
++    // MaybeStart runs once per GPU thread loop: read the clock every 256th call only.
++    if (++l949_report_calls % 256 != 0) {
++        return;
++    }
++    const u64 now = WaitClockNs();
++    if (l949_window_start == 0) {
++        l949_window_start = now;
++        return;
++    }
++    if (now - l949_window_start < 10'000'000'000ULL) {
++        return;
++    }
++    l949_window_start = now;
++    auto& stats = g_l949_stats;
++    const auto take = [](std::atomic<u64>& counter) {
++        return counter.exchange(0, std::memory_order_relaxed);
++    };
++    const u64 passed = take(stats.passed);
++    const u64 by_queued = take(stats.by_queued);
++    const u64 held = take(stats.held);
++    const u64 latched = take(stats.latched);
++    const u64 old_path = take(stats.old_path);
++    const u64 old_operation = take(stats.old_operation);
++    const u64 old_settings = take(stats.old_settings);
++    const u64 old_word = take(stats.old_word);
++    const u64 old_queued = take(stats.old_queued);
++    const u64 old_unmet = take(stats.old_unmet);
++    const u64 valve_drains = take(stats.valve_drains);
++    const u64 polls = take(stats.polls);
++    const u64 sem_fast_valve = take(stats.sem_fast_valve);
++    const u64 acquire_polls = take(stats.acquire_polls);
++    const u64 list_polls = take(stats.list_polls);
++    const u64 early_publishes = take(stats.early_publishes);
++    const u64 settles = take(stats.settles);
++    const u64 back_waits = take(stats.back_waits);
++    const double spin_ms = static_cast<double>(take(stats.back_spin_ns)) / 1e6;
++    const u64 back_hooks = take(stats.back_hooks);
++    const double hook_ms = static_cast<double>(take(stats.back_hook_ns)) / 1e6;
++    const u64 back_sleeps = take(stats.back_sleeps);
++    const double sleep_ms = static_cast<double>(take(stats.back_sleep_ns)) / 1e6;
++    LOG_INFO(HW_GPU,
++             "Lichii #949 in 10 s (EDEN_UP_L949_ACQUIRE={}, EDEN_UP_SHIP2_FEED={}, "
++             "EDEN_UP_L949_DRAIN_VALVE={}): acquires {} passed without a drain ({} by a queued "
++             "release), {} met by a queued release held until its fence (not passed), {} resumed "
++             "by a latch, {} left to the old path ({} equal or mask, {} by the "
++             "settings, {} unmapped or GPU-written word, {} queued write unknown or not met, {} "
++             "not met at the acquire), {} valve drains, {} polls waited without a drain, {} "
++             "SEM_FAST valve drains; polls: {} of acquires, {} of GPU-written list copies; back: "
++             "{} waits for work, {:.1f} ms spinning, {} idle hooks ({:.1f} ms), {} sleeps ({:.1f} "
++             "ms); {} early publishes, {} idle hooks asked by polls",
++             L949Acquire() ? 1 : 0, feed ? 1 : 0, L949DrainValve() ? 1 : 0, passed, by_queued,
++             held, latched, old_path, old_operation, old_settings, old_word, old_queued, old_unmet,
++             valve_drains, polls, sem_fast_valve, acquire_polls, list_polls, back_waits, spin_ms,
++             back_hooks, hook_ms, back_sleeps, sleep_ms, early_publishes, settles);
++    const u64 mismatches = take(stats.mismatches);
++    const u64 unlanded = take(stats.unlanded);
++    const u64 late = take(stats.late);
++    if (L949AcquireVerify()) {
++        LOG_WARNING(HW_GPU,
++                    "Lichii #949 acquire verify in 10 s: {} passed but not met after a drain, {} "
++                    "met by a queued release not in memory after it, {} polls waited though a "
++                    "drain meets them",
++                    mismatches, unlanded, late);
++    }
++}
++
+ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
+     front_engine = engine;
+     u64* const entry = Reserve(2);
+@@ -760,6 +871,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+ #endif
+     Common::HangThreadStarts(Common::HangThread::Back);
+     const bool hang_watch = Common::HangWatchOn();
++    // zortos293/Lichii #949, as MaybeStart set them before this thread started.
++    const bool feed_on = feed;
++    const bool counting = g_l949_counting;
+     u64 read_position = 0;
+     while (!stop_token.stop_requested()) {
+         Nx2Profile::Report("GPU back thread");
+@@ -767,6 +881,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         if (available == read_position) {
+             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+             const BackIdleClock idle_clock{back_idle_ns};
++            if (feed_on) {
++                // EDEN_UP_SHIP2_FEED: the front publishes what it holds after a few more words.
++                back_idle_at.store(read_position, std::memory_order_relaxed);
++            }
++            const u64 spin_start = counting ? WaitClockNs() : 0;
+             // The front usually sends more within microseconds: spin briefly before sleeping.
+             for (u32 spins = 0; spins < 8192 && available == read_position &&
+                                 !hook_requested.load(std::memory_order_relaxed);
+@@ -774,15 +893,24 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+                 Pause();
+                 available = published.load(std::memory_order_acquire);
+             }
++            if (counting) [[unlikely]] {
++                L949Count(g_l949_stats.back_waits);
++                L949Count(g_l949_stats.back_spin_ns, WaitClockNs() - spin_start);
++            }
+             if (available == read_position) {
+                 hook_requested.store(false, std::memory_order_seq_cst);
+                 // The front may already see everything consumed: Drain() waits for back_quiet
+                 // too, so the deferred submit can't overlap whatever the front does next.
+                 if (!back_quiet.load(std::memory_order_relaxed)) {
+                     if (idle_hook != nullptr) {
++                        const u64 hook_start = counting ? WaitClockNs() : 0;
+                         back_going_quiet = true;
+                         idle_hook(idle_argument);
+                         back_going_quiet = false;
++                        if (counting) [[unlikely]] {
++                            L949Count(g_l949_stats.back_hooks);
++                            L949Count(g_l949_stats.back_hook_ns, WaitClockNs() - hook_start);
++                        }
+                     }
+                     back_quiet.store(true, std::memory_order_release);
+                 }
+@@ -797,7 +925,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+                 // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
+                 if (available == read_position && !stop_token.stop_requested() &&
+                     !hook_requested.load(std::memory_order_seq_cst)) {
++                    const u64 sleep_start = counting ? WaitClockNs() : 0;
+                     wake.wait(seen, std::memory_order_seq_cst);
++                    if (counting) [[unlikely]] {
++                        L949Count(g_l949_stats.back_sleeps);
++                        L949Count(g_l949_stats.back_sleep_ns, WaitClockNs() - sleep_start);
++                    }
+                 }
+                 back_waiting.store(false, std::memory_order_relaxed);
+                 continue;
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -34,6 +34,50 @@ class EngineInterface;
+ 
+ namespace VideoCommon {
+ 
++// zortos293/Lichii #949 (capy/egla66-ship2, merged into nx2 as a4f6287327): how semaphore acquires
++// and the polls of suspended ones were decided (EDEN_UP_L949_ACQUIRE, EDEN_UP_L949_DRAIN_VALVE),
++// what the feed did (EDEN_UP_SHIP2_FEED) and how the back waited for work. Counted only with
++// EDEN_UP_L949_STATS=1 or EDEN_UP_L949_ACQUIRE_VERIFY=1 (as of the split's last start; any arm,
++// the control included) and logged every 10 s by the front (GpuSplit::ReportL949).
++struct L949Stats {
++    std::atomic<u64> passed{};          ///< Acquires and polls met without a drain
++    std::atomic<u64> by_queued{};       ///< Of passed: met by a release the back had not run yet
++    /// A queued release meets it but lands at its host fence (EDEN_NX2_QUERY_KEEP_PENDING,
++    /// EDEN_NX2_READBACK_WAIT=2/3): not met until then, as T83
++    std::atomic<u64> held{};
++    std::atomic<u64> latched{};         ///< Polls resumed by a release the back ran (no drain)
++    std::atomic<u64> old_path{};        ///< Acquires and polls left to the T83 path
++    std::atomic<u64> old_operation{};   ///< Of old_path: an equal or mask acquire
++    std::atomic<u64> old_settings{};    ///< ...the split, front macros or the fence settings
++    std::atomic<u64> old_word{};        ///< ...the word is unmapped or on a GPU-written page
++    std::atomic<u64> old_queued{};      ///< ...a queued write to it is unknown or doesn't meet it
++    std::atomic<u64> old_unmet{};       ///< ...an acquire not met yet (its first check drains)
++    std::atomic<u64> valve_drains{};    ///< Drains of unmet polls, at most once per 1 ms
++    std::atomic<u64> polls{};           ///< Unmet polls that kept waiting without a drain
++    std::atomic<u64> sem_fast_valve{};  ///< EDEN_UP_L949_DRAIN_VALVE drains of SEM_FAST polls
++    std::atomic<u64> acquire_polls{};   ///< Polls of suspended channels waiting on an acquire
++    std::atomic<u64> list_polls{};      ///< ...and on a command list copy the GPU writes
++    std::atomic<u64> early_publishes{}; ///< Publishes to a back that waits for work (Commit)
++    std::atomic<u64> settles{};         ///< Idle hooks asked of a back that ran everything
++    std::atomic<u64> back_waits{};      ///< The back ran out of work
++    std::atomic<u64> back_spin_ns{};    ///< ...and spun for more before its hook or sleep
++    std::atomic<u64> back_hooks{};      ///< ...and ran its idle hook (the deferred submit)
++    std::atomic<u64> back_hook_ns{};
++    std::atomic<u64> back_sleeps{};     ///< ...and slept
++    std::atomic<u64> back_sleep_ns{};
++    std::atomic<u64> mismatches{}; ///< VERIFY: passed, yet the word after a drain doesn't meet it
++    std::atomic<u64> unlanded{};   ///< VERIFY: met by a queued release not in memory after a drain
++    std::atomic<u64> late{};       ///< VERIFY: a poll kept waiting, yet a drain meets it
++};
++inline L949Stats g_l949_stats;
++/// Whether g_l949_stats counts, as of the split's last start (set before its back starts).
++inline bool g_l949_counting{};
++inline void L949Count(std::atomic<u64>& counter, u64 amount = 1) {
++    if (g_l949_counting) [[unlikely]] {
++        counter.fetch_add(amount, std::memory_order_relaxed);
++    }
++}
++
+ // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
+ // CPU's commands, parses command lists and runs the puller; engine method calls and everything
+ // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a
+@@ -392,6 +436,75 @@ public:
+ 
+     /// Makes what was sent visible to the back.
+     void Publish();
++
++    // EDEN_UP_SHIP2_FEED=1 (zortos293/Lichii #949: a20471e48c, made always-on in ea4340a5b4; the
++    // publish part of jpkto's 62db242b34, PR #805): keeps a back that ran out of work fed. A drain
++    // sets publish_every back to 8 words; between drains it doubles up to 256, so with fewer
++    // drains (EDEN_NX2_SEM_FAST, EDEN_NX2_DMA_SNAPSHOT, EDEN_UP_DRAIN_SKIP_SAME,
++    // EDEN_UP_L949_ACQUIRE) a back that ran dry in the middle of a parse waits until the front
++    // holds 256 words. The back stores where it ran dry (back_idle_at) and Commit publishes to it
++    // once the front holds 8 words; the GPU thread's pending-channel loop asks a back that ran
++    // everything for its idle hook without waiting for it (SettleIdleBack), as a poll's drain did.
++    // Off unless exactly "1"; read once.
++    [[nodiscard]] static bool Ship2Feed() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_SHIP2_FEED");
++        return enabled;
++    }
++    /// Front, polling suspended channels with nothing to send: a back that ran everything and has
++    /// not run its idle hook (the deferred submit) runs it now instead of after its spin. No wait.
++    void SettleIdleBack() {
++        if (!feed || hook_requested.load(std::memory_order_relaxed) || BackQuiet() ||
++            consumed.load(std::memory_order_acquire) != write_position) {
++            return;
++        }
++        L949Count(g_l949_stats.settles);
++        RequestIdleHook();
++    }
++
++    // EDEN_UP_L949_ACQUIRE=1 (zortos293/Lichii #949: jpkto's fb4d4e47a7 from PR #805 as cf42f364f7,
++    // gated in a20471e48c, always-on in ea4340a5b4, with PantACRO4life's 1 ms drain valve
++    // b837e742c4 as 53bd961ab4): a greater-or-equal Switch 2 acquire is decided without draining
++    // the back when the word or the last release the front queued to it tells (puller.cpp,
++    // CheckWithoutDrain). Off unless exactly "1"; read once.
++    [[nodiscard]] static bool L949Acquire() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_L949_ACQUIRE");
++        return enabled;
++    }
++    /// EDEN_UP_L949_ACQUIRE_VERIFY=1 with EDEN_UP_L949_ACQUIRE=1: drains anyway after every
++    /// decision made without a drain and counts the words that disagree (diagnostic, slow).
++    [[nodiscard]] static bool L949AcquireVerify() {
++        static const bool enabled = L949Acquire() && Common::PeSwitch("EDEN_UP_L949_ACQUIRE_VERIFY");
++        return enabled;
++    }
++    /// EDEN_UP_L949_DRAIN_VALVE=1 (PantACRO4life's b837e742c4, Lichii #949 53bd961ab4): an
++    /// EDEN_NX2_SEM_FAST poll that keeps waiting drains when the acquire's last drain is 1 ms old,
++    /// instead of only once after 2 s. EDEN_UP_L949_ACQUIRE's polls always have the valve.
++    [[nodiscard]] static bool L949DrainValve() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_L949_DRAIN_VALVE");
++        return enabled;
++    }
++    /// EDEN_UP_L949_STATS=1: count and log the acquire, feed and back-wait line (g_l949_stats).
++    [[nodiscard]] static bool L949StatsSwitch() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_L949_STATS");
++        return enabled;
++    }
++    /// Front, EDEN_UP_L949_ACQUIRE: a semaphore release was just sent. Once the back ran it, the
++    /// u32 at `device_address` holds `payload`, or a value the front can't tell (`known` false: a
++    /// reduction, a counter report). Nothing is recorded with the switch off.
++    void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known) {
++        if (L949Acquire()) [[unlikely]] {
++            RecordSemaphoreWrite(device_address, payload, known);
++        }
++    }
++    struct QueuedSemaphoreWrite {
++        u32 payload;
++        bool known;
++    };
++    /// Front: the last write sent to the semaphore word at `device_address`, while the back may
++    /// not have run it yet.
++    [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
++        u64 device_address) const;
++
+     /// Waits until the back executed everything sent so far.
+     void Drain();
+     /// As Drain, counting the wait under `site` (EDEN_NX2_SPLIT_WAITS, EDEN_NX2_GPU_PROFILE).
+@@ -525,6 +638,8 @@ private:
+     static constexpr size_t RingMask = RingWords - 1;
+     static constexpr u32 MaxMultiWords = 8192;
+     static constexpr size_t PublishEvery = 256;
++    /// EDEN_UP_SHIP2_FEED: words a back waiting for work gets without waiting for publish_every.
++    static constexpr size_t PublishAfterWait = 8;
+ 
+     template <typename Func>
+     static void CallThunk(const u64* payload) {
+@@ -574,6 +689,11 @@ private:
+         write_position += words;
+         if (write_position - published_local >= publish_every) {
+             Publish();
++        } else if (feed && write_position - published_local >= PublishAfterWait &&
++                   back_idle_at.load(std::memory_order_relaxed) == published_local) [[unlikely]] {
++            // EDEN_UP_SHIP2_FEED: the back waits for work at the last position published.
++            L949Count(g_l949_stats.early_publishes);
++            Publish();
+         }
+     }
+     void WaitForSpace(size_t words);
+@@ -587,6 +707,10 @@ private:
+     void ReportWaits();
+     /// Front thread, EDEN_NX2_HANG_WATCH=1: logs what the back is doing, with a long wait's report.
+     void ReportBack();
++    /// Front thread, while g_l949_counting: logs g_l949_stats every 10 s.
++    void ReportL949();
++    /// EDEN_UP_L949_ACQUIRE: NoteSemaphoreWrite with the switch on.
++    void RecordSemaphoreWrite(u64 device_address, u32 payload, bool known);
+     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+         if (engine != front_engine) [[unlikely]] {
+             SwitchEngine(engine);
+@@ -602,6 +726,11 @@ private:
+     bool active{};
+     bool front_macros{};
+     bool reg_blocks{};
++    /// EDEN_UP_SHIP2_FEED as of the last start: set before the back thread starts, read by both.
++    bool feed{};
++    /// Front, while g_l949_counting: calls of ReportL949 and the start of its window.
++    u32 l949_report_calls{};
++    u64 l949_window_start{};
+     u64 session_generation{};
+     std::unique_ptr<u64[]> ring;
+ 
+@@ -653,6 +782,15 @@ private:
+     /// writer (NoteListSync, NoteCopyWriter); 0 before the first this session.
+     u64 list_sync_position{};
+     u64 last_copy_writer_position{};
++    /// EDEN_UP_L949_ACQUIRE: the last semaphore write sent to each word (NoteSemaphoreWrite), by
++    /// device address; what the back ran past is forgotten once there are more than the limit.
++    struct SemaphoreWrite {
++        u64 position; ///< write_position once it was sent
++        u32 payload;
++        bool known;
++    };
++    std::unordered_map<u64, SemaphoreWrite> semaphore_writes;
++    size_t semaphore_writes_limit{1024};
+     /// EDEN_UP_DRAIN_SKIP_SAME: the words whose drained reads hold at same_read_position.
+     std::array<u64, 4> same_read_keys{};
+     size_t same_read_count{};
+@@ -700,6 +838,9 @@ private:
+     std::jthread back_thread;
+     /// EDEN_NX2_SPLIT_WAITS=1: time the back spun or slept for work or ran its idle hook.
+     alignas(128) std::atomic<u64> back_idle_ns{};
++    /// EDEN_UP_SHIP2_FEED: the back's position when it last ran out of work, stored before it
++    /// spins: while it equals published_local, the back waits for the words the front holds.
++    alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
+     /// EDEN_NX2_HANG_WATCH=1: the entry the back runs now, for the front's reports. `consumed` only
+     /// moves every 4096 words and at the end of a batch, so it can't say which entry that is.
+     alignas(128) std::atomic<u64> back_entry_position{};
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -149,6 +149,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                     // millisecond before sleeping, or every wait also waits out a host sleep
+                     // (title 1 waits ~25 times a second).
+                     Profile::Scope scope{Profile::Zone::PendingSleep};
++                    // EDEN_UP_SHIP2_FEED=1 (Lichii #949): nothing to send while the channels
++                    // wait; a back that ran everything submits its deferred work now, as a
++                    // poll's drain made it do, without the wait. Off: returns at once.
++                    split.SettleIdleBack();
+                     const auto waited = std::chrono::steady_clock::now() - last_progress;
+                     if (waited < pending_spin) {
+                         std::this_thread::yield();
+diff --git a/src/video_core/nx2_fast_draw.h b/src/video_core/nx2_fast_draw.h
+--- a/src/video_core/nx2_fast_draw.h
++++ b/src/video_core/nx2_fast_draw.h
+@@ -93,6 +93,43 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
+     return exempt;
+ }
+ 
++/// EDEN_UP_L949_UBO_KEEP=1 with EDEN_UP_FAST_DRAW=1 (zortos293/Lichii #949: 6b38851501 and
++/// 3e86407514, zortos293): a delta draw binds a small streamed uniform buffer from the stream
++/// allocation the previous draw made for the same stage, slot, address and size in the same
++/// command buffer, without reading guest memory, when nothing between the two draws wrote its
++/// range (BufferCache::UniformRangeKept). Read once.
++[[nodiscard]] inline bool UboKeepEnabled() {
++    static const bool enabled = Enabled() && Common::PeSwitch("EDEN_UP_L949_UBO_KEEP");
++    return enabled;
++}
++/// EDEN_UP_L949_UBO_KEEP_VERIFY=1 with EDEN_UP_L949_UBO_KEEP=1: binds what a keep would skip the
++/// original way and logs where guest memory changed.
++[[nodiscard]] inline bool UboKeepVerify() {
++    static const bool verify = UboKeepEnabled() && Common::PeSwitch("EDEN_UP_L949_UBO_KEEP_VERIFY");
++    return verify;
++}
++/// EDEN_UP_L949_DESC_REPLAY=1 with EDEN_UP_FAST_DRAW=1 (zortos293/Lichii #949, ee98215f14): delta
++/// draws copy the image descriptor entries and rescaling words the capturing resolve pushed
++/// instead of looking up every view and sampler again (GraphicsPipeline::ConfigureDelta). Read
++/// once.
++[[nodiscard]] inline bool DescReplayEnabled() {
++    static const bool enabled = Enabled() && Common::PeSwitch("EDEN_UP_L949_DESC_REPLAY");
++    return enabled;
++}
++/// EDEN_UP_L949_DESC_REPLAY_VERIFY=1 with EDEN_UP_L949_DESC_REPLAY=1: delta draws resolve their
++/// image descriptors as before and count where they differ from the kept ones.
++[[nodiscard]] inline bool DescReplayVerify() {
++    static const bool verify =
++        DescReplayEnabled() && Common::PeSwitch("EDEN_UP_L949_DESC_REPLAY_VERIFY");
++    return verify;
++}
++/// EDEN_UP_L949_STATS=1: the uniform keep and descriptor replay lines are logged (their verify
++/// switches log them too).
++[[nodiscard]] inline bool L949StatsEnabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_L949_STATS");
++    return enabled;
++}
++
+ /// Whether vertex stream strides (and enables) stay out of graphics pipeline keys, set once by the
+ /// Vulkan rasterizer (PipelineCache::StridesOutsideKey). Until then, and on other renderers, a
+ /// stride change ends reuse with EDEN_UP_FAST_DRAW_OOT_EXEMPT too.
+diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
+--- a/src/video_core/renderer_vulkan/pipeline_helper.h
++++ b/src/video_core/renderer_vulkan/pipeline_helper.h
+@@ -370,6 +370,11 @@ public:
+         return words;
+     }
+ 
++    /// EDEN_UP_L949_DESC_REPLAY: the words of an earlier draw's pushes (delta draws); push no more.
++    void Assign(const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& data) noexcept {
++        words = data;
++    }
++
+ private:
+     std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> words{};
+     u32* texture_ptr{words.data()};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -10,6 +10,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
++#include <optional>
+ #include <span>
+ 
+ #include <boost/container/small_vector.hpp>
+@@ -301,6 +302,35 @@ void ReportTextureMemo() {
+                  hits, misses, g_memo_mismatches.load(std::memory_order_relaxed));
+     }
+ }
++// EDEN_UP_L949_DESC_REPLAY (Lichii #949): delta draws on the drawing thread, logged every 10 s
++// with EDEN_UP_L949_STATS=1 or EDEN_UP_L949_DESC_REPLAY_VERIFY=1.
++struct DeltaDescriptorStats {
++    u64 replayed{};
++    u64 pushed{};
++    u64 verified{};
++    u64 mismatches{};
++    std::chrono::steady_clock::time_point next_report{};
++} delta_descriptor_stats;
++
++void ReportDeltaDescriptors() {
++    DeltaDescriptorStats& stats = delta_descriptor_stats;
++    if (((stats.replayed + stats.pushed) & 1023) != 0 ||
++        (!VideoCommon::Nx2FastDraw::L949StatsEnabled() &&
++         !VideoCommon::Nx2FastDraw::DescReplayVerify())) {
++        return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now < stats.next_report) {
++        return;
++    }
++    if (stats.next_report != std::chrono::steady_clock::time_point{}) {
++        LOG_INFO(Render_Vulkan,
++                 "Lichii #949 delta descriptors in 10 s: {} replayed, {} pushed, {} verified, {} "
++                 "verify mismatches",
++                 stats.replayed, stats.pushed, stats.verified, stats.mismatches);
++    }
++    stats = {.next_report = now + std::chrono::seconds{10}};
++}
+ } // Anonymous namespace
+ 
+ // TODO(crueter): This is the worst-formatted code I have EVER seen
+@@ -743,6 +773,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+         }
+         ReportTextureMemo();
+     }
++    // EDEN_UP_L949_DESC_REPLAY: this resolve's image descriptors are kept for the delta draws
++    // that follow it (KeepImageDescriptors below).
++    bool keep_images = false;
+     if (fast_draw_on && std::exchange(capture_delta, false) &&
+         delta_blocker == DeltaBlocker::None) {
+         const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
+@@ -759,6 +792,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+         configured_stages = Spec::enabled_stages;
+         // A view pointed at a colour target's copy needs that copy taken again for each draw.
+         delta_views_valid = texture_cache.FeedbackViewCopies() == feedback_copies;
++        if (VideoCommon::Nx2FastDraw::DescReplayEnabled()) {
++            keep_images = true;
++            kept_images_valid = false;
++            kept_image_entries.clear();
++        }
+     }
+ 
+     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
+@@ -865,8 +903,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+         }
+         {
+             Profile::Scope scope{Profile::Zone::PushDescriptors};
++            const size_t first_entry = keep_images ? guest_descriptor_queue.UpdateCount() : 0;
+             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                  rescaling, samplers_it, views_it);
++            if (keep_images) {
++                KeepImageDescriptors(stage, first_entry);
++            }
+         }
+         const auto& info{stage_infos[stage]};
+         if (info.uses_render_area) {
+@@ -893,6 +935,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     if constexpr (Spec::enabled_stages[4]) {
+         prepare_stage(4);
+     }
++    if (keep_images) {
++        kept_rescaling = rescaling.Data();
++        kept_scale_epoch = texture_cache.ScaleEpoch();
++        kept_images_valid = true;
++    }
+     if (buffer_cache.any_buffer_uploaded) {
+         buffer_cache.runtime.PostCopyBarrier();
+         buffer_cache.any_buffer_uploaded = false;
+@@ -966,6 +1013,25 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
+     RenderAreaPushConstant render_area;
+     const VideoCommon::SamplerId* samplers_it{delta_samplers.data()};
+     const VideoCommon::ImageViewInOut* views_it{delta_views.data()};
++    // EDEN_UP_L949_DESC_REPLAY (zortos293/Lichii #949, ee98215f14): push the entries kept for
++    // delta_views instead of resolving every view and sampler again; with _VERIFY resolve them
++    // and compare.
++    const bool desc_replay = VideoCommon::Nx2FastDraw::DescReplayEnabled();
++    const bool kept_usable =
++        desc_replay && kept_images_valid && kept_scale_epoch == textures.ScaleEpoch();
++    const bool replay_images = kept_usable && !VideoCommon::Nx2FastDraw::DescReplayVerify();
++    struct KeptImages {
++        std::vector<DescriptorUpdateEntry> entries;
++        std::array<std::pair<u32, u32>, NUM_STAGES> ranges;
++        std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling;
++    };
++    std::optional<KeptImages> verify_kept;
++    if (desc_replay && !replay_images) {
++        if (kept_usable) {
++            verify_kept.emplace(std::move(kept_image_entries), kept_image_ranges, kept_rescaling);
++        }
++        kept_image_entries.clear();
++    }
+     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+         if (!configured_stages[stage]) {
+             continue;
+@@ -974,10 +1040,18 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
+             Profile::Scope scope{Profile::Zone::BindStageBuffers};
+             buffers.BindHostStageBuffers(stage);
+         }
+-        {
++        if (replay_images) {
++            Profile::Scope scope{Profile::Zone::PushDescriptors};
++            const auto [first, count] = kept_image_ranges[stage];
++            guest_descriptor_queue.AddEntries({kept_image_entries.data() + first, count});
++        } else {
+             Profile::Scope scope{Profile::Zone::PushDescriptors};
++            const size_t first_entry = desc_replay ? guest_descriptor_queue.UpdateCount() : 0;
+             PushImageDescriptors(textures, guest_descriptor_queue, stage_infos[stage], rescaling,
+                                  samplers_it, views_it);
++            if (desc_replay) {
++                KeepImageDescriptors(stage, first_entry);
++            }
+         }
+         if (stage_infos[stage].uses_render_area) {
+             render_area.uses_render_area = true;
+@@ -988,6 +1062,36 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
+                                  static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
+         }
+     }
++    if (replay_images) {
++        rescaling.Assign(kept_rescaling);
++        ++delta_descriptor_stats.replayed;
++    } else if (desc_replay) {
++        kept_rescaling = rescaling.Data();
++        kept_scale_epoch = textures.ScaleEpoch();
++        kept_images_valid = true;
++        ++delta_descriptor_stats.pushed;
++        if (verify_kept) {
++            ++delta_descriptor_stats.verified;
++            const auto same_image = [](const DescriptorUpdateEntry& lhs,
++                                       const DescriptorUpdateEntry& rhs) {
++                return lhs.image.sampler == rhs.image.sampler &&
++                       lhs.image.imageView == rhs.image.imageView &&
++                       lhs.image.imageLayout == rhs.image.imageLayout;
++            };
++            if ((verify_kept->ranges != kept_image_ranges ||
++                 verify_kept->rescaling != kept_rescaling ||
++                 !std::ranges::equal(verify_kept->entries, kept_image_entries, same_image)) &&
++                delta_descriptor_stats.mismatches++ < 16) {
++                LOG_ERROR(Render_Vulkan,
++                          "Lichii #949 delta descriptors verify: pipeline {:016x} resolved other "
++                          "image descriptors or rescaling words than the previous draw",
++                          key.Hash());
++            }
++        }
++    }
++    if (desc_replay) {
++        ReportDeltaDescriptors();
++    }
+     if (buffers.any_buffer_uploaded) {
+         buffers.runtime.PostCopyBarrier();
+         buffers.any_buffer_uploaded = false;
+@@ -1017,6 +1121,16 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
+     return this->ConfigureDraw(rescaling, render_area);
+ }
+ 
++void GraphicsPipeline::KeepImageDescriptors(size_t stage, size_t first_entry) {
++    // EDEN_UP_L949_DESC_REPLAY (Lichii #949).
++    const DescriptorUpdateEntry* const entries = guest_descriptor_queue.UpdateData();
++    const size_t end_entry = guest_descriptor_queue.UpdateCount();
++    kept_image_ranges[stage] = {static_cast<u32>(kept_image_entries.size()),
++                                static_cast<u32>(end_entry - first_entry)};
++    kept_image_entries.insert(kept_image_entries.end(), entries + first_entry,
++                              entries + end_entry);
++}
++
+ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+                                      const RenderAreaPushConstant& render_area) {
+     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -261,6 +261,10 @@ private:
+     template <typename Spec>
+     bool ConfigureImpl(bool is_indexed);
+ 
++    /// EDEN_UP_L949_DESC_REPLAY: keeps the image descriptor entries `stage` pushed from
++    /// `first_entry` of the descriptor queue on.
++    void KeepImageDescriptors(size_t stage, size_t first_entry);
++
+     bool ConfigureDraw(const RescalingPushConstant& rescaling,
+                        const RenderAreaPushConstant& render_are);
+ 
+@@ -315,6 +319,14 @@ private:
+     std::array<u32, NUM_STAGES> handle_constant_buffers{};
+     std::vector<VideoCommon::ImageViewInOut> delta_views;
+     std::vector<VideoCommon::SamplerId> delta_samplers;
++    /// EDEN_UP_L949_DESC_REPLAY (zortos293/Lichii #949, ee98215f14): the image descriptor entries
++    /// (first entry and count per stage) and rescaling words pushed for delta_views, which delta
++    /// draws push again while no image changed its scale (TextureCache::ScaleEpoch).
++    std::vector<DescriptorUpdateEntry> kept_image_entries;
++    std::array<std::pair<u32, u32>, NUM_STAGES> kept_image_ranges{};
++    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> kept_rescaling{};
++    u64 kept_scale_epoch{};
++    bool kept_images_valid{};
+     std::array<u8, 8> fragment_color_components{};
+     /// EDEN_UP_DJ_FRAG_BARRIER: a stage writes storage buffers, images or global memory.
+     bool writes_storage{};
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -371,6 +371,16 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
+         }
+     }
+     taken_draw = draw;
++    if (FastDraw::UboKeepEnabled()) {
++        // EDEN_UP_L949_UBO_KEEP (Lichii #949): what BeginGraphicsUniforms reads, before the delta
++        // is emptied on the way out (only the binds and the device ranges).
++        taken_delta.binds = delta.binds;
++        taken_delta.num_device_writes = delta.num_device_writes;
++        std::copy_n(delta.device_begin.begin(), delta.num_device_writes,
++                    taken_delta.device_begin.begin());
++        std::copy_n(delta.device_end.begin(), delta.num_device_writes,
++                    taken_delta.device_end.begin());
++    }
+     return draw.pipeline;
+ }
+ 
+@@ -1065,6 +1075,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         (delta_path || verify_views) && DeltaStillHolds(draw_serial, draw_map_serial);
+     const bool delta_draw = delta_path && delta_holds;
+     const bool verify_draw = verify_views && delta_holds;
++    if (fast_draw_on && FastDraw::UboKeepEnabled()) {
++        // EDEN_UP_L949_UBO_KEEP (Lichii #949): each draw records the uniform buffers it streams;
++        // a delta draw may bind the previous draw's again (BufferCache::UniformRangeKept).
++        buffer_cache.BeginGraphicsUniforms(delta_draw ? &taken_delta : nullptr);
++    }
+     if (verify_views && !delta_holds) {
+         --fast_draw_stats.verified; // counted under its full draw reason instead, not compared
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -366,6 +366,9 @@ private:
+     void ReportFastDraws();
+     ReusableDraw reusable_draw;
+     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
++    /// EDEN_UP_L949_UBO_KEEP: the constant buffer binds and the device ranges of the inline
++    /// constant data since the previous draw, as TakeReusableDraw last returned a pipeline.
++    VideoCommon::Nx2FastDraw::Delta taken_delta;
+     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
+     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
+                Maxwell::MaxShaderStage>
+diff --git a/src/video_core/renderer_vulkan/vk_update_descriptor.h b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+--- a/src/video_core/renderer_vulkan/vk_update_descriptor.h
++++ b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+@@ -6,7 +6,9 @@
+ 
+ #pragma once
+ 
++#include <cstring>
+ #include <memory>
++#include <span>
+ #include <variant>
+ #include <vector>
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -63,6 +65,17 @@ public:
+         return upload_start;
+     }
+ 
++    /// Entries added since the last Acquire (EDEN_UP_L949_DESC_REPLAY).
++    size_t UpdateCount() const noexcept {
++        return upload_start ? static_cast<size_t>(payload_cursor - upload_start) : 0;
++    }
++
++    /// EDEN_UP_L949_DESC_REPLAY: entries an earlier draw added (fast draw delta draws).
++    void AddEntries(std::span<const DescriptorUpdateEntry> entries) {
++        std::memcpy(payload_cursor, entries.data(), entries.size_bytes());
++        payload_cursor += entries.size();
++    }
++
+     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
+         *(payload_cursor++) = VkDescriptorImageInfo{
+             .sampler = sampler,
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -4012,6 +4012,7 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
+ 
+ template <class P>
+ void TextureCache<P>::InvalidateScale(Image& image) {
++    ++scale_epoch; // EDEN_UP_L949_DESC_REPLAY: kept image descriptors are stale now
+     if (image.scale_tick <= frame_tick) {
+         image.scale_tick = frame_tick + 1;
+     }
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -239,6 +239,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     u64 astc_alpha_images{};
+     std::vector<u8> astc_scan_buffer;
+     u64 images_deleted{};
++    u64 scale_epoch{}; ///< InvalidateScale calls (EDEN_UP_L949_DESC_REPLAY)
+     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
+     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+ 
+@@ -519,6 +520,12 @@ public:
+ 
+     [[nodiscard]] bool IsRescaling(const ImageViewBase& image_view) const noexcept;
+ 
++    /// Counts InvalidateScale calls: an image changed its scale and lost its views (fast draw
++    /// delta draws replaying kept image descriptors, EDEN_UP_L949_DESC_REPLAY).
++    [[nodiscard]] u64 ScaleEpoch() const noexcept {
++        return scale_epoch;
++    }
++
+     /// Create channel state.
+     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
+ 

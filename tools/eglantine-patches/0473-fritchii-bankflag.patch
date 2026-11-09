@@ -64,7 +64,7 @@ pulls guest bytes in at the bind, earlier than the gather would. Without the fra
 the too-new risk BANK_REUPLOAD=4 showed at the pond. With the full frame wait (the play env) the
 game does not run a frame ahead, so test it with the wait on.
 
-T83: rebased onto the T83 stack (context only: fritchii-churn and fritchii2-lastaddr changed neighbouring lines).
+T83: rebased onto the T83 stack (context only: other T83 patches changed neighbouring lines).
 
 diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
 index 52889b8..2c89300 100644

@@ -68,6 +68,39 @@ void ResetCounters() noexcept {
         counter->store(0, std::memory_order_relaxed);
 }
 
+// ---- EDEN_UP_L961_ZERO_TRIM=1: zortos293/Lichii#961's schedule for the scanner (off unless set) ----
+//
+// Upstream (Ghostwolf13 #431, Zortos #961) takes resident all-zero guest pages out of the Windows
+// working set, in every title, a pass every 5 s while a pass finds 64 MiB or more, backing off to
+// once a minute. The scanner below already does the PS5's form of it for every title (a slot of
+// zeroes goes back whole, a written slot with many 16 KiB pages of zeroes becomes Fine), and does it
+// safely: the slot is fenced before the check, so a write meanwhile faults and waits. What it lacks
+// is the schedule: one pass every 20 s, however much each pass finds. With the switch:
+//   - a pass that gave back 64 MiB or more brings the next one in 5 s; otherwise the wait doubles,
+//     up to EDEN_UP_L961_ZERO_TRIM_MAX_S (default 20, T83's fixed wait; 60 is upstream's);
+//   - a pass that comes sooner than that after the last full one is a quick pass: it looks at Own
+//     slots only. Armed slots (EDEN_GUEST_SWAP) cannot have changed while armed, and lending each one
+//     costs two mprotects; full passes lend them, at T83's pace;
+//   - the Fine backoff counts full passes, and only a full pass ends one, so a slot made whole waits
+//     as long as it does in T83 (in full passes, at most MAX_S apart);
+//   - EDEN_CRAM_ZEROS is kept from full passes only (a quick pass does not see armed slots).
+// Readouts: EDEN_UP_L961 lines (each pass that gave back 64 MiB or more, and beside each EDEN_CRAM).
+std::atomic<bool> l961_zero_trim{false};
+std::atomic<unsigned> l961_max_s{20};
+constexpr std::uint64_t L961Busy = std::uint64_t{64} << 20;
+constexpr unsigned L961FastS = 5;
+std::atomic<std::uint64_t> l961_whole{0}, l961_fine{0}, l961_zero_filled{0}; // bytes, this session
+std::atomic<std::uint64_t> l961_passes{0}, l961_full{0}, l961_busy{0}, l961_interval_s{0};
+std::atomic<std::uint64_t> full_passes{0}; // passes that lent armed slots (all of them without the switch)
+// The pass count the Fine backoff runs on: every pass in T83, full passes with the switch.
+std::uint64_t BackoffPasses() noexcept {
+    return l961_zero_trim.load(std::memory_order_relaxed) ? full_passes.load(std::memory_order_relaxed)
+                                                          : counters.passes.load(std::memory_order_relaxed);
+}
+void L961Add(std::atomic<std::uint64_t>& counter, std::uint64_t bytes) noexcept {
+    if (l961_zero_trim.load(std::memory_order_relaxed)) counter.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 bool LockSlot(SparseRange& range, std::size_t slot, bool count_wait = false) noexcept {
     auto& state = range.state[slot];
     bool waited = false;
@@ -485,7 +518,7 @@ bool PromoteFine(SparseRange& range, std::size_t slot) noexcept {
     guest_committed.fetch_add(SparseSlot - kept * FinePage, std::memory_order_relaxed);
     const unsigned times = std::min<unsigned>(((range.fine[slot] >> 8) & 0xf) + 1, FineBackoffMax);
     range.fine[slot] = static_cast<std::uint16_t>(times << 8);
-    range.fine_after[slot] = static_cast<std::uint32_t>(counters.passes.load(std::memory_order_relaxed)) + (1u << times);
+    range.fine_after[slot] = static_cast<std::uint32_t>(BackoffPasses()) + (1u << times);
     counters.unfined.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -1678,6 +1711,7 @@ bool ScanZero(SparseRange& range, std::size_t slot) noexcept {
     if (zero) ReturnSlot(range, slot);
     else Unfence(at);
     UnlockSlot(range, slot, zero ? SlotZero : SlotOwn);
+    if (zero) L961Add(l961_whole, SparseSlot);
     return zero;
 }
 
@@ -1700,7 +1734,17 @@ void NoteZeroPages(std::size_t zeros, bool waiting) noexcept {
         zero_counts_now.waiting_pages.fetch_add(static_cast<std::uint32_t>(zeros), std::memory_order_relaxed);
     }
 }
-void KeepZeroCounts() noexcept {
+// A quick pass (EDEN_UP_L961_ZERO_TRIM) starts the counts again without keeping them.
+void KeepZeroCounts(bool keep = true) noexcept {
+    if (!keep) {
+        for (std::size_t place = 0; place < ZeroPlaces; ++place) {
+            zero_counts_now.slots[place].store(0, std::memory_order_relaxed);
+            zero_counts_now.pages[place].store(0, std::memory_order_relaxed);
+        }
+        zero_counts_now.waiting_slots.store(0, std::memory_order_relaxed);
+        zero_counts_now.waiting_pages.store(0, std::memory_order_relaxed);
+        return;
+    }
     for (std::size_t place = 0; place < ZeroPlaces; ++place) {
         zero_counts.slots[place].store(zero_counts_now.slots[place].exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
         zero_counts.pages[place].store(zero_counts_now.pages[place].exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
@@ -1710,11 +1754,16 @@ void KeepZeroCounts() noexcept {
 }
 
 // An Own slot with many pages of zeroes becomes Fine. A racy count first, then the count again fenced.
-bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
+// `quick` (EDEN_UP_L961_ZERO_TRIM): a quick pass never ends a backoff. The full pass that T83's count
+// ends it on must have run first (fine_after == full passes until then), so a slot made whole is made
+// Fine again no sooner than in T83, counted in full passes. fine_after 0: never made whole, no backoff.
+bool ScanFine(SparseRange& range, std::size_t slot, bool quick = false) noexcept {
     const std::uintptr_t at = SlotAddress(range, slot);
     std::size_t zeros = 0;
     for (std::size_t page = 0; page < FinePages; ++page) zeros += PageZero(at + page * FinePage);
-    const bool waiting = counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot];
+    const std::uint64_t done = BackoffPasses();
+    const std::uint32_t after = range.fine_after[slot];
+    const bool waiting = done < after || (quick && after != 0 && done == after);
     NoteZeroPages(zeros, waiting);
     if (waiting || zeros < fine_min_zero_pages) return false;
     LockSlot(range, slot);
@@ -1731,11 +1780,13 @@ bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
         ReturnSlot(range, slot);
         UnlockSlot(range, slot, SlotZero);
         counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
+        L961Add(l961_whole, SparseSlot);
         return true;
     }
     if (zeros >= fine_min_zero_pages) {
         fined = MakeFine(range, slot, zero, FinePages - zeros);
         if (!fined) counters.fine_failures.fetch_add(1, std::memory_order_relaxed);
+        else L961Add(l961_fine, zeros * FinePage);
     }
     if (!fined) Unfence(at);
     UnlockSlot(range, slot, fined ? SlotFine : SlotOwn);
@@ -1769,6 +1820,7 @@ bool ScanShare(SparseRange& range, std::size_t keep, std::size_t other) noexcept
             range.physical[other] = range.physical[keep];
             guest_committed.fetch_sub(SparseSlot, std::memory_order_relaxed);
             shared = true;
+            L961Add(l961_whole, SparseSlot);
         }
 #else
         (void)same;
@@ -1784,7 +1836,8 @@ bool ScanShare(SparseRange& range, std::size_t keep, std::size_t other) noexcept
     return shared;
 }
 
-void ScanPass(SparseRange& range) noexcept {
+// `full`: armed slots are lent and looked at too (every pass without EDEN_UP_L961_ZERO_TRIM).
+void ScanPass(SparseRange& range, bool full = true) noexcept {
     const auto start = std::chrono::steady_clock::now();
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
     std::vector<std::pair<std::uint64_t, std::size_t>> samples;
@@ -1792,7 +1845,7 @@ void ScanPass(SparseRange& range) noexcept {
         const std::uint8_t state = SlotState(range, slot);
 #ifdef PS5_NATIVE
         const std::uint32_t armed_at = range.swap[slot];
-        const bool armed = state == SlotProbe && LendArmedSlot(range, slot);
+        const bool armed = state == SlotProbe && full && LendArmedSlot(range, slot);
 #else
         constexpr bool armed = false;
 #endif
@@ -1800,7 +1853,7 @@ void ScanPass(SparseRange& range) noexcept {
         const std::uintptr_t at = SlotAddress(range, slot);
         if (AllZero(at)) { // a read without the lock: only a hint, checked again fenced
             if (ScanZero(range, slot)) counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
-        } else if (fine_requested.load(std::memory_order_relaxed) && ScanFine(range, slot)) {
+        } else if (fine_requested.load(std::memory_order_relaxed) && ScanFine(range, slot, !full)) {
             // now Fine
         } else if (dedup_requested.load(std::memory_order_relaxed)) {
             samples.emplace_back(SampleHash(at), slot);
@@ -1829,8 +1882,9 @@ void ScanPass(SparseRange& range) noexcept {
         }
         i = j;
     }
-    KeepZeroCounts();
+    KeepZeroCounts(full);
     counters.passes.fetch_add(1, std::memory_order_relaxed);
+    if (full) full_passes.fetch_add(1, std::memory_order_relaxed);
     counters.scan_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
 }
@@ -1870,6 +1924,17 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
         (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20));
     if (length > 0) Report(line);
+    if (l961_zero_trim.load(std::memory_order_relaxed)) {
+        char trim[224];
+        const int written = std::snprintf(trim, sizeof(trim),
+            "EDEN_UP_L961 %s passes=%llu full=%llu busy=%llu gave_back=%lluMiB whole=%lluMiB fine=%lluMiB "
+            "wait_s=%llu kernel_zero_filled=%lluMiB\n",
+            when, (unsigned long long)l961_passes.load(), (unsigned long long)l961_full.load(),
+            (unsigned long long)l961_busy.load(), (unsigned long long)((l961_whole.load() + l961_fine.load()) >> 20),
+            (unsigned long long)(l961_whole.load() >> 20), (unsigned long long)(l961_fine.load() >> 20),
+            (unsigned long long)l961_interval_s.load(), (unsigned long long)(l961_zero_filled.load() >> 20));
+        if (written > 0) Report(trim);
+    }
     SwapReport(range);
     // Where the slots lie, per GiB of the guest's memory: the kernel's pools are apart here (the
     // game's at the top, then the applets', then the system's, whose end nx2:gpu's blocks come from).
@@ -2041,15 +2106,55 @@ void MeasureFinePages(SparseRange& range) noexcept {
     if (length > 0) Report(line);
 }
 
+// EDEN_UP_L961_ZERO_TRIM=1 (zortos293/Lichii#961): one pass, full or quick, and the wait before the
+// next one: 5 s after a pass that gave back 64 MiB or more, else twice the last wait, up to the most.
+std::chrono::seconds L961Pass(SparseRange& range, std::chrono::seconds interval,
+                              std::chrono::steady_clock::time_point& last_full) noexcept {
+    const auto start = std::chrono::steady_clock::now();
+    const std::chrono::seconds most{l961_max_s.load(std::memory_order_relaxed)};
+    const bool full = start - last_full >= most;
+    if (full) last_full = start;
+    const std::uint64_t whole_before = l961_whole.load(std::memory_order_relaxed);
+    const std::uint64_t fine_before = l961_fine.load(std::memory_order_relaxed);
+    ScanPass(range, full);
+    const std::uint64_t whole = l961_whole.load(std::memory_order_relaxed) - whole_before;
+    const std::uint64_t fine = l961_fine.load(std::memory_order_relaxed) - fine_before;
+    l961_passes.fetch_add(1, std::memory_order_relaxed);
+    if (full) l961_full.fetch_add(1, std::memory_order_relaxed);
+    const bool busy = whole + fine >= L961Busy;
+    interval = busy ? std::chrono::seconds{L961FastS} : std::min(interval * 2, most);
+    l961_interval_s.store(static_cast<std::uint64_t>(interval.count()), std::memory_order_relaxed);
+    if (!busy) return interval;
+    l961_busy.fetch_add(1, std::memory_order_relaxed);
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    char line[224];
+    const int length = std::snprintf(line, sizeof(line),
+        "EDEN_UP_L961 pass gave back %lluMiB (whole %lluMiB, fine %lluMiB) of held=%zuMiB in %lldms full=%d, "
+        "next in %llds; kernel zero-filled %lluMiB so far\n",
+        (unsigned long long)((whole + fine) >> 20), (unsigned long long)(whole >> 20), (unsigned long long)(fine >> 20),
+        guest_committed.load(std::memory_order_relaxed) >> 20, ms, full ? 1 : 0,
+        static_cast<long long>(interval.count()), (unsigned long long)(l961_zero_filled.load() >> 20));
+    if (length > 0) Report(line);
+    return interval;
+}
+
 void ScannerLoop(SparseRange* range) {
     if (::eden_crash_name_thread) ::eden_crash_name_thread("CramScanner");  // crash report, thread dump
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    // 20 s between passes, or with EDEN_UP_L961_ZERO_TRIM what the passes give back says (L961Pass).
+    const bool adaptive = l961_zero_trim.load(std::memory_order_relaxed);
+    std::chrono::seconds interval{adaptive ? L961FastS : 20};
+    auto last_full = std::chrono::steady_clock::now();
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
-        scanner_wake.wait_for(lock, std::chrono::seconds(20), [] { return scanner_stop; });
+        scanner_wake.wait_for(lock, interval, [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
-        if (scan_requested.load(std::memory_order_relaxed)) ScanPass(*range);
+        if (scan_requested.load(std::memory_order_relaxed)) {
+            if (adaptive) interval = L961Pass(*range, interval, last_full);
+            else ScanPass(*range);
+        }
         if (std::chrono::steady_clock::now() >= next_report) {
             ServiceReport(*range, "now");
             next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -2195,6 +2300,17 @@ void ServiceStart(SparseRange& range) noexcept {
         return;
     }
     ResetCounters();
+    // EDEN_UP_L961_ZERO_TRIM=1 (zortos293/Lichii#961): the scanner's schedule (at L961Busy, above).
+    l961_zero_trim.store(Common::PeSwitch("EDEN_UP_L961_ZERO_TRIM"), std::memory_order_relaxed);
+    {
+        const char* most = std::getenv("EDEN_UP_L961_ZERO_TRIM_MAX_S");
+        const unsigned long asked = most != nullptr ? std::strtoul(most, nullptr, 10) : 0;
+        l961_max_s.store(asked >= L961FastS && asked <= 300 ? static_cast<unsigned>(asked) : 20u,
+                         std::memory_order_relaxed);
+    }
+    for (auto* counter : {&l961_whole, &l961_fine, &l961_zero_filled, &l961_passes, &l961_full, &l961_busy,
+                          &l961_interval_s, &full_passes})
+        counter->store(0, std::memory_order_relaxed);
     range.promote = true;
     const char* const free_return = std::getenv("EDEN_CRAM_FREE_RETURN");
     free_return_requested.store(free_return != nullptr && free_return[0] == '1', std::memory_order_relaxed);
@@ -2255,6 +2371,13 @@ void ServiceStart(SparseRange& range) noexcept {
                                      reserve_count.load() * (SparseSlot >> 20), fine_min_zero_pages,
                                      free_return_requested.load() ? 1 : 0);
     if (length > 0) Report(line);
+    if (l961_zero_trim.load(std::memory_order_relaxed)) {
+        const int written = std::snprintf(line, sizeof(line),
+                                          "EDEN_UP_L961_ZERO_TRIM on: first=%us fast=%us most=%us busy=%lluMiB\n",
+                                          L961FastS, L961FastS, l961_max_s.load(),
+                                          (unsigned long long)(L961Busy >> 20));
+        if (written > 0) Report(line);
+    }
 }
 
 void ServiceStop(SparseRange& range) noexcept {
@@ -2447,6 +2570,7 @@ void ClearGuestMemory(std::uint8_t* at, std::uint64_t offset, std::size_t bytes,
             UnlockSlot(*range, slot, SlotZero);
         } else if (SlotState(*range, slot) != SlotZero) {
             std::memset(at + (cursor - offset), 0, static_cast<std::size_t>(piece_end - cursor));
+            L961Add(l961_zero_filled, piece_end - cursor);
         }
         cursor = piece_end;
     }

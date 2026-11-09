@@ -25,6 +25,19 @@
 
 #include "fastmem.h"
 
+// EDEN_UP_* switches (guest_memory_service.inc). The host checks compile this file without the
+// core's include path (tools/check-jit-allocator.py): there, the same rule written out.
+#if __has_include("common/pe_switch.h")
+#include "common/pe_switch.h"
+#else
+namespace Common {
+inline bool PeSwitch(const char* name) noexcept {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+} // namespace Common
+#endif
+
 #if __has_include(<lz4.h>)
 #include <lz4.h>
 #define EDEN_SWAP_LZ4 1

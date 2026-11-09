@@ -1,0 +1,73 @@
+Subject: [PATCH] EDEN_UP_PIPELINE_LIST_KEEP: a session does not save the used-pipelines list, so test runs stop pushing the pipelines of real play off the list the next boot builds; EDEN_UP_PIPELINE_COLD: also builds no cached pipeline at boot, so every run pays the first-visit builds; both off by default
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index ef3950d..5d86f04 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -870,6 +870,29 @@ u32 NullSlotsMode() {
+     return mode;
+ }
+ 
++// EDEN_UP_PIPELINE_LIST_KEEP=1 (exact "1"): this session does not save the list of used pipelines
++// (<title>/vulkan_used.bin), so it does not count as one of the "last two sessions" whose
++// pipelines the next boot builds. For test runs: a scripted walk uses a few hundred pipelines, and
++// two such sessions in a row push everything else real play used off the list. The next
++// session then builds those on the GPU thread at first sight ("on disk, not built at boot": 255
++// of the 400 runtime builds in the play session of 9 Nov, which came after a night of batches).
++// The pipeline cache files themselves are written as always.
++bool UsedListKept() {
++    static const bool keep = Common::PeSwitch("EDEN_UP_PIPELINE_LIST_KEEP") ||
++                             Common::PeSwitch("EDEN_UP_PIPELINE_COLD");
++    return keep;
++}
++
++// EDEN_UP_PIPELINE_COLD=1 (exact "1"): no cached graphics pipeline is built at boot, so each is
++// built on the GPU thread the first time a draw needs it, as in an area the last two sessions
++// did not visit. Every run of a route then pays the same first-visit cost, which a repeated walk
++// otherwise hides after its first run. Includes EDEN_UP_PIPELINE_LIST_KEEP (the run must not
++// change what the next boot builds). EDEN_NX2_PRELOAD_ALL_PIPELINES=1 wins over it.
++bool PipelineColdBoot() {
++    static const bool cold = Common::PeSwitch("EDEN_UP_PIPELINE_COLD");
++    return cold;
++}
++
+ // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
+ bool PreloadAllPipelines() {
+     static const bool all = [] {
+@@ -914,6 +937,10 @@ PipelineCache::~PipelineCache() {
+ void PipelineCache::SaveUsedPipelines(bool queue_write) {
+     used_pipelines_saved = std::chrono::steady_clock::now();
+     used_pipelines_dirty = false;
++    // EDEN_UP_PIPELINE_LIST_KEEP / EDEN_UP_PIPELINE_COLD: the list stays as the last session left it.
++    if (UsedListKept()) {
++        return;
++    }
+     // A session too short to say what the game uses (a boot to the menu) keeps the old list.
+     constexpr size_t MinimumUsed = 64;
+     if (used_pipelines_filename.empty() ||
+@@ -1644,8 +1671,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         const u64 hash = key.Hash();
+         disk_pipelines.insert(hash);
+         if (!PreloadAllPipelines() &&
+-            (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
+-                                    : !used_pipelines.contains(hash))) {
++            (PipelineColdBoot() ||
++             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
++                                     : !used_pipelines.contains(hash)))) {
+             ++skipped_pipelines;
+             return;
+         }
+@@ -1685,6 +1713,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+                  "{} cached graphics pipelines are built when first needed",
+                  skipped_pipelines);
+     }
++    if (UsedListKept()) {
++        LOG_INFO(Render_Vulkan,
++                 "{}: {} cached graphics pipelines left for their first use, {} built at boot; "
++                 "this session does not save the used list",
++                 PipelineColdBoot() ? "EDEN_UP_PIPELINE_COLD=1" : "EDEN_UP_PIPELINE_LIST_KEEP=1",
++                 skipped_pipelines, queued_graphics);
++    }
+ 
+     std::unique_lock lock{state.mutex};
+     callback(VideoCore::LoadCallbackStage::Build, 0, state.total);
