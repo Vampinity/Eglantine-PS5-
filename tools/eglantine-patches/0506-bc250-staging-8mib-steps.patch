@@ -1,0 +1,397 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_STAGING_STEPS=1: staging buffers over 8 MiB in 8 MiB steps, idle ones let go each frame beyond 64 MiB (lethevimlet/oot-bc250 eeea507); EDEN_UP_STAGING_KEEP=1: one 128 MiB upload staging buffer made at the start and kept; both off by default
+
+lethevimlet/oot-bc250 eeea507 (Ocarina of Time on the BC-250, same GPU family and driver):
+staging buffers were powers of two and were let go one size level per frame. A Kokiri Forest
+load held 1.1 GiB of 256 MiB staging buffers while the board swapped the game out (reported
+~70 MiB held after the change). Ours rounds the same way (CreateStagingBuffer,
+`.size = 1ULL << log2_size`). On the console prepare-vulkan-port.py already makes a buffer the
+CPU maps its transfer in 16 MiB steps (headless/staging_buffers.h). What is new there: 8 MiB
+steps, the same for buffers only the GPU uses (the BC transcode output and the compute passes,
+still powers of two: a 136 MiB transcode output takes 256 MiB), and the prompt release.
+
+EDEN_UP_STAGING_STEPS=1 (Common::PeSwitch, exactly "1"):
+- a staging buffer over 8 MiB is its transfer rounded up to 8 MiB, never more than the size
+  chosen before (on the console the smaller of its 16 MiB step and the 8 MiB step);
+- each buffer records its size (capacity), and a kept one is handed out only when it holds the
+  transfer;
+- before a new buffer over 8 MiB is made, the idle ones over 8 MiB of its kind are let go;
+- each TickFrame, idle buffers over 8 MiB beyond 64 MiB per kind (device-local, upload,
+  download) are let go, the largest kept first. With EDEN_UP_STAGING_REUSE on, this limits the
+  idle 16 and 32 MiB upload buffers it keeps to 64 MiB, and making any new upload buffer over
+  8 MiB lets them all go first.
+Upstream's opt-out (EDEN_NX2_STAGING_POW2) is turned into this opt-in switch.
+On the console it gains little for Ocarina: device-local staging is about 0.6 MiB at the door
+and CPU-mapped buffers already come in 16 MiB steps. Its let-go-before-making can drop idle
+buffers in the middle of a burst that the next request would have reused, which can add fresh
+allocations in the door frame. Test it on its own, not stacked with KEEP. Same as upstream: the
+let-go-before-making can also drop a download buffer the GPU is done with before the CPU has
+read it; no caller asks for staging between Finish and that read today.
+
+EDEN_UP_STAGING_KEEP=1 (not upstream): the door hitch (batch t87-a, runs 739-743). In the ~1 s
+GPU-thread frame as the village appears, the buffer cache asks the pool for 128 MiB and then
+64 MiB of upload staging with nothing that large in it (stderr MKW_STAGING_MISS, upload pool
+busy=3 free=0): each a fresh allocation and mapping. With KEEP one upload buffer is made at the
+start, 128 MiB (EDEN_UP_STAGING_KEEP_MIB=<16..1024> sets it, rounded up to a power of two),
+written once and never swept. Only TakeKeptUpload hands it out, the normal lookup skips it: an
+upload that is not deferred, over one ring region and over a quarter of its size, takes it when
+no other buffer of its own level is free and the GPU is done with the kept one. The 128 MiB
+upload takes it, and the 64 MiB one too when the GPU has finished the first copy (in the run
+checked it had: tick 8296, completed 8288, the first copy 8268). 128 MiB is the size that covers both: at 256 MiB or more the 64 MiB upload is not
+over a quarter and makes its own buffer, at 64 MiB or less the 128 MiB one does not fit. The
+guest read into it (ReadGuestForBuffer) costs what it did.
+What is saved for sure is the allocation and mapping. Whether the first write costs anything on
+the console is not shown: the graphics pool may not fault on first touch. 0498's "staging made"
+time ends once the buffer is made and mapped; a first-write cost would show in its "buffer
+upload: 128.0 MiB ... took X ms" line, so compare that line, KEEP against control, with
+EDEN_UP_HITCH_TRACE=1.
+On the console ReleaseCompleted (memory short, a refused buffer) lets it go like any idle
+buffer; it is not made again, and the next large upload logs that. In the t87-a runs memory is
+not short before the door (short=0) and goes short right after it, so the kept buffer reaches
+the door but later areas get nothing from it. Making it at the start prints one set of
+MKW_STAGING_MISS lines (asked=134217728 at the default size, before the first frame): door-miss
+counts skip it.
+KEEP_MIB without KEEP=1 only logs a warning.
+
+Log lines (eden_log): "EDEN_UP_STAGING_STEPS: N MiB staging buffer for B bytes, not P MiB"
+(1st, 2nd, 4th ...), "EDEN_UP_STAGING_KEEP: 128 MiB upload staging buffer made at the start and
+kept", "... used for B bytes, n times so far" (every use counted, 1st, 2nd, 4th ... logged),
+"... was let go".
+
+Unset: buffers are sized, handed out and swept as before. The new capacity field is filled but
+read only under STEPS or by the kept buffer; kept is never set.
+
+PS5 prepare-vulkan-port.py: every anchor in these two files is byte-identical and still matches
+once (CreateStagingBuffer's signature, the vulkan_wrapper.h include, TickFrame's signature, the
+is_free lambda, the log2_size line, `.size = 1ULL << log2_size,`, the CreateBuffer line, the
+header's TickFrame declaration). The step is applied after the create info is built, so it
+takes the smaller of it and the console's `made`; the console's OOM retry only shrinks it
+further and capacity is read after it. Known gap: staging_buffers.h Holds() takes a GPU-only
+buffer to be its power of two, so under STEPS the "MiB of finished staging" the refusal hook
+counts is too high for those (by under half each), which can skip the guest-reserve lend in a
+refusal. Negligible in Ocarina; Holds() reading capacity would fix it.
+
+Not compiled or run here. git apply --check: clean on T88 and on T88 plus 0498-hitch-trace, in
+either order.
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 839f51e..c5b85ff 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <cstdlib>
++#include <cstring>
+ #include <utility>
+ #include <vector>
+ 
+@@ -115,6 +116,49 @@ size_t StreamRingSize(size_t chosen) {
+              (ring / StagingBufferPool::NUM_SYNCS) >> 10);
+     return ring;
+ }
++
++// EDEN_UP_STAGING_STEPS=1 (lethevimlet/oot-bc250 eeea507): staging buffers over 8 MiB are made
++// in 8 MiB steps, not the next power of two, and idle ones over 8 MiB go each frame beyond 64 MiB
++// of each kind. A Kokiri Forest load on the BC-250 held 1.1 GiB of them; with this, ~70 MiB.
++bool StagingSteps() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_STAGING_STEPS");
++    return enabled;
++}
++
++// EDEN_UP_STAGING_KEEP=1: one upload staging buffer made at the start and kept, for the large
++// buffer uploads of a new area (Ocarina, the village after Link's door: 128 MiB, then 64 MiB, each
++// a fresh allocation and mapping in the ~1 s frame). EDEN_UP_STAGING_KEEP_MIB=<16..1024> sets its
++// size, 128 MiB when unset. It is rounded up to a power of two: it then holds every transfer of
++// its size level, and the console's 16 MiB sizing (staging_buffers.h), which lets go of a kept
++// buffer too small for a transfer of its level, never lets it go for that. It serves uploads over
++// a quarter of its size (TakeKeptUpload): 128 MiB covers both door uploads, 256 MiB or more no
++// longer takes the 64 MiB one, 64 MiB or less never the 128 MiB one.
++VkDeviceSize KeptUploadBytes() {
++    const char* const mib_value = std::getenv("EDEN_UP_STAGING_KEEP_MIB");
++    if (!Common::PeSwitch("EDEN_UP_STAGING_KEEP")) {
++        if (mib_value != nullptr) {
++            LOG_WARNING(Render_Vulkan,
++                        "EDEN_UP_STAGING_KEEP_MIB={} is set without EDEN_UP_STAGING_KEEP=1: no "
++                        "upload buffer is kept",
++                        mib_value);
++        }
++        return 0;
++    }
++    constexpr unsigned long long DefaultMiB = 128;
++    constexpr unsigned long long MinMiB = 16;
++    constexpr unsigned long long MaxMiB = 1024;
++    unsigned long long mib = DefaultMiB;
++    if (mib_value != nullptr) {
++        const unsigned long long asked = std::strtoull(mib_value, nullptr, 10);
++        if (asked < MinMiB || asked > MaxMiB) {
++            LOG_WARNING(Render_Vulkan, "EDEN_UP_STAGING_KEEP_MIB={} is not {} to {}: {} MiB",
++                        mib_value, MinMiB, MaxMiB, DefaultMiB);
++        } else {
++            mib = asked;
++        }
++    }
++    return VkDeviceSize{1} << Common::Log2Ceil<u64>(static_cast<u64>(mib) << 20);
++}
+ } // Anonymous namespace
+ 
+ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
+@@ -152,6 +196,37 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
+     reserved_ci.size = 4_MiB;
+     reserved_ci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+     reserved_download = memory_allocator.CreateBuffer(reserved_ci, MemoryUsage::Download);
++
++    // EDEN_UP_STAGING_KEEP=1: the kept upload buffer, written once now so that its pages are
++    // there before the first large upload. Refused, the session goes on without it.
++    if (const VkDeviceSize keep = KeptUploadBytes(); keep != 0) {
++        try {
++            const StagingBufferRef ref =
++                CreateStagingBuffer(static_cast<size_t>(keep), MemoryUsage::Upload, false);
++            auto& entries = upload_cache[ref.log2_level].entries;
++            const auto it = std::find_if(entries.begin(), entries.end(),
++                                         [&ref](const StagingBuffer& entry) {
++                                             return entry.index == ref.index;
++                                         });
++            ASSERT(it != entries.end());
++            it->kept = true;
++            it->tick = 0;
++            if (!ref.mapped_span.empty()) {
++                std::memset(ref.mapped_span.data(), 0, ref.mapped_span.size());
++            }
++            kept_level = ref.log2_level;
++            kept_index = ref.index;
++            kept_size = it->capacity;
++            LOG_INFO(Render_Vulkan,
++                     "EDEN_UP_STAGING_KEEP: {} MiB upload staging buffer made at the start and kept",
++                     kept_size >> 20);
++        } catch (const vk::Exception& refused) {
++            LOG_WARNING(Render_Vulkan,
++                        "EDEN_UP_STAGING_KEEP: no {} MiB upload staging buffer at the start ({}): "
++                        "none kept",
++                        keep >> 20, refused.what());
++        }
++    }
+ }
+ 
+ StagingBufferPool::~StagingBufferPool() = default;
+@@ -243,6 +318,40 @@ void StagingBufferPool::TickFrame() {
+         ReleaseCache(MemoryUsage::Upload);
+         ReleaseCache(MemoryUsage::Download);
+     }
++    // EDEN_UP_STAGING_STEPS: idle buffers over 8 MiB beyond 64 MiB of each kind go now, not when
++    // the sweep above reaches their level (one level a frame, up to 4 with EDEN_NX2_CLEAN_BY_TIME,
++    // 16 buffers at most).
++    if (StagingSteps()) {
++        for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
++            ReleaseIdleLarge(*cache, LargeStagingReserve);
++        }
++    }
++}
++
++void StagingBufferPool::ReleaseIdleLarge(StagingBuffersCache& cache, VkDeviceSize keep) {
++    // Largest levels first: what stays is the largest idle buffers, the likeliest to fit again.
++    // A deferred buffer, one the GPU still reads and the kept upload buffer always stay.
++    VkDeviceSize kept_bytes = 0;
++    for (size_t log2 = NUM_LEVELS; log2-- > LargeStagingLog2 + 1;) {
++        StagingBuffers& staging = cache[log2];
++        auto& entries = staging.entries;
++        const auto end =
++            std::remove_if(entries.begin(), entries.end(), [&](const StagingBuffer& entry) {
++                if (entry.kept || entry.deferred || !scheduler.IsFree(entry.tick)) {
++                    return false;
++                }
++                if (kept_bytes + entry.capacity <= keep) {
++                    kept_bytes += entry.capacity;
++                    return false;
++                }
++                return true;
++            });
++        if (end != entries.end()) {
++            entries.erase(end, entries.end());
++            staging.delete_index = 0;
++            staging.iterate_index = 0;
++        }
++    }
+ }
+ 
+ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size, bool may_wait) {
+@@ -360,13 +469,23 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
+     const auto is_free = [this](const StagingBuffer& entry) {
+         return !entry.deferred && scheduler.IsFree(entry.tick);
+     };
++    // EDEN_UP_STAGING_STEPS: a level also holds buffers smaller than its power of two, and one
++    // is handed out only when it holds the transfer. The console's is_free (prepare-vulkan-port.py)
++    // knows only a mapped buffer's size and takes a GPU-only one to be its power of two, so this
++    // check stays. EDEN_UP_STAGING_KEEP: the kept buffer is never handed out here, only by
++    // TakeKeptUpload below, which turns down a deferred request (the unswizzle queue's would hold
++    // it until its unswizzle is done) and counts every use in the log. Unset (kept never set,
++    // STEPS off): as before.
++    const auto usable = [&is_free, size, steps = StagingSteps()](const StagingBuffer& entry) {
++        return is_free(entry) && !entry.kept && (!steps || entry.capacity >= size);
++    };
+     auto& entries = cache_level.entries;
+     const auto hint_it = entries.begin() + cache_level.iterate_index;
+-    auto it = std::find_if(entries.begin() + cache_level.iterate_index, entries.end(), is_free);
++    auto it = std::find_if(entries.begin() + cache_level.iterate_index, entries.end(), usable);
+     if (it == entries.end()) {
+-        it = std::find_if(entries.begin(), hint_it, is_free);
++        it = std::find_if(entries.begin(), hint_it, usable);
+         if (it == hint_it) {
+-            return std::nullopt;
++            return TakeKeptUpload(size, usage, deferred);
+         }
+     }
+     cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
+@@ -376,6 +495,44 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
+     return it->Ref();
+ }
+ 
++std::optional<StagingBufferRef> StagingBufferPool::TakeKeptUpload(size_t size, MemoryUsage usage,
++                                                                  bool deferred) {
++    // The only way the kept buffer is handed out, also for an upload of its own level, after the
++    // other free buffers of the request's level. Only a large upload: over a ring region and over
++    // a quarter of the kept buffer. A smaller one would hold it while the next large upload makes
++    // a buffer of its own anyway. Never deferred: that holds a buffer until it is given back.
++    // Unset (kept_size 0): nothing, as before.
++    if (kept_size == 0 || usage != MemoryUsage::Upload || deferred || size > kept_size ||
++        size <= region_size || size <= kept_size / 4) {
++        return std::nullopt;
++    }
++    auto& entries = upload_cache[kept_level].entries;
++    const auto it = std::find_if(entries.begin(), entries.end(), [this](const StagingBuffer& entry) {
++        return entry.index == kept_index;
++    });
++    if (it == entries.end()) {
++        // On the console the pool lets go of every idle buffer when the memory it shares with
++        // the GPU runs short or a buffer is refused. It is not made again.
++        LOG_WARNING(Render_Vulkan,
++                    "EDEN_UP_STAGING_KEEP: the kept {} MiB upload buffer was let go (memory short); "
++                    "large uploads make their own buffers again",
++                    kept_size >> 20);
++        kept_size = 0;
++        return std::nullopt;
++    }
++    if (it->deferred || !scheduler.IsFree(it->tick)) {
++        return std::nullopt;
++    }
++    it->tick = scheduler.CurrentTick();
++    static u64 times = 0;
++    if (++times; (times & (times - 1)) == 0) { // the 1st, 2nd, 4th, 8th ... time
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_STAGING_KEEP: kept {} MiB upload buffer used for {} bytes, {} times so far",
++                 kept_size >> 20, size, times);
++    }
++    return it->Ref();
++}
++
+ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
+     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
+     VkBufferCreateInfo buffer_ci = {
+@@ -390,6 +547,24 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+         .queueFamilyIndexCount = 0,
+         .pQueueFamilyIndices = nullptr,
+     };
++    // EDEN_UP_STAGING_STEPS=1: over 8 MiB, the transfer rounded up to 8 MiB (136 MiB, not 256),
++    // after the idle buffers over 8 MiB of this kind are let go. Never more than the size above,
++    // which on the console is already the transfer in 16 MiB steps for a buffer the CPU maps.
++    if (StagingSteps() && log2_size > LargeStagingLog2) {
++        const VkDeviceSize stepped =
++            Common::AlignUp(static_cast<VkDeviceSize>(size), LargeStagingStep);
++        if (stepped < buffer_ci.size) {
++            static u64 smaller = 0;
++            if (++smaller; (smaller & (smaller - 1)) == 0) { // the 1st, 2nd, 4th, 8th ... time
++                LOG_INFO(Render_Vulkan,
++                         "EDEN_UP_STAGING_STEPS: {} MiB staging buffer for {} bytes, not {} MiB "
++                         "({} so far)",
++                         stepped >> 20, size, buffer_ci.size >> 20, smaller);
++            }
++            buffer_ci.size = stepped;
++        }
++        ReleaseIdleLarge(GetCache(usage), 0);
++    }
+     if (device.IsExtTransformFeedbackSupported()) {
+         buffer_ci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+     }
+@@ -415,6 +590,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+         .usage = usage,
+         .log2_level = log2_size,
+         .index = unique_ids++,
++        .capacity = buffer_ci.size,
+         .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
+         .deferred = deferred,
+     });
+@@ -457,7 +633,8 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+         // nothing; it states that a handed-out deferred buffer is never counted or freed here.
+         size_t idle = 0;
+         std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
+-            return !entry.deferred && scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
++            return !entry.kept && !entry.deferred && scheduler.IsFree(entry.tick) &&
++                   ++idle > KeepPerLevel;
+         });
+         staging.delete_index = 0;
+         if (staging.iterate_index > entries.size()) {
+@@ -467,7 +644,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+     }
+ 
+     const auto is_deletable = [this](const StagingBuffer& entry) {
+-        return scheduler.IsFree(entry.tick);
++        return !entry.kept && scheduler.IsFree(entry.tick);
+     };
+     const size_t begin_offset = staging.delete_index;
+     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 3331ec7..c2677bf 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -87,8 +87,13 @@ private:
+         MemoryUsage usage;
+         u32 log2_level;
+         u64 index;
++        /// Its size. EDEN_UP_STAGING_STEPS makes buffers smaller than their level's power of two.
++        VkDeviceSize capacity{};
+         u64 tick = 0;
+         bool deferred{};
++        /// EDEN_UP_STAGING_KEEP: the upload buffer made at the start; the sweeps leave it and only
++        /// TakeKeptUpload hands it out.
++        bool kept{};
+ 
+         StagingBufferRef Ref() const noexcept {
+             return {
+@@ -110,6 +115,11 @@ private:
+     };
+ 
+     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
++    /// EDEN_UP_STAGING_STEPS: buffers over 2^23 bytes (8 MiB) are made in 8 MiB steps.
++    static constexpr u32 LargeStagingLog2 = 23;
++    static constexpr VkDeviceSize LargeStagingStep = VkDeviceSize{8} << 20;
++    /// EDEN_UP_STAGING_STEPS: idle buffers over 8 MiB kept between frames, per memory usage.
++    static constexpr VkDeviceSize LargeStagingReserve = VkDeviceSize{64} << 20;
+     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
+ 
+     StagingBufferRef GetStreamBuffer(size_t size, bool may_wait);
+@@ -131,6 +141,13 @@ private:
+     void ReleaseCache(MemoryUsage usage);
+ 
+     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
++
++    /// EDEN_UP_STAGING_STEPS: lets go of idle buffers over 8 MiB, keeping up to `keep` bytes.
++    void ReleaseIdleLarge(StagingBuffersCache& cache, VkDeviceSize keep);
++
++    /// EDEN_UP_STAGING_KEEP: the kept upload buffer, for a large upload with none of its own size.
++    std::optional<StagingBufferRef> TakeKeptUpload(size_t size, MemoryUsage usage, bool deferred);
++
+     size_t Region(size_t iter) const noexcept {
+         return iter / region_size;
+     }
+@@ -163,6 +180,11 @@ private:
+     VideoCommon::FrameSteps frame_steps;
+     u64 buffer_index = 0;
+     u64 unique_ids{};
++
++    /// EDEN_UP_STAGING_KEEP: the kept upload buffer's level, index and size (0: none).
++    u32 kept_level = 0;
++    u64 kept_index = 0;
++    VkDeviceSize kept_size = 0;
+ };
+ 
+ } // namespace Vulkan

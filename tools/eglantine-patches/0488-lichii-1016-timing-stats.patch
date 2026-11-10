@@ -1,0 +1,228 @@
+Subject: [PATCH] Lichii #1016: HostTiming waits in the OS (EDEN_UP_L1016_TIMING_SLEEP) and wait stats (EDEN_UP_L1016_STATS); both off by default
+
+Port of zortos293/Lichii #1016 (zortos293, merged as b9bb5a0992; "core_timing: sleep the
+HostTiming thread in the OS instead of a hardware wait"), which follows Eglantine #538
+(a51de161ed, pretend7979). On top of T85 (0001..0486). Touches src/core/core_timing.cpp only; no
+headless derivation reads that file.
+
+Mapped against T85:
+- The busy wait #1016 removes: Event::WaitFor's MONITORX/MWAITX and UMONITOR/UMWAIT loop
+  (common/thread.cpp:647-702) is inside `#ifdef _WIN32`. The PS5 target (x86_64-sie-ps5) predefines
+  __FreeBSD__, __PROSPERO__ and __unix__, not _WIN32, so the PS5 build compiles the `#else`
+  branch, a condition-variable wait_for (thread.cpp:704-708). The HostTiming thread already blocks
+  in the OS on the PS5; cpu_features' caps.monitorx is read but nothing on this target uses it.
+- Upstream's Event::SleepFor is a Windows high-resolution waitable timer and, off Windows,
+  `return WaitFor(time)`. Not ported as a new Event method: Event::WaitUntil is already a
+  condition-variable wait on every platform, and TIMING_SLEEP uses it.
+- HOST_WAIT_MARGIN_NS (0 upstream): not ported. With both halves the same condition variable on
+  the PS5 a margin changes nothing; upstream found margins never sleep at 7.6k-16.7k waits/s.
+- Upstream's per-second HostTiming stats line and debug-server toggle: the stats are ported as a
+  10 s line (below); the debug-server tool, docs and tests are not.
+- Event::WaitFor's other caller (audio_core/renderer/system.cpp:448, a 1 s terminate wait) is
+  unchanged.
+
+What each switch does (Common::PeSwitch, exactly "1"; read once when the timer thread starts):
+EDEN_UP_L1016_TIMING_SLEEP=1: the timer thread waits for the next event with Event::WaitUntil
+  (steady clock deadline) instead of Event::WaitFor. On the PS5 both are the same condition
+  variable wait, so this is expected to change nothing there; it is the port's behaviour half,
+  kept so the stats can show it. Set() (every ScheduleEvent) still ends the wait at once and the
+  loop re-runs Advance(), so an event scheduled earlier during the wait is not missed.
+EDEN_UP_L1016_STATS=1 (no behaviour change; any arm, the control included) logs every 10 s:
+  "Lichii #1016 HostTiming in 10.0 s (EDEN_UP_L1016_TIMING_SLEEP=0|1): W waits, S woken by Set,
+  T timed out; timed-out waits late p50/p99/max a/b/c us; in wait X ms/s, thread CPU Y ms/s (-1:
+  no clock); CPUs 0x...". Late = how long after its deadline a wait that timed out returned (the
+  oversleep; Set wakes are not counted), from a 1 us histogram (p50/p99 top out at 8191; max is
+  exact), so the 10 s report costs no sort on the timer thread. In wait = time inside the waits per second; thread CPU =
+  CLOCK_THREAD_CPUTIME_ID per second (a busy-waiting core shows about 1000); CPUs = the thread's
+  affinity mask on the PS5. A start line "Lichii #1016: EDEN_UP_L1016_TIMING_SLEEP=.. STATS=.."
+  shows the switches as read.
+Both unset: the timer loop runs T85's WaitFor call as before (two getenv reads at thread start).
+
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -5,11 +5,15 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <ctime>
+ #include <mutex>
+ #include <string>
+ #include <tuple>
++#include <vector>
+ #include "common/cpu_features.h"
+ #include "common/cpu_features.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
+ 
+ #ifdef _WIN32
+ #include "common/windows/timer_resolution.h"
+@@ -19,6 +23,11 @@
+ #include "core/core_timing.h"
+ #include "core/hardware_properties.h"
+ 
++#if defined(__PROSPERO__)
++#include <sys/param.h>
++#include <sys/cpuset.h>
++#endif
++
+ namespace Core::Timing {
+ 
+ constexpr s64 MAX_SLICE_LENGTH = 10000;
+@@ -37,7 +46,125 @@
+         return CPU_CLOCK_BASE_MHZ;
+     }
+ }
++
++namespace {
++
++// zortos293/Lichii #1016 (zortos293), after Eglantine #538 (pretend7979): the timer thread's wait
++// for the next event. Upstream's Windows wait was a user-mode MWAITX/UMWAIT loop that kept a core
++// busy; #1016 sleeps in the OS instead. Event::WaitFor takes that loop only under _WIN32, and
++// elsewhere it is already a condition-variable wait, which is also what #1016 does off Windows.
++// EDEN_UP_L1016_TIMING_SLEEP=1: wait with Event::WaitUntil, the condition variable on every
++// platform (upstream's high-resolution Windows timer is not ported). Set() still ends the wait at
++// once, so an event scheduled earlier during the wait is picked up by the next Advance().
++// EDEN_UP_L1016_STATS=1: one line every 10 s about these waits (no behaviour change).
++// Both are read once, when the timer thread starts.
++struct L1016Waits {
++    bool sleep = false;
++    bool stats = false;
++    s64 start = 0;
++    s64 cpu_start = -1;
++    s64 waited_ns = 0;
++    u64 waits = 0;
++    u64 set_wakes = 0;
++    u64 timeouts = 0;
++    // How late each timed-out wait returned past its deadline, in 1 us buckets (the last bucket
++    // also holds anything later), plus the exact maximum. A histogram, not a list to sort: at
++    // about 10^5 waits per 10 s a sort would hold up this thread, and its events, for milliseconds.
++    // Allocated once, when STATS is on.
++    static constexpr std::size_t LATE_BUCKETS = 8192;
++    std::vector<u32> late;
++    u64 late_count = 0;
++    s64 late_max_ns = 0;
++
++    static s64 ThreadCpuNs() {
++#if defined(CLOCK_THREAD_CPUTIME_ID)
++        timespec ts{};
++        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
++            return static_cast<s64>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
++        }
++#endif
++        return -1;
++    }
++
++    static unsigned long long AffinityMask() {
++        unsigned long long mask = 0;
++#if defined(__PROSPERO__)
++        cpuset_t set{};
++        if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(unsigned long long),
++                               &set) == 0) {
++            for (unsigned cpu = 0; cpu < 64; ++cpu) {
++                if (CPU_ISSET(cpu, &set)) {
++                    mask |= 1ULL << cpu;
++                }
++            }
++        }
++#endif
++        return mask;
++    }
++
++    template <typename Now>
++    void Wait(Common::Event& event, s64 deadline, s64 wait_ns, Now&& now_ns) {
++        const s64 begin = stats ? now_ns() : 0;
++        const bool set =
++            sleep ? event.WaitUntil(std::chrono::steady_clock::now() + std::chrono::nanoseconds(wait_ns))
++                  : event.WaitFor(std::chrono::nanoseconds(wait_ns));
++        if (!stats) {
++            return;
++        }
++        const s64 end = now_ns();
++        ++waits;
++        waited_ns += end - begin;
++        if (set) {
++            ++set_wakes;
++        } else {
++            ++timeouts;
++            const s64 late_ns = std::max<s64>(end - deadline, 0);
++            ++late[std::min<std::size_t>(static_cast<std::size_t>(late_ns / 1000), LATE_BUCKETS - 1)];
++            ++late_count;
++            late_max_ns = std::max(late_max_ns, late_ns);
++        }
++        if (start == 0) {
++            start = end;
++            cpu_start = ThreadCpuNs();
++        } else if (end - start >= 10'000'000'000) {
++            Report(end);
++        }
++    }
+ 
++    void Report(s64 now) {
++        const f64 seconds = static_cast<f64>(now - start) / 1e9;
++        // The bucket (us) that holds the index-th smallest late value.
++        const auto at = [this](u64 index) {
++            u64 seen = 0;
++            for (std::size_t us = 0; us < late.size(); ++us) {
++                seen += late[us];
++                if (seen > index) {
++                    return static_cast<s64>(us);
++                }
++            }
++            return s64{0};
++        };
++        const s64 cpu = ThreadCpuNs();
++        const f64 cpu_ms = cpu >= 0 && cpu_start >= 0 ? static_cast<f64>(cpu - cpu_start) / 1e6 / seconds
++                                                      : -1.0;
++        LOG_INFO(Core_Timing,
++                 "Lichii #1016 HostTiming in {:.1f} s (EDEN_UP_L1016_TIMING_SLEEP={}): {} waits, {} "
++                 "woken by Set, {} timed out; timed-out waits late p50/p99/max {}/{}/{} us; in wait "
++                 "{:.1f} ms/s, thread CPU {:.1f} ms/s (-1: no clock); CPUs {:#x}",
++                 seconds, sleep ? 1 : 0, waits, set_wakes, timeouts, at(late_count / 2),
++                 at(late_count * 99 / 100), late_max_ns / 1000,
++                 static_cast<f64>(waited_ns) / 1e6 / seconds, cpu_ms, AffinityMask());
++        start = now;
++        cpu_start = cpu;
++        waited_ns = 0;
++        waits = set_wakes = timeouts = late_count = 0;
++        late_max_ns = 0;
++        std::fill(late.begin(), late.end(), 0u);
++    }
++};
++
++} // Anonymous namespace
++
+ std::shared_ptr<EventType> CreateEvent(std::string name, TimedCallback&& callback) {
+     return std::make_shared<EventType>(std::move(callback), std::move(name));
+ }
+@@ -77,6 +204,16 @@
+             Common::SetCurrentThreadToPerformanceCores();
+             on_thread_init();
+             has_started = true;
++            L1016Waits l1016;
++            l1016.sleep = Common::PeSwitch("EDEN_UP_L1016_TIMING_SLEEP");
++            l1016.stats = Common::PeSwitch("EDEN_UP_L1016_STATS");
++            if (l1016.stats) {
++                l1016.late.assign(L1016Waits::LATE_BUCKETS, 0u);
++            }
++            if (l1016.sleep || l1016.stats) {
++                LOG_INFO(Core_Timing, "Lichii #1016: EDEN_UP_L1016_TIMING_SLEEP={} EDEN_UP_L1016_STATS={}",
++                         l1016.sleep ? 1 : 0, l1016.stats ? 1 : 0);
++            }
+ 
+             // base frequency in MHz: 1ns (10^-9) = 1GHz (10^9)
+             while (!stop_token.stop_requested()) {
+@@ -86,7 +223,12 @@
+                         // There are more events left in the queue, wait until the next event.
+                         auto const wait_time = *next_time - GetGlobalTimeNs().count();
+                         if (wait_time > 0) {
+-                            event.WaitFor(std::chrono::nanoseconds(wait_time));
++                            if (!l1016.sleep && !l1016.stats) {
++                                event.WaitFor(std::chrono::nanoseconds(wait_time));
++                            } else {
++                                l1016.Wait(event, *next_time, wait_time,
++                                           [this] { return GetGlobalTimeNs().count(); });
++                            }
+                         }
+                     } else {
+                         // Queue is empty, wait until another event is scheduled and signals us to

@@ -289,6 +289,7 @@ struct eden_heap_thread {
   long live;
   long blocks;
   unsigned pending;
+  unsigned starve_left; /* EDEN_TEST_HEAP_STARVE: this thread's next refusals */
   /* Small requests that went to the heap's spaces, frees there, and their cycles: added to the
    * process's totals with live and blocks (eden_heap_flush). */
   unsigned long long spills, spill_cycles, shared_frees, shared_free_cycles;
@@ -1753,8 +1754,95 @@ void eden_heap_arena_report(void) {
           (slack > named ? slack - named : 0) >> 20);
 }
 
+/* EDEN_UP_HEAP_RESCUE=1 (off unless set; read from main in eden_heap_pool_init): a request the
+ * heap is about to refuse (no room in the thread's arenas or the heap's spaces, and the pool has
+ * no memory to grow with) is asked of every arena, whoever's it is, before it fails. Arenas take
+ * requests under 256 KiB only and a thread uses its own, so at a refusal the heap can hold
+ * hundreds of MiB it cannot give: at a crash in free play on 10 Nov 2026 it held 1760 MiB with 866 MiB in
+ * use, 372 MiB of that in whole free 2 MiB pages, while 968 requests of 280 to 750 KiB failed and
+ * the driver's shader compiler, which does not check its allocations, ended the session. An arena
+ * serves any thread (mspaces take their own locks, and a block finds its arena by its address), so
+ * the block is freed like any other. Up to 4 MiB: an arena is 8 MiB. Under the creation lock, as
+ * every walk of the arena list. */
+#define EDEN_HEAP_RESCUE_MAX ((size_t)4 << 20)
+static atomic_int eden_heap_rescue_on;
+static atomic_uint eden_heap_rescue_next;
+static atomic_ullong eden_heap_rescued, eden_heap_rescue_missed;
+
+void eden_heap_set_rescue(int on) {
+  atomic_store_explicit(&eden_heap_rescue_on, on, memory_order_relaxed);
+}
+
+void eden_heap_rescue_stats(unsigned long long *rescued, unsigned long long *missed) {
+  *rescued = atomic_load_explicit(&eden_heap_rescued, memory_order_relaxed);
+  *missed = atomic_load_explicit(&eden_heap_rescue_missed, memory_order_relaxed);
+}
+
+static void *eden_heap_arena_rescue(size_t count, size_t size, int zero) {
+  if (!atomic_load_explicit(&eden_heap_rescue_on, memory_order_relaxed) || count * size > EDEN_HEAP_RESCUE_MAX)
+    return NULL;
+  /* Not for a request made under the creation lock (a report that prints while it walks the
+   * arenas): the lock is not recursive. */
+  if (atomic_load_explicit(&eden_heap_create_holder, memory_order_relaxed) == (unsigned long)pthread_self())
+    return NULL;
+  void *address = NULL;
+  eden_heap_create_acquire();
+  const unsigned arenas = atomic_load_explicit(&eden_heap_arena_count, memory_order_acquire);
+  const unsigned start = atomic_fetch_add_explicit(&eden_heap_rescue_next, 1, memory_order_relaxed);
+  for (unsigned i = 0; i < arenas && address == NULL; ++i) {
+    void *arena = eden_heap_arena_list[(start + i) % arenas];
+    if (arena == NULL || eden_heap_is_spare(arena))
+      continue; /* a spare goes whole to the next thread that needs an arena */
+    address = eden_heap_arena_try(arena, count, size, zero);
+  }
+  eden_heap_create_release();
+  atomic_fetch_add_explicit(address != NULL ? &eden_heap_rescued : &eden_heap_rescue_missed, 1, memory_order_relaxed);
+  return address;
+}
+
+/* EDEN_TEST_HEAP_STARVE=<every>[,<attempts>] (a test, off unless set; read from main in
+ * eden_heap_pool_init, headless/heap_pages.cpp): on a pipeline builder thread ("VkPipeline..."),
+ * every <every>-th request of 256 KiB or more is refused as if the heap had nothing to give, and so
+ * are that thread's next <attempts> - 1 requests of that size (default 150: 300 ms of
+ * EDEN_UP_HEAP_WAIT_MS's 2 ms steps). No memory is taken away, so nothing else runs short: the
+ * pool hog (EDEN_TEST_POOL_HOG_MIB) ended runs in the guest's memory or the driver's before a
+ * builder was ever refused. Without EDEN_UP_HEAP_WAIT_MS the first refusal reaches the driver's
+ * shader compiler as NULL, as on 10 Nov 2026; with it the builder has to come through. */
+static atomic_uint eden_heap_starve_every, eden_heap_starve_attempts;
+static atomic_ullong eden_heap_starve_seen, eden_heap_starve_begun, eden_heap_starve_refused;
+
+void eden_heap_set_starve(unsigned every, unsigned attempts) {
+  atomic_store_explicit(&eden_heap_starve_attempts, attempts != 0 ? attempts : 150u, memory_order_relaxed);
+  atomic_store_explicit(&eden_heap_starve_every, every, memory_order_relaxed);
+}
+
+void eden_heap_starve_stats(unsigned long long *begun, unsigned long long *refused) {
+  *begun = atomic_load_explicit(&eden_heap_starve_begun, memory_order_relaxed);
+  *refused = atomic_load_explicit(&eden_heap_starve_refused, memory_order_relaxed);
+}
+
+static int eden_heap_starve(size_t bytes) {
+  const unsigned every = atomic_load_explicit(&eden_heap_starve_every, memory_order_relaxed);
+  if (every == 0 || bytes < EDEN_HEAP_SMALL_REQUEST)
+    return 0;
+  struct eden_heap_thread *self = eden_heap_self();
+  if (self == NULL || strncmp(self->name, "VkPipeline", 10) != 0)
+    return 0;
+  if (self->starve_left == 0) {
+    if ((atomic_fetch_add_explicit(&eden_heap_starve_seen, 1, memory_order_relaxed) + 1) % every != 0)
+      return 0;
+    self->starve_left = atomic_load_explicit(&eden_heap_starve_attempts, memory_order_relaxed);
+    atomic_fetch_add_explicit(&eden_heap_starve_begun, 1, memory_order_relaxed);
+  }
+  --self->starve_left;
+  atomic_fetch_add_explicit(&eden_heap_starve_refused, 1, memory_order_relaxed);
+  return 1;
+}
+
 static void *eden_heap_allocate(size_t count, size_t size, int zero) {
   const size_t bytes = count * size;
+  if (eden_heap_starve(bytes))
+    return NULL;
   if (bytes >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows) {
     /* Memory of its own (it arrives zeroed). With every entry taken, or no memory left to take,
      * the heap's spaces: a piece committed earlier may still have the room. */
@@ -1768,18 +1856,108 @@ static void *eden_heap_allocate(size_t count, size_t size, int zero) {
       return NULL;
     }
   }
+  void *address;
   if (bytes < EDEN_HEAP_SMALL_REQUEST) {
-    void *address = eden_heap_arena_allocate(count, size, zero);
-    return address != NULL ? address : eden_heap_spill(count, size, zero);
+    address = eden_heap_arena_allocate(count, size, zero);
+    if (address == NULL)
+      address = eden_heap_spill(count, size, zero);
+  } else {
+    address = zero ? eden_heap_main(EDEN_HEAP_CALLOC, count, size) : eden_heap_main(EDEN_HEAP_MALLOC, bytes, 0);
   }
-  return zero ? eden_heap_main(EDEN_HEAP_CALLOC, count, size) : eden_heap_main(EDEN_HEAP_MALLOC, bytes, 0);
+  if (address == NULL && bytes != 0)
+    address = eden_heap_arena_rescue(count, size, zero);
+  return address;
+}
+
+/* EDEN_UP_HEAP_WAIT_MS=<n> (0 or unset: off; read from main in eden_heap_pool_init, headless/heap_pages.cpp).
+ * A pipeline builder thread ("VkPipeline..." by the name on its record) whose request the heap
+ * cannot serve asks again every 2 ms, for up to n ms, instead of getting NULL at once. The
+ * driver's shader compiler does not check its allocations (RADV's NIR passes over ralloc): a NULL
+ * there ended the session with a SIGSEGV in nir_opt_copy_prop_vars (10 Nov 2026, in free
+ * play, largest free block 3 MiB; the same on a PS5 Pro in issue 21). While a request waits,
+ * eden_heap_wanted() is not 0 and the caches see memory short with none free
+ * (headless/performance.cpp, GraphicsMemoryShort, as for a guest write that waits for a block), so
+ * the texture collector evicts at its hardest until the request is served. The builders are
+ * background threads: a wait holds one pipeline up, not the frame. Still nothing after n ms: NULL
+ * as before. eden_heap_wait_stats counts the waits for the 20 s heap line. */
+static atomic_uint eden_heap_wait_ms;
+static atomic_uint eden_heap_waiting;
+static atomic_ullong eden_heap_wait_count, eden_heap_wait_total_ms, eden_heap_wait_lost;
+static atomic_uint eden_heap_wait_longest_ms;
+
+void eden_heap_set_wait_ms(unsigned ms) {
+  atomic_store_explicit(&eden_heap_wait_ms, ms, memory_order_relaxed);
+}
+
+unsigned eden_heap_wanted(void) {
+  return atomic_load_explicit(&eden_heap_waiting, memory_order_relaxed);
+}
+
+void eden_heap_wait_stats(unsigned long long *count, unsigned long long *total_ms, unsigned *longest_ms,
+                          unsigned long long *lost) {
+  *count = atomic_load_explicit(&eden_heap_wait_count, memory_order_relaxed);
+  *total_ms = atomic_load_explicit(&eden_heap_wait_total_ms, memory_order_relaxed);
+  *longest_ms = atomic_load_explicit(&eden_heap_wait_longest_ms, memory_order_relaxed);
+  *lost = atomic_load_explicit(&eden_heap_wait_lost, memory_order_relaxed);
+}
+
+static int eden_heap_may_wait(void) {
+  if (atomic_load_explicit(&eden_heap_wait_ms, memory_order_relaxed) == 0)
+    return 0;
+  struct eden_heap_thread *self = eden_heap_self();
+  return self != NULL && strncmp(self->name, "VkPipeline", 10) == 0;
+}
+
+/* A request that just failed, on a thread that may wait: `again` makes it once more (NULL: not
+ * yet). Returns its block, or NULL when the time is up. */
+static void *eden_heap_wait_for(void *(*again)(void *), void *request) {
+  const unsigned limit = atomic_load_explicit(&eden_heap_wait_ms, memory_order_relaxed);
+  void *block = NULL;
+  unsigned waited = 0;
+  atomic_fetch_add_explicit(&eden_heap_waiting, 1, memory_order_relaxed);
+  while (block == NULL && waited < limit) {
+    sceKernelUsleep(2000);
+    waited += 2;
+    block = again(request);
+  }
+  atomic_fetch_sub_explicit(&eden_heap_waiting, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_wait_count, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_wait_total_ms, waited, memory_order_relaxed);
+  if (block == NULL)
+    atomic_fetch_add_explicit(&eden_heap_wait_lost, 1, memory_order_relaxed);
+  unsigned longest = atomic_load_explicit(&eden_heap_wait_longest_ms, memory_order_relaxed);
+  while (waited > longest &&
+         !atomic_compare_exchange_weak_explicit(&eden_heap_wait_longest_ms, &longest, waited, memory_order_relaxed,
+                                                memory_order_relaxed)) {
+  }
+  return block;
+}
+
+struct eden_heap_wait_request {
+  size_t count, size, alignment;
+  int zero;
+};
+
+static void *eden_heap_wait_allocate_again(void *request) {
+  const struct eden_heap_wait_request *r = request;
+  return eden_heap_allocate(r->count, r->size, r->zero);
+}
+
+/* eden_heap_allocate, and on a thread that may wait, again until it is served or the time is up. */
+static void *eden_heap_allocate_or_wait(size_t count, size_t size, int zero) {
+  void *block = eden_heap_allocate(count, size, zero);
+  if (block == NULL && count * size != 0 && eden_heap_may_wait()) {
+    struct eden_heap_wait_request request = {count, size, 0, zero};
+    block = eden_heap_wait_for(eden_heap_wait_allocate_again, &request);
+  }
+  return block;
 }
 
 void *__wrap_malloc(size_t size) {
   if (!ps5_heap_ready())
     return __real_malloc(size);
   void *cached = eden_tcache_take(size);
-  void *block = cached != NULL ? cached : eden_heap_record(eden_heap_allocate(1, size, 0), size);
+  void *block = cached != NULL ? cached : eden_heap_record(eden_heap_allocate_or_wait(1, size, 0), size);
   eden_site_alloc(block, size);
   return block;
 }
@@ -1796,7 +1974,7 @@ void *__wrap_calloc(size_t count, size_t size) {
     eden_site_alloc(cached, count * size);
     return memset(cached, 0, count * size);
   }
-  void *block = eden_heap_record(eden_heap_allocate(count, size, 1), count * size);
+  void *block = eden_heap_record(eden_heap_allocate_or_wait(count, size, 1), count * size);
   eden_site_alloc(block, count * size);
   return block;
 }
@@ -1837,7 +2015,7 @@ static void *eden_realloc_inner(void *address, size_t size) {
   }
   /* The block cannot stay where it is (its arena or its piece of the heap is full, or it
    * crosses the size at which blocks get memory of their own): move it. */
-  void *moved = eden_heap_allocate(1, size, 0);
+  void *moved = eden_heap_allocate_or_wait(1, size, 0);
   if (moved == NULL) {
     eden_heap_failed(size, atomic_load_explicit(&eden_heap_grow_why, memory_order_relaxed));
     return NULL;
@@ -1885,6 +2063,32 @@ void __wrap_free(void *address) {
     __real_free(address);
 }
 
+/* One try of posix_memalign's request: the block, or NULL. */
+static void *eden_heap_aligned_try(size_t alignment, size_t size) {
+  void *block = NULL;
+  if (size < EDEN_HEAP_SMALL_REQUEST && alignment <= 4096) {
+    void *arena = eden_heap_thread_arena();
+    if (arena != NULL) {
+      if (sceLibcMspacePosixMemalign(arena, &block, alignment, size) == 0) {
+        eden_heap_arena_took(block);
+        return block;
+      }
+      block = NULL;
+    }
+  }
+  /* A large block's own memory starts on a page; the heap's spaces align anything. */
+  if (alignment <= 4096 && size >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows)
+    block = eden_heap_large_allocate(size);
+  if (block == NULL)
+    block = eden_heap_main(EDEN_HEAP_ALIGNED, alignment, size);
+  return block;
+}
+
+static void *eden_heap_wait_aligned_again(void *request) {
+  const struct eden_heap_wait_request *r = request;
+  return eden_heap_aligned_try(r->alignment, r->size);
+}
+
 int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
   if (!ps5_heap_ready())
     return __real_posix_memalign(address, alignment, size);
@@ -1892,26 +2096,16 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
   if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0)
     return EINVAL;
   int result = ENOMEM;
-  if (size < EDEN_HEAP_SMALL_REQUEST && alignment <= 4096) {
-    void *arena = eden_heap_thread_arena();
-    if (arena != NULL) {
-      result = sceLibcMspacePosixMemalign(arena, address, alignment, size);
-      if (result == 0)
-        eden_heap_arena_took(*address);
+  {
+    void *block = eden_heap_aligned_try(alignment, size);
+    /* EDEN_UP_HEAP_WAIT_MS: a pipeline builder asks again until it is served or the time is up. */
+    if (block == NULL && size != 0 && eden_heap_may_wait()) {
+      struct eden_heap_wait_request request = {1, size, alignment, 0};
+      block = eden_heap_wait_for(eden_heap_wait_aligned_again, &request);
     }
-  }
-  if (result != 0) {
-    /* A large block's own memory starts on a page; the heap's spaces align anything. */
-    void *block = NULL;
-    if (alignment <= 4096 && size >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows)
-      block = eden_heap_large_allocate(size);
-    if (block == NULL)
-      block = eden_heap_main(EDEN_HEAP_ALIGNED, alignment, size);
     if (block != NULL) {
       *address = block;
       result = 0;
-    } else {
-      result = ENOMEM;
     }
   }
   if (result == 0) {

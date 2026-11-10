@@ -1,0 +1,160 @@
+From a0fe450633843860e73f1ba1f0c116d357fec7dd Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Tue, 10 Nov 2026 07:00:00 +0100
+Subject: [PATCH] EDEN_UP_FRITCHII_USAGE_TRACKER=1: UsageTracker::Track fills
+ only the pages outside the run already known to be all ones (Fritchii Nx2Perf
+ usage_tracker); off by default
+
+Port of the Nx2Perf usage_tracker option from Frizti/Fritchii v5.5
+(src/video_core/nx2_perf.h Opt::UsageTracker, src/video_core/buffer_cache/usage_tracker.h
+FillPages). It comes from zortos293/Lichii PR #184 by zortos293 ("buffer_cache: skip clean
+tracker words, refilled usage pages and repeated index binds (Nx2Perf)"); upstream Lichii has
+since made it unconditional. GPL-3.0-or-later.
+
+The same fill was our old 0365 (lichii-cpu-0235, same Lichii commit 440f0c2ac4, no switch) in
+the t20-t22 series; migration 020 left it out under the generic "switch never set" reason. This
+brings it back behind a switch with Fritchii's verify mode. 0365's check (1.5 million random
+Track and Reset calls, pages equal to the plain loop after each) covers the same FillPages.
+
+Draws bind the same multi-megabyte storage buffers again and again. Ours already skips a range
+tracked just before (the four-entry recent list, 0064), but a binding at a new offset or size
+still writes one word per 4 KiB page of the range, on the GPU back thread. In an Ocarina of Time
+walk on the PS5, UsageTracker took 4.3% of the back thread's samples. Pages are only ever cleared
+by Reset, so a run of pages filled since the last Reset stays all ones: Track now fills only the
+pages of a range outside that run and grows the run, which makes re-tracking a large binding
+O(1) once filled. IsUsed and Reset answer exactly as before.
+
+Switches (Common::PeSwitch, exactly "1"; unset or anything else = the old loop, byte for byte):
+- EDEN_UP_FRITCHII_USAGE_TRACKER=1: the run above.
+- EDEN_UP_FRITCHII_USAGE_TRACKER_VERIFY=1 (only with the switch above; Fritchii's
+  EDEN_NX2_PERF_VERIFY for this option): fills every page as before and logs (HW_GPU error,
+  at most 64 lines, "Fritchii usage_tracker: usage pages A..B not all tracked") when a page the
+  run would have skipped was not all ones.
+
+Not in TranslationSwitches (vk_pipeline_prep.cpp) on purpose: they change no SPIR-V or info,
+so test arms share one prep store.
+
+Test: one verify run first (expect zero "not all tracked" lines), then the switch alone against
+two controls on the house-to-village benchmark, reading GPUBack's UsageTracker share in a stack
+sample and fps.
+---
+ src/video_core/buffer_cache/usage_tracker.h | 69 ++++++++++++++++++++-
+ 1 file changed, 67 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/usage_tracker.h b/src/video_core/buffer_cache/usage_tracker.h
+index 5dc58e4..374abf2 100644
+--- a/src/video_core/buffer_cache/usage_tracker.h
++++ b/src/video_core/buffer_cache/usage_tracker.h
+@@ -6,12 +6,16 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <utility>
+ #include <vector>
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -33,6 +37,8 @@ public:
+         tracked = false;
+         std::ranges::fill(pages, 0ULL);
+         recent.fill({~u64{0}, 0});
++        full_begin = 0;
++        full_end = 0;
+     }
+ 
+     void Track(u64 offset, u64 size) noexcept {
+@@ -55,8 +61,12 @@ public:
+         if (page == page_end) {
+             return;
+         }
+-        for (size_t i = page + 1; i < page_end; i++) {
+-            pages[i] = ~u64{0};
++        if (FillRuns()) {
++            FillPages(page + 1, page_end);
++        } else {
++            for (size_t i = page + 1; i < page_end; i++) {
++                pages[i] = ~u64{0};
++            }
+         }
+         const size_t offset_end = offset + size;
+         const size_t offset_end_page_aligned = Common::AlignDown(offset_end, BUFFER_PAGE_BYTES);
+@@ -83,6 +93,58 @@ public:
+     }
+ 
+ private:
++    /// EDEN_UP_FRITCHII_USAGE_TRACKER=1 (Frizti/Fritchii Nx2Perf usage_tracker): Track fills only
++    /// the pages outside the run already known to be all ones.
++    static bool FillRuns() noexcept {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_USAGE_TRACKER");
++        return enabled;
++    }
++
++    /// EDEN_UP_FRITCHII_USAGE_TRACKER_VERIFY=1 (with the switch above): fills every page as before
++    /// and logs when a page the run skips was not all ones.
++    static bool FillRunsVerify() noexcept {
++        static const bool enabled =
++            FillRuns() && Common::PeSwitch("EDEN_UP_FRITCHII_USAGE_TRACKER_VERIFY");
++        return enabled;
++    }
++
++    void FillPages(size_t begin, size_t end) noexcept {
++        if (begin >= end) {
++            return;
++        }
++        // Pages in [full_begin, full_end) are all ones already (only Reset clears a page): fill
++        // around that run and grow it. Keeps tracking a multi-megabyte binding O(1) once filled.
++        if (end < full_begin || begin > full_end) {
++            std::fill(pages.begin() + begin, pages.begin() + end, ~u64{0});
++            if (end - begin > full_end - full_begin) {
++                full_begin = begin;
++                full_end = end;
++            }
++            return;
++        }
++        if (FillRunsVerify()) {
++            static std::atomic<u32> logged{};
++            const size_t check_begin = (std::max)(begin, full_begin);
++            const size_t check_end = (std::min)(end, full_end);
++            if (!std::all_of(pages.begin() + check_begin, pages.begin() + check_end,
++                             [](u64 page) { return page == ~u64{0}; }) &&
++                logged.fetch_add(1, std::memory_order_relaxed) < 64) {
++                LOG_ERROR(HW_GPU, "Fritchii usage_tracker: usage pages {}..{} not all tracked",
++                          check_begin, check_end);
++            }
++            std::fill(pages.begin() + begin, pages.begin() + end, ~u64{0});
++        } else {
++            if (begin < full_begin) {
++                std::fill(pages.begin() + begin, pages.begin() + full_begin, ~u64{0});
++            }
++            if (end > full_end) {
++                std::fill(pages.begin() + full_end, pages.begin() + end, ~u64{0});
++            }
++        }
++        full_begin = (std::min)(begin, full_begin);
++        full_end = (std::max)(end, full_end);
++    }
++
+     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+         if (size == 0) {
+             return;
+@@ -116,6 +178,9 @@ private:
+     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
+     size_t recent_cursor{};
+     bool tracked{};
++    /// Pages known to be all ones (FillPages, EDEN_UP_FRITCHII_USAGE_TRACKER).
++    size_t full_begin{};
++    size_t full_end{};
+ };
+ 
+ } // namespace VideoCommon
+-- 
+2.54.0
+

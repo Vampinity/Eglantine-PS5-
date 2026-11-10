@@ -1,0 +1,358 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_FAST_CFG=1: ordered CFG block lookup and two-sided sibling walk at shader translation, and a pipeline a draw waits for goes to the front of the builder queue; off by default
+
+Port of EdGlantine-PS5 24c41c41aa (UB-056, 99zzzz4-faster-shader-translation.diff), itself from
+Lichii #71. Two parts:
+
+- Translation: CFG::InspectVisitedBlocks finds the block that holds pc with an ordered lookup
+  instead of a scan of every block, and AreOrdered walks from both siblings at once. These are the
+  bodies 0172 already carries under EDEN_NX2_SHADER_FAST_SCAN; EDEN_UP_FAST_CFG=1 turns on the
+  same path (one static per function reads both names), no second copy of the code.
+- Builds: upstream lets the first worker or waiter claim a pipeline build, so a draw that waits
+  does not sit behind hundreds of queued builds. Here the waiter never builds. The pipeline holds
+  its build task; the constructor queues a claim-once copy, and a draw or dispatch that finds the
+  pipeline unbuilt asks the builder once more with ThreadWorker::QueueWorkFront, ahead of the
+  builds QueueWork queued but behind earlier front entries, so a burst P1..PN is built P1 first,
+  the pipeline the first wait is for (BuildFirst, on the GPU thread, before the wait is recorded;
+  the task and mesh-as-compute path asks the same way before its own wait). Whichever copy a
+  VkPipelineBuilder thread takes first builds; the other returns. The build thus stays on a
+  VkPipelineBuilder thread, the only threads the heap lets wait for memory (EDEN_UP_HEAP_WAIT_MS,
+  headless/heap_arenas.inc):
+  the upstream form would run RADV's compiler on the VulkanWorker scheduler thread, where a NULL
+  from the pool ends the session in nir_opt_copy_prop_vars and the wait would hold
+  execution_mutex. The Vulkan failure path (is_built published, MarkShaderComplete) is as before;
+  any other exception publishes completion, drops the task and rethrows, as upstream.
+  With more than one builder thread the front entry goes to the next free one; all busy, the
+  draw waits for the first to finish, as now.
+
+Unset: the constructor queues the task as before, the waits are unchanged, the CFG reads only
+EDEN_NX2_SHADER_FAST_SCAN. ThreadWorker's queue is a std::deque with the same push-back/pop-front
+order (std::queue was that deque); its front_queued count stays 0, so a pop does what it did. No
+cache key, serialization or output change.
+
+Not ported: upstream's foreign host pointer guard in src/core (memory.cpp, device_memory_manager.h);
+a separate change, not needed for either part above.
+
+Checked: git apply --check on a copy of the T88 core with patches through 0493. Not compiled, not
+run on the console.
+
+---
+diff --git a/src/common/thread_worker.h b/src/common/thread_worker.h
+index f0cdf96..cb10233 100644
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -15,6 +15,7 @@
+ #include <type_traits>
+ #include <vector>
+ #include <queue>
++#include <deque>
+
+ #include "common/polyfill_thread.h"
+ #include "common/thread.h"
+@@ -71,7 +72,10 @@ public:
+                             break;
+                         }
+                         task = std::move(requests.front());
+-                        requests.pop();
++                        requests.pop_front();
++                        if (front_queued > 0) {
++                            --front_queued; // it was a QueueWorkFront entry
++                        }
+                     }
+                     if constexpr (with_state) {
+                         task(&state);
+@@ -102,7 +106,22 @@ public:
+     void QueueWork(Task work) {
+         {
+             std::unique_lock lock{queue_mutex};
+-            requests.emplace(std::move(work));
++            requests.emplace_back(std::move(work));
++            ++work_scheduled;
++        }
++        condition.notify_one();
++    }
++
++    /// EDEN_UP_FAST_CFG: the next free worker takes this before the work queued with
++    /// QueueWork (a pipeline a draw waits for, behind hundreds of builds). Front entries keep
++    /// their arrival order among themselves, so a burst P1..PN is taken P1 first, the pipeline
++    /// the first wait is for. The work still runs on a worker thread.
++    void QueueWorkFront(Task work) {
++        {
++            std::unique_lock lock{queue_mutex};
++            const auto at = static_cast<typename std::deque<Task>::difference_type>(front_queued);
++            requests.emplace(requests.begin() + at, std::move(work));
++            ++front_queued;
+             ++work_scheduled;
+         }
+         condition.notify_one();
+@@ -121,7 +140,10 @@ public:
+     }
+
+ private:
+-    std::queue<Task> requests;
++    std::deque<Task> requests;
++    /// How many QueueWorkFront entries lead requests, in arrival order. Guarded by queue_mutex;
++    /// stays 0 unless QueueWorkFront is used (EDEN_UP_FAST_CFG).
++    size_t front_queued{};
+     std::mutex queue_mutex;
+     std::condition_variable_any condition;
+     std::condition_variable wait_condition;
+diff --git a/src/shader_recompiler/frontend/maxwell/control_flow.cpp b/src/shader_recompiler/frontend/maxwell/control_flow.cpp
+index f657c23..56737d3 100644
+--- a/src/shader_recompiler/frontend/maxwell/control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/control_flow.cpp
+@@ -15,6 +15,7 @@
+ #include <fmt/ranges.h>
+ 
+ #include <ranges>
++#include "common/pe_switch.h"
+ #include "shader_recompiler/exception.h"
+ #include "shader_recompiler/frontend/maxwell/control_flow.h"
+ #include "shader_recompiler/frontend/maxwell/decode.h"
+@@ -258,11 +259,12 @@ void CFG::AnalyzeLabel(FunctionId function_id, Label& label) {
+ bool CFG::InspectVisitedBlocks(FunctionId function_id, const Label& label) {
+     const Location pc{label.address};
+     Function& function{functions[function_id]};
+-    // EDEN_NX2_SHADER_FAST_SCAN=1: blocks never overlap, so only the last one starting at or
+-    // before pc can contain it. A function-local static: env.txt is read in main.
++    // EDEN_NX2_SHADER_FAST_SCAN=1 or EDEN_UP_FAST_CFG=1: blocks never overlap, so only the last
++    // one starting at or before pc can contain it. A function-local static: env.txt is read in
++    // main.
+     static const bool fast_scan = [] {
+         const char* const value = std::getenv("EDEN_NX2_SHADER_FAST_SCAN");
+-        return value != nullptr && value[0] == '1';
++        return (value != nullptr && value[0] == '1') || Common::PeSwitch("EDEN_UP_FAST_CFG");
+     }();
+     auto it{function.blocks.end()};
+     if (fast_scan) {
+diff --git a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+index 6d97f95..621355d 100644
+--- a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+@@ -17,6 +17,7 @@
+ #include <boost/intrusive/list.hpp>
+ 
+ #include <ranges>
++#include "common/pe_switch.h"
+ #include "shader_recompiler/environment.h"
+ #include "shader_recompiler/frontend/ir/basic_block.h"
+ #include "shader_recompiler/frontend/ir/ir_emitter.h"
+@@ -300,11 +301,11 @@ Node SiblingFromNephew(Node uncle, Node nephew) noexcept {
+ 
+ bool AreOrdered(Node left_sibling, Node right_sibling) noexcept {
+     const Node end{right_sibling->up->children.end()};
+-    // EDEN_NX2_SHADER_FAST_SCAN=1: walk forward from both siblings at once. Whichever meets the
+-    // other or the end first decides, so the cost is the shorter walk.
++    // EDEN_NX2_SHADER_FAST_SCAN=1 or EDEN_UP_FAST_CFG=1: walk forward from both siblings at
++    // once. Whichever meets the other or the end first decides, so the cost is the shorter walk.
+     static const bool fast_scan = [] {
+         const char* const value = std::getenv("EDEN_NX2_SHADER_FAST_SCAN");
+-        return value != nullptr && value[0] == '1';
++        return (value != nullptr && value[0] == '1') || Common::PeSwitch("EDEN_UP_FAST_CFG");
+     }();
+     if (fast_scan) {
+         if (left_sibling == right_sibling) {
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 03035a3..d71678c 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -24,6 +24,7 @@
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "common/settings.h"
+ 
+ namespace Vulkan {
+@@ -152,13 +153,55 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+             shader_notify->MarkShaderComplete();
+         }
+     }};
+-    if (thread_worker) {
++    // EDEN_UP_FAST_CFG=1: the build is held by the pipeline and claimed once, so a dispatch that
++    // waits for it can move it to the front of the builder queue (BuildFirst). It still runs on
++    // a VkPipelineBuilder thread: only those may wait for heap memory (EDEN_UP_HEAP_WAIT_MS),
++    // and the scheduler thread keeps its locks out of the driver's compiler.
++    static const bool fast_cfg = Common::PeSwitch("EDEN_UP_FAST_CFG");
++    if (fast_cfg) {
++        build_task = std::move(func);
++        if (thread_worker) {
++            build_worker = thread_worker;
++            thread_worker->QueueWork([this] { RunBuild(); });
++        } else {
++            RunBuild();
++        }
++    } else if (thread_worker) {
+         thread_worker->QueueWork(std::move(func));
+     } else {
+         func();
+     }
+ }
+ 
++void ComputePipeline::RunBuild() {
++    // The first queued copy to get here builds; a later one finds the claim taken and returns.
++    if (build_claimed.exchange(true)) {
++        return;
++    }
++    try {
++        build_task();
++    } catch (...) {
++        {
++            std::scoped_lock lock{build_mutex};
++            is_built = true;
++            build_condvar.notify_one();
++        }
++        build_task = {};
++        throw;
++    }
++    build_task = {};
++}
++
++void ComputePipeline::BuildFirst() {
++    // Off, or built on the calling thread already: nothing is queued. Asked once per pipeline;
++    // a build that a worker has begun is not queued again.
++    if (build_worker == nullptr || build_claimed.load(std::memory_order::relaxed) ||
++        build_asked_first.exchange(true)) {
++        return;
++    }
++    build_worker->QueueWorkFront([this] { RunBuild(); });
++}
++
+ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
+                                 BufferCache& buffer_cache, TextureCache& texture_cache) {
+@@ -289,6 +332,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                          views_it);
+ 
+     if (!is_built.load(std::memory_order::relaxed)) {
++        BuildFirst(); // EDEN_UP_FAST_CFG: before the worker waits, so the builder has it first.
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
+             Common::HangSite site{"worker: waiting for a pipeline build"};
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index c682b27..1000499 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -94,6 +94,16 @@ private:
+     vk::DescriptorUpdateTemplate descriptor_update_template;
+     vk::Pipeline pipeline;
+ 
++    /// EDEN_UP_FAST_CFG: runs the held build once, on whichever queued copy gets there first.
++    void RunBuild();
++    /// EDEN_UP_FAST_CFG: a dispatch waits for this pipeline; put its build at the front of the
++    /// builder queue. Never builds on the calling thread.
++    void BuildFirst();
++
++    Common::UniqueFunction<void> build_task;
++    Common::ThreadWorker* build_worker{nullptr};
++    std::atomic_bool build_claimed{false};
++    std::atomic_bool build_asked_first{false};
+     std::condition_variable build_condvar;
+     std::mutex build_mutex;
+     std::atomic_bool is_built{false};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index b2ed76c..e354468 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -35,6 +35,7 @@
+ #include "video_core/texture_cache/texture_cache.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
++#include "common/pe_switch.h"
+ #include "common/settings.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
+@@ -531,13 +532,55 @@ GraphicsPipeline::GraphicsPipeline(
+     // Before the build: it frees the modules this looks at.
+     configure_func = RunsMeshAsCompute() ? MakeConfigureSpecFunc<DefaultSpec>()
+                                          : ConfigureFunc(spv_modules, stage_infos);
+-    if (worker_thread) {
++    // EDEN_UP_FAST_CFG=1: the build is held by the pipeline and claimed once, so a draw that
++    // waits for it can move it to the front of the builder queue (BuildFirst). It still runs on
++    // a VkPipelineBuilder thread: only those may wait for heap memory (EDEN_UP_HEAP_WAIT_MS),
++    // and the scheduler and GPU threads keep their locks out of the driver's compiler.
++    static const bool fast_cfg = Common::PeSwitch("EDEN_UP_FAST_CFG");
++    if (fast_cfg) {
++        build_task = std::move(func);
++        if (worker_thread) {
++            build_worker = worker_thread;
++            worker_thread->QueueWork([this] { RunBuild(); });
++        } else {
++            RunBuild();
++        }
++    } else if (worker_thread) {
+         worker_thread->QueueWork(std::move(func));
+     } else {
+         func();
+     }
+ }
+ 
++void GraphicsPipeline::RunBuild() {
++    // The first queued copy to get here builds; a later one finds the claim taken and returns.
++    if (build_claimed.exchange(true)) {
++        return;
++    }
++    try {
++        build_task();
++    } catch (...) {
++        {
++            std::scoped_lock lock{build_mutex};
++            is_built = true;
++            build_condvar.notify_one();
++        }
++        build_task = {};
++        throw;
++    }
++    build_task = {};
++}
++
++void GraphicsPipeline::BuildFirst() {
++    // Off, or built on the calling thread already: nothing is queued. Asked once per pipeline;
++    // a build that a worker has begun is not queued again.
++    if (build_worker == nullptr || build_claimed.load(std::memory_order::relaxed) ||
++        build_asked_first.exchange(true)) {
++        return;
++    }
++    build_worker->QueueWorkFront([this] { RunBuild(); });
++}
++
+ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
+     transition_keys.push_back(transition->key);
+     transitions.push_back(transition);
+@@ -547,6 +590,7 @@ template <typename Spec>
+ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     if (RunsMeshAsCompute()) {
+         // The compute path reads pipeline handles on this thread, before scheduler.Record.
++        BuildFirst(); // EDEN_UP_FAST_CFG: asks the builder, never builds on the GPU thread.
+         std::unique_lock lock{build_mutex};
+         build_condvar.wait(lock, [this] { return is_built.load(std::memory_order_relaxed); });
+     }
+@@ -1195,6 +1239,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+         scheduler.NoteRenderPassStores(); // Read only with EDEN_UP_DJ_FRAG_BARRIER
+     }
+     if (!is_built.load(std::memory_order::relaxed)) {
++        BuildFirst(); // EDEN_UP_FAST_CFG: before the worker waits, so the builder has it first.
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
+             Common::HangSite site{"worker: waiting for a pipeline build"};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 417479d..21a2c77 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -354,6 +354,16 @@ private:
+     u32 last_descriptor_buffer_chunk{};
+     u64 last_descriptor_buffer_generation{};
+ 
++    /// EDEN_UP_FAST_CFG: runs the held build once, on whichever queued copy gets there first.
++    void RunBuild();
++    /// EDEN_UP_FAST_CFG: a draw waits for this pipeline; put its build at the front of the
++    /// builder queue. Never builds on the calling thread.
++    void BuildFirst();
++
++    Common::UniqueFunction<void> build_task;
++    Common::ThreadWorker* build_worker{nullptr};
++    std::atomic_bool build_claimed{false};
++    std::atomic_bool build_asked_first{false};
+     std::condition_variable build_condvar;
+     std::mutex build_mutex;
+     std::atomic_bool is_built{false};

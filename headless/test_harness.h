@@ -59,6 +59,18 @@
 //   <seconds> WAIT <timeout_s> GONE <x> <y> <w> <h> <cols>x<rows>:<hex> [<min>]
 //   <seconds> MAYBE ...                        the same, but a timeout goes on instead of stopping
 //   <seconds> END                              the script is done here
+//   <seconds> STEER <timeout_s> <x>,<y> [<x>,<y> ...] [r=<n>]
+//                                              walk Link through these points of the minimap
+//
+// STEER ends its section as a WAIT does, and is met when Link reaches the last point. Points are
+// in per mille of the picture, as a LOOK's region is (steer-route.py prints them from a
+// recording). While it walks the app reads the frame back every kLookEvery, as for a LOOK, finds
+// Link's arrowhead and the camera's wedge on the minimap (minimap_steer.h) and holds the left
+// stick toward the next point; a point counts as reached within r per mille of the picture's
+// width (default 6). With no arrowhead or wedge for kSteerLostLooks looks in a row the stick is
+// let go until they are back: Link stands rather than runs blind. A timeout stops the script, as
+// a WAIT's does. EDEN_TEST steer_point, steer_met and steer_timeout lines say what happened.
+// Use it in steady play only: a look is a read of the whole frame.
 //
 // The lines between two WAITs are a section, and a section's seconds count from the moment the
 // WAIT before it was met (the first section's from the guest starting, as above). A WAIT starts
@@ -78,6 +90,7 @@
 // best score and, on a timeout, the grid that was seen. A look and a shot share the renderer's one
 // screenshot slot: one asked for while the other is pending is dropped (the look tries again).
 #pragma once
+#include "minimap_steer.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -123,6 +136,8 @@ inline constexpr std::string_view kShotListFile = "game-shots.txt";
 inline constexpr std::chrono::seconds kShotWait{10};
 // How often a WAIT asks for a picture. Each one is a GPU readback of the whole frame.
 inline constexpr std::uint64_t kLookEvery = 500;  // ms
+inline constexpr std::size_t kMaxSteerPoints = 64;
+inline constexpr unsigned kSteerLostLooks = 4;  // looks without Link's marker before the stick is let go
 inline constexpr unsigned kMaxCells = 256;  // so a timeout's seen= grid fits a Report line (900 characters)
 
 struct NamedButton {
@@ -308,6 +323,9 @@ struct Wait {
     Ms at = 0, timeout = 0;  // in its section's seconds; the timeout counts from at
     bool end = false;        // END
     bool maybe = false;      // MAYBE: a timeout goes on to the next section
+    bool steer = false;      // STEER: met when Link has walked through points
+    std::vector<std::pair<unsigned, unsigned>> points;  // per mille of the picture
+    unsigned radius = 6;     // a point is reached within this, in per mille of the picture's width
     Look look;
     unsigned line = 0;
 };
@@ -389,6 +407,47 @@ inline bool ParseWait(const std::vector<std::string>& words, Wait& wait, std::st
         return false;
     }
     wait.maybe = words[1] == "MAYBE";
+    if (words[1] == "STEER") {
+        wait.steer = true;
+        if (words.size() < 4) {
+            error = "wrong number of fields";
+            return false;
+        }
+        const auto timeout = Seconds(words[2]);
+        if (!timeout || *timeout == 0) {
+            error = "bad timeout";
+            return false;
+        }
+        wait.timeout = *timeout;
+        for (std::size_t i = 3; i < words.size(); ++i) {
+            const std::string_view word{words[i]};
+            if (i + 1 == words.size() && i > 3 && word.substr(0, 2) == "r=") {
+                const auto radius = Number(word.substr(2), 100);
+                if (!radius || *radius == 0) {
+                    error = "bad radius, r=1-100";
+                    return false;
+                }
+                wait.radius = static_cast<unsigned>(*radius);
+                break;
+            }
+            const auto comma = word.find(',');
+            if (comma == word.npos) {
+                error = "bad point, not <x>,<y>";
+                return false;
+            }
+            const auto x = Number(word.substr(0, comma), 1000), y = Number(word.substr(comma + 1), 1000);
+            if (!x || !y) {
+                error = "bad point, not <x>,<y> in 0-1000";
+                return false;
+            }
+            wait.points.emplace_back(static_cast<unsigned>(*x), static_cast<unsigned>(*y));
+        }
+        if (wait.points.empty() || wait.points.size() > kMaxSteerPoints) {
+            error = "1 to 64 points";
+            return false;
+        }
+        return true;
+    }
     if (words.size() != 9 && words.size() != 10) {
         error = "wrong number of fields";
         return false;
@@ -485,7 +544,8 @@ inline Script ParseScript(std::istream& input, const ButtonMapping& mapping) {
         bool ok = !ended;
         if (!ok) {
             script.error = "a line after END";
-        } else if (words.size() > 1 && (words[1] == "WAIT" || words[1] == "MAYBE" || words[1] == "END")) {
+        } else if (words.size() > 1 && (words[1] == "WAIT" || words[1] == "MAYBE" || words[1] == "END" ||
+                                        words[1] == "STEER")) {
             Wait wait;
             wait.line = number;
             ok = ParseWait(words, wait, script.error);
@@ -525,13 +585,14 @@ public:
             active.push_back(event);
         }
         std::erase_if(active, [now](const Event& event) { return event.end <= now; });
-        if (active.empty()) {
+        if (active.empty() && !steer) {
             if (!held) return {};
             held = false;
             return Neutral();
         }
         held = true;
         auto sample = Neutral();
+        if (steer) sample.left_stick = {steer->first, steer->second};
         for (const Event& event : active) {
             sample.buttons |= event.buttons;
             if (event.stick == StickSide::left) sample.left_stick = {event.x, event.y};
@@ -552,13 +613,17 @@ public:
     void Pass(Ms now) {
         while (next < events.size() && events[next].section <= section) ++next;
         active.clear();
+        steer.reset();
         ++section;
         zero = now;
     }
+    // STEER holds the left stick here from one look to the next. Empty: no STEER is walking.
+    void Steer(std::optional<std::pair<std::uint8_t, std::uint8_t>> stick) { steer = stick; }
     // Nothing more is pressed: END, or a WAIT that timed out.
     void Stop() {
         next = events.size();
         active.clear();
+        steer.reset();
         section = static_cast<unsigned>(waits.size());
     }
     bool Done() const { return next == events.size() && active.empty() && !held && section >= waits.size(); }
@@ -577,6 +642,7 @@ private:
     unsigned section = 0;  // the WAITs met so far
     Ms zero = 0;           // when this section started
     std::vector<Event> active;
+    std::optional<std::pair<std::uint8_t, std::uint8_t>> steer;
     bool held = false;
 };
 
@@ -836,6 +902,10 @@ private:
             player->Stop();
             return;
         }
+        if (wait.steer) {
+            CheckSteer(wait, now);
+            return;
+        }
         if (pending.valid() && pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             std::shared_ptr<const Picture> picture;
             try {
@@ -884,8 +954,68 @@ private:
             pending = {};
         }
     }
+    // One step of a STEER, on every Sample while it walks: a picture that came says where Link
+    // is and where the camera looks, and the stick is held toward the next point until the next
+    // picture. Asks for pictures as Check does for a LOOK.
+    void CheckSteer(const Wait& wait, Ms now) {
+        const auto where = [&] {
+            return "line=" + std::to_string(wait.line) + " at=" + SecondsText(now) + " point=" +
+                   std::to_string(walk.point) + "/" + std::to_string(wait.points.size()) +
+                   " looks=" + std::to_string(looks) + " seen=" + std::to_string(walk.seen);
+        };
+        if (pending.valid() && pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            std::shared_ptr<const Picture> picture;
+            try {
+                picture = pending.get();
+            } catch (...) {  // dropped: the renderer had a picture pending already (a shot)
+            }
+            pending = {};
+            if (picture && picture->bgra.size() >= std::size_t{picture->width} * picture->height * 4) {
+                const steer::Fix fix =
+                    steer::Find(picture->bgra.data(), picture->width, picture->height, picture->flip);
+                ++looks;
+                steer::Stick stick;
+                const std::size_t reached = walk.point;
+                const steer::Walk::Do todo = walk.Look(fix, wait.points, wait.radius, kSteerLostLooks, stick);
+                if (walk.point != reached) Report("test", ("EDEN_TEST steer_point " + where()).c_str());
+                if (todo == steer::Walk::Do::Done) {
+                    Report("test", ("EDEN_TEST steer_met " + where()).c_str());
+                    player->Pass(now);
+                    Reset(now);
+                    return;
+                }
+                if (todo == steer::Walk::Do::Hold) {
+                    player->Steer(std::pair<std::uint8_t, std::uint8_t>{stick.x, stick.y});
+                } else if (todo == steer::Walk::Do::Stand) {
+                    // No arrowhead or no wedge for a while (a menu, a fade, a talk): stand still.
+                    player->Steer(std::pair<std::uint8_t, std::uint8_t>{128, 128});
+                }
+            }
+        }
+        if (player->TimedOut(now)) {
+            Report("test", ("EDEN_TEST steer_timeout " + where()).c_str());
+            stopped = true;
+            player->Stop();
+            Reset(now);
+            return;
+        }
+        if (pending.valid() || now < next_look) return;
+        next_look = now + kLookEvery;
+        if (!look) {
+            Report("test", ("EDEN_TEST wait_error " + where() + " reason=no_pictures").c_str());
+            stopped = true;
+            player->Stop();
+            return;
+        }
+        try {
+            pending = look();
+        } catch (...) {
+            pending = {};
+        }
+    }
     // A new WAIT: a picture still on its way was asked for the last one and is not used.
     void Reset(Ms now) {
+        walk = {};
         pending = {};
         seen.clear();
         looks = 0;
@@ -935,6 +1065,7 @@ private:
     unsigned looks = 0;
     int best = -100;
     Ms next_look = 0;
+    steer::Walk walk;  // the STEER that is walking: points reached, looks with and without Link's marker
 };
 
 // EDEN_TEST_SHOTS's times for this session: empty without the setting, and in any game but the

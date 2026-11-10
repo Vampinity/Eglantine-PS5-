@@ -1,0 +1,748 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_VMA_TRIM=1: while the pool is short or an area loads, an image takes no new 16 MiB block (a hole first, else memory of its own over 4 MiB or an 8 MiB block); EDEN_VMA_TRIM logs the slack by pool and the device memory freed; off by default
+
+Not a port. PS5_Lichii keeps VMA's 16 MiB blocks and has no trim (its tools/prepare-vulkan-port.py,
+read 10 Nov with gh api); its one other VMA change, the allocator's own budget instead of the
+driver's double count, is our EDEN_PE_VMA_OWN_BUDGET (0312).
+
+Why 684 MiB sat unused in the allocator's blocks (run739, t=89 s: 2931 MiB of blocks, 2247 in use):
+- Not empty blocks. VMA 3.3 keeps at most one empty block per block vector (VmaBlockVector::Free:
+  a block that empties is freed when another one is already empty, or at once when the heap's
+  budget reads exceeded). The vectors with blocks here are VMA's own for memory types 0, 2, 3 and 5
+  and the SparsePages and DeviceBuffers pools of type 0 (EDEN_REFUSED_VMA in earlier runs): at most
+  6 x 16 MiB = 96 MiB, and none once the driver's double-counted budget reads exceeded. VMA has no
+  call that frees that block sooner, so this patch does not try; the trim's own pool keeps at most
+  one empty 8 MiB block.
+- Not memory of its own. VMA counts a dedicated allocation as a block exactly as large as its use,
+  so the 297 MiB image and everything else over half a block (8 MiB) adds no slack.
+- Holes in the shared blocks. Images up to 8 MiB share 16 MiB blocks (VMA gives over half a block
+  memory of its own), placed best fit (STRATEGY_MIN_MEMORY), and a block goes back only when every
+  image in it is gone. At the door 619 images arrive in 23 frames, mixed into the same blocks as
+  the new area's textures, and AREA_EVICT deletes about 2 GiB over the next ~180 frames (run739
+  frames 3082-3266), many of them 2-8 MiB (frames 3247-3257: 11-13 images and 72-82 MiB a frame).
+  Their places become holes that the neighbours which stay hold open. RADV_PS5_MEMORY at t=89: the
+  allocator's 2931 MiB are 136 VkDeviceMemory objects, ~15 of them over 32 MiB (EDEN_POOL_LEDGER:
+  1343 MiB in 15 larger), so the 684 MiB sit in at most ~120 shared blocks, a third or more of
+  their space. Refusal reports of earlier runs show the same: type 0 with 400-1400 holes, the
+  largest 8-15 MiB (a 16 MiB block held by one small image). Over 1872 refusal lines in 66 runs
+  the slack was 216 MiB at the median (p75 293, max 547); only the earliest door refusal (hog
+  1280, run761: 13 MiB) came before the evictions had made holes.
+- Our budget/slack logic hides it rather than causes it: AllocatedUsage (vulkan_device.cpp) leaves
+  the holes out of the caches' usage so the collector does not evict for them, and on the console
+  the port measures usage by the pool. The collector deletes candidates in the emptiest blocks
+  first (texture_cache.h), but only among images old enough; AREA_EVICT goes by age alone.
+
+What it does (MemoryAllocator::CreateImage, before vmaCreateImage, while the trim is active):
+1. The image is made (vkCreateImage) and its memory requirements read.
+2. Space the blocks already hold: vmaAllocateMemoryForImage with NEVER_ALLOCATE, in the memory type
+   the usual path takes first (no new memory, so outside the budget too). For images up to 8 MiB
+   this is what vmaCreateImage does first anyway (VmaBlockVector::AllocatePage searches the blocks
+   before it makes one); it is new only for larger ones, which VMA gives memory of their own first.
+   The change is in steps 3 and 4: what finds no hole takes no new 16 MiB block.
+3. None fits and it needs over half a small block (EDEN_UP_VMA_TRIM_BLOCK_MIB, 2/4/8, unset 8, at
+   most half of EDEN_VMA_BLOCK_MIB): memory of its own (DEDICATED, within the budget, any type, as
+   the usual path asks for it). It goes back to the pool when the texture cache deletes the image.
+4. Otherwise a small block of a pool of its own (Device::SeparatePool::TrimmedImages, blocks of
+   EDEN_UP_VMA_TRIM_BLOCK_MIB), a new one only within the budget. A block one image holds open
+   holds 8 MiB, not 16.
+5. Anything refused: the memory and the image are let go and the usual path makes it with all its
+   fallbacks (outside the budget, host memory, unbacked, on the console the port's
+   ReleaseRefused). Huge images, those asked for `dedicated`, sparse, disjoint, lazily allocated,
+   external and DRM-modifier ones never take this path.
+The memory type: vmaAllocateMemoryForImage cannot use VMA_MEMORY_USAGE_AUTO*, so it asks with
+UNKNOWN and the same preferred flag; VMA's cost (device-local preferred, uncached not preferred)
+then picks the type vmaCreateImage picks for an image the host never touches (type 0, 0x1, here).
+
+Active: the pool's largest free block under EDEN_UP_VMA_TRIM_MIB (unset 2048; off again over 1.5x),
+read at most every 100 ms through the front's eden_free_memory_bytes (weak, ELF only; the mig020
+front since 0503). Without it (the T88 front, other platforms) the trim goes by what the
+allocator's budget leaves in the device-local heaps, which on the console is the driver's double
+count: use the mig020 front. Also active for 10 s after EDEN_UP_VMA_TRIM_BURST (unset 100; 0 off)
+images were made within one second, an area load (AREA_EVICT's rule: 100 in 30 frames). Without
+that, the door's images would be placed the usual way: run739's largest block fell from 5126 MiB
+(t=81 s) to 612 (t=89 s), so most of the load came in above any mark.
+
+Not thrashing at the door: nothing is moved and nothing is freed early; each image is allocated
+once and freed when the texture cache deletes it, as before. More calls: one vkAllocateMemory /
+vkFreeMemory pair per 4-8 MiB image that finds no hole (VMA's own path takes one per 16 MiB block),
+and one per 8 MiB small block instead of per 16 MiB block. VMA keeps one empty block per pool, so
+a small block is not made and freed as one image comes and goes, and the 1.5x way back keeps the
+mark from flapping. Per image while active: vkGetImageMemoryRequirements and one to three VMA
+calls (vmaCreateImage does one create and one allocation); every 100 ms the front's free memory
+query (two kernel calls, as RefreshFreeMemory makes at 10 Hz). After the door the trim stays on
+(run739's largest free block was 212-612 MiB from t=89 s on, under the mark), and memory of its own
+has no empty-block hysteresis: a 4-8 MiB image the caches remake every few frames with no hole free
+is one vkAllocateMemory / vkFreeMemory pair each time. The test reads that (Churn line, taken=).
+Budget: run739's env reads the driver's budget (no EDEN_PE_VMA_OWN_BUDGET). VMA 3.3 checks
+WITHIN_BUDGET only for memory of its own; a new block needs the budget's room whatever the flag.
+Once the double count reads used up, the usual path already gives every image outside a hole
+memory of its own (PS5_Lichii's note: 926 allocations), and the trim's steps 3-4 fall back
+(fallback= rises): the trim acts only while the driver's budget still has room.
+
+Trade-off: memory of its own of 2 MiB or more starts on a 2 MiB boundary of the pool
+(radv_ps5_memory_alloc, the note in 0158), so a 5 MiB image leaves a 1 MiB tail only blocks under
+2 MiB can use (EDEN_POOL_LEDGER's "under 2 MiB" may grow by that). That is why the default sends
+only images over 4 MiB to memory of their own; EDEN_UP_VMA_TRIM_BLOCK_MIB=4 sends all over 2 MiB.
+
+Interplay: no guest memory, swap, JIT, heap or ahead-guard code is touched. The heap rescue and
+EDEN_UP_HEAP_WAIT_MS are unchanged; a refused image reaches the port's ReleaseRefused through the
+usual path as before. The census (0517) sees the trim's blocks in vma_blocks / vma_used
+(vmaGetHeapBudgets counts pools). The collector's block order (texture_cache.h, MemoryBlock) sees
+the small blocks at their own size and memory of its own in the middle, as before.
+EDEN_PS5_TRANSIENT_POOLS images use their own pool first; only what falls back to CreateImage meets
+the trim.
+
+Lines (stderr.log; MiB, count/MiB):
+  EDEN_VMA_TRIM ready: on under 2048 MiB of largest free block (off over 3072), small blocks 8 MiB,
+      own memory over 4 MiB, burst 100 images/s, the figure from the pool|the allocator's budget
+  EDEN_VMA_TRIM on|off largest= mark= burst=<bursts>[+ while one is on] blocks= used= slack=
+      (+/-n since on) shared= sparse= buffers= trim= (blocks/slack each) holes= own= large= small=
+      fallback= freed= taken=
+when it turns on or off, and while on every 2 s with images placed (else every 20 s). slack: the
+allocator's blocks less their use, all heaps; shared: VMA's own blocks, then the SparsePages,
+DeviceBuffers and TrimmedImages pools (vmaGetPoolStatistics; the pools count alignment padding as
+used, so shared is a few MiB high). freed / taken: all device memory the allocator gave back to /
+took from the driver since the last line (its callbacks, for any reason): the freed MiB. The line
+is written by the thread making the image (the GPU thread), which makes every other allocator call
+there too; the allocator is externally synchronized and the census thread only reads budgets.
+
+Expected (a guess, nothing measured): after the door (run739 t=89 s) slack ~250-350 MiB instead of
+684, so ~300-400 MiB more of the pool free; at a refusal ~100-150 MiB more than the 216 MiB median
+leaves, minus up to ~1 MiB of 2 MiB tail per "own" image. Whether the largest free block grows by
+that much depends on where the freed blocks sit. A lower guess is as likely: run275 (T59, new game,
+EDEN_VMA_BLOCK_MIB=8, the same placement all the time) still showed 333-389 MiB slack in its heavy
+scenes, and the own images' tails move part of the slack into the pool instead of freeing it; so
+~150-300 MiB more largest free block. Not helped, and slightly worse: a refusal during the load
+itself, before AREA_EVICT has made holes (run761, slack 13 MiB), where the usual path packs a new
+16 MiB block tight and an own image leaves its tail. Not helped: slack in the DeviceBuffers or
+SparsePages pools (the line's buffers= and sparse= say whether that is the next step).
+
+Switches: EDEN_UP_VMA_TRIM (Common::PeSwitch, exactly "1"). EDEN_UP_VMA_TRIM_MIB,
+EDEN_UP_VMA_TRIM_BLOCK_MIB and EDEN_UP_VMA_TRIM_BURST are read only with it on. Unset: CreateImage
+reads one cached flag and calls vmaCreateImage as before; the device installs the same memory
+callbacks as before (the churn ones with EDEN_UP_FRITCHII_CHURN, else none); GetSeparatePool's new
+block size argument defaults to the old 16 MiB, the third pool row is never made, and
+AddSeparatePoolUsage is only called by the trim's line.
+
+Checks: not compiled, not run. git apply --check on T88 (ours-core-full); the same with 0493-0519
+applied first, and 0493-0519 apply and skip the same with this applied first (none touches these
+four files). The 24 literal prepare-vulkan-port.py anchors in vulkan_memory_allocator.cpp/.h and
+vulkan_device.cpp match as before (mig020-front and fable-tricks-16 copies); the port does not call
+GetSeparatePool. VMA 3.3.0 calls checked against its header: vmaAllocateMemoryForImage,
+vmaBindImageMemory, vmaFindMemoryTypeIndex, vmaGetMemoryProperties, vmaGetHeapBudgets,
+vmaGetPoolStatistics; NEVER_ALLOCATE never with DEDICATED, DEDICATED never with a pool (VMA refuses
+both pairs). The fable-swap core (older, no churn callbacks) does not take it.
+
+PS5 test (the a1-walk-fast door run on run739's env, mig020 front, RADV_PS5_MEMORY_REPORT=1, and
+EDEN_UP_MEM_CENSUS=1 with 0517 in the build, EDEN_UP_FRITCHII_CHURN=1 in every arm (its Churn line
+counts the allocator's vkAllocateMemory / vkFreeMemory with the trim on or off); EDEN_UP_HEAP_RESCUE
+off, since with it hog 1024-1280 ended in SIGSEGV on CPUCore_4; same-batch control, about 3 valid
+runs per arm, two batches of 5):
+  A  EDEN_TEST_POOL_HOG_MIB=1152                     control (1024 lived in run759, 1280 died at 91 s)
+  B  EDEN_TEST_POOL_HOG_MIB=1152 EDEN_UP_VMA_TRIM=1
+  D  EDEN_TEST_POOL_HOG_MIB=1152 EDEN_VMA_BLOCK_MIB=8  the existing switch (0158; one run so far,
+     run275, never on the door): the trim's placement all the time, no new code. If D matches B,
+     ship the env line instead of this patch.
+  later: EDEN_UP_VMA_TRIM_BLOCK_MIB=4 in B; hog 1024 with the trim against its own same-batch
+  control; hog 1280 dies during the load itself (slack 13 MiB), which this does not address.
+Read: slack at the first EDEN_VMA_USAGE after the door (B and D under 350 against A's ~600),
+EDEN_MEMORY's largest free block at t~90 and t~110, crash or not and when, EDEN_VMA_TRIM fallback=
+(near 0; high means the driver's budget read used up) and taken= / freed= counts (tens per 2 s
+line at the door, not hundreds; freed MiB is large at the door, that is AREA_EVICT), the Churn
+line's device allocations after the door against A, shared= against buffers= slack, RADV app
+objects (136 in run739; a few hundred is fine, thousands is thrash), EDEN_POOL_LEDGER "under
+2 MiB", and the door's frame times and stutter in play-report.py against A.
+
+---
+ src/video_core/vulkan_common/vma_trim.h                  |  62 ++++++
+ src/video_core/vulkan_common/vulkan_device.cpp           |  37 +++-
+ src/video_core/vulkan_common/vulkan_device.h             |  12 +-
+ src/video_core/vulkan_common/vulkan_memory_allocator.cpp | 363 ++++++++++++++++++++++++++++++++++-
+ 4 files changed, 467 insertions(+), 7 deletions(-)
+
+diff --git a/src/video_core/vulkan_common/vma_trim.h b/src/video_core/vulkan_common/vma_trim.h
+new file mode 100644
+index 0000000..b2a0e9e
+--- /dev/null
++++ b/src/video_core/vulkan_common/vma_trim.h
+@@ -0,0 +1,62 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++
++#include "common/common_types.h"
++#include "common/pe_switch.h"
++
++/// EDEN_UP_VMA_TRIM=1 (off unless exactly "1"): keeps images from leaving holes in the
++/// allocator's shared 16 MiB blocks while the pool is short or an area loads
++/// (MemoryAllocator::CreateImage, vulkan_memory_allocator.cpp). A block goes back to the driver
++/// only when every image in it is gone, so one small image that stays holds the whole block.
++/// While the switch is on and the trim is active, an image goes into space the blocks already
++/// hold; where none fits it gets memory of its own when over half a small block
++/// (EDEN_UP_VMA_TRIM_BLOCK_MIB, 8), else a small block of a pool of its own
++/// (Device::SeparatePool::TrimmedImages), instead of a new 16 MiB block. What it cannot place
++/// that way goes the usual way, with every fallback as before. Active: the pool's largest
++/// free block under EDEN_UP_VMA_TRIM_MIB (2048; off again at 1.5 times that), or for 10 s after
++/// EDEN_UP_VMA_TRIM_BURST (100) images were made within a second (an area load). The line
++/// EDEN_VMA_TRIM in stderr.log says what was placed how and what device memory went back.
++namespace Vulkan::VmaTrim {
++
++[[nodiscard]] inline bool Enabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_VMA_TRIM");
++    return enabled;
++}
++
++enum Counter : size_t {
++    Holes,          ///< Images placed in space the blocks already held
++    HoleBytes,
++    Own,            ///< Images given memory of their own instead of a place in a shared block
++    OwnBytes,
++    Large,          ///< Images over half of VMA's block: memory of their own, as without the trim
++    LargeBytes,
++    Small,          ///< Images placed in the small blocks of the trim's own pool
++    SmallBytes,
++    Fallbacks,      ///< Images the trim could not place (the usual path made them)
++    Freed,          ///< Device memory the allocator gave back (blocks and memory of its own)
++    FreedBytes,
++    Taken,          ///< Device memory the allocator took
++    TakenBytes,
++    Count,
++};
++
++/// Written only with the switch on (the allocator's callbacks, vulkan_device.cpp, and
++/// CreateImage); read and cleared by the EDEN_VMA_TRIM line.
++inline std::array<std::atomic<u64>, Count> g_counters{};
++
++inline void Add(Counter counter, u64 amount = 1) {
++    g_counters[counter].fetch_add(amount, std::memory_order_relaxed);
++}
++
++/// The count since the last call, set back to 0.
++[[nodiscard]] inline u64 Take(Counter counter) {
++    return g_counters[counter].exchange(0, std::memory_order_relaxed);
++}
++
++} // namespace Vulkan::VmaTrim
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index cfb9f0c..31d08b6 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -31,6 +31,7 @@
+ #include "video_core/churn_counters.h"
+ #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
+ #include "video_core/vulkan_common/vma.h"
++#include "video_core/vulkan_common/vma_trim.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+@@ -827,6 +828,21 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+         },
+         .pUserData = nullptr,
+     };
++    // EDEN_UP_VMA_TRIM=1 (vma_trim.h): the same counts, and the device memory the allocator takes
++    // from and gives back to the driver, for the EDEN_VMA_TRIM line.
++    static const VmaDeviceMemoryCallbacks trim_callbacks{
++        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize size, void*) {
++            VideoCommon::Churn::Add(VideoCommon::Churn::DeviceAllocations);
++            VmaTrim::Add(VmaTrim::Taken);
++            VmaTrim::Add(VmaTrim::TakenBytes, size);
++        },
++        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize size, void*) {
++            VideoCommon::Churn::Add(VideoCommon::Churn::DeviceFrees);
++            VmaTrim::Add(VmaTrim::Freed);
++            VmaTrim::Add(VmaTrim::FreedBytes, size);
++        },
++        .pUserData = nullptr,
++    };
+     const VmaAllocatorCreateInfo allocator_info{
+             .flags = flags,
+             .physicalDevice = physical,
+@@ -840,7 +856,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
+             .preferredLargeHeapBlockSize = vma_block_bytes,
+             .pAllocationCallbacks = nullptr,
+-            .pDeviceMemoryCallbacks = VideoCommon::Churn::Enabled() ? &churn_callbacks : nullptr,
++            .pDeviceMemoryCallbacks = VmaTrim::Enabled()              ? &trim_callbacks
++                                      : VideoCommon::Churn::Enabled() ? &churn_callbacks
++                                                                      : nullptr,
+             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
+             .pVulkanFunctions = &functions,
+             .instance = instance,
+@@ -878,14 +896,15 @@ Device::~Device() {
+     vmaDestroyAllocator(allocator);
+ }
+ 
+-VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
++VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type,
++                                VkDeviceSize block_size) const {
+     std::scoped_lock lk{separate_pools_mutex};
+     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
+     if (pool == VK_NULL_HANDLE) {
+         const VmaPoolCreateInfo ci{
+             .memoryTypeIndex = memory_type,
+             .flags = 0,
+-            .blockSize = SeparatePoolBlockSize,
++            .blockSize = block_size,
+             .minBlockCount = 0,
+             .maxBlockCount = 0,
+             .priority = 0.f,
+@@ -899,6 +918,18 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+     return pool;
+ }
+ 
++void Device::AddSeparatePoolUsage(SeparatePool kind, u64& blocks, u64& used) const {
++    std::scoped_lock lk{separate_pools_mutex};
++    for (const VmaPool pool : separate_pools[static_cast<u32>(kind)]) {
++        if (pool != VK_NULL_HANDLE) {
++            VmaStatistics statistics{};
++            vmaGetPoolStatistics(allocator, pool, &statistics);
++            blocks += statistics.blockBytes;
++            used += statistics.allocationBytes;
++        }
++    }
++}
++
+ void Device::LoadStaticPipelineCache() {
+     const auto create = [this](size_t size, const void* data) {
+         static_pipeline_cache = logical.CreatePipelineCache({
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index ff9cb18..52239e5 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -273,11 +273,19 @@ public:
+     enum class SeparatePool : u32 {
+         SparsePages,
+         DeviceBuffers,
++        TrimmedImages, ///< EDEN_UP_VMA_TRIM's small blocks for images (vma_trim.h)
+     };
+     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+ 
+     /// The pool of that kind for a memory type, created on first use (null if that failed).
+-    VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
++    /// `block_size` counts only when the call creates it.
++    VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type,
++                            VkDeviceSize block_size = SeparatePoolBlockSize) const;
++
++    /// Adds the blocks and the use of the pools of that kind made so far, all memory types
++    /// (vmaGetPoolStatistics: one step per block, no walk of the allocations). For the
++    /// EDEN_VMA_TRIM line.
++    void AddSeparatePoolUsage(SeparatePool kind, u64& blocks, u64& used) const;
+ 
+     /// Returns the logical device.
+     const vk::Device& GetLogical() const {
+@@ -1246,7 +1254,7 @@ private:
+     VkInstance instance;         ///< Vulkan instance.
+     VmaAllocator allocator{};    ///< VMA allocator.
+     mutable std::mutex separate_pools_mutex;
+-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
++    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 3> separate_pools{};
+     vk::DeviceDispatch dld;      ///< Device function pointers.
+     vk::PhysicalDevice physical; ///< Physical device.
+     vk::Device logical;          ///< Logical device.
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 90599c1..d21cb41 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -6,7 +6,11 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <bit>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <limits>
+ #include <optional>
+ #include <type_traits>
+@@ -21,12 +25,24 @@
+ #include <ranges>
+ #include "video_core/vulkan_common/unbacked_fallback.h"
+ #include "video_core/vulkan_common/vma.h"
++#include "video_core/vulkan_common/vma_trim.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "common/settings.h"
+ 
++// EDEN_UP_VMA_TRIM=1 (vma_trim.h): the PS5 front's eden_free_memory_bytes (headless/performance.cpp
++// since 0503, the mig020 front: the pool's largest free block, 0 when not known). ELF only, where a
++// weak reference nobody defines reads as null; elsewhere, and on a front without it (T88), the trim
++// goes by the allocator's budget.
++#if (defined(__GNUC__) || defined(__clang__)) && (defined(__FreeBSD__) || defined(__linux__))
++#define VULKAN_VMA_TRIM_FRONT 1
++extern "C" unsigned long long eden_free_memory_bytes(void) __attribute__((weak));
++#else
++#define VULKAN_VMA_TRIM_FRONT 0
++#endif
++
+ namespace Vulkan {
+ namespace {
+ 
+@@ -86,6 +102,342 @@ namespace {
+         }
+         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+     }
++
++// EDEN_UP_VMA_TRIM=1 (vma_trim.h). Nothing below is read or run without the switch.
++
++[[nodiscard]] long long TrimNowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++/// EDEN_UP_VMA_TRIM_MIB: the pool's largest free block under which the trim is active (unset, 0
++/// or over 2^20: 2048). Off again once the block is back over 1.5 times that.
++[[nodiscard]] u64 TrimMarkBytes() {
++    static const u64 mark = [] {
++        const char* value = std::getenv("EDEN_UP_VMA_TRIM_MIB");
++        const unsigned long long mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
++        return (mib != 0 && mib <= (1ULL << 20) ? mib : 2048ULL) << 20;
++    }();
++    return mark;
++}
++
++/// Half of VMA's own blocks (EDEN_VMA_BLOCK_MIB, 16 MiB, read as vulkan_device.cpp reads it):
++/// what VMA gives memory of its own anyway.
++[[nodiscard]] VkDeviceSize TrimDefaultHalfBlock() {
++    static const VkDeviceSize half = [] {
++        VkDeviceSize bytes = 16ULL << 20;
++        if (const char* value = std::getenv("EDEN_VMA_BLOCK_MIB")) {
++            const unsigned long mib = std::strtoul(value, nullptr, 10);
++            if (mib >= 2 && mib <= 64) {
++                bytes = VkDeviceSize{mib} << 20;
++            }
++        }
++        return bytes / 2;
++    }();
++    return half;
++}
++
++/// EDEN_UP_VMA_TRIM_BLOCK_MIB: the trim's small blocks, 2, 4 or 8 MiB (anything else: 8), at
++/// most half of VMA's own. An image over half of one gets memory of its own, the rule VMA keeps
++/// for half of its 16 MiB blocks.
++[[nodiscard]] VkDeviceSize TrimBlockBytes() {
++    static const VkDeviceSize bytes = [] {
++        const char* value = std::getenv("EDEN_UP_VMA_TRIM_BLOCK_MIB");
++        const unsigned long mib = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
++        const VkDeviceSize asked = VkDeviceSize{mib == 2 || mib == 4 || mib == 8 ? mib : 8UL} << 20;
++        return (std::min)(asked, (std::max)(VkDeviceSize{2} << 20, TrimDefaultHalfBlock()));
++    }();
++    return bytes;
++}
++
++/// EDEN_UP_VMA_TRIM_BURST: images made within one second that count as an area load (unset: 100,
++/// as EDEN_NX2_AREA_EVICT_BURST counts 100 within 30 frames); 0: the pool alone decides.
++[[nodiscard]] u32 TrimBurstImages() {
++    static const u32 images = [] {
++        const char* value = std::getenv("EDEN_UP_VMA_TRIM_BURST");
++        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 100U;
++    }();
++    return images;
++}
++
++/// The pool's largest free block (the front's figure); where there is none, what the allocator's
++/// budget leaves in the device-local heap with the most left.
++[[nodiscard]] u64 TrimFreeBytes(VmaAllocator allocator, bool& from_front) {
++#if VULKAN_VMA_TRIM_FRONT
++    if (eden_free_memory_bytes != nullptr) {
++        if (const u64 bytes = eden_free_memory_bytes(); bytes != 0) {
++            from_front = true;
++            return bytes;
++        }
++    }
++#endif
++    from_front = false;
++    const VkPhysicalDeviceMemoryProperties* properties{};
++    vmaGetMemoryProperties(allocator, &properties);
++    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
++    vmaGetHeapBudgets(allocator, budgets.data());
++    u64 left = 0;
++    for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
++        if ((properties->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 &&
++            budgets[heap].budget > budgets[heap].usage) {
++            left = (std::max)(left, u64{budgets[heap].budget - budgets[heap].usage});
++        }
++    }
++    return left;
++}
++
++/// Whether the allocator's budget has room for `bytes` more in the heap of that memory type: what
++/// lets the usual path take a new block.
++[[nodiscard]] bool TrimBudgetLeft(VmaAllocator allocator, u32 type, VkDeviceSize bytes) {
++    const VkPhysicalDeviceMemoryProperties* properties{};
++    vmaGetMemoryProperties(allocator, &properties);
++    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
++    vmaGetHeapBudgets(allocator, budgets.data());
++    const VmaBudget& heap = budgets[properties->memoryTypes[type].heapIndex];
++    return heap.usage + bytes <= heap.budget;
++}
++
++struct TrimState {
++    std::atomic<long long> checked_ns{0};     ///< Last look at the pool (every 100 ms at most)
++    std::atomic<u64> largest{0};              ///< Its largest free block then
++    std::atomic<bool> from_front{false};      ///< That figure was the front's
++    std::atomic<bool> low{false};             ///< Under the mark (back over 1.5 times it: off)
++    std::atomic<long long> window_ns{0};      ///< Start of the second images are counted in
++    std::atomic<u32> window_images{0};
++    std::atomic<long long> burst_until_ns{0}; ///< Active until then after a burst
++    std::atomic<u32> bursts{0};
++    std::atomic<bool> announced{false};
++    std::atomic<long long> logged_ns{0};
++    std::atomic<bool> reported{false};        ///< Active at the last line
++    std::atomic<u64> slack_at_start{0};       ///< The blocks' unused space when it turned on
++};
++TrimState trim_state;
++
++/// EDEN_VMA_TRIM (stderr.log), in MiB, count/MiB for the images and device memory since the last
++/// line: when the trim turns on or off, and while on every 2 s with images placed (else 20 s).
++///   EDEN_VMA_TRIM on|off largest mark burst=<bursts so far>[+] blocks used slack (change since on)
++///       shared sparse buffers trim (blocks/slack each) holes own large small fallback freed taken
++/// slack: the allocator's blocks less their use, all heaps; shared: VMA's own blocks (images up
++/// to half a block, host-visible buffers; memory of its own counts as fully used), sparse /
++/// buffers / trim: the SparsePages, DeviceBuffers and TrimmedImages pools. holes: images in space
++/// the blocks held already; own: images given memory of their own that VMA would have put in a
++/// shared block (over half a small block, up to half of VMA's); large: images over half of VMA's
++/// block (memory of their own as before); small: images in the trim's small blocks; fallback:
++/// images the trim left to the usual path; freed / taken: device memory the allocator gave back
++/// to / took from the driver, its blocks and memory of its own, for any reason (the callbacks in
++/// vulkan_device.cpp).
++void TrimReport(const Device& device, long long now, bool active, bool burst_on) {
++    TrimState& s = trim_state;
++    const bool was = s.reported.load(std::memory_order_relaxed);
++    long long last = s.logged_ns.load(std::memory_order_relaxed);
++    if (active == was) {
++        if (!active) {
++            return;
++        }
++        u64 placed = 0;
++        for (const VmaTrim::Counter counter :
++             {VmaTrim::Holes, VmaTrim::Own, VmaTrim::Large, VmaTrim::Small, VmaTrim::Fallbacks}) {
++            placed += VmaTrim::g_counters[counter].load(std::memory_order_relaxed);
++        }
++        if (now - last < (placed != 0 ? 2'000'000'000LL : 20'000'000'000LL)) {
++            return;
++        }
++    }
++    if (!s.logged_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
++        return; // another thread writes this one
++    }
++    s.reported.store(active, std::memory_order_relaxed);
++    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
++    vmaGetHeapBudgets(device.GetAllocator(), budgets.data());
++    u64 blocks = 0, used = 0;
++    for (const VmaBudget& heap : budgets) {
++        blocks += heap.statistics.blockBytes;
++        used += heap.statistics.allocationBytes;
++    }
++    const u64 slack = blocks > used ? blocks - used : 0;
++    std::array<u64, 3> pool_blocks{}, pool_used{};
++    for (u32 kind = 0; kind < 3; ++kind) {
++        device.AddSeparatePoolUsage(static_cast<Device::SeparatePool>(kind), pool_blocks[kind],
++                                    pool_used[kind]);
++    }
++    const auto pool_slack = [&](u32 kind) {
++        return static_cast<unsigned long long>(
++            (pool_blocks[kind] > pool_used[kind] ? pool_blocks[kind] - pool_used[kind] : 0) >> 20);
++    };
++    const u64 all_pools = pool_blocks[0] + pool_blocks[1] + pool_blocks[2];
++    const u64 all_pools_used = pool_used[0] + pool_used[1] + pool_used[2];
++    const u64 all_pools_slack = all_pools > all_pools_used ? all_pools - all_pools_used : 0;
++    const u64 shared_blocks = blocks > all_pools ? blocks - all_pools : 0;
++    const u64 shared_slack = slack > all_pools_slack ? slack - all_pools_slack : 0;
++    if (active && !was) {
++        s.slack_at_start.store(slack, std::memory_order_relaxed);
++    }
++    const u64 slack_at_start = s.slack_at_start.load(std::memory_order_relaxed);
++    const long long change =
++        static_cast<long long>(slack >> 20) - static_cast<long long>(slack_at_start >> 20);
++    const auto take = [](VmaTrim::Counter counter) {
++        return static_cast<unsigned long long>(VmaTrim::Take(counter));
++    };
++    const auto mib = [](u64 bytes) { return static_cast<unsigned long long>(bytes >> 20); };
++    const unsigned long long holes = take(VmaTrim::Holes), own = take(VmaTrim::Own),
++                             large = take(VmaTrim::Large), small = take(VmaTrim::Small),
++                             fallbacks = take(VmaTrim::Fallbacks), freed = take(VmaTrim::Freed),
++                             taken = take(VmaTrim::Taken);
++    std::fprintf(stderr,
++                 "EDEN_VMA_TRIM %s largest=%llu mark=%llu burst=%u%s blocks=%llu used=%llu "
++                 "slack=%llu (%+lld since on) shared=%llu/%llu sparse=%llu/%llu buffers=%llu/%llu "
++                 "trim=%llu/%llu holes=%llu/%llu own=%llu/%llu large=%llu/%llu "
++                 "small=%llu/%llu fallback=%llu freed=%llu/%llu taken=%llu/%llu\n",
++                 active ? "on" : "off", mib(s.largest.load(std::memory_order_relaxed)),
++                 mib(TrimMarkBytes()), s.bursts.load(std::memory_order_relaxed), burst_on ? "+" : "",
++                 mib(blocks), mib(used), mib(slack), change, mib(shared_blocks), mib(shared_slack),
++                 mib(pool_blocks[0]), pool_slack(0), mib(pool_blocks[1]), pool_slack(1),
++                 mib(pool_blocks[2]), pool_slack(2), holes, take(VmaTrim::HoleBytes) >> 20,
++                 own, take(VmaTrim::OwnBytes) >> 20, large, take(VmaTrim::LargeBytes) >> 20, small,
++                 take(VmaTrim::SmallBytes) >> 20, fallbacks, freed, take(VmaTrim::FreedBytes) >> 20,
++                 taken, take(VmaTrim::TakenBytes) >> 20);
++}
++
++/// Whether the trim is active now, counting this image toward a burst.
++bool TrimActive(const Device& device) {
++    const VmaAllocator allocator = device.GetAllocator();
++    TrimState& s = trim_state;
++    const long long now = TrimNowNs();
++    if (const u32 burst = TrimBurstImages(); burst != 0) {
++        if (now - s.window_ns.load(std::memory_order_relaxed) >= 1'000'000'000) {
++            s.window_ns.store(now, std::memory_order_relaxed);
++            s.window_images.store(0, std::memory_order_relaxed);
++        }
++        if (s.window_images.fetch_add(1, std::memory_order_relaxed) + 1 == burst) {
++            s.burst_until_ns.store(now + 10'000'000'000LL, std::memory_order_relaxed);
++            s.bursts.fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++    if (now - s.checked_ns.load(std::memory_order_relaxed) >= 100'000'000) {
++        s.checked_ns.store(now, std::memory_order_relaxed);
++        bool from_front = false;
++        const u64 largest = TrimFreeBytes(allocator, from_front);
++        const u64 mark = TrimMarkBytes();
++        s.largest.store(largest, std::memory_order_relaxed);
++        s.from_front.store(from_front, std::memory_order_relaxed);
++        s.low.store(largest < mark ||
++                        (s.low.load(std::memory_order_relaxed) && largest < mark + mark / 2),
++                    std::memory_order_relaxed);
++    }
++    if (!s.announced.exchange(true, std::memory_order_relaxed)) {
++        std::fprintf(stderr,
++                     "EDEN_VMA_TRIM ready: on under %llu MiB of largest free block (off over %llu), "
++                     "small blocks %llu MiB, own memory over %llu MiB, burst %u images/s, the "
++                     "figure from %s\n",
++                     static_cast<unsigned long long>(TrimMarkBytes() >> 20),
++                     static_cast<unsigned long long>((TrimMarkBytes() + TrimMarkBytes() / 2) >> 20),
++                     static_cast<unsigned long long>(TrimBlockBytes() >> 20),
++                     static_cast<unsigned long long>(TrimBlockBytes() >> 21), TrimBurstImages(),
++                     s.from_front.load(std::memory_order_relaxed) ? "the pool"
++                                                                  : "the allocator's budget");
++    }
++    const bool burst_on = now < s.burst_until_ns.load(std::memory_order_relaxed);
++    const bool active = s.low.load(std::memory_order_relaxed) || burst_on;
++    TrimReport(device, now, active, burst_on);
++    return active;
++}
++
++/// While the trim is active: makes the image and gives it memory without a new shared block.
++/// First space the blocks already hold (no new memory, so no budget either); where none fits,
++/// memory of its own when it needs over half a small block, else a small block of the trim's
++/// pool. True with the image made and bound; false leaves nothing behind, and the usual path
++/// makes the image with all its fallbacks (outside the budget, host memory, unbacked, and on the
++/// console the port's ReleaseRefused).
++bool CreateTrimmedImage(const Device& device, VmaAllocator allocator, const VkImageCreateInfo& ci,
++                        const VmaAllocationCreateInfo& alloc_ci, VkImage& handle,
++                        VmaAllocation& allocation, VmaAllocationInfo& alloc_info) {
++    // Images that take no memory the usual way (sparse, lazily allocated, planes bound one by
++    // one) or that the driver may want memory of their own for (external memory) stay on the
++    // usual path: VMA allows them no hole and no pool.
++    constexpr VkImageCreateFlags unusual =
++        VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
++        VK_IMAGE_CREATE_SPARSE_ALIASED_BIT | VK_IMAGE_CREATE_DISJOINT_BIT;
++    if ((ci.flags & unusual) != 0 || (ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0 ||
++        (ci.tiling != VK_IMAGE_TILING_OPTIMAL && ci.tiling != VK_IMAGE_TILING_LINEAR)) {
++        return false;
++    }
++    for (auto next = static_cast<const VkBaseInStructure*>(ci.pNext); next != nullptr;
++         next = next->pNext) {
++        if (next->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
++            return false;
++        }
++    }
++    const auto& dld = device.GetDispatchLoader();
++    const VkDevice logical = *device.GetLogical();
++    VkImage image{};
++    if (dld.vkCreateImage(logical, &ci, nullptr, &image) != VK_SUCCESS) {
++        return false;
++    }
++    VkMemoryRequirements requirements{};
++    dld.vkGetImageMemoryRequirements(logical, image, &requirements);
++    // vmaAllocateMemoryForImage does not know the image's usage, which VMA_MEMORY_USAGE_AUTO*
++    // needs. UNKNOWN with the same preferred flag (device-local; VMA adds "not uncached" to both)
++    // picks the memory type vmaCreateImage picks for an image the host never touches.
++    VmaAllocationCreateInfo base = alloc_ci;
++    base.usage = VMA_MEMORY_USAGE_UNKNOWN;
++    VmaAllocation memory{};
++    VmaAllocationInfo info{};
++    VmaTrim::Counter kind = VmaTrim::Holes;
++    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++    // The holes and the small blocks only in the type the usual path takes first: VMA would
++    // otherwise go on to the holes of the host-visible types, where the usual path puts no image
++    // while it can still take a block.
++    u32 type{};
++    if (vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &base, &type) ==
++        VK_SUCCESS) {
++        VmaAllocationCreateInfo holes = base;
++        holes.flags =
++            (holes.flags & ~VmaAllocationCreateFlags{VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT}) |
++            VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
++        holes.memoryTypeBits = 1U << type;
++        result = vmaAllocateMemoryForImage(allocator, image, &holes, &memory, &info);
++        const VkDeviceSize block = TrimBlockBytes();
++        if (result != VK_SUCCESS && requirements.size > block / 2) {
++            // Within the budget and in any type, as the usual path asks for memory of its own.
++            VmaAllocationCreateInfo own = base;
++            own.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
++            kind = requirements.size > TrimDefaultHalfBlock() ? VmaTrim::Large : VmaTrim::Own;
++            result = vmaAllocateMemoryForImage(allocator, image, &own, &memory, &info);
++        } else if (result != VK_SUCCESS) {
++            if (const VmaPool pool =
++                    device.GetSeparatePool(Device::SeparatePool::TrimmedImages, type, block)) {
++                VmaAllocationCreateInfo small = base;
++                small.pool = pool;
++                // A new small block only within the budget, as the usual path takes a new block;
++                // past it, only the small blocks held already.
++                if (!TrimBudgetLeft(allocator, type, block)) {
++                    small.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
++                }
++                kind = VmaTrim::Small;
++                result = vmaAllocateMemoryForImage(allocator, image, &small, &memory, &info);
++            }
++        }
++    }
++    if (result == VK_SUCCESS && vmaBindImageMemory(allocator, memory, image) == VK_SUCCESS) {
++        handle = image;
++        allocation = memory;
++        alloc_info = info;
++        VmaTrim::Add(kind);
++        VmaTrim::Add(kind == VmaTrim::Holes   ? VmaTrim::HoleBytes
++                     : kind == VmaTrim::Own   ? VmaTrim::OwnBytes
++                     : kind == VmaTrim::Large ? VmaTrim::LargeBytes
++                                              : VmaTrim::SmallBytes,
++                     info.size);
++        return true;
++    }
++    if (memory != VK_NULL_HANDLE) {
++        vmaFreeMemory(allocator, memory);
++    }
++    dld.vkDestroyImage(logical, image, nullptr);
++    VmaTrim::Add(VmaTrim::Fallbacks);
++    return false;
++}
+ } // namespace
+ 
+ //MemoryCommit is now VMA-backed
+@@ -233,8 +585,15 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+     // unbacked sparse fallback below.
+     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
+     const bool huge = texels > (u64{1} << 28);
+-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++    // EDEN_UP_VMA_TRIM=1 (vma_trim.h): while the pool is short or an area loads, an image takes
++    // no new shared block (CreateTrimmedImage); false sends it on as before. Every image counts
++    // toward a burst. Unset: only the cached switch is read.
++    const bool trimmed = VmaTrim::Enabled() && TrimActive(device) && !huge && !dedicated &&
++                         CreateTrimmedImage(device, allocator, ci, alloc_ci, handle, allocation,
++                                            alloc_info);
++    VkResult result = huge      ? VK_ERROR_OUT_OF_DEVICE_MEMORY
++                      : trimmed ? VK_SUCCESS
++                                : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
+         // it out rather than failing the draw and aborting.

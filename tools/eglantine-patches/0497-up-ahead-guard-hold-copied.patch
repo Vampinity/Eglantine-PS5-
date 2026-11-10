@@ -1,0 +1,196 @@
+Subject: [PATCH] EDEN_UP_AHEAD_GUARD=3 holds only the writes that went to copied pages, and claims them at once
+
+0496 held every guest write collected while a guard was up. But the caches rely on collected
+writes being applied soon: applying one first takes it out of the GPU-written ranges, which is
+what keeps a fence or read download from landing the GPU's older bytes over it. EDEN_NX2_OVERWRITE_CHECK
+saw guest writes over GPU-written ranges not yet landed in 10-20% of frames. Held for a frame,
+those would be overwritten in guest memory.
+
+Now a gather made while a guard is up keeps back only the writes that went to a page with a
+copy (so: made after the present, to a page the frame in flight reads), takes them out of the
+GPU-written ranges at once (RasterizerInterface::ClaimCpuWrites, what OnCacheInvalidations does
+first) and applies them at the first gather after the guard is lifted. Every other write is
+applied as before, so traffic between the game and the GPU on other pages is untouched.
+
+---
+diff --git a/src/video_core/ahead_guard.h b/src/video_core/ahead_guard.h
+index 5f22167..21048d9 100644
+--- a/src/video_core/ahead_guard.h
++++ b/src/video_core/ahead_guard.h
+@@ -44,15 +44,17 @@
+ ///      (TakeRedirty), so a buffer uploaded from a copy is uploaded again from memory. With the
+ ///      pool full a write waits as with =1.
+ ///
+-///   =3 (copy and hold): as =2, and the guest writes the cores collect while a guard is up stay
+-///      with them until it is lifted (GPU::GatherAndApply gathers nothing meanwhile); those made
+-///      before the present are gathered at the present (GPU::GatherForAheadGuard) and applied
+-///      as usual. T89, batch t89-a: with =2 a write made after the present was still applied
+-///      in the middle of the frame in flight. For most pages that only marks them for an upload,
+-///      which then reads the copy; but a write into memory the GPU owns is uploaded into the host
+-///      buffer at once (BufferCache's inline page writes), and a texture the write touches is
+-///      uploaded again from memory. Two small dark glitches and a fade out of order stayed, and
+-///      eleven moments with EDEN_UP_AHEAD_ALWAYS.
++///   =3 (copy and hold): as =2, and a guest write collected while a guard is up that went to a
++///      copied page (so: made after the present, to a page the frame in flight reads) is applied
++///      only after the guard is lifted (GPU::GatherAndApply). It leaves the GPU-written ranges
++///      at once, so no download lands over it meanwhile. The writes made before the present are
++///      gathered at the present (GPU::GatherForAheadGuard) and applied as usual, and so is every
++///      write to a page without a copy. T89, batch t89-a: with =2 a write made after the present
++///      was still applied in the middle of the frame in flight. For most pages that only marks
++///      them for an upload, which then reads the copy; but a write into memory the GPU owns is
++///      uploaded into the host buffer at once (BufferCache's inline page writes), and a texture
++///      the write touches is uploaded again from memory. One or two small dark glitches and a
++///      fade out of order stayed, and nine moments with EDEN_UP_AHEAD_ALWAYS.
+ ///
+ ///   EDEN_UP_AHEAD_GUARD_SETS=<mask>   which finished frames' pages are guarded, bit d = the frame
+ ///                                     d presents back (default 14: one, two and three back;
+@@ -461,11 +463,28 @@ inline bool Active() {
+     return Enabled() && Get().active.load(std::memory_order_acquire);
+ }
+ 
+-/// =3: a guard is up, so the guest writes collected now are a later frame's and stay with their
+-/// cores until it is lifted (GPU::GatherAndApply).
++/// =3: a guard is up, so a guest write collected now that went to a copied page is a later
++/// frame's and is applied after the guard is lifted (GPU::GatherAndApply).
+ inline bool HoldWrites() {
+     return Mode() == 3 && Get().active.load(std::memory_order_acquire);
+ }
++
++/// Whether a page of [device_addr, device_addr + size) has a copy now: a guest thread wrote it
++/// after the present of the frame in flight. Lock-free.
++inline bool HasCopy(u64 device_addr, u64 size) {
++    constexpr u64 limit = u64{1} << AddressBits;
++    if (size == 0 || device_addr >= limit) {
++        return false;
++    }
++    State& s = Get();
++    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++        if ((s.copied[page / 64].load(std::memory_order_acquire) & (u64{1} << (page % 64))) != 0) {
++            return true;
++        }
++    }
++    return false;
++}
+ inline bool Guarded(u64 device_addr, u64 size) {
+     constexpr u64 limit = u64{1} << AddressBits;
+     if (size == 0 || device_addr >= limit) {
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index bb8c30b..b5781fc 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -189,9 +189,10 @@ struct GPU::Impl {
+     ///      so buffers uploaded from the copies are uploaded again;
+     ///  =3: first the writes gathered at the present that put the guard up
+     ///      (GatherForAheadGuard): they were made before it, so they are the frame's own. While
+-    ///      the guard is up nothing more is gathered: what the cores collect meanwhile is a later
+-    ///      frame's, stays with them (and in ForEachPendingCpuWrite's view), and is applied by
+-    ///      the first gather after the guard is lifted.
++    ///      the guard is up, a gathered write that went to a copied page is a later frame's, to a
++    ///      page the frame in flight reads: it is kept (in ForEachPendingCpuWrite's view, and out
++    ///      of the GPU-written ranges at once, so no download lands over it) and applied by the
++    ///      first gather after the guard is lifted. Every other write is applied as before.
+     void GatherForApply(std::function<void(PAddr, size_t)>& callback_writes) {
+         if (!VideoCommon::AheadGuard::Enabled()) [[likely]] {
+             system.GatherGPUDirtyMemory(callback_writes);
+@@ -203,8 +204,26 @@ struct GPU::Impl {
+         }
+         ahead_gathered_writes.clear();
+         if (!VideoCommon::AheadGuard::HoldWrites()) {
++            for (const auto& [address, size] : ahead_held_writes) {
++                callback_writes(address, size);
++            }
++            ahead_held_writes.clear();
+             system.GatherGPUDirtyMemory(callback_writes);
+             VideoCommon::AheadGuard::TakeRedirty(callback_writes);
++            return;
++        }
++        std::vector<std::pair<DAddr, u64>> kept;
++        std::function<void(PAddr, size_t)> split([&](PAddr address, size_t size) {
++            if (VideoCommon::AheadGuard::HasCopy(address, size)) {
++                kept.emplace_back(address, size);
++            } else {
++                callback_writes(address, size);
++            }
++        });
++        system.GatherGPUDirtyMemory(split);
++        if (!kept.empty()) {
++            renderer->ReadRasterizer()->ClaimCpuWrites(kept);
++            ahead_held_writes.insert(ahead_held_writes.end(), kept.begin(), kept.end());
+         }
+     }
+ 
+@@ -299,12 +318,16 @@ struct GPU::Impl {
+         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+             manager.ForEachPending(callback);
+         }
+-        // EDEN_UP_AHEAD_GUARD=3: the writes gathered at a present and not applied yet.
++        // EDEN_UP_AHEAD_GUARD=3: the writes gathered at a present and not applied yet, and
++        // those kept until a guard is lifted.
+         if (VideoCommon::AheadGuard::Mode() == 3) [[unlikely]] {
+             std::scoped_lock lock{ahead_gather_mutex};
+             for (const auto& [address, size] : ahead_gathered_writes) {
+                 callback(address, size);
+             }
++            for (const auto& [address, size] : ahead_held_writes) {
++                callback(address, size);
++            }
+         }
+         // EDEN_UP_L1028_ASYNC_READBACK or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: the gathered writes
+         // being applied (GatherAndApply).
+@@ -670,8 +693,10 @@ struct GPU::Impl {
+     std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
+     std::mutex applying_writes_mutex;
+     /// EDEN_UP_AHEAD_GUARD=3: guest writes gathered at a present (GatherForAheadGuard), for the
+-    /// next GatherAndApply; the mutex also keeps the two gathers apart.
++    /// next GatherAndApply, and those kept until a guard is lifted; the mutex also keeps the two
++    /// gathers apart.
+     std::vector<std::pair<DAddr, u64>> ahead_gathered_writes;
++    std::vector<std::pair<DAddr, u64>> ahead_held_writes;
+     std::mutex ahead_gather_mutex;
+ 
+     const bool is_async;
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index c899bdb..978488c 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -202,6 +202,11 @@ public:
+         }
+     }
+ 
++    /// EDEN_UP_AHEAD_GUARD=3 (ahead_guard.h): guest writes that are applied later. Until then a
++    /// download must not land the GPU's older bytes over them: they leave the GPU-written ranges
++    /// now, as OnCacheInvalidations does first.
++    virtual void ClaimCpuWrites([[maybe_unused]] std::span<const std::pair<DAddr, u64>> ranges) {}
++
+     /// EDEN_UP_HELD_VS_DOWNLOAD: around each round of OnCacheInvalidations (one gather).
+     virtual void BeginCachedWrites() {}
+     virtual void EndCachedWrites() {}
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index e3f21bd..9d23d39 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2641,6 +2641,11 @@ bool PresentFenceReached(Tegra::Host1x::SyncpointManager& syncpoints, u64 fence)
+ }
+ } // Anonymous namespace
+ 
++void RasterizerVulkan::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges) {
++    std::scoped_lock lock{buffer_cache.mutex};
++    buffer_cache.ClaimCpuWrites(ranges);
++}
++
+ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+     if (!ranges.empty()) {
+         // EDEN_UP_FAST_DRAW: guest CPU writes land here in batches (list starts, cache
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 2fa6ce8..7334d62 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -123,6 +123,7 @@ public:
+     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+     void OnCacheInvalidation(DAddr addr, u64 size) override;
+     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
++    void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges) override;
+     void BeginCachedWrites() override;
+     void EndCachedWrites() override;
+     bool TryCacheInvalidation(DAddr addr, u64 size) override;

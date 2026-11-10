@@ -1,0 +1,180 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_FRITCHII_DEPTH_CLEAR=1: a new depth target that the clear binding it covers is not uploaded from guest memory first when the colour targets are smaller (Fritchii EXP56); off by default
+
+Credits. Port of Frizti/Fritchii f93124a6b8 ("texture_cache: EXP56 skips a cleared depth
+target's upload; EXP57 caps collector GPU waits", 2026-11-09, EXP56 half only) and 6129793a6b
+(EXP56 on by default upstream), by Frizti. Hand port: the upstream diff does not apply here
+(Nx2Debug::Experiment, EXP7 log strings). Upstream measured Castle Town 41.3 -> 43.8 fps and its
+clear zone 54.7 -> 36.3 ms/s with a live toggle, screenshots off/on identical. Not compiled or
+run here.
+
+Why. JoinImages' overwritten_by_clear lets a new render target skip its upload when the clear
+that binds it overwrites it whole, but it refuses whenever any bound colour target is smaller
+than the new image (the clear only covers the framebuffer's render area). Ocarina of Time binds
+a 1920x1024 depth buffer under 1280x720 colour, so its 7.5 MiB depth target is uploaded from guest
+memory each time it is made. The PS5 shows it in every Link's-house window: "largest 7 MiB"
+uploads, 1,228-1,412 uploads and 323-577 MiB per 600 frames (t98-b run797); village walk 5,351
+uploads, 6,151 MiB per 600 frames (t85-f run702). The upload is GPU back-thread work, and the back
+thread is the fly-over limit.
+
+EDEN_UP_FRITCHII_DEPTH_CLEAR=1 (Common::PeSwitch, exact 1; unset or anything else: the old code
+path, unchanged).
+- overwritten_by_clear skips the smaller-colour-target refusal for the clear's own depth target
+  (zeta enabled, zeta address == the new image's address), as upstream. Every other test stays:
+  no joins, plain single-level 2D, clear layer 0, the scissor and window-origin tests, the depth
+  size test, and the Z / full stencil mask tests by format type.
+- The image then stays CpuModified, and UpdateRenderTargets' PrepareImage drops the upload only
+  when IsFullClear agrees, as it already does for an existing depth target (IsFullClear ignores
+  the colour sizes, same code as upstream). If IsFullClear refuses, PrepareImage uploads after all.
+- Relocation (EDEN_UP_FRITCHII_RELOCATE) is unchanged: RelocationCandidate refuses a target larger
+  than a bound colour target by its own test. (Upstream's has no such test, so upstream also
+  relocates the drifted depth target; here a new image is still made, only its upload goes.)
+- With EDEN_UP_SKIP_STALE_UPLOADS=1 such a target takes GuestBytes, as the skipped upload would
+  have set it: outside the render area guest memory holds its bytes, so it is never marked stale.
+- 600-frame line (with the switch on): "N cleared depth targets over smaller colour targets
+  skipped the join upload (M MiB ...)". The first 8 cleared depth targets of 1 MiB or more that
+  still took the upload are logged as "Depth clear: ... uploaded: ..." with the clear state
+  (EXP7's refusal reasons, as a state dump).
+
+Risk. Texels of the depth target outside the clear's render area hold undefined data instead of
+guest bytes, as an existing depth target's already do after a full clear. Only a later use at a
+larger render area without a clear could read them.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index cd2d143..42664fa 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -278,6 +278,21 @@ constexpr u64 KeepRemadeWindow = 600;
+     return enabled;
+ }
+ 
++/// EDEN_UP_FRITCHII_DEPTH_CLEAR=1 (off unless set; Fritchii f93124a6b8 EXP56, on by default
++/// upstream since 6129793a6b): JoinImages' overwritten_by_clear no longer refuses the clear's own
++/// depth target because a bound colour target is smaller. Ocarina of Time binds a 1920x1024 depth
++/// buffer under 1280x720 colour, and that rule uploaded its 7.5 MiB from guest memory each time
++/// the target was made ("largest 7 MiB" in the 600-frame upload line). The image stays
++/// CpuModified, and UpdateRenderTargets' PrepareImage drops the upload when IsFullClear agrees, as
++/// for an existing depth target: texels outside the clear's render area then hold undefined data
++/// instead of guest bytes. With the switch on, the 600-frame lines count the skips, and the first
++/// 8 cleared depth targets of 1 MiB or more that still took the upload are logged with the state
++/// that refused them (EXP7's purpose).
++[[nodiscard]] inline bool FritchiiDepthClear() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_DEPTH_CLEAR");
++    return enabled;
++}
++
+ using Tegra::Texture::TICEntry;
+ using Tegra::Texture::TSCEntry;
+ using VideoCore::Surface::GetFormatType;
+@@ -1470,6 +1485,14 @@ void TextureCache<P>::TickFrame() {
+                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
+         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
+                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
++        if (FritchiiDepthClear()) {
++            LOG_INFO(HW_GPU,
++                     "Texture cache last 600 frames: {} cleared depth targets over smaller colour "
++                     "targets skipped the join upload ({} MiB; PrepareImage uploads any that "
++                     "IsFullClear refuses)",
++                     tc_depth_clear_skips, tc_depth_clear_skip_bytes >> 20);
++            tc_depth_clear_skips = tc_depth_clear_skip_bytes = 0;
++        }
+         if (NoStaleUpload()) {
+             LOG_INFO(HW_GPU,
+                      "Texture cache last 600 frames: stale uploads skipped {} ({} MiB), {} uploaded "
+@@ -5192,7 +5215,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+     // A new render target that the clear binding it overwrites whole (every channel, the whole
+     // image) needs no upload from guest memory first: Ocarina of Time creates ~4 such targets a
+     // frame outdoors, and uploading them was ~15% of the GPU back thread.
++    // EDEN_UP_FRITCHII_DEPTH_CLEAR: set when the depth exemption below decided the result.
++    bool depth_clear_relaxed = false;
+     const auto overwritten_by_clear = [&] {
++        depth_clear_relaxed = false;
+         if (!clearing_render_targets || !join_copies_to_do.empty() ||
+             new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
+             new_info.resources.layers != 1 || new_info.num_samples != 1) {
+@@ -5222,10 +5248,19 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             }
+         }
+         // The clear covers the framebuffer's render area, the smallest bound target.
++        // EDEN_UP_FRITCHII_DEPTH_CLEAR=1 (Fritchii f93124a6b8, EXP56): not for the clear's own
++        // depth target, which follows IsFullClear as an existing one does (its contents are
++        // dropped, the colour targets' sizes aside).
++        const bool depth_follows_full_clear =
++            FritchiiDepthClear() && regs.zeta_enable && regs.zeta.Address() == gpu_addr;
+         for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+             const auto& rt = regs.rt[index];
+             if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+                 (rt.width < width || rt.height < height)) {
++                if (depth_follows_full_clear) {
++                    depth_clear_relaxed = true;
++                    continue;
++                }
+                 return false;
+             }
+         }
+@@ -5645,6 +5680,15 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+     if (overwritten_by_clear() && !clear_guard_keeps_upload()) {
+         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
+         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
++        if (depth_clear_relaxed) {
++            ++tc_depth_clear_skips;
++            tc_depth_clear_skip_bytes += new_image.guest_size_bytes;
++            if (SkipStaleUploads()) {
++                // UB-128: outside the clear's render area guest memory, not the GPU, holds this
++                // target's bytes, as the upload it replaces would have set: never marked stale.
++                new_image.flags |= ImageFlagBits::GuestBytes;
++            }
++        }
+         runtime.TransitionImageLayout(new_image);
+     } else if (copied_whole) {
+         // What RefreshContents does, without the upload.
+@@ -5674,6 +5718,36 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+         }
+         runtime.TransitionImageLayout(new_image);
+     } else {
++        if (FritchiiDepthClear() && clearing_render_targets &&
++            new_image.guest_size_bytes >= 1_MiB && maxwell3d->regs.zeta_enable &&
++            maxwell3d->regs.zeta.Address() == gpu_addr) [[unlikely]] {
++            // EDEN_UP_FRITCHII_DEPTH_CLEAR: why a cleared depth target was still uploaded.
++            static u32 depth_refusals_logged{};
++            if (depth_refusals_logged < 8) {
++                ++depth_refusals_logged;
++                const auto& regs = maxwell3d->regs;
++                const auto& surface = regs.clear_surface;
++                const auto& scissor = regs.scissor_test[0];
++                LOG_INFO(HW_GPU,
++                         "Depth clear: depth target format {} {}x{} levels {} layers {} samples "
++                         "{} at {:#x} uploaded: {} join copies, clear Z {} S {} layer {}, "
++                         "stencil mask {:#x}, scissor {} ({},{})-({},{}), rt0 {}x{} of {} "
++                         "targets, depth {}x{}, clear test passed {} (then a guard kept it)",
++                         static_cast<u32>(new_info.format), new_info.size.width,
++                         new_info.size.height, new_info.resources.levels,
++                         new_info.resources.layers, new_info.num_samples, gpu_addr,
++                         join_copies_to_do.size(), static_cast<u32>(surface.Z),
++                         static_cast<u32>(surface.S), static_cast<u32>(surface.layer),
++                         static_cast<u32>(regs.stencil_front_mask),
++                         static_cast<u32>(regs.clear_control.use_scissor),
++                         static_cast<u32>(scissor.min_x), static_cast<u32>(scissor.min_y),
++                         static_cast<u32>(scissor.max_x), static_cast<u32>(scissor.max_y),
++                         static_cast<u32>(regs.rt[0].width), static_cast<u32>(regs.rt[0].height),
++                         static_cast<u32>(regs.rt_control.count),
++                         static_cast<u32>(regs.zeta_size.width),
++                         static_cast<u32>(regs.zeta_size.height), overwritten_by_clear());
++            }
++        }
+         // TODO: Only upload what we need
+         RefreshContents(new_image, new_image_id);
+     }
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index e6055b0..980da29 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -199,6 +199,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     u64 area_evicted_images{};  ///< This burst's totals (the done line)
+     u64 area_evicted_bytes{};
+     u64 area_dropped_images{};  ///< Of them, GPU-written images deleted without a copy
++    u64 tc_depth_clear_skips{};      ///< EDEN_UP_FRITCHII_DEPTH_CLEAR: join uploads left to the clear
++    u64 tc_depth_clear_skip_bytes{}; ///< Their guest sizes (last 600 frames)
+     /// EDEN_NX2_CLEAN_BY_TIME: AreaEvict's window also ends no earlier than this (see AreaEvict)
+     std::chrono::steady_clock::time_point area_evict_until_time{};
+     u64 area_evict_min_until{}; ///< ...but not before this frame (very low frame rates)

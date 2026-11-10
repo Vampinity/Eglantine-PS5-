@@ -1,0 +1,235 @@
+Subject: [PATCH] EDEN_UP_AHEAD_GUARD_FRONT=1: the front names the constant buffer pages a frame's lists bind, and the guard takes them; off by default
+
+Ten door runs with EDEN_UP_AHEAD_GUARD=3 (T91, T94, T95): 4 single glitch moments in all against
+2-4 a run for the controls, fade in order in 10 of 10, speed as the control. But the over-bright
+first frame after the cut to Link's house stayed in 3 of 10 (controls about 4 of 9); the waiting
+guard (=1) had it in 0 of 3. The guard guesses a frame's pages from the frames before it, and
+the first frame after a cut reads pages none of them read (and that no cache traps yet).
+
+The split GPU thread's front parses a frame's lists soon after they are submitted, before the
+back draws them. With this switch it tells the guard the pages of every constant buffer bind it
+parses (Maxwell3D FrontNoteGuardBind, up to 64 KiB a bind). The guard adds them when a present
+puts it up, and traps at once a page named while it is up.
+
+---
+diff --git a/src/video_core/ahead_guard.h b/src/video_core/ahead_guard.h
+index 54ce911..fd404d9 100644
+--- a/src/video_core/ahead_guard.h
++++ b/src/video_core/ahead_guard.h
+@@ -72,6 +72,9 @@
+ ///                                     guessed (a power of two; default 1: the page alone)
+ ///   EDEN_UP_AHEAD_GUARD_ALL_WRITES=1  while a guard is up, a write to any page the caches track
+ ///                                     is copied first, not only to the guessed pages
++///   EDEN_UP_AHEAD_GUARD_FRONT=1       the front names the constant buffer pages a frame's lists
++///                                     bind, and the guard takes them too (for the frame after
++///                                     a scene cut)
+ /// Covered: buffer uploads, streamed uniform blocks, and the texture handles and storage buffer
+ /// pointers read from constant buffers at a draw (ReadGpu). Not covered: texture data and
+ /// descriptor tables the texture cache reads.
+@@ -173,6 +176,21 @@ inline bool AllWrites() {
+     return on;
+ }
+ 
++/// EDEN_UP_AHEAD_GUARD_FRONT=1 (with the guard on): the split GPU thread's front, which parses a
++/// frame's command lists soon after they are submitted, tells the guard which constant buffer
++/// pages the lists bind (NoteFront), and the guard takes those pages too. The guess from earlier
++/// frames cannot hold a page no frame read before, which is every page of the first frame after
++/// a scene cut. T91-T95, ten door runs with =3: the over-bright first frame after the cut to
++/// Link's house stayed in 3 of 10 (controls about 4 of 9), while the waiting guard had it in 0
++/// of 3. A page the front names while a guard is up is trapped at once.
++inline bool FrontNotes() {
++    static const bool on = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_FRONT");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return on && Enabled();
++}
++
+ inline u32 CopyCapacity() {
+     static const u32 pages = [] {
+         const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_COPY_PAGES");
+@@ -225,6 +243,13 @@ struct State {
+     std::vector<std::pair<u64, u32>> served, redirty;
+     std::atomic<bool> redirty_ready{}; ///< `redirty` is not empty
+ 
++    // EDEN_UP_AHEAD_GUARD_FRONT (all under the mutex).
++    std::unique_ptr<u64[]> front_seen; ///< pages of `front_pages`; made at the first note
++    std::vector<u32> front_pages;      ///< pages the front named since the last present
++    /// UpdatePagesCachedBatch of the device memory AtPresent was given, for NoteFront.
++    void (*trap)(void*, const std::vector<Run>&, int){};
++    void* trap_context{};
++
+     // Per log window (under the mutex).
+     struct Stats {
+         u32 presents{}, arms{}, overlaps{}, gave_up{}, gave_up_gpu{};
+@@ -242,6 +267,7 @@ struct State {
+         u32 other_thread_holds{};
+         u64 copies{}, copy_reads{}, copy_read_bytes{}, value_reads{};
+         u64 other_copies{}, other_skipped{};
++        u64 front_pages{}, front_late{};
+         u32 most_copies{}, pool_full{};
+         u64 armed_new_pages{}, armed_unguarded_pages{};
+     } stats{};
+@@ -284,6 +310,50 @@ inline void NoteRead(u64 device_addr, u64 size) {
+     }
+ }
+ 
++/// EDEN_UP_AHEAD_GUARD_FRONT, on the split's front: a command list binds a constant buffer of
++/// `size` bytes at `device_addr`. Its pages go into the next guard; with a guard up they are
++/// trapped now (a list parsed late, or the next frame's, whose buffer no thread should write
++/// again before its frame is drawn).
++inline void NoteFront(u64 device_addr, u64 size) {
++    constexpr u64 limit = u64{1} << AddressBits;
++    if (size == 0 || device_addr >= limit) {
++        return;
++    }
++    State& s = Get();
++    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    std::vector<State::Run> late;
++    std::scoped_lock lk{s.mutex};
++    if (!s.front_seen) {
++        s.front_seen.reset(new u64[PageLimit / 64]());
++    }
++    const bool armed = s.active.load(std::memory_order_relaxed) && s.trap != nullptr;
++    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++        const u64 bit = u64{1} << (page % 64);
++        u64& word = s.front_seen[page / 64];
++        if ((word & bit) != 0) {
++            continue;
++        }
++        word |= bit;
++        s.front_pages.push_back(static_cast<u32>(page));
++        ++s.stats.front_pages;
++        if (armed && ((s.guarded[page / 64].load(std::memory_order_relaxed) |
++                       s.copied[page / 64].load(std::memory_order_relaxed)) &
++                      bit) == 0) {
++            s.guarded[page / 64].fetch_or(bit, std::memory_order_relaxed);
++            s.armed_pages.push_back(static_cast<u32>(page));
++            if (!late.empty() && late.back().first + late.back().second == page << PageBits) {
++                late.back().second += PageSize;
++            } else {
++                late.emplace_back(page << PageBits, static_cast<size_t>(PageSize));
++            }
++            ++s.stats.front_late;
++        }
++    }
++    if (!late.empty()) {
++        s.trap(s.trap_context, late, 1);
++    }
++}
++
+ namespace Detail {
+ 
+ inline void EndFrameLocked(State& s, u64 number) {
+@@ -343,7 +413,11 @@ void DisarmLocked(State& s, DeviceMemory& device_memory) {
+     if (!s.active.load(std::memory_order_relaxed)) {
+         return;
+     }
+-    // The pages still trapped: a copied page gave its trap back when it was copied.
++    // The pages still trapped: a copied page gave its trap back when it was copied. Sorted
++    // again: NoteFront adds pages while the guard is up.
++    std::sort(s.armed_pages.begin(), s.armed_pages.end());
++    s.armed_pages.erase(std::unique(s.armed_pages.begin(), s.armed_pages.end()),
++                        s.armed_pages.end());
+     std::vector<State::Run> runs;
+     RunsOf(s.armed_pages, runs, [&s](u32 page) { return GuardedBit(s, page); });
+     for (const u32 page : s.armed_pages) {
+@@ -408,10 +482,11 @@ inline void LogWindowLocked(State& s, u64 present_number) {
+                  "{} of {}), the pool was full {} times; {} GPU thread reads took {} KiB from "
+                  "copies, and {} handle or pointer reads; of {} pages first read with a guard "
+                  "up, {} were not in it; {} pages outside the guard copied before a write ({} "
+-                 "left for a full pool)",
++                 "left for a full pool); the front named {} pages, {} of them with a guard up",
+                  st.copies, st.copies / arms, st.most_copies, CopyCapacity(), st.pool_full,
+                  st.copy_reads, st.copy_read_bytes >> 10, st.value_reads, st.armed_new_pages,
+-                 st.armed_unguarded_pages, st.other_copies, st.other_skipped);
++                 st.armed_unguarded_pages, st.other_copies, st.other_skipped, st.front_pages,
++                 st.front_late);
+     }
+     st = {};
+ }
+@@ -458,6 +533,8 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+                 const auto start = State::Clock::now();
+                 std::vector<u32>& pages = s.armed_pages;
+                 pages.assign(s.current.begin(), s.current.end());
++                // EDEN_UP_AHEAD_GUARD_FRONT: what the front has parsed of this frame's binds.
++                pages.insert(pages.end(), s.front_pages.begin(), s.front_pages.end());
+                 for (u32 back = 1; back <= 3; ++back) {
+                     const State::Frame& frame = s.frames[(number - back) & 3];
+                     if ((SetsMask() & (1U << back)) != 0 && number >= back &&
+@@ -507,6 +584,20 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+                 }
+             }
+         }
++        // The front's notes up to here were this frame's (or an earlier one's): the next
++        // frame's lists are submitted after this present returns.
++        if (!s.front_pages.empty()) {
++            for (const u32 page : s.front_pages) {
++                s.front_seen[page / 64] &= ~(u64{1} << (page % 64));
++            }
++            s.front_pages.clear();
++        }
++        if (s.trap == nullptr) {
++            s.trap_context = &device_memory;
++            s.trap = [](void* context, const std::vector<State::Run>& runs, int delta) {
++                static_cast<DeviceMemory*>(context)->UpdatePagesCachedBatch(runs, delta);
++            };
++        }
+         Detail::LogWindowLocked(s, number);
+     }
+     if (lifted) {
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 01ad6c7..5a1a6a8 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -22,6 +22,7 @@
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
++#include "video_core/ahead_guard.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/engines/maxwell_3d.h"
+@@ -1477,6 +1478,22 @@ void FrontNoteBind(const void* engine, MemoryManager& memory_manager, const u32*
+         valid ? memory_manager.GpuToCpuAddress(address) : std::optional<DAddr>{}, size);
+ }
+ 
++// EDEN_UP_AHEAD_GUARD_FRONT (ahead_guard.h): a bind group write as ProcessCBBind will run it on
++// the back, against the front's copy of the registers: the pages of the constant buffer it
++// binds go to the guard.
++void FrontNoteGuardBind(MemoryManager& memory_manager, const u32* regs, u32 value) {
++    if ((value & 1) == 0) {
++        return;
++    }
++    const GPUVAddr address =
++        (GPUVAddr{regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
++        regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
++    const u32 size = regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
++    if (const std::optional<DAddr> device = memory_manager.GpuToCpuAddress(address)) {
++        VideoCommon::AheadGuard::NoteFront(*device, (std::min<u32>)(size, 0x10000));
++    }
++}
++
+ // EDEN_UP_UBO_AHEAD / _VERIFY: a bind group write (`value`, shadow RAM applied) as ProcessCBBind
+ // will run it on the back, against the front's copy of the registers: the binding, and the
+ // front's copy of the pages it reads (ubo_ahead.h).
+@@ -1708,6 +1725,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+                 FrontNoteUboAheadBind(fs.ubo_bindings, memory_manager, fs.regs.data(), method,
+                                       value);
+             }
++            if (VideoCommon::AheadGuard::FrontNotes()) [[unlikely]] {
++                FrontNoteGuardBind(memory_manager, fs.regs.data(), value);
++            }
+             break;
+         case MAXWELL3D_REG_INDEX(sync_info):
+             // EDEN_UP_OOT_FRONT_WAIT: counted before it is sent (GpuSplit::FrontReached).
+@@ -1917,6 +1937,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+                     FrontNoteUboAheadBind(fs.ubo_bindings, memory_manager, fs.regs.data(), method,
+                                           value);
+                 }
++                if (VideoCommon::AheadGuard::FrontNotes()) [[unlikely]] {
++                    FrontNoteGuardBind(memory_manager, fs.regs.data(), value);
++                }
+                 break;
+             case MAXWELL3D_REG_INDEX(sync_info):
+                 // EDEN_UP_OOT_FRONT_WAIT: counted before the words are sent, after this loop.

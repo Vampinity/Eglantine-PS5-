@@ -1,0 +1,1273 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_STAGE_CACHE=1: translated shader stages reused across pipelines that differ only in fixed state (Djihads80/Eglantine d1195b7), capped by EDEN_UP_STAGE_CACHE_MIB (32) with least-recently-used eviction; EDEN_UP_STAGE_CACHE_VERIFY=1 rebuilds and compares; all off by default
+
+Djihads80/Eglantine d1195b7 (EDEN_NX2_STAGE_CACHE there, on by default): pipelines that differ
+only in fixed state translate the same programs again. In an Ocarina of Time cold boot 64% of the
+stages gave SPIR-V the same program had already given, about half of the translation and emission
+time; 0 differences in its verify mode on NVIDIA (1,276 stages reused) and RADV (106 reused). On
+the PS5 translation is the stall at a first visit: 8-18 ms a pipeline on the GPU thread, up to
+280 ms for a mesh pipeline.
+
+How it works (as upstream): a native stage is translated through a forwarding environment that
+records the reads translation makes (constant buffer values, storage pointer checks, texture
+types and formats, viewport transform, HLE replacements), in order. Another pipeline reuses the
+translation when its own environment answers those reads the same way, replayed in order, and
+the program, slot, environment constants and recompiler settings match. Translation is
+deterministic, so every read replayed up to a difference is one the translation would make too:
+the live environment ends up holding exactly the answers its own translation would have asked
+for, which is what goes to vulkan.bin. The emitted SPIR-V, program metadata and outgoing
+bindings are reused when the runtime info and incoming bindings are byte-for-byte equal;
+otherwise the stage is translated again and emitted. A merged VertexA/VertexB pair, Switch 1
+programs and layer emulation sources always translate.
+
+Changed for this tree:
+- Off unless EDEN_UP_STAGE_CACHE is exactly "1" (Common::PeSwitch); the upstream name is not read.
+- Memory: EDEN_UP_STAGE_CACHE_MIB=<n> (8-4096, default 32; upstream 256 MiB and starts over).
+  Past the cap the least recently used translations go until a quarter of the cap is free; at
+  most 8 translations per program and slot and 8 emitted variants per translation (the least
+  recently used goes); two workers that translated the same stage at once keep one copy; a
+  bad_alloc in a pipeline build or in the cache empties it. The driver's compiler running out of
+  memory on a worker is not seen here, so the cap is the guard: a translation and each emitted
+  variant hold about 10 KB of shader info besides their SPIR-V, the boot translates thousands of
+  stages while every worker compiles, and the PS5 has a few hundred MB free.
+- A reused stage replays the lowest and highest program address its translation read, so a
+  program read past its known size still keeps the pipeline out of vulkan.bin
+  (has_unbound_instructions) instead of a record that fails at the next boot (upstream skips it).
+- Our CreateGraphicsPipeline: the OoT visual workaround runs before the translation is kept (and
+  again when a reused translation is re-emitted), the known-broken-pattern check is skipped for a
+  reused stage (it passed when translated), guest shader dumps turn the cache off for that build,
+  mesh-as-compute and the noperspective fields are in the runtime key.
+- Reads are told apart exactly (upstream keeps a 64-bit hash of each); the signature also holds
+  the downscale setting and the OoT workaround state; verify also compares the shader infos.
+- Log line every 10 s while it works: stages reused whole, translations reused, translated, held
+  MiB, evicted, lookups with no signature held (and of those, the ones whose program is held under
+  another signature: a disk record's environment answers HasHLEMacroState and IsProprietaryDriver
+  by other rules than a live one, so boot entries may never match a lookup during play), and
+  which kind of read made a reuse fail.
+- The three switch names are in the shader preparation's stamp list (vk_pipeline_prep.cpp): set,
+  an arm gets a store of its own (one preparation at its first boot); unset, the stamp is the same.
+  _MIB and _VERIFY change no output but stay listed on purpose: each arm's first boot is then a
+  cold preparation (the prep time and peak memory a test compares), and a verify run checks every
+  stage the boot reuses instead of finding the store already full.
+
+With the shader preparation (EDEN_UP_SHADER_PREP) and the shader set (EDEN_UP_SHADER_SET):
+- Boot: the preparation translates every disk record on the workers, and with the shader set every
+  recipe's predicted record too. These share programs heavily (the shader set's canonical keys
+  found up to 20 keys for the same shaders in Ocarina), so this is where the cache saves most:
+  fewer translations per preparation, less worker time beside the guest cores. The kept SPIR-V
+  and infos are the same bytes either way.
+- A pipeline made from the kept store is not translated and does not ask the cache. The boot's
+  sample of kept records translated again for comparison builds like any pipeline: it asks and
+  fills the cache (stages this build translated, so the comparison still holds).
+- A pipeline that is not kept (a new fixed-state combination, a refused or struck-out record)
+  translates on the GPU thread as before, and its stages can come from what the boot translated:
+  the recorded answers (a disk record's, or a predicted record's guessed ones) are replayed
+  against the game's state now and must all be the same. The kept check (AnswersHoldFor) is
+  looser: texture handle and pointer words may differ. The miss counts by read kind tell whether
+  that rule is worth adding here later.
+- The prep verify build (EDEN_UP_SHADER_PREP_VERIFY=1) never takes a stage from the cache
+  (ShaderPrep::Stages::no_stage_cache), so it stays a check of real translations, and of what
+  the cache gave the kept store at boot.
+- Memory: the boot likely fills the cache up to the cap and least-recently-used eviction keeps it
+  there during play; the cap is the cost to watch on the PS5 (held MiB in the log line).
+
+Unset or anything but "1": no stage is looked up, recorded or kept, the build runs the same
+translation and emission calls in the same order, and the prep stamp is the same.
+---
+ src/video_core/CMakeLists.txt                        |   2 +
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 151 ++++++++-
+ src/video_core/renderer_vulkan/vk_pipeline_cache.h   |   4 +
+ src/video_core/renderer_vulkan/vk_pipeline_prep.cpp  |   3 +-
+ src/video_core/renderer_vulkan/vk_pipeline_prep.h    |   2 +
+ src/video_core/stage_cache.cpp                       | 641 +++++++++++++++++++++++++++++++++++++++
+ src/video_core/stage_cache.h                         | 253 +++++++++++++++
+ 7 files changed, 1047 insertions(+), 9 deletions(-)
+
+Rebased onto T98 (0505-0507 and, for the later two, the drafts before it) with patch -F3; no hunk rejected.
+
+---
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 5bd1356..911d4f1 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -269,6 +269,8 @@ add_library(video_core STATIC
+     shader_notify.h
+     smaa_area_tex.h
+     smaa_search_tex.h
++    stage_cache.cpp
++    stage_cache.h
+     surface.cpp
+     surface.h
+     texture_cache/accelerated_swizzle.cpp
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 0b1f335..415be99 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -2353,6 +2353,22 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     const bool uses_vertex_a{key.unique_hashes[0] != 0};
+     const bool uses_vertex_b{key.unique_hashes[1] != 0};
+ 
++    // EDEN_UP_STAGE_CACHE=1 (video_core/stage_cache.h, port of Djihads80/Eglantine d1195b7):
++    // native stages translated before for other pipelines are reused. A merged VertexA/VertexB
++    // pair, guest shader dumps (they need the program read) and the shader preparation's verify
++    // build (it checks real translations) always translate.
++    using StageCache = VideoCommon::StageCache;
++    const bool cache_stages{stage_cache.Enabled() && !uses_vertex_a &&
++                            !Settings::values.dump_guest_shaders.GetValue() &&
++                            (kept_out == nullptr || !kept_out->no_stage_cache)};
++    const u64 stage_salt{visual_workaround_title ^ (oot_visual_workaround ? 1ULL : 0ULL)};
++    std::array<Shader::Environment*, Maxwell::MaxShaderProgram> stage_envs{};
++    std::array<std::shared_ptr<const StageCache::Translation>, Maxwell::MaxShaderProgram> reused{};
++    std::array<std::shared_ptr<StageCache::Translation>, Maxwell::MaxShaderProgram> recorded{};
++    std::vector<std::pair<std::shared_ptr<StageCache::Translation>,
++                          std::shared_ptr<const StageCache::Emitted>>>
++        new_translations;
++
+     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
+     Shader::IR::Program* layer_source_program{};
+ 
+@@ -2397,25 +2413,54 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         }
+ 
+         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+-        if (!uses_vertex_a || index != 1) {
++        // EDEN_UP_STAGE_CACHE: a stage another pipeline translated with the same answers.
++        const bool cacheable{cache_stages && env.IsNativeProgram()};
++        std::vector<u8> stage_signature;
++        if (cacheable) {
++            stage_envs[index] = &env;
++            stage_signature =
++                StageCache::Signature(env, key.unique_hashes[index], index, stage_salt);
++            reused[index] = stage_cache.Find(stage_signature, env);
++            // A layer emulation source is needed with its IR (GenerateGeometryPassthrough).
++            if (reused[index] && reused[index]->program.info.requires_layer_emulation) {
++                reused[index] = nullptr;
++            }
++        }
++        if (reused[index]) {
++            programs[index] = reused[index]->program;
++        } else if (cacheable) {
++            // Translated through a recorder: its reads let other pipelines reuse the stage.
++            StageCache::Recorder recorder{env};
++            Shader::Maxwell::Flow::CFG cfg(recorder, pools.flow_block, cfg_offset, index == 0);
++            programs[index] = TranslateProgram(pools.inst, pools.block, recorder, cfg, host_info);
++            auto translation = std::make_shared<StageCache::Translation>();
++            translation->signature = std::move(stage_signature);
++            translation->reads = recorder.TakeReads();
++            translation->instruction_low = recorder.InstructionLow();
++            translation->instruction_high = recorder.InstructionHigh();
++            recorded[index] = std::move(translation);
++        } else if (!uses_vertex_a || index != 1) {
+             // Normal path
++            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+             programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+         } else {
+             // VertexB path when VertexA is present.
++            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+             auto& program_va{programs[0]};
+             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+         }
+ 
+-        if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
+-                programs[index], visual_workaround_title, key.unique_hashes[index],
+-                oot_visual_workaround)) {
++        if (reused[index]) {
++            // EDEN_UP_STAGE_CACHE: edited and checked when it was translated (its IR is gone).
++        } else if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
++                       programs[index], visual_workaround_title, key.unique_hashes[index],
++                       oot_visual_workaround)) {
+             LOG_WARNING(Render_Vulkan,
+                         "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
+                         key.unique_hashes[index], *edits);
+         }
+-        if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
++        if (!reused[index] && device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
+             LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
+             return nullptr;
+         }
+@@ -2424,6 +2469,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+             env.Dump(hash, key.unique_hashes[index]);
+         }
+ 
++        if (recorded[index]) {
++            // EDEN_UP_STAGE_CACHE: the program as this pipeline gets it, the edits above included.
++            // A layer emulation source is not kept: it is needed with its IR.
++            if (programs[index].info.requires_layer_emulation) {
++                recorded[index] = nullptr;
++            } else {
++                recorded[index]->program = StageCache::Summary(programs[index]);
++            }
++        }
++
+         if (programs[index].info.requires_layer_emulation) {
+             layer_source_program = &programs[index];
+         }
+@@ -2507,8 +2562,79 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+ 
+         const auto runtime_info{
+             MakeRuntimeInfo(programs, key, program, previous_stage, device, mesh_as_compute)};
+-        ConvertLegacyToGeneric(program, runtime_info);
+-        const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
++        // EDEN_UP_STAGE_CACHE: a stage emitted before for the same runtime info and bindings is
++        // reused whole; a reused translation without one is translated again here and emitted.
++        const StageCache::Translation* const stage_translation{
++            reused[index] ? reused[index].get() : recorded[index].get()};
++        std::vector<u32> code;
++        if (stage_translation == nullptr) {
++            ConvertLegacyToGeneric(program, runtime_info);
++            code = EmitSPIRV(profile, runtime_info, program, binding);
++        } else {
++            std::vector<u8> runtime_key = StageCache::RuntimeKey(runtime_info, binding);
++            std::shared_ptr<const StageCache::Emitted> emitted;
++            if (reused[index]) {
++                emitted = StageCache::FindEmitted(*reused[index], runtime_key);
++            }
++            if (emitted && !stage_cache.Verify()) {
++                code = emitted->spirv;
++                program = emitted->program;
++                binding = emitted->bindings_out;
++                stage_cache.CountReuse(true);
++            } else {
++                if (reused[index]) {
++                    // Emitted for other runtime info only, or verifying: the IR is needed again.
++                    // The environment holds the answers the reuse check got, so this is the
++                    // translation that was reused.
++                    Shader::Environment& stage_env{*stage_envs[index]};
++                    const u32 stage_cfg_offset{
++                        static_cast<u32>(stage_env.StartAddress() + sizeof(Shader::ProgramHeader))};
++                    Shader::Maxwell::Flow::CFG cfg(stage_env, pools.flow_block, stage_cfg_offset,
++                                                   index == 0);
++                    program = TranslateProgram(pools.inst, pools.block, stage_env, cfg, host_info);
++                    static_cast<void>(Shader::Optimization::ApplyOotVisualWorkaround(
++                        program, visual_workaround_title, key.unique_hashes[index],
++                        oot_visual_workaround));
++                    if (stage_cache.Verify()) {
++                        std::vector<u8> fresh_info, kept_info;
++                        ShaderPrep::SerializeInfo(program.info, fresh_info);
++                        ShaderPrep::SerializeInfo(reused[index]->program.info, kept_info);
++                        if (fresh_info != kept_info) {
++                            stage_cache.CountVerifyMismatch(key.unique_hashes[index],
++                                                            "translated infos");
++                        }
++                    }
++                }
++                ConvertLegacyToGeneric(program, runtime_info);
++                code = EmitSPIRV(profile, runtime_info, program, binding);
++                if (emitted) {
++                    std::vector<u8> fresh_info, kept_info;
++                    ShaderPrep::SerializeInfo(program.info, fresh_info);
++                    ShaderPrep::SerializeInfo(emitted->program.info, kept_info);
++                    if (code != emitted->spirv) {
++                        stage_cache.CountVerifyMismatch(key.unique_hashes[index], "SPIR-V");
++                    } else if (std::memcmp(&binding, &emitted->bindings_out, sizeof(binding)) !=
++                               0) {
++                        stage_cache.CountVerifyMismatch(key.unique_hashes[index], "bindings");
++                    } else if (fresh_info != kept_info) {
++                        stage_cache.CountVerifyMismatch(key.unique_hashes[index], "emitted infos");
++                    }
++                    stage_cache.CountReuse(true);
++                } else {
++                    auto entry = std::make_shared<StageCache::Emitted>();
++                    entry->runtime_key = std::move(runtime_key);
++                    entry->spirv = code;
++                    entry->program = StageCache::Summary(program);
++                    entry->bindings_out = binding;
++                    if (reused[index]) {
++                        stage_cache.AddEmitted(*reused[index], std::move(entry));
++                        stage_cache.CountReuse(false);
++                    } else {
++                        new_translations.emplace_back(recorded[index], std::move(entry));
++                    }
++                }
++            }
++        }
+         device.SaveShader(code);
+         modules[stage_index] = BuildShader(device, code);
+         if (kept_out) {
+@@ -2549,6 +2675,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         }
+         previous_stage = &program;
+     }
++    // EDEN_UP_STAGE_CACHE: this pipeline's new translations, findable by the next ones.
++    for (auto& [new_translation, entry] : new_translations) {
++        stage_cache.Insert(std::move(new_translation), std::move(entry));
++    }
+     // Run as compute: the task and mesh modules leave the graphics stages for compute pipelines,
+     // the vertex slot gets the readback shader, and a task pipeline gets the scan between them.
+     std::unique_ptr<MeshComputeShaders> mesh_compute;
+@@ -2639,6 +2769,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     LOG_ERROR(Render_Vulkan, "{}", exception.what());
+     return nullptr;
+ } catch (const std::bad_alloc&) {
++    if (stage_cache.Enabled()) {
++        // EDEN_UP_STAGE_CACHE: what it holds is given back before the session goes on.
++        stage_cache.Clear();
++    }
+     SurviveBadAlloc("a graphics pipeline");
+     return nullptr;
+ }
+@@ -4265,6 +4399,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateKeptGraphicsPipeline(
+             // (with its own pools: the caller releases main_pools after this). It is the one
+             // drawn with either way: its build is queued on a worker already.
+             ShaderPrep::Stages fresh;
++            fresh.no_stage_cache = true;
+             ShaderPools pools;
+             made = CreateGraphicsPipeline(pools, graphics_key, live, nullptr, true, &fresh);
+             if (made == nullptr) {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index e638ac2..65c946f 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -45,6 +45,7 @@
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_prep.h"
+ #include "video_core/shader_cache.h"
++#include "video_core/stage_cache.h"
+ 
+ namespace Core {
+ class System;
+@@ -371,6 +372,9 @@ private:
+ 
+     Shader::Profile profile;
+     Shader::HostTranslateInfo host_info;
++    /// EDEN_UP_STAGE_CACHE: translated stages reused across pipelines (declared before the
++    /// workers that fill it).
++    VideoCommon::StageCache stage_cache;
+ 
+     std::filesystem::path pipeline_cache_filename;
+     /// Task and mesh pipelines, with the mesh state they are translated with.
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+index ba6b18f..c13f5d1 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -145,7 +145,8 @@ constexpr const char* TranslationSwitches[] = {
+     "EDEN_UP_NULL_POINTER_SLOTS", "EDEN_UP_OOT_FRONT_WAIT", "EDEN_UP_OOT_FSR_SHARPNESS",
+     "EDEN_UP_OOT_FSR_SPATIAL", "EDEN_UP_OOT_MIST_DEPTH", "EDEN_UP_OOT_MIST_DEPTH_ULPS",
+     "EDEN_UP_OOT_MOVIE_COPY", "EDEN_UP_QUERY_LIGHT", "EDEN_UP_QUERY_STATS",
+-    "EDEN_UP_SHADOW_REGISTERS", "EDEN_UP_SPLIT_FIRST_DRAIN", "EDEN_UP_STAGING_REUSE",
++    "EDEN_UP_SHADOW_REGISTERS", "EDEN_UP_SPLIT_FIRST_DRAIN", "EDEN_UP_STAGE_CACHE",
++    "EDEN_UP_STAGE_CACHE_MIB", "EDEN_UP_STAGE_CACHE_VERIFY", "EDEN_UP_STAGING_REUSE",
+     "EDEN_UP_SWAPCHAIN_RECREATE", "EDEN_UP_TC_BUDGET_CAP", "EDEN_UP_UBO_SNAPSHOT",
+     "EDEN_UP_UPLOAD_ALL_STAGES", "EDEN_UP_WIDE_COMPUTE_SSBOS", "EDEN_UP_ZPASS_QUERY_BANKS",
+     "EDEN_VMA_BLOCK_MIB",
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.h b/src/video_core/renderer_vulkan/vk_pipeline_prep.h
+index 36fe70d..063da37 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.h
+@@ -68,6 +68,8 @@ struct Stages {
+     /// In: build with the driver's own cache only, not the emulator's VkPipelineCache (every
+     /// pipeline that is only being prepared: no draw has asked for it yet).
+     bool driver_cache_only{};
++    /// In: every stage is translated, none taken from EDEN_UP_STAGE_CACHE (the verify build).
++    bool no_stage_cache{};
+ };
+ 
+ /// Every field of Shader::Info, in a fixed order.
+diff --git a/src/video_core/stage_cache.cpp b/src/video_core/stage_cache.cpp
+new file mode 100644
+index 0000000..fe38b73
+--- /dev/null
++++ b/src/video_core/stage_cache.cpp
+@@ -0,0 +1,641 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// EDEN_UP_STAGE_CACHE (stage_cache.h): port of Djihads80/Eglantine d1195b7.
++
++#include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <new>
++#include <string>
++#include <type_traits>
++#include <utility>
++
++#include "common/cityhash.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "common/settings.h"
++#include "shader_recompiler/exception.h"
++#include "video_core/stage_cache.h"
++
++namespace VideoCommon {
++namespace {
++
++/// EDEN_UP_STAGE_CACHE_MIB unset, 0 or not a number. The boot's translations fill it while
++/// every worker compiles, with a few hundred MB free on the PS5, and allocator overhead is not
++/// counted.
++constexpr size_t DefaultMiB = 32;
++/// Translations kept per program and slot (they differ in the answers their reads got).
++constexpr size_t MaxPerSignature = 8;
++/// Emitted stages kept per translation (they differ in runtime info or incoming bindings).
++constexpr size_t MaxEmittedPerTranslation = 8;
++
++[[nodiscard]] size_t CapBytes() {
++    size_t mib = DefaultMiB;
++    if (const char* const text = std::getenv("EDEN_UP_STAGE_CACHE_MIB")) {
++        char* end = nullptr;
++        const unsigned long long asked = std::strtoull(text, &end, 10);
++        if (end != text && asked != 0) {
++            mib = static_cast<size_t>(std::clamp<unsigned long long>(asked, 8, 4096));
++        }
++    }
++    return mib << 20;
++}
++
++class Writer {
++public:
++    template <typename T>
++        requires std::is_trivially_copyable_v<T>
++    void Put(const T& value) {
++        const auto* const begin = reinterpret_cast<const u8*>(&value);
++        bytes.insert(bytes.end(), begin, begin + sizeof(T));
++    }
++
++    std::vector<u8> bytes;
++};
++
++[[nodiscard]] u64 HashBytes(const std::vector<u8>& bytes) {
++    return Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
++}
++
++/// The program and slot a signature starts with (StageCache::Signature: unique hash, then slot).
++[[nodiscard]] u64 ProgramKey(const std::vector<u8>& signature) {
++    return Common::CityHash64(reinterpret_cast<const char*>(signature.data()),
++                              (std::min)(signature.size(), sizeof(u64) + sizeof(u32)));
++}
++
++[[nodiscard]] u64 EncodeReplacement(const std::optional<Shader::ReplaceConstant>& value) {
++    return value ? (u64{1} << 32) | static_cast<u32>(*value) : 0;
++}
++
++template <typename Container>
++[[nodiscard]] size_t HeapOf(const Container& container) {
++    return container.capacity() * sizeof(typename Container::value_type);
++}
++
++/// What a program summary holds on the heap (a little over: small vectors count their inline
++/// part again).
++[[nodiscard]] size_t ProgramHeapBytes(const Shader::IR::Program& program) {
++    const Shader::Info& info = program.info;
++    size_t size = HeapOf(info.texture_buffer_descriptors) + HeapOf(info.image_buffer_descriptors) +
++                  HeapOf(info.texture_descriptors) + HeapOf(info.image_descriptors) +
++                  HeapOf(info.handle_programs) + HeapOf(info.storage_write_extents) +
++                  info.legacy_stores_mapping.size() * 64;
++    for (const auto& handle_program : info.handle_programs) {
++        size += HeapOf(handle_program);
++    }
++    return size;
++}
++
++[[nodiscard]] size_t EmittedBytes(const StageCache::Emitted& emitted) {
++    return sizeof(StageCache::Emitted) + HeapOf(emitted.runtime_key) + HeapOf(emitted.spirv) +
++           ProgramHeapBytes(emitted.program);
++}
++
++[[nodiscard]] size_t TranslationBytes(const StageCache::Translation& translation) {
++    return sizeof(StageCache::Translation) + HeapOf(translation.signature) +
++           HeapOf(translation.reads) + ProgramHeapBytes(translation.program);
++}
++
++/// What `env` answers to `read` now.
++[[nodiscard]] u64 Answer(Shader::Environment& env, const StageCache::Translation::Read& read) {
++    switch (read.kind) {
++    case StageCache::CbufValue:
++        return env.ReadCbufValue(read.a, read.b);
++    case StageCache::StoragePointer:
++        return env.IsCbufStorageBufferPointer(read.a, read.b) ? 1 : 0;
++    case StageCache::IndirectStoragePointer:
++        return env.IsCbufIndirectStorageBufferPointer(read.a, read.b, read.c) ? 1 : 0;
++    case StageCache::TextureType:
++        return static_cast<u64>(env.ReadTextureType(read.a));
++    case StageCache::TexturePixelFormat:
++        return static_cast<u64>(env.ReadTexturePixelFormat(read.a));
++    case StageCache::TextureInteger:
++        return env.IsTexturePixelFormatInteger(read.a) ? 1 : 0;
++    case StageCache::ViewportTransform:
++        return env.ReadViewportTransformState();
++    case StageCache::Replacement:
++        return EncodeReplacement(env.GetReplaceConstBuffer(read.a, read.b));
++    default:
++        // Never recorded: a value no answer gives.
++        return ~read.value;
++    }
++}
++
++} // Anonymous namespace
++
++size_t StageCache::Recorder::ReadKeyHash::operator()(const ReadKey& key) const noexcept {
++    return static_cast<size_t>(
++        Common::CityHash64(reinterpret_cast<const char*>(key.data()), sizeof(ReadKey)));
++}
++
++StageCache::Recorder::Recorder(Shader::Environment& inner_) : inner{inner_} {
++    sph = inner.SPH();
++    gp_passthrough_mask = inner.GpPassthroughMask();
++    mesh_registers = inner.MeshRegisters();
++    mesh_primitive_header = inner.MeshPrimitiveHeader();
++    stage = inner.ShaderStage();
++    start_address = inner.StartAddress();
++    is_proprietary_driver = inner.IsProprietaryDriver();
++}
++
++u64 StageCache::Recorder::Log(u8 kind, u32 a, u32 b, u32 c, u64 value) {
++    // Only first reads: within one translation a repeated read is answered from what the first
++    // one gave (the environments keep their first answers), and a replay asks each read once.
++    if (logged.insert(ReadKey{kind, a, b, c}).second) {
++        reads.push_back({kind, a, b, c, value});
++    }
++    return value;
++}
++
++u64 StageCache::Recorder::ReadInstruction(u32 address) {
++    // The range is replayed on a reuse (Find): the environment marks a program read past its
++    // known size as not storable, and a disk environment throws there.
++    instruction_low = (std::min)(instruction_low, address);
++    instruction_high = (std::max)(instruction_high, address);
++    return inner.ReadInstruction(address);
++}
++
++u32 StageCache::Recorder::TranslateProgramAddress(u32 address) const {
++    return inner.TranslateProgramAddress(address);
++}
++
++bool StageCache::Recorder::IsNativeProgram() const {
++    return inner.IsNativeProgram();
++}
++
++bool StageCache::Recorder::IsCbufStorageBufferPointer(u32 index, u32 offset) {
++    return Log(StoragePointer, index, offset, 0,
++               inner.IsCbufStorageBufferPointer(index, offset) ? 1 : 0) != 0;
++}
++
++bool StageCache::Recorder::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
++                                                              u32 indirect) {
++    return Log(IndirectStoragePointer, index, offset, indirect,
++               inner.IsCbufIndirectStorageBufferPointer(index, offset, indirect) ? 1 : 0) != 0;
++}
++
++std::vector<std::pair<u32, u32>> StageCache::Recorder::NullStoragePointerSlots() const {
++    // Made from the answers to the pointer reads above, which are recorded.
++    return inner.NullStoragePointerSlots();
++}
++
++u32 StageCache::Recorder::ReadCbufValue(u32 index, u32 offset) {
++    return static_cast<u32>(Log(CbufValue, index, offset, 0, inner.ReadCbufValue(index, offset)));
++}
++
++Shader::TextureType StageCache::Recorder::ReadTextureType(u32 handle) {
++    return static_cast<Shader::TextureType>(
++        Log(TextureType, handle, 0, 0, static_cast<u64>(inner.ReadTextureType(handle))));
++}
++
++Shader::TexturePixelFormat StageCache::Recorder::ReadTexturePixelFormat(u32 handle) {
++    return static_cast<Shader::TexturePixelFormat>(Log(
++        TexturePixelFormat, handle, 0, 0, static_cast<u64>(inner.ReadTexturePixelFormat(handle))));
++}
++
++bool StageCache::Recorder::IsTexturePixelFormatInteger(u32 handle) {
++    return Log(TextureInteger, handle, 0, 0, inner.IsTexturePixelFormatInteger(handle) ? 1 : 0) !=
++           0;
++}
++
++u32 StageCache::Recorder::ReadViewportTransformState() {
++    return static_cast<u32>(Log(ViewportTransform, 0, 0, 0, inner.ReadViewportTransformState()));
++}
++
++u32 StageCache::Recorder::TextureBoundBuffer() const {
++    return inner.TextureBoundBuffer();
++}
++
++u32 StageCache::Recorder::LocalMemorySize() const {
++    return inner.LocalMemorySize();
++}
++
++u32 StageCache::Recorder::SharedMemorySize() const {
++    return inner.SharedMemorySize();
++}
++
++std::array<u32, 3> StageCache::Recorder::WorkgroupSize() const {
++    return inner.WorkgroupSize();
++}
++
++bool StageCache::Recorder::HasHLEMacroState() const {
++    return inner.HasHLEMacroState();
++}
++
++std::optional<Shader::ReplaceConstant> StageCache::Recorder::GetReplaceConstBuffer(u32 bank,
++                                                                                   u32 offset) {
++    const auto value = inner.GetReplaceConstBuffer(bank, offset);
++    Log(Replacement, bank, offset, 0, EncodeReplacement(value));
++    return value;
++}
++
++void StageCache::Recorder::Dump(u64 pipeline_hash, u64 shader_hash) {
++    inner.Dump(pipeline_hash, shader_hash);
++}
++
++StageCache::StageCache()
++    : enabled{Common::PeSwitch("EDEN_UP_STAGE_CACHE")},
++      verify{enabled && Common::PeSwitch("EDEN_UP_STAGE_CACHE_VERIFY")},
++      max_bytes{enabled ? CapBytes() : 0} {
++    if (enabled) {
++        LOG_INFO(Render_Vulkan, "EDEN_UP_STAGE_CACHE=1: translated stages are reused, at most {} MiB{}",
++                 max_bytes >> 20,
++                 verify ? " (verify: every reused stage is rebuilt and compared)" : "");
++    }
++}
++
++std::vector<u8> StageCache::Signature(Shader::Environment& env, u64 unique_hash, size_t slot,
++                                      u64 salt) {
++    Writer writer;
++    writer.Put(unique_hash);
++    writer.Put(static_cast<u32>(slot));
++    writer.Put(salt);
++    writer.Put(env.ShaderStage());
++    writer.Put(env.StartAddress());
++    writer.Put(env.IsProprietaryDriver());
++    writer.Put(env.IsNativeProgram());
++    writer.Put(env.SPH());
++    writer.Put(env.GpPassthroughMask());
++    writer.Put(env.MeshRegisters());
++    writer.Put(env.MeshPrimitiveHeader());
++    writer.Put(env.TextureBoundBuffer());
++    writer.Put(env.LocalMemorySize());
++    writer.Put(env.SharedMemorySize());
++    writer.Put(env.WorkgroupSize());
++    writer.Put(env.HasHLEMacroState());
++    // What the recompiler reads from the settings (the list the shader preparation's stamp
++    // keeps, vk_pipeline_prep.cpp MakeStamp), which can change during a session.
++    const auto& resolution = Settings::values.resolution_info;
++    writer.Put(resolution.up_scale);
++    writer.Put(resolution.down_shift);
++    writer.Put(resolution.up_factor);
++    writer.Put(resolution.down_factor);
++    writer.Put(resolution.active);
++    writer.Put(resolution.downscale);
++    writer.Put(static_cast<bool>(Settings::values.renderer_debug.GetValue()));
++    writer.Put(static_cast<bool>(Settings::values.disable_shader_loop_safety_checks.GetValue()));
++    writer.Put(static_cast<bool>(Settings::values.fix_bloom_effects.GetValue()));
++    return std::move(writer.bytes);
++}
++
++std::shared_ptr<const StageCache::Translation> StageCache::Find(const std::vector<u8>& signature,
++                                                                Shader::Environment& env) {
++    const u64 hash = HashBytes(signature);
++    std::vector<TranslationPtr> candidates;
++    {
++        std::scoped_lock lock{mutex};
++        if (const auto it = translations.find(hash); it != translations.end()) {
++            for (const TranslationPtr& entry : it->second) {
++                if (entry->signature == signature) {
++                    candidates.push_back(entry);
++                }
++            }
++        }
++        if (candidates.empty()) {
++            // No translation with this signature. Counted apart when the program and slot are
++            // held under another one (a disk record's environment answers HasHLEMacroState and
++            // IsProprietaryDriver by other rules than a live one): those entries never match.
++            no_signature.fetch_add(1, std::memory_order_relaxed);
++            if (held_programs.contains(ProgramKey(signature))) {
++                other_signature.fetch_add(1, std::memory_order_relaxed);
++            }
++            return nullptr;
++        }
++    }
++    // Newest first. Two candidates that both hold are the same translation (the same answers
++    // give the same reads), so the order only changes how soon one is found.
++    for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
++        const Translation& candidate = **it;
++        bool same = true;
++        try {
++            // In the order translation read them: up to the first difference, every read is one
++            // translating here would make too.
++            for (const Translation::Read& read : candidate.reads) {
++                if (Answer(env, read) != read.value) {
++                    same = false;
++                    if (read.kind < NumReadKinds) {
++                        misses_by_kind[read.kind].fetch_add(1, std::memory_order_relaxed);
++                    }
++                    break;
++                }
++            }
++            if (same && candidate.instruction_low <= candidate.instruction_high) {
++                // The program words translation read, as translating here would read them: a
++                // read past the program's known size keeps the pipeline out of the disk cache
++                // (has_unbound_instructions), and a disk environment without them throws.
++                static_cast<void>(env.ReadInstruction(candidate.instruction_low));
++                static_cast<void>(env.ReadInstruction(candidate.instruction_high));
++            }
++        } catch (const Shader::Exception&) {
++            // A disk cache environment that never recorded this read: translating with it
++            // would throw at the same read.
++            same = false;
++        }
++        if (same) {
++            candidate.last_use.store(tick.fetch_add(1, std::memory_order_relaxed) + 1,
++                                     std::memory_order_relaxed);
++            return *it;
++        }
++    }
++    return nullptr;
++}
++
++std::shared_ptr<const StageCache::Emitted> StageCache::FindEmitted(
++    const Translation& translation, const std::vector<u8>& runtime_key) {
++    std::scoped_lock lock{translation.emitted_mutex};
++    auto& list = translation.emitted;
++    const auto it = std::ranges::find_if(
++        list, [&runtime_key](const auto& emitted) { return emitted->runtime_key == runtime_key; });
++    if (it == list.end()) {
++        return nullptr;
++    }
++    // Most recently used last: a full list drops its front (Insert, AddEmitted).
++    std::rotate(it, it + 1, list.end());
++    return list.back();
++}
++
++void StageCache::Insert(std::shared_ptr<Translation> translation,
++                        std::shared_ptr<const Emitted> emitted) noexcept {
++    try {
++        translation->hash = HashBytes(translation->signature);
++        const size_t emitted_size = EmittedBytes(*emitted);
++        const size_t size = TranslationBytes(*translation) + emitted_size;
++        std::scoped_lock lock{mutex};
++        translated.fetch_add(1, std::memory_order_relaxed);
++        if (const auto it = translations.find(translation->hash); it != translations.end()) {
++            for (const TranslationPtr& existing : it->second) {
++                if (existing->signature == translation->signature &&
++                    existing->reads == translation->reads) {
++                    // Another worker translated the same stage at the same time: one copy.
++                    merged.fetch_add(1, std::memory_order_relaxed);
++                    std::scoped_lock emitted_lock{existing->emitted_mutex};
++                    for (const auto& known : existing->emitted) {
++                        if (known->runtime_key == emitted->runtime_key) {
++                            return;
++                        }
++                    }
++                    if (existing->emitted.size() >= MaxEmittedPerTranslation) {
++                        const size_t freed = EmittedBytes(*existing->emitted.front());
++                        existing->emitted.erase(existing->emitted.begin());
++                        existing->bytes -= freed;
++                        bytes -= freed;
++                    }
++                    existing->emitted.push_back(std::move(emitted));
++                    existing->bytes += emitted_size;
++                    bytes += emitted_size;
++                    break;
++                }
++            }
++            if (!emitted) {
++                TrimLocked();
++                return;
++            }
++            if (it->second.size() >= MaxPerSignature) {
++                // The least recently used of this program's translations makes room.
++                const Translation* oldest = nullptr;
++                u64 oldest_use = ~u64{0};
++                for (const TranslationPtr& candidate : it->second) {
++                    const u64 use = candidate->last_use.load(std::memory_order_relaxed);
++                    if (oldest == nullptr || use < oldest_use) {
++                        oldest = candidate.get();
++                        oldest_use = use;
++                    }
++                }
++                EvictLocked(*oldest);
++            }
++        }
++        translation->emitted.push_back(std::move(emitted));
++        translation->bytes = size;
++        translation->cached = true;
++        translation->last_use.store(tick.fetch_add(1, std::memory_order_relaxed) + 1,
++                                    std::memory_order_relaxed);
++        ++held_programs[ProgramKey(translation->signature)];
++        translations[translation->hash].push_back(std::move(translation));
++        bytes += size;
++        ++count;
++        TrimLocked();
++    } catch (const std::bad_alloc&) {
++        // No memory: what the cache holds is given back, the pipeline goes on without it.
++        Clear();
++    } catch (const std::exception&) {
++        Clear();
++    }
++    Log();
++}
++
++void StageCache::AddEmitted(const Translation& translation,
++                            std::shared_ptr<const Emitted> emitted) noexcept {
++    try {
++        const size_t size = EmittedBytes(*emitted);
++        std::scoped_lock lock{mutex};
++        if (!translation.cached) {
++            return; // evicted while its pipeline was built
++        }
++        {
++            std::scoped_lock emitted_lock{translation.emitted_mutex};
++            for (const auto& known : translation.emitted) {
++                if (known->runtime_key == emitted->runtime_key) {
++                    return;
++                }
++            }
++            if (translation.emitted.size() >= MaxEmittedPerTranslation) {
++                const size_t freed = EmittedBytes(*translation.emitted.front());
++                translation.emitted.erase(translation.emitted.begin());
++                translation.bytes -= freed;
++                bytes -= freed;
++            }
++            translation.emitted.push_back(std::move(emitted));
++        }
++        translation.bytes += size;
++        bytes += size;
++        TrimLocked();
++    } catch (const std::bad_alloc&) {
++        Clear();
++    } catch (const std::exception&) {
++        Clear();
++    }
++    Log();
++}
++
++void StageCache::EvictLocked(const Translation& translation) {
++    if (!translation.cached) {
++        return;
++    }
++    // Everything read from `translation` before it is dropped: the map may hold its last pointer.
++    const u64 hash = translation.hash;
++    translation.cached = false;
++    bytes -= (std::min)(bytes, translation.bytes);
++    --count;
++    if (const auto held = held_programs.find(ProgramKey(translation.signature));
++        held != held_programs.end() && --held->second == 0) {
++        held_programs.erase(held);
++    }
++    evicted.fetch_add(1, std::memory_order_relaxed);
++    const auto it = translations.find(hash);
++    if (it == translations.end()) {
++        return;
++    }
++    const Translation* const target = &translation;
++    std::erase_if(it->second, [target](const TranslationPtr& entry) { return entry.get() == target; });
++    if (it->second.empty()) {
++        translations.erase(it);
++    }
++}
++
++void StageCache::TrimLocked() {
++    if (bytes <= max_bytes) {
++        return;
++    }
++    // Down to three quarters of the cap, so the next inserts do not each evict again.
++    const size_t target = max_bytes - max_bytes / 4;
++    std::vector<std::pair<u64, const Translation*>> order;
++    order.reserve(count);
++    for (const auto& [hash, list] : translations) {
++        for (const TranslationPtr& entry : list) {
++            order.emplace_back(entry->last_use.load(std::memory_order_relaxed), entry.get());
++        }
++    }
++    std::ranges::sort(order, {}, &std::pair<u64, const Translation*>::first);
++    for (const auto& [use, translation] : order) {
++        if (bytes <= target) {
++            break;
++        }
++        EvictLocked(*translation);
++    }
++}
++
++void StageCache::Clear() noexcept {
++    std::scoped_lock lock{mutex};
++    for (const auto& [hash, list] : translations) {
++        for (const TranslationPtr& entry : list) {
++            entry->cached = false;
++        }
++    }
++    evicted.fetch_add(count, std::memory_order_relaxed);
++    translations.clear();
++    held_programs.clear();
++    bytes = 0;
++    count = 0;
++}
++
++std::vector<u8> StageCache::RuntimeKey(const Shader::RuntimeInfo& info,
++                                       const Shader::Backend::Bindings& bindings) {
++    // Every field of RuntimeInfo: one left out would let different SPIR-V share a key.
++    Writer writer;
++    writer.Put(bindings);
++    writer.Put(info.generic_input_types);
++    for (size_t index = 0; index < info.previous_stage_stores.mask.size(); index += 64) {
++        u64 word{};
++        for (size_t bit = 0; bit < 64 && index + bit < info.previous_stage_stores.mask.size();
++             ++bit) {
++            word |= u64{info.previous_stage_stores.mask[index + bit]} << bit;
++        }
++        writer.Put(word);
++    }
++    writer.Put(static_cast<u64>(info.per_primitive_generics.to_ullong()));
++    writer.Put(static_cast<u64>(info.noperspective_outputs.to_ullong()));
++    writer.Put(info.scaled_noperspective_inputs);
++    writer.Put(info.mesh_as_compute);
++    writer.Put(info.mesh_compute_primitive_id_location.has_value());
++    writer.Put(info.mesh_compute_primitive_id_location.value_or(0));
++    writer.Put(static_cast<u32>(info.previous_stage_legacy_stores_mapping.size()));
++    for (const auto& [from, to] : info.previous_stage_legacy_stores_mapping) {
++        writer.Put(from);
++        writer.Put(to);
++    }
++    writer.Put(info.convert_depth_mode);
++    writer.Put(info.force_early_z);
++    writer.Put(info.tess_primitive);
++    writer.Put(info.tess_spacing);
++    writer.Put(info.tess_clockwise);
++    writer.Put(info.input_topology);
++    writer.Put(info.fixed_state_point_size.has_value());
++    writer.Put(info.fixed_state_point_size.value_or(0.0f));
++    writer.Put(info.alpha_test_func.has_value());
++    writer.Put(info.alpha_test_func.value_or(Shader::CompareFunction{}));
++    writer.Put(info.alpha_test_reference);
++    writer.Put(info.y_negate);
++    writer.Put(info.glasm_use_storage_buffers);
++    writer.Put(info.xfb_count);
++    for (u32 index = 0; index < info.xfb_count && index < info.xfb_varyings.size(); ++index) {
++        const auto& varying = info.xfb_varyings[index];
++        writer.Put(varying.buffer);
++        writer.Put(varying.stream);
++        writer.Put(varying.stride);
++        writer.Put(varying.offset);
++        writer.Put(varying.components);
++    }
++    writer.Put(info.color_output_types);
++    writer.Put(info.dual_source_blend);
++    return std::move(writer.bytes);
++}
++
++Shader::IR::Program StageCache::Summary(const Shader::IR::Program& program) {
++    Shader::IR::Program summary;
++    summary.info = program.info;
++    summary.stage = program.stage;
++    summary.workgroup_size = program.workgroup_size;
++    summary.output_topology = program.output_topology;
++    summary.output_vertices = program.output_vertices;
++    summary.invocations = program.invocations;
++    summary.local_memory_size = program.local_memory_size;
++    summary.shared_memory_size = program.shared_memory_size;
++    summary.is_geometry_passthrough = program.is_geometry_passthrough;
++    summary.mesh = program.mesh;
++    return summary;
++}
++
++void StageCache::CountReuse(bool emitted) {
++    (emitted ? reused_emitted : reused_translation).fetch_add(1, std::memory_order_relaxed);
++    Log();
++}
++
++void StageCache::CountVerifyMismatch(u64 unique_hash, const char* what) {
++    if (verify_mismatches.fetch_add(1, std::memory_order_relaxed) < 32) {
++        LOG_ERROR(Render_Vulkan, "Stage cache: reused stage {:016x} differs from a fresh build ({})",
++                  unique_hash, what);
++    }
++}
++
++void StageCache::Log() {
++    const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
++                        std::chrono::steady_clock::now().time_since_epoch())
++                        .count();
++    s64 last = last_log.load(std::memory_order_relaxed);
++    if (now - last < 10 || !last_log.compare_exchange_strong(last, now)) {
++        return;
++    }
++    if (last == 0) {
++        return;
++    }
++    try {
++        size_t held_bytes{}, held{};
++        {
++            std::scoped_lock lock{mutex};
++            held_bytes = bytes;
++            held = count;
++        }
++        const auto miss = [this](ReadKind kind) {
++            return misses_by_kind[kind].load(std::memory_order_relaxed);
++        };
++        LOG_INFO(Render_Vulkan,
++                 "Stage cache: {} stages reused whole, {} translations reused, {} translated ({} "
++                 "kept once for two workers), {} held in {:.1f} of {} MiB, {} evicted; no "
++                 "signature held {} ({} with the program held under another); reads that "
++                 "missed: cbuf {}, pointer {}, pointer table {}, texture type {}, pixel format {}, "
++                 "integer {}, viewport {}, HLE {}{}",
++                 reused_emitted.load(), reused_translation.load(), translated.load(),
++                 merged.load(), held, static_cast<double>(held_bytes) / (1 << 20),
++                 max_bytes >> 20, evicted.load(), no_signature.load(), other_signature.load(),
++                 miss(CbufValue), miss(StoragePointer),
++                 miss(IndirectStoragePointer), miss(TextureType), miss(TexturePixelFormat),
++                 miss(TextureInteger), miss(ViewportTransform), miss(Replacement),
++                 verify ? fmt::format(", {} verify mismatches", verify_mismatches.load())
++                        : std::string{});
++    } catch (const std::exception&) {
++    }
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/stage_cache.h b/src/video_core/stage_cache.h
+new file mode 100644
+index 0000000..c95e853
+--- /dev/null
++++ b/src/video_core/stage_cache.h
+@@ -0,0 +1,253 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// EDEN_UP_STAGE_CACHE=1 (default off): translated shader stages reused across pipelines.
++//
++// Port of Djihads80/Eglantine d1195b7 (EDEN_NX2_STAGE_CACHE there, on by default; that name is not
++// read here). Pipelines that differ only in fixed state (blending, depth, render targets, vertex
++// input) translate the same programs again: in an Ocarina of Time cold boot 64% of the stages gave
++// SPIR-V the same program had already given, about half of the translation time (upstream's
++// measurement, 0 differences on NVIDIA and RADV). On the PS5 translation is the stall: 8-18 ms a
++// pipeline on the GPU thread, up to 280 ms for a mesh pipeline.
++//
++// A stage's IR depends only on its program, the environment's constant properties and the
++// answers to the reads translation makes (constant buffer values, texture types and formats,
++// storage pointer checks, ...); its SPIR-V also on the runtime info and the bindings the earlier
++// stages took. A translation is reused when those reads, replayed in the order translation made
++// them, give the same answers: translation is deterministic, so every read replayed up to a
++// difference is one it would make too (the live environment ends up holding exactly the answers
++// its own translation would have asked for, which is what goes to the disk cache). Emitted
++// stages are reused when the runtime info and bindings are also byte-for-byte equal.
++//
++// Differences from upstream:
++// - Off unless EDEN_UP_STAGE_CACHE is exactly "1"; unset, the pipeline cache runs as before.
++// - Memory: EDEN_UP_STAGE_CACHE_MIB=<n> caps it (32 MiB; upstream 256 MiB and starts over). Past
++//   the cap the least recently used translations go until a quarter of the cap is free; at most
++//   8 translations per program and slot and 8 emitted variants per translation (the least
++//   recently used goes); two workers that translated the same stage at once keep one copy; a
++//   bad_alloc empties it. The driver's compiler running out of memory is not seen here, so the
++//   cap is the guard: the boot's translations fill it while every worker compiles.
++// - Reads are told apart exactly (upstream keeps a 64-bit hash of each read).
++// - A reuse replays the lowest and highest program address its translation read, so a program
++//   read past its known size still keeps the pipeline out of the disk cache
++//   (has_unbound_instructions; upstream skips this).
++// - The signature also holds the setting downscale and the OoT visual workaround's state, and
++//   EDEN_UP_STAGE_CACHE_VERIFY=1 also compares the shader infos (vk_pipeline_prep.h's
++//   SerializeInfo), not only SPIR-V and bindings.
++// - The log line counts which kind of read made a reuse fail, so a later relaxed match (texture
++//   handle and pointer words, as the shader preparation's AnswersHoldFor does) can be judged. It
++//   also counts lookups that found no translation with the same signature, and of those the ones
++//   whose program is held under another signature: a disk record's environment answers
++//   HasHLEMacroState and IsProprietaryDriver by other rules than a live one, so what the boot
++//   translated from disk records may never match a lookup during play.
++//
++// Thread safe: pipelines are built on the GPU thread and the pipeline workers.
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <limits>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++#include "common/common_types.h"
++#include "shader_recompiler/backend/bindings.h"
++#include "shader_recompiler/environment.h"
++#include "shader_recompiler/frontend/ir/program.h"
++#include "shader_recompiler/runtime_info.h"
++
++namespace VideoCommon {
++
++class StageCache {
++public:
++    /// Kinds of reads translation makes through the environment.
++    enum ReadKind : u8 {
++        CbufValue,
++        StoragePointer,
++        IndirectStoragePointer,
++        TextureType,
++        TexturePixelFormat,
++        TextureInteger,
++        ViewportTransform,
++        Replacement,
++        NumReadKinds,
++    };
++
++    /// A stage emitted for one runtime info: what a reused stage stands in for.
++    struct Emitted {
++        std::vector<u8> runtime_key; ///< Serialized runtime info and incoming bindings
++        std::vector<u32> spirv;
++        Shader::IR::Program program; ///< After emission, without IR
++        Shader::Backend::Bindings bindings_out;
++    };
++
++    struct Translation {
++        struct Read {
++            u8 kind{};
++            u32 a{}, b{}, c{};
++            u64 value{};
++
++            [[nodiscard]] bool operator==(const Read& other) const noexcept {
++                return kind == other.kind && a == other.a && b == other.b && c == other.c &&
++                       value == other.value;
++            }
++        };
++
++        std::vector<u8> signature;
++        std::vector<Read> reads;
++        Shader::IR::Program program; ///< After translation (and the OoT edits), without IR
++        /// Lowest and highest program address translation read (low above high: none).
++        u32 instruction_low = (std::numeric_limits<u32>::max)();
++        u32 instruction_high = 0;
++
++        mutable std::mutex emitted_mutex;
++        /// Least recently used first: a full list drops its front.
++        mutable std::vector<std::shared_ptr<const Emitted>> emitted;
++
++        // Guarded by StageCache's mutex.
++        mutable u64 hash{};       ///< Of the signature
++        mutable size_t bytes{};   ///< Counted against the cap, emitted stages included
++        mutable bool cached{};    ///< In the cache (false once evicted)
++        mutable std::atomic<u64> last_use{};
++    };
++
++    /// Records the reads translation makes through it, forwarding everything to `inner`.
++    class Recorder final : public Shader::Environment {
++    public:
++        explicit Recorder(Shader::Environment& inner);
++
++        u64 ReadInstruction(u32 address) override;
++        u32 TranslateProgramAddress(u32 address) const override;
++        bool IsNativeProgram() const override;
++        bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
++        bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override;
++        std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
++        u32 ReadCbufValue(u32 index, u32 offset) override;
++        Shader::TextureType ReadTextureType(u32 handle) override;
++        Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
++        bool IsTexturePixelFormatInteger(u32 handle) override;
++        u32 ReadViewportTransformState() override;
++        u32 TextureBoundBuffer() const override;
++        u32 LocalMemorySize() const override;
++        u32 SharedMemorySize() const override;
++        std::array<u32, 3> WorkgroupSize() const override;
++        bool HasHLEMacroState() const override;
++        std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
++        void Dump(u64 pipeline_hash, u64 shader_hash) override;
++
++        [[nodiscard]] std::vector<Translation::Read> TakeReads() {
++            return std::move(reads);
++        }
++
++        [[nodiscard]] u32 InstructionLow() const noexcept {
++            return instruction_low;
++        }
++
++        [[nodiscard]] u32 InstructionHigh() const noexcept {
++            return instruction_high;
++        }
++
++    private:
++        using ReadKey = std::array<u32, 4>;
++        struct ReadKeyHash {
++            size_t operator()(const ReadKey& key) const noexcept;
++        };
++
++        u64 Log(u8 kind, u32 a, u32 b, u32 c, u64 value);
++
++        Shader::Environment& inner;
++        std::vector<Translation::Read> reads;
++        std::unordered_set<ReadKey, ReadKeyHash> logged;
++        u32 instruction_low = (std::numeric_limits<u32>::max)();
++        u32 instruction_high = 0;
++    };
++
++    StageCache();
++
++    /// EDEN_UP_STAGE_CACHE=1.
++    [[nodiscard]] bool Enabled() const noexcept {
++        return enabled;
++    }
++
++    /// EDEN_UP_STAGE_CACHE_VERIFY=1: every reused stage is also built and compared; the fresh
++    /// build is the one used.
++    [[nodiscard]] bool Verify() const noexcept {
++        return verify;
++    }
++
++    /// The bytes translation depends on besides the reads: program, slot, environment constants,
++    /// the settings the recompiler reads and `salt` (the caller's own translation state).
++    [[nodiscard]] static std::vector<u8> Signature(Shader::Environment& env, u64 unique_hash,
++                                                   size_t slot, u64 salt);
++
++    /// A translation of `signature` whose reads `env` answers the same way, or null. On a hit
++    /// `env` has also read the lowest and highest program address the translation read.
++    [[nodiscard]] std::shared_ptr<const Translation> Find(const std::vector<u8>& signature,
++                                                          Shader::Environment& env);
++
++    /// The emitted stage of `translation` for `runtime_key`, or null (a hit becomes the most
++    /// recently used).
++    [[nodiscard]] static std::shared_ptr<const Emitted> FindEmitted(
++        const Translation& translation, const std::vector<u8>& runtime_key);
++
++    /// Makes a translation (from a Recorder) findable, with its first emitted stage. Never throws:
++    /// out of memory, the cache is emptied and the pipeline goes on.
++    void Insert(std::shared_ptr<Translation> translation,
++                std::shared_ptr<const Emitted> emitted) noexcept;
++
++    /// Adds an emitted stage to a translation found earlier (dropped when it was evicted since).
++    void AddEmitted(const Translation& translation, std::shared_ptr<const Emitted> emitted) noexcept;
++
++    /// Drops everything (translations in use by a build stay alive through their pointers).
++    void Clear() noexcept;
++
++    [[nodiscard]] static std::vector<u8> RuntimeKey(const Shader::RuntimeInfo& info,
++                                                    const Shader::Backend::Bindings& bindings);
++
++    /// Program metadata without its IR.
++    [[nodiscard]] static Shader::IR::Program Summary(const Shader::IR::Program& program);
++
++    /// Counts for the periodic log line.
++    void CountReuse(bool emitted);
++    void CountVerifyMismatch(u64 unique_hash, const char* what);
++
++private:
++    using TranslationPtr = std::shared_ptr<const Translation>;
++
++    /// Under `mutex`: drops `translation` from the map and the byte count.
++    void EvictLocked(const Translation& translation);
++    /// Under `mutex`: evicts the least recently used translations while over the cap.
++    void TrimLocked();
++    void Log();
++
++    bool enabled{};
++    bool verify{};
++    size_t max_bytes{};
++
++    std::mutex mutex;
++    std::unordered_map<u64, std::vector<TranslationPtr>> translations;
++    /// Translations held per program and slot (a signature's first bytes): a lookup with no
++    /// signature held is told apart from one whose program is held under another signature.
++    std::unordered_map<u64, u32> held_programs;
++    size_t bytes{};
++    size_t count{};
++
++    std::atomic<u64> tick{};
++    std::atomic<u64> reused_emitted{};
++    std::atomic<u64> reused_translation{};
++    std::atomic<u64> translated{};
++    std::atomic<u64> no_signature{};
++    std::atomic<u64> other_signature{};
++    std::atomic<u64> merged{};
++    std::atomic<u64> evicted{};
++    std::atomic<u64> verify_mismatches{};
++    std::array<std::atomic<u64>, NumReadKinds> misses_by_kind{};
++    std::atomic<s64> last_log{};
++};
++
++} // namespace VideoCommon

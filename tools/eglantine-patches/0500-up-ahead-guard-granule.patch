@@ -1,0 +1,75 @@
+Subject: [PATCH] EDEN_UP_AHEAD_GUARD_GRANULE=<pages>: the guard takes the whole granule of each page it guessed; default 1 (off)
+
+T91, batch t91-a (door walk): EDEN_UP_AHEAD_GUARD=3 left no glitch moment in 2 of 2 runs (the
+control had 2) with the fade in order in both, at 17.1 / 18.1 fps against 17.4. What stayed:
+the first frame after the cut to Link's house was over-bright in 1 of 2. That frame reads pages
+no frame before it read, so the guess from the last three frames cannot hold them; the game's
+per-frame memory goes on from where the last frame's ended, so the pages next to the guessed
+ones are the likely ones. With a granule of n pages the guard takes all n pages around each
+guessed page. More pages are trapped (arming takes longer) and a write to any of them is copied.
+
+---
+diff --git a/src/video_core/ahead_guard.h b/src/video_core/ahead_guard.h
+index 21048d9..8bf3ccb 100644
+--- a/src/video_core/ahead_guard.h
++++ b/src/video_core/ahead_guard.h
+@@ -68,6 +68,8 @@
+ ///                                     blocked (EDEN_UP_OOT_FRAME_WAIT), so nothing a held writer
+ ///                                     does is needed for the fence.
+ ///   EDEN_UP_AHEAD_GUARD_COPY_PAGES=<n> the copy pool in pages (default 2048 = 8 MiB, 64 to 16384)
++///   EDEN_UP_AHEAD_GUARD_GRANULE=<n>   the guard takes the whole n-page granule of each page it
++///                                     guessed (a power of two; default 1: the page alone)
+ /// Covered: buffer uploads, streamed uniform blocks, and the texture handles and storage buffer
+ /// pointers read from constant buffers at a draw (ReadGpu). Not covered: texture data and
+ /// descriptor tables the texture cache reads.
+@@ -133,6 +135,26 @@ inline bool GpuEscape() {
+     return on;
+ }
+ 
++/// EDEN_UP_AHEAD_GUARD_GRANULE=<pages> (a power of two up to 1024; default 1): the guard takes
++/// the whole granule of each page it guessed, so the pages next to those the last frames read
++/// are in it too. T91, batch t91-a: with =3 no glitch was left on the door walk, but the first
++/// frame after the cut to Link's house was still over-bright in 1 of 2 runs: that frame reads
++/// pages no frame before it read, and the game's per-frame memory goes on from where the last
++/// frame's ended.
++inline u32 Granule() {
++    static const u32 pages = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_GRANULE");
++        const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 1UL;
++        const unsigned long clamped = (std::clamp)(parsed, 1UL, 1024UL);
++        unsigned long power = 1;
++        while (power * 2 <= clamped) {
++            power *= 2;
++        }
++        return static_cast<u32>(power);
++    }();
++    return pages;
++}
++
+ inline u32 CopyCapacity() {
+     static const u32 pages = [] {
+         const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_COPY_PAGES");
+@@ -425,6 +447,23 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+                 }
+                 std::sort(pages.begin(), pages.end());
+                 pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
++                if (const u32 granule = Granule(); granule > 1 && !pages.empty()) {
++                    // The whole granule of each page: sorted pages give sorted granules.
++                    std::vector<u32> wide;
++                    wide.reserve(pages.size() * 2);
++                    u32 done = ~u32{0};
++                    for (const u32 page : pages) {
++                        const u32 first = page & ~(granule - 1);
++                        if (first == done) {
++                            continue;
++                        }
++                        done = first;
++                        for (u32 at = first; at < first + granule && at < PageLimit; ++at) {
++                            wide.push_back(at);
++                        }
++                    }
++                    pages.swap(wide);
++                }
+                 if (!pages.empty()) {
+                     std::vector<State::Run> runs;
+                     Detail::RunsOf(pages, runs, [](u32) { return true; });

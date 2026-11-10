@@ -1,0 +1,115 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_MESH_CACHE=1: every task/mesh record of vulkan_mesh.bin is built at boot, not only the used list's, and a mesh pipeline made at run time says whether it was on disk; off by default
+
+Task/mesh pipelines were thought never to reach the disk cache: every boot of T88 logs
+"Graphics pipeline built on the GPU thread in N ms: mesh, not in the disk cache <hash>", and the
+boot's preparation line says "0 task or mesh in vulkan.bin". Neither says that. The runtime report
+sets the reason "mesh, not in the disk cache" for every task/mesh pipeline, whether or not
+disk_pipelines has its key (CreateGraphicsPipeline, after the kept translation is used); and the
+"task or mesh in vulkan.bin" count is the mesh records found in the wrong file, 0 being right.
+
+What run 739 (batch t87-a, T88) shows instead: vulkan_mesh.bin is read at boot (the PS5's RADV
+offers VK_EXT_mesh_shader; 256 task and mesh programs are translated on the workers between the
+"Total Pipeline Count" line and the preparation), the runtime builds of the walk (23 in 10 s, 21 of
+them mesh) are all "made without translating" from kept translations with 0 refused, and the record
+count stays at 1876 over the five runs of the batch: nothing is appended again. The same key hashes
+(a6a6715e57348ef3, 81b1fd0ba118e6e3) come back at run time in runs 739 and 743, because the used
+list keeps a pipeline for two sessions (UsedPipelinesMaxAge) and a walk does not draw every effect
+every run. A mesh pipeline made at run time still costs the GPU thread 1-7 ms (kept path) and the
+draw then waits for the driver's build of its compute passes (EDEN_NX2_RADV_MESH_COMPUTE), at the
+first draw of foliage or an effect.
+
+With EDEN_UP_MESH_CACHE=1 the boot builds every task/mesh record of vulkan_mesh.bin on the
+workers, whether or not the used list has it (EDEN_UP_PIPELINE_COLD=1 still builds nothing), and
+logs "EDEN_UP_MESH_CACHE=1: N task/mesh pipelines of vulkan_mesh.bin built at boot, M of them not
+in the used list". The runtime report then says "mesh, not in the disk cache" only for a mesh
+pipeline that was not on disk; one that was reads "on disk, not built at boot" or "evicted" like
+any other. The file formats, vulkan.bin, vulkan_mesh.bin, vulkan_used.bin and the kept store, are
+not touched; unset or anything but "1" changes nothing.
+
+---
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 36 ++++++++++++++++++++--
+ 1 file changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 5f97bb0..e69d6a1 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -903,6 +903,20 @@ bool PreloadAllPipelines() {
+     }();
+     return all;
+ }
++
++// EDEN_UP_MESH_CACHE=1 (exact "1"): every task/mesh record of vulkan_mesh.bin is built at boot,
++// not only those the used list names. The mesh records are few (run 739: 256 task and mesh
++// programs translated at boot, 10-21 mesh pipelines made during the walk), and a task/mesh
++// pipeline a draw asks for at run time is made on the GPU thread (from its kept translation) and
++// the draw then waits for the driver's build of its compute passes (EDEN_NX2_RADV_MESH_COMPUTE).
++// Off: the used list decides, as before. EDEN_UP_PIPELINE_COLD=1 wins over it (a cold boot
++// builds nothing). With it, the runtime report tells a mesh pipeline that was on disk ("on disk,
++// not built at boot", "evicted") from one that was not ("mesh, not in the disk cache"); off,
++// every mesh pipeline made at run time is reported as the latter, whether on disk or not.
++bool MeshCacheBoot() {
++    static const bool on = Common::PeSwitch("EDEN_UP_MESH_CACHE");
++    return on;
++}
+ } // Anonymous namespace
+ 
+ bool DropMeshDrawsBeforeBuild() {
+@@ -1582,6 +1596,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     std::atomic<size_t> prep_differed{};
+     size_t skipped_pipelines = 0;
+     size_t queued_graphics = 0;
++    size_t mesh_queued = 0;   // EDEN_UP_MESH_CACHE: task/mesh records built at boot ...
++    size_t mesh_unlisted = 0; // ... of them not in the used list (skipped without the switch)
+ 
+     if (use_vulkan_pipeline_cache) {
+         vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
+@@ -1680,7 +1696,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+ 
+         const u64 hash = key.Hash();
+         disk_pipelines.insert(hash);
+-        if (!PreloadAllPipelines() &&
++        // EDEN_UP_MESH_CACHE=1: a task/mesh record is built whether or not the used list has it.
++        const bool mesh_always = loading_mesh_file && MeshCacheBoot() && !PipelineColdBoot();
++        if (!PreloadAllPipelines() && !mesh_always &&
+             (PipelineColdBoot() ||
+              (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
+                                      : !used_pipelines.contains(hash)))) {
+@@ -1688,6 +1706,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+             return;
+         }
+         ++queued_graphics;
++        if (mesh_always) {
++            ++mesh_queued;
++            if (!used_pipelines.contains(hash)) {
++                ++mesh_unlisted;
++            }
++        }
+ 
+         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback, prep,
+                            &prep_compared, &prep_differed]() mutable {
+@@ -1729,6 +1753,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+                  "{} cached graphics pipelines are built when first needed",
+                  skipped_pipelines);
+     }
++    if (mesh_queued != 0) {
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_MESH_CACHE=1: {} task/mesh pipelines of vulkan_mesh.bin built at boot, "
++                 "{} of them not in the used list",
++                 mesh_queued, mesh_unlisted);
++    }
+     if (UsedListKept()) {
+         LOG_INFO(Render_Vulkan,
+                  "{}: {} cached graphics pipelines left for their first use, {} built at boot; "
+@@ -2303,7 +2333,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     // Task and mesh programs are translated with the mesh registers, which vulkan.bin doesn't
+     // carry: they go to their own file (builds without it never read those records).
+     const bool is_mesh = pipeline->IsMeshPipeline();
+-    if (is_mesh) {
++    // EDEN_UP_MESH_CACHE=1: "mesh, not in the disk cache" only when it is not; a mesh pipeline
++    // the boot read and left for its first use is reported like any other (off: as before).
++    if (is_mesh && (!MeshCacheBoot() || !disk_pipelines.contains(key_hash))) {
+         reason = RuntimeBuild::Mesh;
+     }
+     if (disk_pipelines.contains(graphics_key.Hash())) {

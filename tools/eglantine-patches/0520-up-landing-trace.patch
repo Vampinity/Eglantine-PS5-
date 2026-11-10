@@ -1,0 +1,204 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_LANDING_TRACE=1: a log of the GPU results that land in guest memory, present by present; a diagnostic, off by default
+
+Run a frame ahead (EDEN_NX2_FRAMES_AHEAD=1), Ocarina's picture is about twice too bright for a
+second after a cut from black in 12 of 32 door runs, and in 0 of 45 with the full wait. The
+exposure is set from a wrong reading there. EDEN_UP_AHEAD_LOAD_WAIT (0511) could not catch the
+cut: the game draws the whole scene under the black and no present comes late.
+
+To find the reading: with this switch each present logs whether it returned before its frame's
+fence, and each small piece of GPU-written data that lands in guest memory (buffer cache
+downloads, with a mark when bytes were kept off because the guest CPU wrote there first; texture
+cache buffer and image downloads) logs its address, size and first 32 bytes against the game's
+latest present. At most 24 lines a present; landings over 256 bytes are only counted.
+
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index b224d69..075340e 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -41,6 +41,7 @@
+ #include "core/frontend/framebuffer_layout.h"
+ #include "core/perf_stats.h"
+ #include "video_core/ahead_guard.h"
++#include "video_core/landing_trace.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/ubo_snapshot.h"
+@@ -2041,10 +2042,17 @@ private:
+             m_stats.pace_us += to_us(paced - composited);
+             m_stats.max_fence_us = (std::max<long long>)(m_stats.max_fence_us, static_cast<long long>(to_us(waited - entered)));
+             // Counted at the reply: the game gets its buffers back with this frame unfinished.
+-            if (const u32 fence_id = ~w[22]; fence_id < 192 &&
+-                !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
++            const bool ran_ahead_now =
++                ~w[22] < 192 &&
++                !system.Host1x().GetSyncpointManager().IsReadyGuest(~w[22], w[24]);
++            if (ran_ahead_now) {
+                 ++m_stats.ran_ahead;
+             }
++            // EDEN_UP_LANDING_TRACE (video_core/landing_trace.h): the downloads that land from
++            // here on are logged against this present.
++            if (VideoCommon::LandingTrace::Enabled()) [[unlikely]] {
++                VideoCommon::LandingTrace::AtPresent(m_presents, ran_ahead_now);
++            }
+             // EDEN_UP_LIVE_SWITCHES=1 (common/live_switch.h): a live schedule changes its
+             // switches here, between two presents, and counts this present for the phase.
+             Common::LiveSwitch::AtPresent(entered);
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 1f441ec..5feadd8 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -30,6 +30,7 @@
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/nx2.h"
+ #include "video_core/hitch_trace.h"
++#include "video_core/landing_trace.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/ubo_ahead.h"
+@@ -2443,6 +2444,11 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
+     // EDEN_UP_HELD_VS_DOWNLOAD: nor over a page whose CPU write is held back (not yet applied).
+     const bool held = HeldVsDownload() && !held_download_bypass &&
+                       cpu_held_ranges.Intersects(device_addr, size);
++    // EDEN_UP_LANDING_TRACE: what lands, and whether the guest CPU wrote there first.
++    if (VideoCommon::LandingTrace::Enabled()) [[unlikely]] {
++        VideoCommon::LandingTrace::Note(
++            held || cpu_written.Intersects(device_addr, size) ? 'k' : 'b', device_addr, data, size);
++    }
+     // EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: what the download brought, wrote and kept off,
+     // until EndLandingStats.
+     const bool landing_stats = VideoCore::LandingPort::StatsEnabled();
+diff --git a/src/video_core/landing_trace.h b/src/video_core/landing_trace.h
+new file mode 100644
+index 0000000..fe9ce5d
+--- /dev/null
++++ b/src/video_core/landing_trace.h
+@@ -0,0 +1,94 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <string>
++
++#include <fmt/format.h>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++
++/// EDEN_UP_LANDING_TRACE=1 (exact "1"; a diagnostic, off by default, hundreds of log lines a
++/// second): what the GPU's results look like as they reach the game, present by present.
++///
++/// Why: run a frame ahead (EDEN_NX2_FRAMES_AHEAD=1), Ocarina's picture comes out at about twice
++/// its brightness for a second after a cut from black, in 12 of 32 door runs and in 0 of 45 with
++/// the full wait (T91-T100). That is the exposure set from a wrong reading. The game reads what
++/// the GPU measured from its own memory, where a GPU write lands only at the fence of the frame
++/// that made it; which bytes those are, and how late they land next to the game's presents, is
++/// not known. This writes it down:
++///
++///   LandingTrace present <n> ahead=<0|1> big=<count> (<bytes> B) dropped=<lines>
++///       from nx2:vi2 at each present of the game; ahead=1: it returned before its own frame's
++///       fence. big / dropped: landings since the last present that were over 256 bytes, and
++///       lines left out by the cap of 24 a present.
++///   LandingTrace <kind> p=<n> addr=<address> size=<bytes> first=<hex of up to 32 bytes>
++///       one piece that lands while the game's latest present is n. Kinds:
++///       b  a buffer cache download, written to guest memory whole (device address)
++///       k  a buffer cache download of which bytes were kept off, because the guest CPU wrote
++///          there after the GPU did and before this landed: the game never sees those
++///       t  a texture cache buffer download (an image copied into memory; GPU address)
++///       i  a small image download (GPU address)
++/// A value that follows the picture's brightness through the fade to black and the cut is the
++/// meter; a 'k' line on it at the cut is the reading lost.
++namespace VideoCommon::LandingTrace {
++
++[[nodiscard]] inline bool Enabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_LANDING_TRACE");
++    return enabled;
++}
++
++inline constexpr u64 SmallBytes = 256;
++inline constexpr u32 LinesAPresent = 24;
++
++inline std::atomic<u64> g_present{};       ///< the game's latest present
++inline std::atomic<u64> g_lines_present{}; ///< the present g_lines counts for
++inline std::atomic<u32> g_lines{};
++inline std::atomic<u64> g_big_count{};
++inline std::atomic<u64> g_big_bytes{};
++inline std::atomic<u64> g_dropped{};
++
++/// A piece of GPU-written data is about to be written to guest memory (any thread that lands
++/// downloads). Call only with Enabled().
++inline void Note(char kind, u64 address, const u8* data, u64 size) {
++    if (data == nullptr || size == 0) {
++        return;
++    }
++    if (size > SmallBytes && kind != 'k') {
++        g_big_count.fetch_add(1, std::memory_order_relaxed);
++        g_big_bytes.fetch_add(size, std::memory_order_relaxed);
++        return;
++    }
++    const u64 present = g_present.load(std::memory_order_relaxed);
++    if (g_lines_present.exchange(present, std::memory_order_relaxed) != present) {
++        g_lines.store(0, std::memory_order_relaxed);
++    }
++    if (g_lines.fetch_add(1, std::memory_order_relaxed) >= LinesAPresent) {
++        g_dropped.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    std::string hex;
++    const u64 shown = (std::min<u64>)(size, 32);
++    hex.reserve(shown * 2);
++    for (u64 i = 0; i < shown; ++i) {
++        hex += fmt::format("{:02x}", data[i]);
++    }
++    LOG_INFO(HW_GPU, "LandingTrace {} p={} addr={:#x} size={} first={}", kind, present, address,
++             size, hex);
++}
++
++/// From nx2:vi2 PresentClientBuffer at its reply. Call only with Enabled().
++inline void AtPresent(u64 number, bool ahead) {
++    g_present.store(number, std::memory_order_relaxed);
++    LOG_INFO(HW_GPU, "LandingTrace present {} ahead={} big={} ({} B) dropped={}", number,
++             ahead ? 1 : 0, g_big_count.exchange(0, std::memory_order_relaxed),
++             g_big_bytes.exchange(0, std::memory_order_relaxed),
++             g_dropped.exchange(0, std::memory_order_relaxed));
++}
++
++} // namespace VideoCommon::LandingTrace
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index fa5ca3d..cd2d143 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -32,6 +32,7 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/memory_census.h"
++#include "video_core/landing_trace.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/texture_cache/formatter.h"
+ #include "video_core/texture_cache/image_view_base.h"
+@@ -3343,6 +3344,10 @@ void TextureCache<P>::PopAsyncFlushes() {
+                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
+                 std::span<u8> download_span =
+                     download_buffer.mapped_span.subspan(download_buffer.offset);
++                if (VideoCommon::LandingTrace::Enabled()) [[unlikely]] {
++                    VideoCommon::LandingTrace::Note('i', image.gpu_addr, download_span.data(),
++                                                    image.unswizzled_size_bytes);
++                }
+                 // EDEN_UP_HELD_VS_DOWNLOAD (MythosOfs/Orchid cc04f48b3d): written by the CPU
+                 // since the download was taken, these bytes are older.
+                 static const bool held_vs_download = Common::PeSwitch("EDEN_UP_HELD_VS_DOWNLOAD");
+@@ -3355,6 +3360,10 @@ void TextureCache<P>::PopAsyncFlushes() {
+                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
+                 std::span<u8> download_span =
+                     download_buffer.mapped_span.subspan(download_buffer.offset);
++                if (VideoCommon::LandingTrace::Enabled()) [[unlikely]] {
++                    VideoCommon::LandingTrace::Note('t', buffer_info.address, download_span.data(),
++                                                    buffer_info.size);
++                }
+                 gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
+                                              buffer_info.size);
+                 ClearStaleGpu(buffer_info.address, buffer_info.size);

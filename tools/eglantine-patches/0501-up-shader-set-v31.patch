@@ -1,0 +1,3690 @@
+Subject: [PATCH] EDEN_UP_SHADER_SET, EDEN_UP_CANONICAL_KEYS, EDEN_UP_SHADER_SET_PREP_ALL: whole-game shader set from Fritchii's recipe (v3.1 draft); off by default
+
+Codex's shader-set v3.1 (~/Downloads/shader-set-phase1/out-1c/shader-set.v3.1.patch, NOTES.md and
+READY.md there), drafted against the T88 core and rebased onto T93: one hunk of
+vk_pipeline_cache.cpp (LoadDiskResources, the used-list test) merged by hand with 0499's
+mesh_always, and the constructor's new block moved ahead of its last statement
+(tools/prepare-vulkan-port.py anchors on the constructor's end). The extractor (core/file_sys/nx2_shader_extract.*) is Fritchii's file. Test order:
+A = EDEN_UP_CANONICAL_KEYS=1 alone; B = + EDEN_UP_SHADER_SET=1 (needs EDEN_UP_NUP_LAZY_DECODE=1 and
+the wrapped recipe beside the pipeline cache); C = + EDEN_UP_SHADER_SET_PREP_ALL=1.
+
+First compile: AtomicFile::Bytes() hid the Bytes type inside the class (renamed Written()).
+
+---
+diff --git a/src/common/thread_worker.h b/src/common/thread_worker.h
+index cb10233..56c0435 100644
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -127,6 +127,14 @@ public:
+         condition.notify_one();
+     }
+ 
++    /// Tasks queued and not yet done (EDEN_UP_SHADER_SET: its background jobs yield to the
++    /// runtime's). Approximate: read without the queue lock.
++    [[nodiscard]] size_t Pending() const noexcept {
++        const size_t scheduled = work_scheduled.load(std::memory_order_acquire);
++        const size_t done = work_done.load(std::memory_order_acquire);
++        return scheduled > done ? scheduled - done : 0;
++    }
++
+     void WaitForRequests(std::stop_token stop_token = {}) {
+         std::stop_callback callback(stop_token, [this] {
+             for (auto& thread : threads) {
+diff --git a/src/core/file_sys/nx2_shader_extract.cpp b/src/core/file_sys/nx2_shader_extract.cpp
+new file mode 100644
+index 0000000..75a7e46
+--- /dev/null
++++ b/src/core/file_sys/nx2_shader_extract.cpp
+@@ -0,0 +1,999 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "core/file_sys/nx2_shader_extract.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <stdexcept>
++#include <string_view>
++#include <thread>
++#include <tuple>
++#include <unordered_map>
++#include <unordered_set>
++
++#include <fmt/format.h>
++#include <openssl/evp.h>
++#include <zstd.h>
++
++#include "common/thread.h"
++#include "core/file_sys/vfs/vfs.h"
++
++namespace FileSys::Nx2ShaderExtract {
++namespace {
++
++// PS5 port (shader-set v2): upstream reads any file or inflated member up to 1 GiB whole. A base
++// PS5 has a few hundred MB to spare while the pipeline cache loads, so the cap is 256 MiB unless
++// EDEN_UP_SHADER_SET_MAX_MB says otherwise; a container above it is reported, not read.
++const size_t MaxBlob = [] {
++    const char* const text = std::getenv("EDEN_UP_SHADER_SET_MAX_MB");
++    const unsigned long long mib = text ? std::strtoull(text, nullptr, 10) : 0;
++    return (mib ? std::clamp<unsigned long long>(mib, 16, 4096) : 256ULL) << 20;
++}();
++constexpr size_t PeekFirst = 32 * 1024 * 1024;    // PS5 port: larger files are peeked before read
++constexpr size_t PeekBytes = 64 * 1024;           // what a compressed file shows before inflating
++constexpr int MaxDepth = 12;
++constexpr std::array<u8, 4> ControlMagic{0x34, 0x12, 0x76, 0x98};
++constexpr std::array<u8, 8> BnshMagic{'B', 'N', 'S', 'H', 0, 0, 0, 0};
++constexpr u32 KeyControl = 0x48;                  // control bytes in a fingerprint
++
++struct Bad : std::runtime_error {
++    using std::runtime_error::runtime_error;
++};
++
++using Bytes = std::span<const u8>;
++
++template <typename T>
++T Load(Bytes data, size_t offset) {
++    if (offset > data.size() || sizeof(T) > data.size() - offset) {
++        throw Bad(fmt::format("read past the end at {:#x}", offset));
++    }
++    T value;
++    std::memcpy(&value, data.data() + offset, sizeof(T));
++    return value;
++}
++
++template <typename T>
++T LoadBE(Bytes data, size_t offset) {
++    T value = Load<T>(data, offset);
++    if constexpr (sizeof(T) == 2) {
++        return static_cast<T>((value >> 8) | (value << 8));
++    } else {
++        u32 v = static_cast<u32>(value);
++        return static_cast<T>((v >> 24) | ((v >> 8) & 0xff00) | ((v << 8) & 0xff0000) | (v << 24));
++    }
++}
++
++Bytes Sub(Bytes data, size_t offset, size_t size) {
++    if (offset > data.size() || size > data.size() - offset) {
++        throw Bad(fmt::format("range {:#x}+{:#x} past the end", offset, size));
++    }
++    return data.subspan(offset, size);
++}
++
++bool Starts(Bytes data, std::string_view magic) {
++    return data.size() >= magic.size() && std::memcmp(data.data(), magic.data(), magic.size()) == 0;
++}
++
++/// An NVN2 control section: the control magic, version 0xc9.
++bool IsNvn2Control(Bytes control) {
++    return control.size() >= KeyControl &&
++           std::memcmp(control.data(), ControlMagic.data(), 4) == 0 && control[4] == 0xc9 &&
++           control[5] == 0 && control[6] == 0 && control[7] == 0;
++}
++
++/// Compute, task and mesh by the control section's stage byte (+0x56), graphics stages by the
++/// program header at the code area's start (bits 10..13 of its first word: 1 vertex .. 5 pixel).
++std::optional<Stage> Nvn2Stage(Bytes control, Bytes code) {
++    if (control.size() > 0x56) {
++        switch (control[0x56]) {
++        case 5:
++            return Stage::Compute;
++        case 6:
++            return Stage::Task;
++        case 7:
++            return Stage::Mesh;
++        default:
++            break;
++        }
++    }
++    if (code.size() < 4) {
++        return std::nullopt;
++    }
++    switch ((Load<u32>(code, 0) >> 10) & 0xF) {
++    case 1:
++        return Stage::Vertex;
++    case 2:
++        return Stage::TessControl;
++    case 3:
++        return Stage::TessEval;
++    case 4:
++        return Stage::Geometry;
++    case 5:
++        return Stage::Fragment;
++    default:
++        return std::nullopt;
++    }
++}
++
++/// The control section names its code area's length at +0x44.
++bool Consistent(Bytes control, Bytes code) {
++    return IsNvn2Control(control) && Load<u32>(control, 0x44) == code.size();
++}
++
++class Zstd {
++public:
++    ~Zstd() {
++        for (auto& [id, dict] : dictionaries) {
++            ZSTD_freeDDict(dict);
++        }
++    }
++
++    /// The game's dictionaries (Pack/ZsDic.pack.zs: a zstd SARC of .zsdic members).
++    void AddDictionary(Bytes dictionary) {
++        const unsigned id = ZSTD_getDictID_fromDict(dictionary.data(), dictionary.size());
++        if (id == 0 || dictionaries.contains(id)) {
++            return;
++        }
++        if (ZSTD_DDict* dict = ZSTD_createDDict(dictionary.data(), dictionary.size())) {
++            dictionaries.emplace(id, dict);
++        }
++    }
++
++    const ZSTD_DDict* Dictionary(Bytes frame) const {
++        const unsigned id = ZSTD_getDictID_fromFrame(frame.data(), frame.size());
++        if (id == 0) {
++            return nullptr;
++        }
++        const auto it = dictionaries.find(id);
++        if (it == dictionaries.end()) {
++            throw Bad(fmt::format("zstd dictionary {} is missing", id));
++        }
++        return it->second;
++    }
++
++    size_t Count() const {
++        return dictionaries.size();
++    }
++
++private:
++    std::unordered_map<unsigned, ZSTD_DDict*> dictionaries;
++};
++
++bool IsZstd(Bytes data) {
++    return data.size() >= 4 && Load<u32>(data, 0) == 0xFD2FB528;
++}
++
++/// Inflates `frame`, or only its first `limit` bytes. Per thread: the context is reused.
++std::vector<u8> Inflate(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, size_t limit) {
++    ZSTD_DCtx_reset(context, ZSTD_reset_session_and_parameters);
++    if (const ZSTD_DDict* dict = zstd.Dictionary(frame)) {
++        ZSTD_DCtx_refDDict(context, dict);
++    }
++    const unsigned long long declared = ZSTD_getFrameContentSize(frame.data(), frame.size());
++    size_t reserve = limit;
++    if (declared != ZSTD_CONTENTSIZE_UNKNOWN && declared != ZSTD_CONTENTSIZE_ERROR) {
++        if (declared > MaxBlob && limit > MaxBlob) {
++            throw Bad(fmt::format("zstd content of {} bytes is too large", declared));
++        }
++        reserve = std::min<size_t>(limit, static_cast<size_t>(declared));
++    }
++    std::vector<u8> out(std::min(reserve, MaxBlob));
++    ZSTD_inBuffer in{frame.data(), frame.size(), 0};
++    size_t produced = 0;
++    while (produced < limit) {
++        if (produced == out.size()) {
++            if (out.size() >= MaxBlob) {
++                throw Bad("zstd content is too large");
++            }
++            out.resize(std::min({std::max<size_t>(out.size() * 2, 1 << 16), limit, MaxBlob}));
++        }
++        ZSTD_outBuffer o{out.data() + produced, out.size() - produced, 0};
++        const size_t status = ZSTD_decompressStream(context, &o, &in);
++        if (ZSTD_isError(status)) {
++            throw Bad(fmt::format("zstd: {}", ZSTD_getErrorName(status)));
++        }
++        produced += o.pos;
++        if (status == 0 || (in.pos == in.size && o.pos == 0)) {
++            break; // end of frame, or no more input
++        }
++    }
++    out.resize(produced);
++    return out;
++}
++
++std::vector<u8> Yaz0(Bytes data) {
++    const u32 size = LoadBE<u32>(data, 4);
++    if (size > MaxBlob) {
++        throw Bad("Yaz0 content is too large");
++    }
++    std::vector<u8> out(size);
++    size_t in = 16, o = 0;
++    while (o < size) {
++        const u8 group = Load<u8>(data, in++);
++        for (int bit = 7; bit >= 0 && o < size; --bit) {
++            if ((group >> bit) & 1) {
++                out[o++] = Load<u8>(data, in++);
++                continue;
++            }
++            const u8 b1 = Load<u8>(data, in++);
++            const u8 b2 = Load<u8>(data, in++);
++            const size_t distance = (size_t{b1 & 0xFu} << 8 | b2) + 1;
++            size_t count = b1 >> 4;
++            count = count == 0 ? size_t{Load<u8>(data, in++)} + 0x12 : count + 2;
++            if (distance > o) {
++                throw Bad("Yaz0 reference before the start");
++            }
++            for (size_t i = 0; i < count && o < size; ++i, ++o) {
++                out[o] = out[o - distance];
++            }
++        }
++    }
++    return out;
++}
++
++struct Member {
++    std::string name;
++    Bytes data;
++};
++
++std::vector<Member> Sarc(Bytes data) {
++    const bool big = Load<u16>(data, 6) == 0xFFFE; // bytes FE FF
++    const auto u16_at = [&](size_t at) { return big ? LoadBE<u16>(data, at) : Load<u16>(data, at); };
++    const auto u32_at = [&](size_t at) { return big ? LoadBE<u32>(data, at) : Load<u32>(data, at); };
++    const u16 header = u16_at(4);
++    const u32 data_offset = u32_at(12);
++    if (header < 0x14 || data_offset > data.size()) {
++        throw Bad("bad SARC header");
++    }
++    const size_t sfat = header;
++    if (!Starts(Sub(data, sfat, 4), "SFAT")) {
++        throw Bad("bad SFAT");
++    }
++    const u16 count = u16_at(sfat + 6);
++    const size_t nodes = sfat + u16_at(sfat + 4);
++    const size_t sfnt = nodes + size_t{count} * 0x10;
++    if (!Starts(Sub(data, sfnt, 4), "SFNT")) {
++        throw Bad("bad SFNT");
++    }
++    const size_t names = sfnt + u16_at(sfnt + 4);
++    std::vector<Member> members;
++    members.reserve(count);
++    for (u16 i = 0; i < count; ++i) {
++        const size_t node = nodes + size_t{i} * 0x10;
++        const u32 flags = u32_at(node + 4);
++        const u32 start = u32_at(node + 8);
++        const u32 end = u32_at(node + 12);
++        std::string name = fmt::format("{:08x}", u32_at(node));
++        if ((flags >> 24) != 0) {
++            const size_t at = names + size_t{flags & 0xFFFFFF} * 4;
++            const auto tail = Sub(data, at, std::min<size_t>(data_offset, data.size()) - at);
++            const auto zero = std::find(tail.begin(), tail.end(), u8{0});
++            name.assign(tail.begin(), zero);
++        }
++        if (end < start) {
++            throw Bad("bad SARC member range");
++        }
++        members.push_back({std::move(name), Sub(data, size_t{data_offset} + start, end - start)});
++    }
++    return members;
++}
++
++/// One extraction worker: its zstd context and the place it reports to.
++class Walker {
++public:
++    using Found = std::function<void(Stage, Bytes control, Bytes code, std::string origin,
++                                     std::string variation)>;
++
++    Walker(const Zstd& zstd_, Found found_, std::vector<std::string>& errors_, Stats& stats_)
++        : zstd{zstd_}, found{std::move(found_)}, errors{errors_}, stats{stats_},
++          context{ZSTD_createDCtx()} {}
++
++    ~Walker() {
++        ZSTD_freeDCtx(context);
++    }
++
++    void File(const VirtualFile& file, const std::string& path) {
++        const size_t size = file->GetSize();
++        ++stats.files;
++        if (size > PeekFirst) {
++            // PS5 port: large media and data are peeked first (upstream peeked only above the
++            // cap); a compressed head is inflated up to PeekBytes, which a partial frame allows.
++            // Only a container at the start is read whole, and only under the cap.
++            const auto head = file->ReadBytes(PeekBytes, 0);
++            stats.file_bytes += head.size();
++            bool container = false;
++            Guard(path, [&] {
++                if (IsZstd(head)) {
++                    const auto peek = Inflate(zstd, context, head, PeekBytes);
++                    container = LooksLikeContainer(peek) && !IsZstd(peek);
++                } else {
++                    container = LooksLikeContainer(head);
++                }
++            });
++            if (!container) {
++                ++stats.peeked_only;
++                return;
++            }
++            if (size > MaxBlob) {
++                errors.push_back(fmt::format("{}: container of {} MiB is over the {} MiB cap "
++                                             "(EDEN_UP_SHADER_SET_MAX_MB) and was not read",
++                                             path, size >> 20, MaxBlob >> 20));
++                return;
++            }
++        }
++        const std::vector<u8> data = file->ReadAllBytes();
++        stats.file_bytes += data.size();
++        Guard(path, [&] { Top(data, path); });
++    }
++
++private:
++    template <typename F>
++    void Guard(const std::string& where, F&& f) {
++        try {
++            f();
++        } catch (const Bad& e) {
++            errors.push_back(where + ": " + e.what());
++        }
++    }
++
++    static bool LooksLikeContainer(Bytes head) {
++        if (head.size() < 8) {
++            return false;
++        }
++        for (const std::string_view magic :
++             {"SARC", "Yaz0", "BNSH", "FSHA", "BAHS", "NDSR", "NDVE", "YB", "BY"}) {
++            if (Starts(head, magic)) {
++                return true;
++            }
++        }
++        return IsZstd(head) ||
++               std::search(head.begin(), head.end(), BnshMagic.begin(), BnshMagic.end()) !=
++                   head.end();
++    }
++
++    /// A RomFS file: a compressed one is inflated only if its start shows a container.
++    void Top(Bytes data, const std::string& label) {
++        if (IsZstd(data)) {
++            const auto head = Inflate(zstd, context, data, PeekBytes);
++            if (!LooksLikeContainer(head) || IsZstd(head)) {
++                ++stats.peeked_only;
++                return;
++            }
++            const auto inner = Inflate(zstd, context, data, MaxBlob);
++            stats.inflated_bytes += inner.size();
++            Walk(inner, label, 1);
++            return;
++        }
++        Walk(data, label, 0);
++    }
++
++    void Walk(Bytes data, const std::string& label, int depth) {
++        if (depth > MaxDepth || data.size() < 8) {
++            return;
++        }
++        if (IsZstd(data)) {
++            const auto inner = Inflate(zstd, context, data, MaxBlob);
++            stats.inflated_bytes += inner.size();
++            Walk(inner, label, depth + 1);
++        } else if (Starts(data, "Yaz0")) {
++            const auto inner = Yaz0(data);
++            stats.inflated_bytes += inner.size();
++            Walk(inner, label, depth + 1);
++        } else if (Starts(data, "SARC")) {
++            ++stats.containers;
++            for (const auto& member : Sarc(data)) {
++                const std::string where = label + "/" + member.name;
++                Guard(where, [&] { Walk(member.data, where, depth + 1); });
++            }
++        } else if (Starts(data, "BAHS")) {
++            ++stats.containers;
++            Bahs(data, label);
++        } else if (Starts(data, "NDSR")) {
++            ++stats.containers;
++            Ndsr(data, label);
++        } else if (Starts(data, "NDVE")) {
++            ++stats.containers;
++            Ndve(data, label);
++        } else {
++            // BNSH files, and BNSH inside other data (BFSHA archives, effect bundles, layouts).
++            if (!EmbeddedBnsh(data, label)) {
++                SeadPrimitive(data, label);
++            }
++        }
++    }
++
++    void Emit(Stage stage, Bytes control, Bytes code, std::string origin, std::string variation) {
++        ++stats.occurrences;
++        found(stage, control, code, std::move(origin), std::move(variation));
++    }
++
++    bool EmbeddedBnsh(Bytes data, const std::string& label) {
++        bool any = false;
++        auto it = data.begin();
++        while ((it = std::search(it, data.end(), BnshMagic.begin(), BnshMagic.end())) !=
++               data.end()) {
++            const size_t base = static_cast<size_t>(it - data.begin());
++            const size_t size =
++                base + 0x20 <= data.size() ? size_t{Load<u32>(data, base + 0x1c)} : 0;
++            const bool bounded = size >= 0x98 && size <= data.size() - base;
++            if (bounded) {
++                Guard(fmt::format("{}#BNSH@{:#x}", label, base), [&] {
++                    Bnsh(Sub(data, base, size), label, base);
++                    any = true;
++                    ++stats.containers;
++                });
++            }
++            it += static_cast<std::ptrdiff_t>(bounded ? size : 8);
++        }
++        return any;
++    }
++
++    // BNSH: +0x60 'grsc', +0x7c variation count, +0x80 variation table; a variation is 0x40
++    // bytes with its program at +0x10; a program has six stage pointers from +0x08 (vertex,
++    // hull, domain, geometry, pixel, compute) and NVN2's task and mesh at +0x40 and +0x48; a
++    // stage record has its control at +0x08, code at +0x10, code length +0x18, control length
++    // +0x1c. All pointers count from the BNSH start.
++    void Bnsh(Bytes d, const std::string& label, size_t base) {
++        if (!Starts(Sub(d, 0x60, 4), "grsc")) {
++            throw Bad("no grsc block");
++        }
++        const u32 count = Load<u32>(d, 0x7c);
++        const u64 table = Load<u64>(d, 0x80);
++        static constexpr std::array slots{Stage::Vertex,   Stage::TessControl, Stage::TessEval,
++                                          Stage::Geometry, Stage::Fragment,    Stage::Compute};
++        for (u32 v = 0; v < count; ++v) {
++            const u64 program = Load<u64>(d, table + 0x40 * u64{v} + 0x10);
++            if (program == 0) {
++                continue;
++            }
++            const std::string variation = fmt::format("{}#BNSH@{:#x}#var{}", label, base, v);
++            const auto stage_at = [&](u64 record, Stage stage, bool optional) {
++                const u64 control_at = Load<u64>(d, record + 0x08);
++                const u64 code_at = Load<u64>(d, record + 0x10);
++                const u32 code_size = Load<u32>(d, record + 0x18);
++                const u32 control_size = Load<u32>(d, record + 0x1c);
++                if (optional && (control_size < KeyControl || control_size >= 0x10000 ||
++                                 control_at + control_size > d.size() ||
++                                 code_at + code_size > d.size())) {
++                    return;
++                }
++                const auto control = Sub(d, control_at, control_size);
++                const auto code = Sub(d, code_at, code_size);
++                if (optional) {
++                    const u8 expected = stage == Stage::Task ? 6 : 7;
++                    if (!IsNvn2Control(control) || control.size() <= 0x56 ||
++                        control[0x56] != expected) {
++                        return;
++                    }
++                }
++                if (!Consistent(control, code)) {
++                    throw Bad(fmt::format("variation {} {}: control +0x44 does not match the code",
++                                          v, StageName(stage)));
++                }
++                Emit(stage, control, code, variation, variation);
++            };
++            for (size_t slot = 0; slot < slots.size(); ++slot) {
++                const u64 record = Load<u64>(d, program + 8 + 8 * slot);
++                if (record != 0) {
++                    stage_at(record, slots[slot], false);
++                }
++            }
++            for (const auto& [offset, stage] :
++                 {std::pair{u64{0x40}, Stage::Task}, std::pair{u64{0x48}, Stage::Mesh}}) {
++                if (program + offset + 8 > d.size()) {
++                    continue;
++                }
++                const u64 record = Load<u64>(d, program + offset);
++                if (record != 0 && record + 0x20 <= d.size()) {
++                    stage_at(record, stage, true);
++                }
++            }
++        }
++    }
++
++    // agl's BAHS (sharcb): +0x18 code region length, +0x1c code region start. A program entry
++    // in the area before it is u32 code offset (multiple of 0x100), u32 0, u32 control length,
++    // i32 distance to the control section. An NVN2 section's +0x38..+0x47 reads as such an
++    // entry, so entries inside a found control section are dropped (nxnative: Ocarina of
++    // Time's agl_common.sharcb@0x357f0).
++    void Bahs(Bytes d, const std::string& label) {
++        const u32 region_size = Load<u32>(d, 0x18);
++        const u32 region = Load<u32>(d, 0x1c);
++        if (size_t{region} + region_size > d.size()) {
++            throw Bad("BAHS code region out of bounds");
++        }
++        struct Entry {
++            size_t at, control_at;
++            Stage stage;
++            Bytes control, code;
++        };
++        std::vector<Entry> entries;
++        for (size_t a = 0; a + 16 < region; a += 4) {
++            const u32 offset = Load<u32>(d, a);
++            const u32 zero = Load<u32>(d, a + 4);
++            const u32 control_size = Load<u32>(d, a + 8);
++            const s32 distance = Load<s32>(d, a + 12);
++            if (zero != 0 || offset % 0x100 != 0 || control_size < KeyControl ||
++                control_size >= 0x10000) {
++                continue;
++            }
++            const s64 control_at = static_cast<s64>(a) + distance;
++            if (control_at < 0 || static_cast<u64>(control_at) + control_size > region) {
++                continue;
++            }
++            const auto control = d.subspan(static_cast<size_t>(control_at), control_size);
++            if (!IsNvn2Control(control)) {
++                continue;
++            }
++            const u32 code_size = Load<u32>(control, 0x44);
++            if (u64{offset} + code_size > region_size) {
++                continue;
++            }
++            const auto code = d.subspan(size_t{region} + offset, code_size);
++            const auto stage = Nvn2Stage(control, code);
++            if (!stage) {
++                continue;
++            }
++            entries.push_back({a, static_cast<size_t>(control_at), *stage, control, code});
++        }
++        std::vector<const Entry*> kept;
++        for (const auto& entry : entries) {
++            const bool inside = std::any_of(entries.begin(), entries.end(), [&](const Entry& e) {
++                return e.control_at <= entry.at && entry.at < e.control_at + KeyControl;
++            });
++            if (!inside) {
++                kept.push_back(&entry);
++            }
++        }
++        std::vector<size_t> taken;
++        for (const Entry* entry : kept) {
++            taken.push_back(entry->at);
++        }
++        const auto variations = BahsVariations(d, label, taken);
++        for (const Entry* entry : kept) {
++            const std::string where = fmt::format("{}#BAHS@{:#x}", label, entry->at);
++            const auto it = variations.find(entry->at);
++            Emit(entry->stage, entry->control, entry->code, where,
++                 it != variations.end() ? it->second : where);
++        }
++    }
++
++    // The variations of a BAHS file's programs. Right before the first entry is a binary array
++    // (u32 byte size, u32 count, then per binary: u32 record size, u32 kind (0 vertex, 1
++    // fragment, 3 compute), two u32, the 16-byte entry), and right after it a program array (u32
++    // byte size, u32 count, then per program: u32 record size, u32 name length, u32 stage mask,
++    // u32 index of its first binary, ...). A program's binaries run to the next program's first;
++    // its n-th vertex and n-th fragment binary are one variation. Arrays that do not read back
++    // give no variations (nxnative: bahs_variations).
++    static std::unordered_map<size_t, std::string> BahsVariations(Bytes d, const std::string& label,
++                                                                  const std::vector<size_t>& taken) {
++        std::unordered_map<size_t, std::string> result;
++        if (taken.empty()) {
++            return result;
++        }
++        const s64 slack = std::max<s64>(1, static_cast<s64>(taken.size()) / 100);
++        const size_t first = *std::min_element(taken.begin(), taken.end());
++        if (first < 0x18 + 0x20) {
++            return result;
++        }
++        const size_t array = first - 0x18;
++        const u32 array_size = Load<u32>(d, array);
++        const u32 array_count = Load<u32>(d, array + 4);
++        if (u64{array} + array_size + 8 > d.size() ||
++            static_cast<s64>(array_count) < static_cast<s64>(taken.size()) - slack) {
++            return result;
++        }
++        struct Record {
++            size_t entry;
++            u32 kind;
++        };
++        std::vector<Record> records;
++        size_t o = array + 8;
++        for (u32 i = 0; i < array_count; ++i) {
++            if (o + 0x20 > array + array_size) {
++                return result;
++            }
++            const u32 size = Load<u32>(d, o);
++            if (size < 0x20) {
++                return result;
++            }
++            records.push_back({o + 0x10, Load<u32>(d, o + 4)});
++            o += size;
++        }
++        const auto in_records = [&](size_t at) {
++            return std::any_of(records.begin(), records.end(),
++                               [&](const Record& r) { return r.entry == at; });
++        };
++        const s64 outside = std::count_if(taken.begin(), taken.end(),
++                                          [&](size_t at) { return !in_records(at); });
++        if (o != array + array_size || outside > slack) {
++            return result;
++        }
++        const u32 programs_size = Load<u32>(d, o);
++        const u32 programs = Load<u32>(d, o + 4);
++        if (u64{o} + programs_size > d.size() || programs == 0) {
++            return result;
++        }
++        std::vector<u32> bases;
++        size_t q = o + 8;
++        for (u32 p = 0; p < programs; ++p) {
++            if (q + 16 > o + programs_size) {
++                return result;
++            }
++            const u32 size = Load<u32>(d, q);
++            const u32 base = Load<u32>(d, q + 12);
++            if (size < 16 || base > array_count || (!bases.empty() && base < bases.back())) {
++                return result;
++            }
++            bases.push_back(base);
++            q += size;
++        }
++        if (q != o + programs_size) {
++            return result;
++        }
++        bases.push_back(array_count);
++        const std::unordered_set<size_t> taken_set(taken.begin(), taken.end());
++        for (u32 p = 0; p < programs; ++p) {
++            std::array<u32, 2> seen{};
++            for (u32 i = bases[p]; i < bases[p + 1]; ++i) {
++                const auto& record = records[i];
++                if (record.kind > 1) {
++                    continue; // compute and the other kinds pair with nothing
++                }
++                if (taken_set.contains(record.entry)) {
++                    result.emplace(record.entry, fmt::format("{}#BAHS#prog{}#var{}", label, p,
++                                                             seen[record.kind]));
++                }
++                ++seen[record.kind];
++            }
++        }
++        return result;
++    }
++
++    // agl's NDSR pack: 16-byte records from +0x10 (or +0x14) up to a zero one: u32 control
++    // offset, u32 control length << 4 | type, u32 code offset, u32. Records not pointing at a
++    // control section hold data and may shift the next by 8. A vertex record is followed by its
++    // pixel record.
++    void Ndsr(Bytes d, const std::string& label) {
++        const auto points_at_control = [&](size_t at) {
++            return u64{at} + KeyControl <= d.size() && IsNvn2Control(d.subspan(at, KeyControl));
++        };
++        const auto score = [&](size_t start) {
++            int n = 0;
++            for (size_t i = 0; i < 16 && start + 16 * i + 16 <= d.size(); ++i) {
++                n += points_at_control(Load<u32>(d, start + 16 * i)) ? 1 : 0;
++            }
++            return n;
++        };
++        size_t o = score(0x14) > score(0x10) ? 0x14 : 0x10;
++        std::string vertex;
++        while (o + 16 <= d.size()) {
++            const u32 control_at = Load<u32>(d, o);
++            const u32 control_word = Load<u32>(d, o + 4);
++            const u32 code_at = Load<u32>(d, o + 8);
++            const u32 last = Load<u32>(d, o + 12);
++            if ((control_at | control_word | code_at | last) == 0) {
++                break;
++            }
++            if (!points_at_control(control_at)) {
++                o += 8;
++                continue;
++            }
++            o += 16;
++            const size_t control_size = std::max<size_t>(control_word >> 4, KeyControl);
++            if (u64{control_at} + control_size > d.size()) {
++                continue;
++            }
++            const auto control = d.subspan(control_at, control_size);
++            const u32 code_size = Load<u32>(control, 0x44);
++            if (u64{code_at} + code_size > d.size()) {
++                continue;
++            }
++            const auto code = d.subspan(code_at, code_size);
++            const auto stage = Nvn2Stage(control, code);
++            if (!stage || !Consistent(control, code)) {
++                continue;
++            }
++            const std::string where = fmt::format("{}#NDSR@{:#x}", label, control_at);
++            std::string variation = where;
++            if (*stage == Stage::Vertex) {
++                vertex = where;
++            } else if (*stage == Stage::Fragment && !vertex.empty()) {
++                variation = vertex; // the pair is labelled by its vertex record
++                vertex.clear();
++            }
++            Emit(*stage, control, code, where, variation);
++        }
++    }
++
++    // nn::ndve's movie enhancement file: +0xc length of its NDSR pack, +0x14 count of 8-byte
++    // model records, then the pack, then the networks: control sections each naming their own
++    // length (+0x30) and their code area's (+0x44), the code area right behind.
++    void Ndve(Bytes d, const std::string& label) {
++        const size_t pack = 0x18 + 8 * size_t{Load<u32>(d, 0x14)};
++        const size_t networks = pack + Load<u32>(d, 0xc);
++        Ndsr(Sub(d, pack, networks - pack), label);
++        for (size_t c = (networks + 3) & ~size_t{3}; c + KeyControl <= d.size(); c += 4) {
++            if (std::memcmp(d.data() + c, ControlMagic.data(), 4) != 0 ||
++                !IsNvn2Control(d.subspan(c, KeyControl))) {
++                continue;
++            }
++            const u32 own = Load<u32>(d, c + 0x30);
++            const u32 code_size = Load<u32>(d, c + 0x44);
++            if (own < KeyControl || c + own + code_size > d.size()) {
++                continue;
++            }
++            const auto control = d.subspan(c, own);
++            const auto code = d.subspan(c + own, code_size);
++            if (const auto stage = Nvn2Stage(control, code)) {
++                const std::string where = fmt::format("{}#NDVE@{:#x}", label, c);
++                Emit(*stage, control, code, where, where);
++            }
++        }
++    }
++
++    // sead's NVN2 primitive drawer: four u32 offsets (vertex control, pixel control, vertex
++    // code, pixel code); each control section names its own length (+0x30) and its code's (+0x44).
++    void SeadPrimitive(Bytes d, const std::string& label) {
++        if (d.size() < 0x10 || d.size() > (1u << 20)) {
++            return;
++        }
++        const u32 vc = Load<u32>(d, 0), pc = Load<u32>(d, 4), vk = Load<u32>(d, 8),
++                  pk = Load<u32>(d, 12);
++        struct Piece {
++            Stage stage;
++            Bytes control, code;
++        };
++        std::vector<Piece> pieces;
++        for (const auto& [stage, c, k] : {std::tuple{Stage::Vertex, vc, vk},
++                                          std::tuple{Stage::Fragment, pc, pk}}) {
++            if (c < 0x10 || u64{c} + KeyControl > d.size() ||
++                !IsNvn2Control(d.subspan(c, KeyControl))) {
++                return;
++            }
++            const u32 own = std::max<u32>(Load<u32>(d, c + 0x30), KeyControl);
++            if (u64{c} + own > d.size()) {
++                return;
++            }
++            const auto control = d.subspan(c, own);
++            const u32 n = Load<u32>(control, 0x44);
++            if (u64{k} + n > d.size()) {
++                return;
++            }
++            const auto code = d.subspan(k, n);
++            if (Nvn2Stage(control, code) != stage) {
++                return;
++            }
++            pieces.push_back({stage, control, code});
++        }
++        ++stats.containers;
++        const std::string variation = fmt::format("{}#SEADPRIM", label);
++        for (const auto& piece : pieces) {
++            Emit(piece.stage, piece.control, piece.code, variation, variation);
++        }
++    }
++
++    const Zstd& zstd;
++    Found found;
++    std::vector<std::string>& errors;
++    Stats& stats;
++    ZSTD_DCtx* context;
++};
++
++struct FileItem {
++    VirtualFile file;
++    std::string path;
++};
++
++void Collect(const VirtualDir& dir, const std::string& path, std::vector<FileItem>& out) {
++    for (const auto& file : dir->GetFiles()) {
++        out.push_back({file, path + "/" + file->GetName()});
++    }
++    for (const auto& sub : dir->GetSubdirectories()) {
++        Collect(sub, path + "/" + sub->GetName(), out);
++    }
++}
++
++void LoadDictionaries(const std::span<const VirtualDir> roots, Zstd& zstd) {
++    ZSTD_DCtx* context = ZSTD_createDCtx();
++    for (const auto& root : roots) {
++        const auto pack = root ? root->GetDirectoryRelative("Pack") : nullptr;
++        const auto file = pack ? pack->GetFile("ZsDic.pack.zs") : nullptr;
++        if (!file) {
++            continue;
++        }
++        try {
++            const auto bytes = file->ReadAllBytes();
++            const auto sarc = Inflate(zstd, context, bytes, MaxBlob);
++            for (const auto& member : Sarc(sarc)) {
++                if (member.data.size() >= 4 && Load<u32>(member.data, 0) == 0xEC30A437) {
++                    zstd.AddDictionary(member.data);
++                }
++            }
++        } catch (const Bad&) {
++        }
++    }
++    ZSTD_freeDCtx(context);
++}
++
++} // Anonymous namespace
++
++const char* StageName(Stage stage) noexcept {
++    switch (stage) {
++    case Stage::Vertex:
++        return "vertex";
++    case Stage::TessControl:
++        return "hull";
++    case Stage::TessEval:
++        return "domain";
++    case Stage::Geometry:
++        return "geometry";
++    case Stage::Fragment:
++        return "pixel";
++    case Stage::Compute:
++        return "compute";
++    case Stage::Task:
++        return "task";
++    case Stage::Mesh:
++        return "mesh";
++    }
++    return "unknown";
++}
++
++u64 Fingerprint(std::span<const u8> control, std::span<const u8> code) {
++    std::array<u8, KeyControl> key{};
++    std::memcpy(key.data(), control.data(), std::min<size_t>(control.size(), KeyControl));
++    std::memset(key.data() + 0x30, 0, 4);
++    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
++    std::array<u8, 32> digest{};
++    unsigned length = 0;
++    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1 ||
++        EVP_DigestUpdate(ctx.get(), key.data(), key.size()) != 1 ||
++        EVP_DigestUpdate(ctx.get(), code.data(), code.size()) != 1 ||
++        EVP_DigestFinal_ex(ctx.get(), digest.data(), &length) != 1) {
++        throw std::runtime_error("SHA-256 failed");
++    }
++    u64 value = 0;
++    for (int i = 0; i < 8; ++i) {
++        value = value << 8 | digest[i]; // the first 16 hex digits, as nxnative prints them
++    }
++    return value;
++}
++
++Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* progress,
++               std::stop_token stop, const std::unordered_set<u64>* wanted) {
++    Zstd zstd;
++    LoadDictionaries(roots, zstd);
++    std::vector<FileItem> files;
++    for (const auto& root : roots) {
++        if (root) {
++            Collect(root, "", files);
++        }
++    }
++    if (progress) {
++        progress->files_total = files.size();
++    }
++
++    Result result;
++    std::mutex mutex;
++    struct Seen {
++        u32 index;
++        size_t file; ///< the earliest file it was found in decides its origin
++    };
++    std::unordered_map<u64, Seen> seen;
++    std::unordered_map<std::string, size_t> variation_index;
++
++    const unsigned count =
++        threads ? threads : std::max(1u, std::thread::hardware_concurrency());
++    std::atomic<size_t> next{0};
++    std::vector<std::vector<std::string>> errors(count);
++    std::vector<Stats> stats(count);
++    std::atomic<unsigned> workers_done{0};
++    const auto work = [&](unsigned worker) {
++        if (progress && progress->low_priority) {
++            // PS5 port: extraction runs beside the game; the GPU and CPU threads come first.
++            Common::SetCurrentThreadName("ShaderSetExtract");
++            Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++            Common::SetCurrentThreadToBackgroundWork();
++        }
++        size_t current = 0;
++        Walker walker(
++            zstd,
++            [&](Stage stage, Bytes control, Bytes code, std::string origin, std::string variation) {
++                // Only the control bytes a fingerprint covers matter to the program; keep them all
++                // (the translator reads up to the section's own length).
++                const u64 fp = Fingerprint(control, code);
++                if (wanted && !wanted->contains(fp)) {
++                    return; // PS5 port: counted in stats.occurrences, payload not kept
++                }
++                std::scoped_lock lock{mutex};
++                auto [it, inserted] = seen.try_emplace(fp, Seen{0, current});
++                if (inserted) {
++                    it->second.index = static_cast<u32>(result.programs.size());
++                    result.programs.push_back({stage, fp, {control.begin(), control.end()},
++                                               {code.begin(), code.end()}, origin});
++                    if (progress) {
++                        progress->wanted_found.fetch_add(1, std::memory_order_relaxed);
++                    }
++                } else if (current < it->second.file) {
++                    it->second.file = current;
++                    result.programs[it->second.index].origin = origin;
++                }
++                auto [v, added] = variation_index.try_emplace(variation, result.variations.size());
++                if (added) {
++                    result.variations.push_back({std::move(variation), {}});
++                }
++                auto& members = result.variations[v->second].programs;
++                if (std::find(members.begin(), members.end(), it->second.index) == members.end()) {
++                    members.push_back(it->second.index);
++                }
++            },
++            errors[worker], stats[worker]);
++        while (!stop.stop_requested() &&
++               !(progress && progress->cancel.load(std::memory_order_relaxed))) {
++            current = next.fetch_add(1);
++            if (current >= files.size()) {
++                break;
++            }
++            const u64 bytes_before = stats[worker].file_bytes;
++            const auto started = std::chrono::steady_clock::now();
++            try {
++                walker.File(files[current].file, files[current].path);
++            } catch (const std::exception& e) {
++                errors[worker].push_back(files[current].path + ": " + e.what());
++            }
++            if (progress) {
++                progress->files_done.fetch_add(1, std::memory_order_relaxed);
++                progress->bytes_read.fetch_add(stats[worker].file_bytes - bytes_before,
++                                               std::memory_order_relaxed);
++                if (progress->after_file) {
++                    // PS5 port: the caller's duty cycle, memory wait and disk check.
++                    progress->after_file(std::chrono::steady_clock::now() - started);
++                }
++            }
++        }
++        workers_done.fetch_add(1, std::memory_order_release);
++    };
++    {
++        std::vector<std::jthread> pool;
++        for (unsigned i = 0; i < count; ++i) {
++            pool.emplace_back(work, i);
++        }
++        // PS5 port: the calling thread reports progress while the workers run, instead of
++        // waiting silently in the pool's destructor.
++        if (progress && progress->on_progress) {
++            auto last = std::chrono::steady_clock::now();
++            while (workers_done.load(std::memory_order_acquire) < count) {
++                std::this_thread::sleep_for(std::chrono::milliseconds{250});
++                const auto now = std::chrono::steady_clock::now();
++                if (now - last >= progress->every) {
++                    last = now;
++                    progress->on_progress(*progress);
++                }
++            }
++        }
++    }
++    for (unsigned i = 0; i < count; ++i) {
++        result.errors.insert(result.errors.end(), errors[i].begin(), errors[i].end());
++        result.stats.files += stats[i].files;
++        result.stats.file_bytes += stats[i].file_bytes;
++        result.stats.inflated_bytes += stats[i].inflated_bytes;
++        result.stats.peeked_only += stats[i].peeked_only;
++        result.stats.containers += stats[i].containers;
++        result.stats.occurrences += stats[i].occurrences;
++    }
++    if (zstd.Count() == 0) {
++        result.errors.push_back("Pack/ZsDic.pack.zs: no zstd dictionaries (files that need one "
++                                "are reported as missing their dictionary)");
++    }
++    return result;
++}
++
++} // namespace FileSys::Nx2ShaderExtract
+diff --git a/src/core/file_sys/nx2_shader_extract.h b/src/core/file_sys/nx2_shader_extract.h
+new file mode 100644
+index 0000000..54fdd97
+--- /dev/null
++++ b/src/core/file_sys/nx2_shader_extract.h
+@@ -0,0 +1,97 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Finds the NVN2 (Switch 2) shader programs a game ships, by their content: every RomFS file is
++// read, zstd (with the game's dictionaries) and Yaz0 are undone, SARC archives are expanded, and
++// BNSH (shader archives, effect bundles, layouts), agl BAHS packs, agl NDSR packs, nn::ndve movie
++// files and sead's primitive drawer are parsed; other data is searched for embedded BNSH.
++//
++// Programs are cut as the game's GPU reads them (control section, then code area of the length
++// the control section names at +0x44) and fingerprinted like nxnative's shader_split.py
++// (github.com/seedds/nxnative, MIT): SHA-256 of the first 0x48 control bytes with +0x30..+0x33
++// zeroed, then the code area; the first 8 bytes. Format notes are from that script and from
++// tools/nx2/shader_archive.py.
++
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <functional>
++#include <span>
++#include <stop_token>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++#include "common/common_types.h"
++#include "core/file_sys/vfs/vfs_types.h"
++
++namespace FileSys::Nx2ShaderExtract {
++
++enum class Stage : u8 { Vertex, TessControl, TessEval, Geometry, Fragment, Compute, Task, Mesh };
++
++[[nodiscard]] const char* StageName(Stage stage) noexcept;
++
++struct Program {
++    Stage stage{};
++    u64 fingerprint{};
++    std::vector<u8> control;
++    std::vector<u8> code;
++    /// Where it was first found: "/RomFS/path[/member]#KIND@offset[#varN]".
++    std::string origin;
++};
++
++/// The programs one variation of a shader program draws together (a BNSH variation, a
++/// vertex/pixel pair of an NDSR pack): indices into Result::programs.
++struct Variation {
++    std::string label;
++    std::vector<u32> programs;
++};
++
++struct Stats {
++    u64 files{};
++    u64 file_bytes{};          ///< bytes of RomFS files read
++    u64 inflated_bytes{};      ///< bytes produced by zstd and Yaz0
++    u64 peeked_only{};         ///< compressed files whose content held no container
++    u64 containers{};          ///< SARC, BNSH, BAHS, NDSR, NDVE, sead files parsed
++    u64 occurrences{};         ///< programs found, before removing duplicates
++};
++
++struct Result {
++    std::vector<Program> programs;   ///< one per fingerprint
++    std::vector<Variation> variations;
++    std::vector<std::string> errors; ///< "origin: reason", for data that looked like a container
++    Stats stats;
++};
++
++struct Progress {
++    std::atomic<u64> files_done{};
++    u64 files_total{};
++    // PS5 port: what a progress line needs while Extract runs (the caller blocks in it).
++    std::atomic<u64> bytes_read{};   ///< RomFS bytes read so far
++    std::atomic<u64> wanted_found{}; ///< distinct wanted fingerprints stored so far
++    /// Called on the calling thread about every `every` seconds while the workers run.
++    std::function<void(const Progress&)> on_progress;
++    std::chrono::seconds every{10};
++    /// The workers run at low priority (Common::ThreadPriority::Low, background placement).
++    bool low_priority{};
++    /// PS5 port (v3.1): called by each worker after each file with the time the file took, on
++    /// that worker (several at once with several threads): the caller rests the worker for its
++    /// duty cycle, waits for memory, or sets `cancel`. Priorities alone do nothing for
++    /// SCHED_OTHER threads on the console.
++    std::function<void(std::chrono::steady_clock::duration took)> after_file;
++    /// Set by the caller: the workers stop at their next file, as with the stop token.
++    std::atomic<bool> cancel{};
++};
++
++/// Directories are scanned in order (base game first, then updates and add-ons); a program found
++/// in several keeps its first origin. `threads` 0 uses the hardware's. PS5 port: with `wanted`,
++/// only programs whose fingerprint is in it are kept (the others are counted, not stored).
++[[nodiscard]] Result Extract(std::span<const VirtualDir> roots, unsigned threads = 0,
++                             Progress* progress = nullptr, std::stop_token stop = {},
++                             const std::unordered_set<u64>* wanted = nullptr);
++
++/// The fingerprint of one program (see the file comment).
++[[nodiscard]] u64 Fingerprint(std::span<const u8> control, std::span<const u8> code);
++
++} // namespace FileSys::Nx2ShaderExtract
+diff --git a/src/core/file_sys/shader_set_source.h b/src/core/file_sys/shader_set_source.h
+new file mode 100644
+index 0000000..877d764
+--- /dev/null
++++ b/src/core/file_sys/shader_set_source.h
+@@ -0,0 +1,34 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include <mutex>
++#include <utility>
++#include <vector>
++#include "common/common_types.h"
++#include "core/file_sys/vfs/vfs_types.h"
++
++namespace FileSys::ShaderSetSource {
++struct Source {
++    const void* owner{}; // identity only; never dereferenced
++    u64 title{};
++    u32 version{};
++    std::vector<VirtualDir> roots;
++};
++// Inline storage shares one registry across the loader and video_core. Snapshots own
++// their VFS references, including the NUP backing files, independently of the loader.
++inline std::mutex mutex;
++inline Source current;
++inline void Install(const void* owner, u64 title, u32 version, std::vector<VirtualDir> roots) {
++    std::scoped_lock lock{mutex};
++    current = {owner, title, version, std::move(roots)};
++}
++inline Source Snapshot() {
++    std::scoped_lock lock{mutex};
++    return current;
++}
++inline void Clear(const void* owner) {
++    std::scoped_lock lock{mutex};
++    if (current.owner == owner) current = {};
++}
++} // namespace FileSys::ShaderSetSource
+diff --git a/src/core/loader/nup.cpp b/src/core/loader/nup.cpp
+index 3640cf4..3ddf995 100644
+--- a/src/core/loader/nup.cpp
++++ b/src/core/loader/nup.cpp
+@@ -7,6 +7,8 @@
+ #include <cstring>
+ 
+ #include "common/logging.h"
++#include "common/pe_switch.h"
++#include "core/file_sys/shader_set_source.h"
+ #include "common/string_util.h"
+ #include "core/core.h"
+ #include "core/file_sys/nup_container.h"
+@@ -170,7 +172,9 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
+     }
+ }
+ 
+-AppLoader_NUP::~AppLoader_NUP() = default;
++AppLoader_NUP::~AppLoader_NUP() {
++    if (shader_set_registered) FileSys::ShaderSetSource::Clear(this);
++}
+ 
+ FileType AppLoader_NUP::IdentifyType(const FileSys::VirtualFile& nup_file) {
+     return FileSys::NupContainer::IsNupFile(nup_file) ? FileType::NUP : FileType::Error;
+@@ -207,6 +211,25 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
+                                        addon_provider.get());
+     }
+ 
++    if (Common::PeSwitch("EDEN_UP_SHADER_SET")) {
++        const auto base = nup->FindBasePackage();
++        const auto update = nup->FindBestUpdatePackage();
++        const auto merged = FileSys::NupContainer::MergeShadowDirs(
++            base ? nup->GetRomFSDir(*base) : FileSys::VirtualDir{},
++            update ? nup->GetRomFSDir(*update) : FileSys::VirtualDir{});
++        const auto effective = update ? update : base;
++        if (merged && effective) {
++            const u32 version = nup->GetPackages()[*effective].version;
++            FileSys::ShaderSetSource::Install(this, base_title_id, version, {merged});
++            shader_set_registered = true;
++            // The recipe is used only when its game_version equals this value.
++            LOG_INFO(Loader, "Shader set: game files registered for {:016X} version {} ({})",
++                     base_title_id, version, DecodeVersion(version));
++        } else {
++            LOG_WARNING(Loader, "Shader set: no RomFS to register for {:016X}", base_title_id);
++        }
++    }
++
+     is_loaded = true;
+     return result;
+ }
+diff --git a/src/core/loader/nup.h b/src/core/loader/nup.h
+index 63f89d9..b8a51be 100644
+--- a/src/core/loader/nup.h
++++ b/src/core/loader/nup.h
+@@ -62,6 +62,7 @@ private:
+     u64 base_title_id{};
+     std::string display_version;
+     bool has_program{};
++    bool shader_set_registered{};
+ };
+ 
+ } // namespace Loader
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 88ad2d7..5bd1356 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -22,6 +22,14 @@ add_library(video_core STATIC
+     buffer_cache/usage_tracker.h
+     buffer_cache/virtual_range_cache.h
+     buffer_cache/word_manager.h
++    shader_set.cpp
++    shader_set.h
++    shader_set_recipe.cpp
++    shader_set_recipe.h
++    pipeline_cache_policy.h
++    ../core/file_sys/nx2_shader_extract.cpp
++    ../core/file_sys/nx2_shader_extract.h
++    ../core/file_sys/shader_set_source.h
+     cache_types.h
+     capture.h
+     cdma_pusher.cpp
+@@ -442,6 +450,9 @@ if (ENABLE_OPENGL)
+     )
+ endif()
+ 
++# The core source list is not supplied in T88. Compile the extractor here; the loader
++# uses only the header-only source registry, avoiding a core -> video_core link dependency.
++target_link_libraries(video_core PRIVATE OpenSSL::Crypto zstd::zstd)
+ target_link_libraries(video_core PUBLIC common core)
+ target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
+ if (ENABLE_OPENGL)
+diff --git a/src/video_core/pipeline_cache_policy.h b/src/video_core/pipeline_cache_policy.h
+new file mode 100644
+index 0000000..4876993
+--- /dev/null
++++ b/src/video_core/pipeline_cache_policy.h
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <span>
++
++#include "common/common_types.h"
++
++namespace VideoCommon {
++
++/// How many graphics pipelines to evict, least recently used first.
++/// @param cached Graphics pipelines in the cache.
++/// @param stale  Pipelines among them unused for long enough to be evicted.
++/// @param limit  Pipelines kept before any is evicted.
++/// @return Zero within the limit, else the excess, at most `stale`.
++constexpr size_t GraphicsPipelinesToEvict(size_t cached, size_t stale, size_t limit) {
++    if (cached <= limit) {
++        return 0;
++    }
++    return (std::min)(stale, cached - limit);
++}
++
++/// Attribute mask of a native vertex program, two bits per attribute as in
++/// FixedPipelineState::attribute_types.
++/// @param input_generic Components of each generic attribute in the program header's input map.
++constexpr u64 VertexAttributeMask(std::span<const std::array<bool, 4>> input_generic) {
++    u64 mask = 0;
++    for (size_t index = 0; index < input_generic.size(); ++index) {
++        if (std::ranges::any_of(input_generic[index], [](bool component) { return component; })) {
++            mask |= u64{3} << (index * 2);
++        }
++    }
++    return mask;
++}
++
++/// Vertex attribute types a graphics pipeline key keeps.
++/// @param attribute_types Types of every attribute register.
++/// @param unique_hashes   Program hash of each stage, zero when the stage is off.
++/// @param attribute_masks ShaderInfo::vertex_attribute_mask of each stage.
++/// @return The types masked by every active stage, or all of them when VertexA is on.
++constexpr u64 KeyedAttributeTypes(u64 attribute_types, std::span<const u64> unique_hashes,
++                                  std::span<const u64> attribute_masks) {
++    if (unique_hashes.empty() || unique_hashes[0] != 0) {
++        return attribute_types;
++    }
++    for (size_t stage = 1; stage < unique_hashes.size(); ++stage) {
++        if (unique_hashes[stage] != 0) {
++            attribute_types &= attribute_masks[stage];
++        }
++    }
++    return attribute_types;
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index 5b9d7de..c180e43 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -13,6 +13,7 @@
+ #include <ranges>
+ #include "common/cityhash.h"
+ #include "common/common_types.h"
++#include "common/pe_switch.h"
+ #include "common/settings.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+@@ -268,9 +269,13 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+         // EDEN_NX2_BLEND_ALWAYS=1 (mja00/Lichii f00aa63884, from sharkiix): native Switch 2 paths
+         // write blend registers without raising Dirty::Blending, which leaves a stale blend state
+         // in the key on a device without dynamic blend. The PS5 runs at dynamic state level 2.
++        // EDEN_UP_CANONICAL_KEYS=1 rebuilds them every time too (as Fritchii v5.5's Refresh
++        // does): a canonical key must carry the current blend state, or the recipe's keys,
++        // which do, never meet it.
+         static const bool blend_always = [] {
+             const char* const value = std::getenv("EDEN_NX2_BLEND_ALWAYS");
+-            return value != nullptr && value[0] != '0';
++            return (value != nullptr && value[0] != '0') ||
++                   Common::PeSwitch("EDEN_UP_CANONICAL_KEYS");
+         }();
+         if (blend_always || maxwell3d.dirty.flags[Dirty::Blending]) {
+             maxwell3d.dirty.flags[Dirty::Blending] = false;
+@@ -421,6 +426,46 @@ void FixedPipelineState::DynamicState::Refresh3(const Maxwell& regs,
+     }
+ }
+ 
++// Ported from Fritchii v5.5 fixed_pipeline_state.cpp (zortos293/Lichii#895). Only called with
++// EDEN_UP_CANONICAL_KEYS=1 (vk_pipeline_cache.cpp CanonicalizeKeyState and the shader-set key
++// mapping); every Refresh rewrites what it clears, except the attribute types and attachments,
++// which the pipeline cache restores from its raw copies before each Refresh.
++void FixedPipelineState::CanonicalizeNative(u32 generic_read_mask) noexcept {
++    if (dynamic_vertex_input) {
++        u64 keep = 0;
++        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
++            if ((generic_read_mask >> index) & 1) {
++                keep |= u64{3} << (index * 2);
++            }
++        }
++        attribute_types &= keep;
++    }
++    if (!extended_dynamic_state_3_blend) {
++        size_t used = 0;
++        for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
++            if (color_formats[index] != 0) {
++                used = index + 1;
++            }
++        }
++        for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
++            auto& attachment = attachments[index];
++            if (index >= used) {
++                attachment.raw = 0;
++            } else if (!attachment.enable) {
++                attachment.raw &= 0xF; // the colour write mask
++            }
++        }
++    }
++    // Outside the hashed bytes but given to the driver: depth bounds are dynamic state, and the
++    // stipple applies only with stippled lines.
++    depth_bounds_min = 0;
++    depth_bounds_max = 0;
++    if (!dynamic_state.line_stipple_enable) {
++        line_stipple_factor = 0;
++        line_stipple_pattern = 0;
++    }
++}
++
+ size_t FixedPipelineState::Hash() const noexcept {
+     const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(this), Size());
+     return static_cast<size_t>(hash);
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.h b/src/video_core/renderer_vulkan/fixed_pipeline_state.h
+index 2f3ca4f..826292c 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.h
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.h
+@@ -267,6 +267,13 @@ struct FixedPipelineState {
+ 
+     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
+ 
++    /// EDEN_UP_CANONICAL_KEYS=1 (ported from Fritchii v5.5, zortos293/Lichii#895). Native
++    /// (Switch 2) pipelines: clears state that cannot change the pipeline, so draws that differ
++    /// only there share one and shader-set keys match them: attribute types of inputs the vertex
++    /// program does not read (vertex input is dynamic), blend equations and factors of
++    /// attachments without blending, and attachments past the last colour target.
++    void CanonicalizeNative(u32 generic_read_mask) noexcept;
++
+     size_t Hash() const noexcept;
+ 
+     bool operator==(const FixedPipelineState& rhs) const noexcept;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index e69d6a1..8323d11 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -10,9 +10,12 @@
+ #include <condition_variable>
+ #include <map>
+ #include <cstddef>
++#include <cstdio>
+ #include <cstdlib>
+ #include <fstream>
+ #include <iostream>
++#include <iterator>
++#include <limits>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -29,6 +32,7 @@
+ #include "common/scope_exit.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
++#include "common/thread.h"
+ #include "common/thread_worker.h"
+ #include "core/core.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
+@@ -61,7 +65,9 @@
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+ #include "video_core/renderer_vulkan/vk_state_tracker.h"
+ #include "video_core/renderer_vulkan/vk_update_descriptor.h"
++#include "video_core/pipeline_cache_policy.h"
+ #include "video_core/shader_cache.h"
++#include "video_core/shader_set.h"
+ #include "video_core/shader_environment.h"
+ #include "video_core/shader_notify.h"
+ #include "video_core/surface.h"
+@@ -709,6 +715,26 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+         device.SupportsProvokingVertexFirstMode();
+     dynamic_features.has_provoking_vertex_last_mode =
+         device.SupportsProvokingVertexLastMode();
++    // EDEN_UP_CANONICAL_KEYS / EDEN_UP_SHADER_SET (LoadDiskResources says what they do). The
++    // audit hook is installed here, before any thread registers a program: the GPU thread calls
++    // it once per native vertex or fragment program (ShaderCache::MakeShaderInfo), rare, and it
++    // only counts and looks the hash up in the set once that is loaded.
++    canonical_keys = VideoCommon::CanonicalKeys();
++    shader_set_enabled = Common::PeSwitch("EDEN_UP_SHADER_SET") && canonical_keys;
++    if (shader_set_enabled) {
++        on_native_program = [this](u64 hash) {
++            audit_programs_total.fetch_add(1, std::memory_order_relaxed);
++            std::scoped_lock lock{shader_set_mutex};
++            if (shader_set_programs) {
++                if (shader_set_programs->contains(hash)) {
++                    audit_programs_in_set.fetch_add(1, std::memory_order_relaxed);
++                }
++            } else if (audit_pending.size() < 65536) {
++                audit_pending.push_back(hash);
++            }
++        };
++    }
++    // (Before the last statement: tools/prepare-vulkan-port.py anchors on the constructor's end.)
+     dynamic_features.has_provoking_vertex_tf_preserve =
+         device.SupportsTransformFeedbackProvokingVertexPreservation();
+ }
+@@ -929,6 +955,15 @@ bool DropMeshDrawsBeforeBuild() {
+ }
+ 
+ PipelineCache::~PipelineCache() {
++    // EDEN_UP_SHADER_SET: the background thread ends first (its jobs on the workers finish
++    // inside it), then the audit line.
++    if (shader_set_thread.joinable()) {
++        shader_set_thread.request_stop();
++        shader_set_thread.join();
++    }
++    if (shader_set_enabled) {
++        LogShaderSetAudit(true);
++    }
+     serialization_thread.WaitForRequests();
+     SaveUsedPipelines();
+     static const bool skip_unchanged = Common::PeSwitch("EDEN_PE_PIPELINE_CACHE_EXIT");
+@@ -1049,6 +1084,61 @@ bool PipelineCleanEnabled() {
+     }();
+     return enabled;
+ }
++
++// EDEN_UP_CANONICAL_KEYS=1: ported from Fritchii v5.5 vk_pipeline_cache.cpp (its
++// EDEN_NX2_CANONICAL_KEYS, on there by default since 2026-11-09). Only called when
++// VideoCommon::CanonicalKeys() holds.
++
++/// Keeps only the vertex attribute types the programs of `envs` read (dynamic vertex input keys).
++void MaskKeyedAttributeTypes(GraphicsPipelineCacheKey& key,
++                             std::span<const VideoCommon::FileEnvironment> envs) {
++    std::array<u64, Maxwell::MaxShaderProgram> attribute_masks;
++    attribute_masks.fill(~u64{0});
++    size_t env_index = 0;
++    for (size_t stage = 0; stage < Maxwell::MaxShaderProgram; ++stage) {
++        if (key.unique_hashes[stage] != 0 && env_index < envs.size()) {
++            attribute_masks[stage] = VideoCommon::VertexAttributeMaskOf(envs[env_index++]);
++        }
++    }
++    key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
++        key.state.attribute_types, key.unique_hashes, attribute_masks);
++}
++
++/// The canonical form of a native key's state. The attribute types are left as they are: draws
++/// and the loader keep only those the programs read (VideoCommon::KeyedAttributeTypes, the rule
++/// CanonicalizeNative's mask follows). Idempotent.
++void CanonicalizeKeyState(FixedPipelineState& state, const DynamicFeatures& features) noexcept {
++    // With a dynamic stipple enable the key never says whether lines are stippled (Refresh3
++    // leaves line_stipple_enable 0), while the factor and pattern stay static in the pipeline:
++    // clearing them would give a game that enables stippling a factor of 0. Kept then.
++    const u32 stipple_factor = state.line_stipple_factor;
++    const u32 stipple_pattern = state.line_stipple_pattern;
++    state.CanonicalizeNative(~0U);
++    if (features.has_dynamic_state3_line_stipple_enable) {
++        state.line_stipple_factor = stipple_factor;
++        state.line_stipple_pattern = stipple_pattern;
++    }
++    // The logic operation counts only with logic op on. Without a dynamic logic op the key held
++    // the register's operation even with logic op off, so keys recorded where it is dynamic
++    // (NVIDIA, the OoT recipe) never matched. Only while the enable itself is static: a dynamic
++    // enable leaves logic_op_enable 0 in every key.
++    if (!features.has_dynamic_state3_logic_op_enable && !state.dynamic_state.logic_op_enable) {
++        state.dynamic_state.logic_op.Assign(0);
++    }
++}
++
++/// EDEN_UP_SHADER_SET_<NAME>=<n>: a number, or `fallback` when unset, 0 or not a number.
++size_t ShaderSetNumber(const char* name, size_t fallback) {
++    const char* const text = std::getenv(name);
++    const unsigned long long value = text ? std::strtoull(text, nullptr, 10) : 0;
++    return value != 0 ? static_cast<size_t>(value) : fallback;
++}
++
++/// Thrown by PrepareShaderSet's record callback to end the pass: ReadPipelines catches it and
++/// stops reading there (the rest of a ~1 GB file is not parsed for nothing).
++struct StopReading : std::runtime_error {
++    using std::runtime_error::runtime_error;
++};
+ } // Anonymous namespace
+ 
+ void PipelineCache::BuildCleanWatch() {
+@@ -1291,8 +1381,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean() {
+     }
+ 
+     TakeCleanSnapshot();
++    RestoreRawKey();
+     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+     ApplyAttributelessVertexInput();
++    CanonicalizeDrawKey();
+     if (current_pipeline) {
+         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
+         if (next) {
+@@ -1398,8 +1490,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+         current_pipeline = nullptr;
+         return nullptr;
+     }
++    RestoreRawKey();
+     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+     ApplyAttributelessVertexInput();
++    CanonicalizeDrawKey();
+ 
+     if (current_pipeline) {
+         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
+@@ -1580,22 +1674,56 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
+         return;
+     }
+-    pipeline_cache_filename = base_dir / "vulkan.bin";
+-    mesh_pipeline_cache_filename = base_dir / "vulkan_mesh.bin";
+-    used_pipelines_filename = base_dir / "vulkan_used.bin";
++    // EDEN_UP_CANONICAL_KEYS=1: canonical records and their used list live in files of their
++    // own; the files written without the switch are read below (rekeyed), never written, so no
++    // file ever holds keys of both kinds. EDEN_UP_SHADER_SET=1 needs it: the recipe's keys are
++    // canonical (Fritchii v5.5 writes them so), so live keys must be too to meet them.
++    canonical_keys = VideoCommon::CanonicalKeys();
++    const bool shader_set_asked = Common::PeSwitch("EDEN_UP_SHADER_SET");
++    if (shader_set_asked && !canonical_keys) {
++        LOG_WARNING(Render_Vulkan, "EDEN_UP_SHADER_SET=1 needs EDEN_UP_CANONICAL_KEYS=1 (the "
++                                   "recipe's keys are canonical): the shader set is not used");
++    }
++    shader_set_enabled = shader_set_asked && canonical_keys;
++    if (shader_set_enabled && StaticVertexInputEnabled()) {
++        // The static-input keys that switch makes for draws without attributes are never
++        // converted from the recipe (MapShaderSetState makes dynamic-input keys only).
++        LOG_WARNING(Render_Vulkan,
++                    "EDEN_UP_SHADER_SET=1 with EDEN_PE_STATIC_VERTEX_INPUT=1: draws without "
++                    "vertex attributes get static-input keys and never hit a prepared record");
++    }
++    if (canonical_keys) {
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_CANONICAL_KEYS=1: native pipeline keys are canonical (attribute types "
++                 "the vertex program reads, blend state of attachments without blending, "
++                 "attachments past the last colour target, depth bounds); records of vulkan.bin "
++                 "are rekeyed at load, new records go to vulkan_canonical.bin");
++        legacy_pipeline_cache_filename = base_dir / "vulkan.bin";
++        legacy_mesh_pipeline_cache_filename = base_dir / "vulkan_mesh.bin";
++        legacy_used_pipelines =
++            LoadUsedPipelines(base_dir / "vulkan_used.bin", MaxUsedPipelineAge(device));
++    }
++    pipeline_cache_filename = base_dir / (canonical_keys ? "vulkan_canonical.bin" : "vulkan.bin");
++    mesh_pipeline_cache_filename =
++        base_dir / (canonical_keys ? "vulkan_mesh_canonical.bin" : "vulkan_mesh.bin");
++    used_pipelines_filename =
++        base_dir / (canonical_keys ? "vulkan_used_canonical.bin" : "vulkan_used.bin");
+     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
+     used_pipelines_saved = std::chrono::steady_clock::now();
+     used_pipelines_loaded = used_pipelines_saved;
+-    // EDEN_UP_SHADER_PREP: the kept translations of this build, driver and switches.
++    // EDEN_UP_SHADER_PREP: the kept translations of this build, driver and switches (and, as
++    // Fritchii's kept stamp, whether keys are canonical: every key hash changes with it).
+     const bool prep =
+-        ShaderPrep::Enabled() &&
++        (ShaderPrep::Enabled() || shader_set_enabled) &&
+         prep_store.Open(base_dir, ShaderPrep::MakeStamp(CACHE_VERSION,
+                                                         static_cast<u32>(device.GetDriverID()),
+-                                                        device.GetDriverVersion()));
++                                                        device.GetDriverVersion()) +
++                                      (canonical_keys ? " canonical1" : ""));
+     std::atomic<size_t> prep_compared{};
+     std::atomic<size_t> prep_differed{};
+     size_t skipped_pipelines = 0;
+     size_t queued_graphics = 0;
++    size_t canonical_rekeyed = 0;
+     size_t mesh_queued = 0;   // EDEN_UP_MESH_CACHE: task/mesh records built at boot ...
+     size_t mesh_unlisted = 0; // ... of them not in the used list (skipped without the switch)
+ 
+@@ -1694,14 +1822,43 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+             return;
+         }
+ 
++        // EDEN_UP_CANONICAL_KEYS=1: native records are looked up as draws key them now. Records
++        // stored before (vulkan.bin, read only) are rekeyed here and their used-list age moves
++        // to the canonical key; records of the canonical file are canonical already (it is
++        // idempotent).
++        if (canonical_keys) {
++            const u64 stored_hash = key.Hash();
++            CanonicalizeLoadedKey(key, envs);
++            const u64 rekeyed = key.Hash();
++            if (rekeyed != stored_hash) {
++                ++canonical_rekeyed;
++            }
++            if (const auto used = legacy_used_pipelines.find(stored_hash);
++                used != legacy_used_pipelines.end()) {
++                const u8 age = used->second;
++                const auto [entry, inserted] = used_pipelines.try_emplace(rekeyed, age);
++                entry->second = (std::min)(entry->second, age);
++            }
++        }
+         const u64 hash = key.Hash();
+-        disk_pipelines.insert(hash);
++        if (!disk_pipelines.insert(hash).second && canonical_keys) {
++            // Records that merge into one canonical key (Ocarina of Time: up to 20 legacy keys
++            // for the same shaders) are built once; the canonical file is read first, so its
++            // record wins, as Fritchii keeps one record list per key.
++            return;
++        }
++        // The canonical used list starts empty on the first canonical boot while the legacy
++        // list (its ages moved above) is loaded apart: it counts as a list, or every record up
++        // to MaxPipelinesWithoutUsedList would be built (the out-of-memory case that limit is
++        // for).
++        const bool have_used_list =
++            !used_pipelines.empty() || (canonical_keys && !legacy_used_pipelines.empty());
+         // EDEN_UP_MESH_CACHE=1: a task/mesh record is built whether or not the used list has it.
+         const bool mesh_always = loading_mesh_file && MeshCacheBoot() && !PipelineColdBoot();
+         if (!PreloadAllPipelines() && !mesh_always &&
+             (PipelineColdBoot() ||
+-             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
+-                                     : !used_pipelines.contains(hash)))) {
++             (!have_used_list ? queued_graphics >= MaxPipelinesWithoutUsedList
++                              : !used_pipelines.contains(hash)))) {
+             ++skipped_pipelines;
+             return;
+         }
+@@ -1746,6 +1903,22 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
+                                    load_compute, load_graphics, true);
+     }
++    if (canonical_keys && !stop_loading.stop_requested()) {
++        // The files written without the switch: read with the reader that never changes a file
++        // (LoadPipelines cuts back one it cannot read), their records rekeyed by load_graphics.
++        loading_mesh_file = false;
++        (void)VideoCommon::ReadPipelines(legacy_pipeline_cache_filename, CACHE_VERSION,
++                                         load_compute, load_graphics, false);
++        if (device.IsExtMeshShaderSupported()) {
++            loading_mesh_file = true;
++            (void)VideoCommon::ReadPipelines(legacy_mesh_pipeline_cache_filename, CACHE_VERSION,
++                                             load_compute, load_graphics, true);
++        }
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_CANONICAL_KEYS: {} cached graphics pipeline records loaded under a new "
++                 "(canonical) key",
++                 canonical_rekeyed);
++    }
+ 
+     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+     if (skipped_pipelines != 0) {
+@@ -1777,6 +1950,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     if (prep && !stop_loading.stop_requested()) {
+         PrepareKept(stop_loading, callback, prep_compared.load(), prep_differed.load());
+     }
++    // EDEN_UP_SHADER_SET: off this (loading) thread: extraction, conversion and the preparation
++    // of the converted records go on beside the game.
++    if (shader_set_enabled && prep && !stop_loading.stop_requested()) {
++        StartShaderSet(title_dir);
++    }
+ 
+     if (use_vulkan_pipeline_cache) {
+         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+@@ -1926,6 +2104,10 @@ void PipelineCache::TickFrame() {
+         std::chrono::steady_clock::now() - used_pipelines_saved > UsedPipelinesSaveInterval) {
+         SaveUsedPipelines(true);
+     }
++    // EDEN_UP_SHADER_SET: the audit line every 60 s (the clock is read once a second of frames).
++    if (shader_set_enabled && frame_count % 60 == 0) {
++        LogShaderSetAudit(false);
++    }
+ }
+ 
+ void PipelineCache::EvictUnusedPipelines() {
+@@ -2076,6 +2258,26 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         if (programs[index].info.requires_layer_emulation) {
+             layer_source_program = &programs[index];
+         }
++        if (canonical_keys && key.state.dynamic_vertex_input != 0 &&
++            env.ShaderStage() == Shader::Stage::VertexB && env.IsNativeProgram()) {
++            // Ported from Fritchii v5.5 vk_pipeline_cache.cpp: the canonical key dropped the
++            // types of attributes outside the input map, so such a read now gets the default
++            // value, and keys that should differ merge. The only such case; logged, not fixed.
++            const u64 attribute_mask = VideoCommon::VertexAttributeMaskOf(env);
++            for (size_t attribute = 0; attribute < Shader::IR::NUM_GENERICS; ++attribute) {
++                if (programs[index].info.loads.Generic(attribute) &&
++                    ((attribute_mask >> (attribute * 2)) & 3) == 0) {
++                    static std::atomic<u32> warned{};
++                    if (warned.fetch_add(1, std::memory_order_relaxed) < 16) {
++                        LOG_WARNING(Render_Vulkan,
++                                    "EDEN_UP_CANONICAL_KEYS: vertex program {:016x} reads "
++                                    "attribute {} outside its input map (its key merged)",
++                                    key.unique_hashes[index], attribute);
++                    }
++                    break;
++                }
++            }
++        }
+     }
+     // A tessellation pipeline the driver would refuse is skipped like a missing mesh pipeline:
+     // the draw is dropped (see the pipeline check in the rasterizer) instead of failing the build.
+@@ -2321,6 +2523,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     // EDEN_UP_SHADER_PREP: a pipeline whose translation was kept is made from that, without
+     // translating on this thread (null: translated as before). What follows is the same for
+     // both: the check asked the game's state every question the translation would have.
++    if (shader_set_enabled) {
++        // Audit: one more live key made at runtime (hit or not, CreateKeptGraphicsPipeline says).
++        audit_keys_total.fetch_add(1, std::memory_order_relaxed);
++    }
+     auto kept{CreateKeptGraphicsPipeline(environments)};
+ 
+     main_pools.ReleaseContents();
+@@ -2854,52 +3060,14 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+     // 9ea66c8, bd59d18c6a) found their preparation skipping 116,373 of 120,461 Ocarina records on
+     // AMD for this (logic op recorded dynamic, static there; or another dynamic state level), and
+     // silently: here such a record is counted by the stats lines instead.
+-    enum : u32 {
+-        OtherMaskComponents,
+-        OtherEds1,
+-        OtherEds2,
+-        OtherEds2LogicOp,
+-        OtherEds3Blend,
+-        OtherEds3Enables,
+-        OtherColorWriteEnable,
+-        OtherVertexInput,
+-        OtherProvokingVertex,
+-        OtherCount,
+-    };
++    // (The bits are PipelineCache::OtherDevice; the test is OtherDeviceBits, shared with the
++    // shader-set mapping and preparation.)
+     const auto other_device = [this](const GraphicsPipelineCacheKey& key) -> u32 {
+-        const FixedPipelineState& recorded = key.state;
+-        const DynamicFeatures& here = dynamic_features;
+-        u32 bits = 0;
+-        const auto differs = [&bits](u32 bit, bool was, bool is) {
+-            if (was != is) {
+-                bits |= 1U << bit;
+-            }
+-        };
+-        differs(OtherMaskComponents, recorded.mask_components != 0,
+-                MaskComponentsEnabled() && !here.has_extended_dynamic_state_3_blend);
+-        differs(OtherEds1, recorded.extended_dynamic_state != 0, here.has_extended_dynamic_state);
+-        differs(OtherEds2, recorded.extended_dynamic_state_2 != 0,
+-                here.has_extended_dynamic_state_2);
+-        differs(OtherEds2LogicOp, recorded.extended_dynamic_state_2_logic_op != 0,
+-                here.has_extended_dynamic_state_2_logic_op);
+-        differs(OtherEds3Blend, recorded.extended_dynamic_state_3_blend != 0,
+-                here.has_extended_dynamic_state_3_blend);
+-        differs(OtherEds3Enables, recorded.extended_dynamic_state_3_enables != 0,
+-                here.has_extended_dynamic_state_3_enables);
+-        differs(OtherColorWriteEnable, recorded.color_write_enable_dynamic != 0,
+-                here.has_color_write_enable);
+-        if ((recorded.dynamic_vertex_input != 0) != here.has_dynamic_vertex_input &&
+-            !(StaticVertexInputEnabled() && here.has_dynamic_vertex_input &&
+-              EdenAttributelessStaticKey(recorded))) {
+-            bits |= 1U << OtherVertexInput;
+-        }
+-        if (recorded.provoking_vertex_last != 0 &&
+-            (!here.has_provoking_vertex_last_mode ||
+-             (recorded.xfb_enabled != 0 && !here.has_provoking_vertex_tf_preserve))) {
+-            bits |= 1U << OtherProvokingVertex;
+-        }
+-        return bits;
++        return OtherDeviceBits(key);
+     };
++    // EDEN_UP_SHADER_SET (v3): prep_shader_set.bin is no longer read here. Its records are
++    // prepared by the background thread (PrepareShaderSet) once the file is reused or made,
++    // with their own cap (EDEN_UP_SHADER_SET_PREP_ALL) and memory floor.
+     // The files are read with a reader of our own: the boot's reader cuts a file back when
+     // anything in its loop runs out of memory, and these passes would be two more chances.
+     const auto read_files = [&](const auto& graphics_for) {
+@@ -2915,6 +3083,17 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+         }
+         whole &= VideoCommon::ReadPipelines(predicted_filename, CACHE_VERSION, skip_compute,
+                                             graphics_for(false, false), false);
++        if (canonical_keys && !legacy_pipeline_cache_filename.empty()) {
++            // EDEN_UP_CANONICAL_KEYS=1: this console's own records written without the switch,
++            // rekeyed by the scan as the boot rekeyed them.
++            whole &= VideoCommon::ReadPipelines(legacy_pipeline_cache_filename, CACHE_VERSION,
++                                                skip_compute, graphics_for(true, false), false);
++            if (device.IsExtMeshShaderSupported()) {
++                whole &= VideoCommon::ReadPipelines(legacy_mesh_pipeline_cache_filename,
++                                                    CACHE_VERSION, skip_compute,
++                                                    graphics_for(true, true), true);
++            }
++        }
+         return whole;
+     };
+ 
+@@ -2960,6 +3139,7 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+         return [&, own, mesh_file](std::ifstream& file, std::vector<FileEnvironment> envs) {
+             GraphicsPipelineCacheKey key;
+             file.read(reinterpret_cast<char*>(&key), sizeof(key));
++            CanonicalizeLoadedKey(key, envs); // EDEN_UP_CANONICAL_KEYS=1: as the boot keyed it
+             const u64 hash = key.Hash();
+             if (stop_loading.stop_requested()) {
+                 return;
+@@ -3146,6 +3326,7 @@ void PipelineCache::PrepareKept(std::stop_token stop_loading,
+         return [&, own](std::ifstream& file, std::vector<FileEnvironment> envs) {
+             GraphicsPipelineCacheKey key;
+             file.read(reinterpret_cast<char*>(&key), sizeof(key));
++            CanonicalizeLoadedKey(key, envs); // EDEN_UP_CANONICAL_KEYS=1: as the scan keyed it
+             const u64 hash = key.Hash();
+             if (queued >= limit || stop_loading.stop_requested() || todo.erase(hash) == 0) {
+                 return;
+@@ -3494,10 +3675,603 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateKeptGraphicsPipeline(
+     if (verified_same) {
+         ++used;
+         report();
++        if (shader_set_enabled && (record.flags & ShaderPrep::KeptStore::FlagShaderSet) != 0) {
++            // Audit: a live key met a record converted from the shader set.
++            audit_keys_hit.fetch_add(1, std::memory_order_relaxed);
++        }
+     } else {
+         note_refusal("differs from its translation (verify)");
+     }
+     return made;
+ }
+ 
++// EDEN_UP_CANONICAL_KEYS=1 -----------------------------------------------------------------
++
++void PipelineCache::RestoreRawKey() {
++    if (!canonical_keys) {
++        return;
++    }
++    // Refresh rewrites the attribute types only when the vertex input is dirty: the masked copy
++    // must not carry over. (The attachments are rebuilt by every Refresh with the switch on,
++    // fixed_pipeline_state.cpp, so they are current and need no copy.)
++    graphics_key.state.attribute_types = vertex_attribute_types;
++}
++
++void PipelineCache::CanonicalizeDrawKey() {
++    if (!canonical_keys) {
++        return;
++    }
++    // As Refresh left them (native or not): back in the key before the next Refresh.
++    vertex_attribute_types = graphics_key.state.attribute_types;
++    if (maxwell3d == nullptr || !maxwell3d->GetNativeMacroEngine().native_turing) {
++        return;
++    }
++    if (graphics_key.state.dynamic_vertex_input != 0) {
++        // Types of attributes the programs don't read would split their pipelines by whatever
++        // the game left in those registers (Ocarina of Time: up to 20 keys for the same
++        // shaders, each built again on the GPU thread).
++        graphics_key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
++            vertex_attribute_types, graphics_key.unique_hashes, vertex_attribute_masks);
++    }
++    CanonicalizeKeyState(graphics_key.state, dynamic_features);
++}
++
++void PipelineCache::CanonicalizeLoadedKey(
++    GraphicsPipelineCacheKey& key, std::span<const VideoCommon::FileEnvironment> envs) const {
++    if (!canonical_keys || envs.empty() ||
++        !std::ranges::all_of(envs, [](const VideoCommon::FileEnvironment& env) {
++            return env.IsNativeProgram();
++        })) {
++        return;
++    }
++    if (key.state.dynamic_vertex_input != 0) {
++        MaskKeyedAttributeTypes(key, envs);
++    }
++    CanonicalizeKeyState(key.state, dynamic_features);
++}
++
++u32 PipelineCache::OtherDeviceBits(const GraphicsPipelineCacheKey& key) const {
++    const FixedPipelineState& recorded = key.state;
++    const DynamicFeatures& here = dynamic_features;
++    u32 bits = 0;
++    const auto differs = [&bits](u32 bit, bool was, bool is) {
++        if (was != is) {
++            bits |= 1U << bit;
++        }
++    };
++    differs(OtherMaskComponents, recorded.mask_components != 0,
++            MaskComponentsEnabled() && !here.has_extended_dynamic_state_3_blend);
++    differs(OtherEds1, recorded.extended_dynamic_state != 0, here.has_extended_dynamic_state);
++    differs(OtherEds2, recorded.extended_dynamic_state_2 != 0, here.has_extended_dynamic_state_2);
++    differs(OtherEds2LogicOp, recorded.extended_dynamic_state_2_logic_op != 0,
++            here.has_extended_dynamic_state_2_logic_op);
++    differs(OtherEds3Blend, recorded.extended_dynamic_state_3_blend != 0,
++            here.has_extended_dynamic_state_3_blend);
++    differs(OtherEds3Enables, recorded.extended_dynamic_state_3_enables != 0,
++            here.has_extended_dynamic_state_3_enables);
++    differs(OtherColorWriteEnable, recorded.color_write_enable_dynamic != 0,
++            here.has_color_write_enable);
++    if ((recorded.dynamic_vertex_input != 0) != here.has_dynamic_vertex_input &&
++        !(StaticVertexInputEnabled() && here.has_dynamic_vertex_input &&
++          EdenAttributelessStaticKey(recorded))) {
++        bits |= 1U << OtherVertexInput;
++    }
++    if (recorded.provoking_vertex_last != 0 &&
++        (!here.has_provoking_vertex_last_mode ||
++         (recorded.xfb_enabled != 0 && !here.has_provoking_vertex_tf_preserve))) {
++        bits |= 1U << OtherProvokingVertex;
++    }
++    return bits;
++}
++
++// EDEN_UP_SHADER_SET=1 ---------------------------------------------------------------------
++
++std::string PipelineCache::ShaderSetDeviceIdentity() const {
++    // What a converted key depends on: the driver fields it carries, the device (its driver
++    // cache is what the preparation fills), every dynamic state the key layout and the
++    // mapping look at, and the key policy switches.
++    const DynamicFeatures& f = dynamic_features;
++    return fmt::format(
++        "driver {:x}.{:x} model {} dynamic {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} mask {} static {} "
++        "canonical {}",
++        f.driver_id, f.driver_version, device.GetModelName(), u32{f.has_extended_dynamic_state},
++        u32{f.has_extended_dynamic_state_2}, u32{f.has_extended_dynamic_state_2_logic_op},
++        u32{f.has_extended_dynamic_state_2_patch_control_points},
++        u32{f.has_extended_dynamic_state_3_blend}, u32{f.has_extended_dynamic_state_3_enables},
++        u32{f.has_dynamic_state3_depth_clamp_enable}, u32{f.has_dynamic_state3_logic_op_enable},
++        u32{f.has_dynamic_state3_line_stipple_enable}, u32{f.has_dynamic_vertex_input},
++        u32{f.has_static_vertex_repack}, u32{f.has_color_write_enable},
++        u32{f.has_provoking_vertex}, u32{f.has_provoking_vertex_first_mode},
++        u32{f.has_provoking_vertex_last_mode}, u32{f.has_provoking_vertex_tf_preserve},
++        MaskComponentsEnabled() ? 1 : 0, StaticVertexInputEnabled() ? 1 : 0,
++        canonical_keys ? 1 : 0);
++}
++
++bool PipelineCache::MapShaderSetState(std::span<const u8> state, std::array<u64, 6> hashes,
++                                      u32 vertex_read_mask, std::vector<u8>& bytes) const {
++    static_assert(sizeof(FixedPipelineState) == 1008);
++    static_assert(sizeof(GraphicsPipelineCacheKey) == 1056);
++    static_assert(offsetof(GraphicsPipelineCacheKey, state) == 48);
++    static_assert(offsetof(FixedPipelineState, attributes) == 112);
++    static_assert(offsetof(FixedPipelineState, depth_bounds_min) == 992);
++    if (state.size() != sizeof(FixedPipelineState)) {
++        return false;
++    }
++    GraphicsPipelineCacheKey key{};
++    key.unique_hashes = hashes;
++    std::memcpy(&key.state, state.data(), state.size());
++    key.state.driver_id = dynamic_features.driver_id;
++    key.state.driver_version = dynamic_features.driver_version;
++    // Deliberately narrow mapping: no reconstruction of state discarded by EDS3, no mesh XOR
++    // reuse, and no dynamic-to-static logic-op guess.
++    if (!key.state.extended_dynamic_state || !key.state.extended_dynamic_state_2 ||
++        !key.state.extended_dynamic_state_2_logic_op || !key.state.dynamic_vertex_input ||
++        key.state.extended_dynamic_state_3_blend || key.state.extended_dynamic_state_3_enables ||
++        key.state.mask_components || key.state.xfb_enabled || key.unique_hashes[0] ||
++        key.state.app_stage.Value() == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro ||
++        OtherDeviceBits(key) != 0) {
++        return false;
++    }
++    // As draws key it here (EDEN_UP_CANONICAL_KEYS=1): the attribute types the vertex program's
++    // header lists (KeyedAttributeTypes' rule) and CanonicalizeKeyState. The recipe's keys are
++    // canonical already (Fritchii v5.5 writes them so); both steps are idempotent.
++    u64 keep = 0;
++    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
++        if ((vertex_read_mask >> index) & 1) {
++            keep |= u64{3} << (index * 2);
++        }
++    }
++    key.state.attribute_types &= keep;
++    CanonicalizeKeyState(key.state, dynamic_features);
++    const auto* start = reinterpret_cast<const u8*>(&key);
++    bytes.assign(start, start + sizeof(key));
++    return true;
++}
++
++void PipelineCache::StartShaderSet(const std::filesystem::path& title_dir) {
++    if (shader_set_thread.joinable()) {
++        return;
++    }
++    audit_logged = std::chrono::steady_clock::now();
++    VideoCommon::ShaderSet::Identity identity;
++    identity.cache_version = CACHE_VERSION;
++    identity.lowering_tag = 0x4f554e4345000003ULL; // shader_environment.cpp Analyze
++    identity.device = ShaderSetDeviceIdentity();
++    // The prepared store's own stamp: the installed build (its eboot), the settings and every
++    // switch the translation and the lowerer read (EDEN_UP_SHADOW_REGISTERS,
++    // EDEN_UP_FRITCHII_SHADOWMORE, EDEN_NX2_NET_BARRIER, EDEN_NX2_TENSOR, ...). A new build or a
++    // flipped switch changes the lowered hashes, so the generated file is made again with it.
++    identity.translation =
++        ShaderPrep::MakeStamp(CACHE_VERSION, static_cast<u32>(device.GetDriverID()),
++                              device.GetDriverVersion()) +
++        (canonical_keys ? " canonical1" : "");
++    const auto output_dir = pipeline_cache_filename.parent_path();
++    shader_set_thread = std::jthread([this, title = visual_workaround_title, title_dir, output_dir,
++                                      identity](std::stop_token stop) {
++        Common::SetCurrentThreadName("ShaderSet");
++        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++        Common::SetCurrentThreadToBackgroundWork();
++        try {
++            const auto outputs = VideoCommon::ShaderSet::Prepare(
++                title, title_dir, output_dir, identity,
++                [this](std::span<const u8> state, std::array<u64, 6> hashes, u32 read_mask,
++                       std::vector<u8>& bytes) {
++                    return MapShaderSetState(state, hashes, read_mask, bytes);
++                },
++                stop);
++            if (outputs.records.empty() || stop.stop_requested()) {
++                return;
++            }
++            {
++                auto programs = std::make_shared<std::unordered_set<u64>>();
++                for (const u64 hash : VideoCommon::ShaderSet::ReadPrograms(outputs.programs)) {
++                    programs->insert(hash);
++                }
++                std::scoped_lock lock{shader_set_mutex};
++                shader_set_programs = std::move(programs);
++            }
++            PrepareShaderSet(outputs.records, stop);
++        } catch (const std::exception& e) {
++            LOG_WARNING(Render_Vulkan, "Shader set: the background work ended: {}", e.what());
++        }
++    });
++}
++
++void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::stop_token stop) {
++    if (!prep_store.IsOpen() || stop.stop_requested()) {
++        return;
++    }
++    const auto begin = std::chrono::steady_clock::now();
++    const auto seconds = [&begin] {
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
++    };
++    // EDEN_UP_SHADER_SET_PREP_ALL=1 lifts EDEN_UP_SHADER_PREP_MAX for these records: memory stays
++    // bounded by the few records in flight (each is translated, built once for the driver's
++    // cache, kept as SPIR-V and infos in the store, and dropped), the index is committed at
++    // most once a minute, and the pass stops under the memory or disk floor and resumes at the
++    // next start (the store remembers what is kept or not keepable).
++    // v3.1: one job in flight by default, a duty cycle (EDEN_UP_SHADER_SET_DUTY: the builds'
++    // time over wall time, percent, 50), and the pass yields while the runtime has builds of
++    // its own queued: the workers are shared, and a new area's pipelines must not wait behind
++    // these (thread priorities do nothing for SCHED_OTHER threads on the console).
++    const bool all = Common::PeSwitch("EDEN_UP_SHADER_SET_PREP_ALL");
++    const size_t limit = all ? std::numeric_limits<size_t>::max() : ShaderPrep::MaxPerBoot();
++    const size_t worker_count =
++        device.HasBrokenParallelShaderCompiling() ? size_t{1} : GetTotalPipelineWorkers();
++    const size_t max_in_flight = std::clamp<size_t>(
++        ShaderSetNumber("EDEN_UP_SHADER_SET_PREP_JOBS", 1), 1, std::max<size_t>(worker_count, 1));
++    const u64 floor = VideoCommon::ShaderSet::MinimumFreeBytes();
++    const u64 disk_floor = VideoCommon::ShaderSet::MinimumFreeDiskBytes();
++    const unsigned duty = VideoCommon::ShaderSet::DutyPercent();
++    if (VideoCommon::ShaderSet::FreeMemoryBytes() == 0 &&
++        !VideoCommon::ShaderSet::MemoryCheckWaived()) {
++        // The floor cannot be checked: refused, not skipped (a base PS5 has a few hundred MB).
++        LOG_WARNING(Render_Vulkan,
++                    "Shader set: free memory is unknown on this platform; the records are not "
++                    "prepared (EDEN_UP_SHADER_SET_NO_MEMORY_CHECK=1 prepares them anyway)");
++        return;
++    }
++    // Once every record of this file is known to the store, the pass is skipped: the file is
++    // ~1 GB, and reading it to its end for nothing costs a boot's worth of I/O. The marker names
++    // the file (size and write time) and the store's size then: a store reset under the same
++    // stamp (the translation changed) has fewer records and reads the file again.
++    const auto done_filename = prep_store.Sidecar(".shader_set_done");
++    std::error_code done_error;
++    const auto file_bytes = std::filesystem::file_size(file, done_error);
++    const auto file_written = std::filesystem::last_write_time(file, done_error);
++    const auto file_identity = fmt::format(
++        "records {} {}", file_bytes,
++        static_cast<long long>(file_written.time_since_epoch().count()));
++    {
++        std::ifstream in{done_filename};
++        std::string text{std::istreambuf_iterator<char>(in), {}};
++        unsigned long long done_store = 0;
++        if (text.rfind(file_identity, 0) == 0 &&
++            std::sscanf(text.c_str() + file_identity.size(), " store %llu", &done_store) == 1 &&
++            prep_store.Size() >= done_store) {
++            LOG_INFO(Render_Vulkan,
++                     "Shader set: every record of {} is known to the prepared store already "
++                     "({} kept); nothing to prepare",
++                     file.filename().string(), prep_store.Size());
++            return;
++        }
++    }
++    auto last_commit = std::chrono::steady_clock::now();
++    std::chrono::steady_clock::duration slept{};
++    std::string stopped; // why the reading stopped early (empty: the file was read to its end)
++
++    // Strikes as PrepareKept keeps them (a record whose build took the app down twice is left
++    // to the draw that needs it), with a journal of this pass's own.
++    const auto strikes_filename = prep_store.Sidecar(".strikes");
++    const auto journal_filename = prep_store.Sidecar(".inflight_set");
++    std::unordered_map<u64, u32> strikes;
++    {
++        std::ifstream in{strikes_filename};
++        u64 hash{};
++        u32 count{};
++        while (in >> std::hex >> hash >> std::dec >> count) {
++            strikes.emplace(hash, count);
++        }
++    }
++    {
++        std::ifstream in{journal_filename, std::ios::binary};
++        u64 hash{};
++        bool added = false;
++        while (in.read(reinterpret_cast<char*>(&hash), sizeof(hash))) {
++            if (hash != 0) {
++                ++strikes[hash];
++                added = true;
++            }
++        }
++        if (added) {
++            // Written beside and renamed over: a kill or a full disk leaves the old list, and
++            // the journal (truncated below) is only cleared once the new list is on disk.
++            std::string text;
++            for (const auto& [struck, count] : strikes) {
++                text += fmt::format("{:x} {}\n", struck, count);
++            }
++            auto partial = strikes_filename;
++            partial += ".part";
++            bool written = false;
++            {
++                std::ofstream out{partial, std::ios::trunc};
++                written = static_cast<bool>(out << text) && static_cast<bool>(out.flush());
++            }
++            std::error_code rename_error;
++            if (written) {
++                std::filesystem::rename(partial, strikes_filename, rename_error);
++            }
++            if (!written || rename_error) {
++                std::filesystem::remove(partial, rename_error);
++                LOG_WARNING(Render_Vulkan,
++                            "Shader set: cannot write {}; the records are not prepared this start",
++                            Common::FS::PathToUTF8String(strikes_filename));
++                return;
++            }
++        }
++    }
++    const auto struck_out = [&strikes](u64 hash) {
++        const auto it = strikes.find(hash);
++        return it != strikes.end() && it->second >= 2;
++    };
++    struct {
++        std::mutex mutex;
++        std::condition_variable cv;
++        size_t in_flight{};
++        size_t finished{};
++        size_t failed{};
++        size_t kept{};
++        size_t not_kept{};
++        std::chrono::steady_clock::duration busy{}; ///< time the builds took, for the duty cycle
++        std::vector<u32> free_slots;
++        std::fstream journal;
++    } state;
++    {
++        std::ofstream create{journal_filename, std::ios::binary | std::ios::trunc};
++        const std::vector<char> zeros(max_in_flight * sizeof(u64), 0);
++        create.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
++    }
++    state.journal.open(journal_filename, std::ios::binary | std::ios::in | std::ios::out);
++    for (u32 slot = 0; slot < max_in_flight; ++slot) {
++        state.free_slots.push_back(slot);
++    }
++    const auto note_slot = [&state](u32 slot, u64 hash) noexcept {
++        try {
++            if (!state.journal.is_open()) {
++                return;
++            }
++            state.journal.clear();
++            state.journal.seekp(static_cast<std::streamoff>(slot * sizeof(u64)));
++            state.journal.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
++            state.journal.flush();
++        } catch (const std::exception&) {
++        }
++    };
++    const auto wait_for_jobs = [&state] {
++        std::unique_lock lock{state.mutex};
++        state.cv.wait(lock, [&] { return state.in_flight == 0; });
++    };
++
++    size_t read = 0, known = 0, left_out = 0, other = 0, struck = 0, queued = 0;
++    bool paused = false;
++    LOG_INFO(Render_Vulkan,
++             "Shader set: preparing the records of {} on the pipeline workers: {} in flight, "
++             "duty {}%, cap {}, memory floor {} MB, disk floor {} MB",
++             file.filename().string(), max_in_flight, duty,
++             all ? std::string{"none (EDEN_UP_SHADER_SET_PREP_ALL=1)"} : fmt::format("{}", limit),
++             floor >> 20, disk_floor >> 20);
++    const auto skip_compute = [](std::ifstream& in, VideoCommon::FileEnvironment) {
++        ComputePipelineCacheKey key;
++        in.read(reinterpret_cast<char*>(&key), sizeof(key));
++    };
++    const bool whole = VideoCommon::ReadPipelines(
++        file, CACHE_VERSION, skip_compute,
++        [&](std::ifstream& in, std::vector<VideoCommon::FileEnvironment> envs) {
++            GraphicsPipelineCacheKey key;
++            in.read(reinterpret_cast<char*>(&key), sizeof(key));
++            if (stop.stop_requested()) {
++                stopped = "stopped at shutdown";
++                throw StopReading{stopped};
++            }
++            ++read;
++            CanonicalizeLoadedKey(key, envs); // idempotent: the mapping made it canonical
++            const u64 hash = key.Hash();
++            const bool mesh =
++                std::ranges::any_of(envs, [](const VideoCommon::FileEnvironment& env) {
++                    return env.ShaderStage() == Shader::Stage::Task ||
++                           env.ShaderStage() == Shader::Stage::Mesh;
++                });
++            if (envs.empty() || envs.size() > ShaderPrep::NumStages ||
++                key.unique_hashes[0] != 0 || mesh ||
++                key.state.driver_id != dynamic_features.driver_id ||
++                key.state.driver_version != dynamic_features.driver_version ||
++                key.state.app_stage.Value() == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro) {
++                ++left_out;
++                return;
++            }
++            if (OtherDeviceBits(key) != 0) {
++                ++other;
++                return;
++            }
++            if (prep_store.Contains(hash)) {
++                ++known; // kept by an earlier start, or remembered as not keepable
++                return;
++            }
++            if (struck_out(hash)) {
++                ++struck;
++                return;
++            }
++            if (queued >= limit) {
++                stopped = fmt::format("the cap of {} per start (EDEN_UP_SHADER_PREP_MAX)", limit);
++                throw StopReading{stopped};
++            }
++            // The index is written at most once a minute (it is rebuilt whole under the
++            // store's lock, which the GPU thread's lookups wait on) and at the end.
++            if (prep_store.Uncommitted() != 0 &&
++                std::chrono::steady_clock::now() - last_commit >= std::chrono::seconds{60}) {
++                prep_store.Commit();
++                last_commit = std::chrono::steady_clock::now();
++            }
++            // Before every record: the memory floor; every 64: the disk floor (the store grows
++            // by gigabytes over a full pass, and a full disk ends keeping for the session).
++            if (const u64 free = VideoCommon::ShaderSet::FreeMemoryBytes();
++                free != 0 && free < floor) {
++                paused = true;
++                stopped = fmt::format("{} MB free, under the {} MB memory floor "
++                                      "(EDEN_UP_SHADER_SET_MIN_FREE_MB)",
++                                      free >> 20, floor >> 20);
++                throw StopReading{stopped};
++            }
++            if (queued % 64 == 0) {
++                std::error_code space_error;
++                const auto space = std::filesystem::space(file.parent_path(), space_error);
++                if (!space_error && space.available < disk_floor) {
++                    paused = true;
++                    stopped = fmt::format("{} MB free on disk, under the {} MB floor",
++                                          space.available >> 20, disk_floor >> 20);
++                    throw StopReading{stopped};
++                }
++            }
++            // Yield while the runtime has builds of its own queued on the shared workers, then
++            // rest as the duty cycle asks (busy time over wall time stays under `duty` percent).
++            for (;;) {
++                size_t in_flight{};
++                std::chrono::steady_clock::duration busy{};
++                {
++                    std::scoped_lock lock{state.mutex};
++                    in_flight = state.in_flight;
++                    busy = state.busy;
++                }
++                if (workers.Pending() > in_flight) {
++                    if (!Common::StoppableTimedWait(stop, std::chrono::milliseconds{100})) {
++                        stopped = "stopped at shutdown";
++                        throw StopReading{stopped};
++                    }
++                    continue;
++                }
++                const auto rest = busy * static_cast<s64>(100 - duty) / static_cast<s64>(duty);
++                if (rest <= slept) {
++                    break;
++                }
++                const auto nap = std::min<std::chrono::steady_clock::duration>(
++                    rest - slept, std::chrono::seconds{2});
++                if (!Common::StoppableTimedWait(stop, nap)) {
++                    stopped = "stopped at shutdown";
++                    throw StopReading{stopped};
++                }
++                slept += nap;
++            }
++            u32 slot{};
++            {
++                std::unique_lock lock{state.mutex};
++                state.cv.wait(lock, [&] { return state.in_flight < max_in_flight; });
++                ++state.in_flight;
++                slot = state.free_slots.back();
++                state.free_slots.pop_back();
++                note_slot(slot, hash);
++            }
++            ++queued;
++            constexpr u32 flags =
++                ShaderPrep::KeptStore::FlagPredicted | ShaderPrep::KeptStore::FlagShaderSet;
++            try {
++                workers.QueueWork([this, key, hash, slot, envs_ = std::move(envs), &state,
++                                   &note_slot, &seconds, queued]() mutable {
++                    bool ok = false;
++                    bool kept = false;
++                    const auto started = std::chrono::steady_clock::now();
++                    try {
++                        ShaderPrep::Stages stages;
++                        stages.driver_cache_only = true;
++                        ShaderPools pools;
++                        boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
++                        for (auto& env : envs_) {
++                            env_ptrs.push_back(&env);
++                        }
++                        // Built on this worker, then dropped: the driver keeps what it compiled.
++                        const auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
++                                                                   nullptr, false, &stages)};
++                        ok = pipeline != nullptr;
++                        if (ok && !stages.unsuitable) {
++                            KeepPrepared(key, stages, envs_, flags);
++                            kept = prep_store.IsKept(hash);
++                        } else {
++                            prep_store.AddNotKeepable(hash);
++                        }
++                    } catch (const std::exception& e) {
++                        LOG_DEBUG(Render_Vulkan, "Shader set: a pipeline failed: {}", e.what());
++                    }
++                    const auto took = std::chrono::steady_clock::now() - started;
++                    std::scoped_lock lock{state.mutex};
++                    state.busy += took;
++                    --state.in_flight;
++                    ++state.finished;
++                    if (!ok) {
++                        ++state.failed;
++                    }
++                    if (kept) {
++                        ++state.kept;
++                    } else if (ok) {
++                        ++state.not_kept;
++                    }
++                    state.free_slots.push_back(slot);
++                    note_slot(slot, 0);
++                    if (state.finished % ShaderPrep::LogEvery() == 0) {
++                        LOG_INFO(Render_Vulkan,
++                                 "Shader set: prepared {} of {} queued, {:.0f} s, {} failed",
++                                 state.finished, queued, seconds(), state.failed);
++                    }
++                    state.cv.notify_all();
++                });
++            } catch (...) {
++                std::scoped_lock lock{state.mutex};
++                --state.in_flight;
++                state.free_slots.push_back(slot);
++                note_slot(slot, 0);
++                state.cv.notify_all();
++                throw;
++            }
++        },
++        false);
++    wait_for_jobs();
++    {
++        std::scoped_lock lock{state.mutex};
++        state.journal.close();
++    }
++    const bool committed = prep_store.Commit();
++    prep_store.Compact();
++    std::error_code error;
++    std::filesystem::remove(journal_filename, error);
++    const double busy_seconds = std::chrono::duration<double>(state.busy).count();
++    LOG_INFO(Render_Vulkan,
++             "Shader set: {} records read: {} prepared ({} kept, {} built but not kept, {} "
++             "failed) in {:.0f} s ({:.0f} s of builds); {} known already, {} struck out, {} left "
++             "out (stages, driver or HLE macro), {} for another dynamic state; {} kept in {} "
++             "MiB{}{}",
++             read, state.finished, state.kept, state.not_kept, state.failed, seconds(),
++             busy_seconds, known, struck, left_out, other, prep_store.Size(),
++             prep_store.DataBytes() >> 20,
++             committed ? std::string{} : std::string{"; the index was NOT written"},
++             !stopped.empty() ? fmt::format("; reading stopped at record {}: {}; the rest is left "
++                                            "for the next start",
++                                            read, stopped)
++             : whole ? std::string{}
++                     : std::string{"; the file could not be read to its end"});
++    if (paused) {
++        LOG_WARNING(Render_Vulkan,
++                    "Shader set: preparation paused ({}); it resumes at the next start", stopped);
++    }
++    if (whole && stopped.empty() && committed && !stop.stop_requested()) {
++        // Everything in the file is known now: the next start skips the pass (see above).
++        std::ofstream out{done_filename, std::ios::trunc};
++        out << file_identity << " store " << prep_store.Size() << '\n';
++    }
++}
++
++void PipelineCache::LogShaderSetAudit(bool final) {
++    const auto now = std::chrono::steady_clock::now();
++    if (!final && now - audit_logged < std::chrono::seconds{60}) {
++        return;
++    }
++    audit_logged = now;
++    {
++        // Programs seen before the set was loaded are counted now.
++        std::scoped_lock lock{shader_set_mutex};
++        if (shader_set_programs && !audit_pending.empty()) {
++            for (const u64 hash : audit_pending) {
++                if (shader_set_programs->contains(hash)) {
++                    audit_programs_in_set.fetch_add(1, std::memory_order_relaxed);
++                }
++            }
++            audit_pending.clear();
++        }
++    }
++    LOG_INFO(Render_Vulkan,
++             "EDEN_UP_SHADER_SET audit: programs {} of {} live in set, pipelines {} of {} live "
++             "hit prepared{}",
++             audit_programs_in_set.load(std::memory_order_relaxed),
++             audit_programs_total.load(std::memory_order_relaxed),
++             audit_keys_hit.load(std::memory_order_relaxed),
++             audit_keys_total.load(std::memory_order_relaxed), final ? " (shutdown)" : "");
++}
++
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 85113a8..11ca8cf 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -17,6 +17,9 @@
+ #include <memory>
+ #include <mutex>
+ #include <set>
++#include <stop_token>
++#include <string>
++#include <thread>
+ #include <type_traits>
+ #include <utility>
+ #include "common/container/unordered_map.h"
+@@ -326,9 +329,75 @@ private:
+     std::unordered_set<u64> prep_rejected;
+     vk::PipelineCache prep_no_cache;
+ 
++    /// EDEN_UP_CANONICAL_KEYS=1 (VideoCommon::CanonicalKeys, ported from Fritchii v5.5).
++    /// Draws key native pipelines canonically (CanonicalizeDrawKey); records read from the disk
++    /// cache are rekeyed the same way (CanonicalizeLoadedKey). Canonical records live in files of
++    /// their own (vulkan_canonical.bin, vulkan_mesh_canonical.bin, vulkan_used_canonical.bin);
++    /// the files written without the switch are read, never written, so no file holds both.
++    bool canonical_keys{};
++    /// The attribute types as Refresh left them, before the canonical mask: Refresh rewrites
++    /// them only when the vertex input is dirty, so the masked copy in the key must not carry
++    /// over to the next Refresh. (Attachments are rebuilt by every Refresh with the switch on.)
++    u64 vertex_attribute_types{};
++    /// GPU thread, after Refresh: graphics_key.state in its canonical form (native draws).
++    void CanonicalizeDrawKey();
++    /// Before Refresh: the raw attribute types back in the key.
++    void RestoreRawKey();
++    /// A key read from a cache file (or converted from a recipe), as draws key it now. Idempotent.
++    void CanonicalizeLoadedKey(GraphicsPipelineCacheKey& key,
++                               std::span<const VideoCommon::FileEnvironment> envs) const;
++    /// The files written without EDEN_UP_CANONICAL_KEYS, read only (empty: none, or not canonical).
++    std::filesystem::path legacy_pipeline_cache_filename;
++    std::filesystem::path legacy_mesh_pipeline_cache_filename;
++    /// Key hash -> age of the list written without the switch, moved to the canonical hashes as
++    /// the records are rekeyed at boot.
++    std::unordered_map<u64, u8> legacy_used_pipelines;
++    /// A bit per dynamic state the key was made with and this device has not, or the other way
++    /// round (PrepareKept's other_device): 0 when a draw here can make this key.
++    enum OtherDevice : u32 {
++        OtherMaskComponents,
++        OtherEds1,
++        OtherEds2,
++        OtherEds2LogicOp,
++        OtherEds3Blend,
++        OtherEds3Enables,
++        OtherColorWriteEnable,
++        OtherVertexInput,
++        OtherProvokingVertex,
++        OtherCount,
++    };
++    [[nodiscard]] u32 OtherDeviceBits(const GraphicsPipelineCacheKey& key) const;
++
++    /// EDEN_UP_SHADER_SET=1 (video_core/shader_set.h): the game's shader programs are extracted,
++    /// lowered and converted into prep_shader_set.bin on this thread, at low priority and off
++    /// the loading thread; the file is reused while its stamp holds. When it is ready, its
++    /// records are prepared on the pipeline workers (PrepareShaderSet) with a few in flight.
++    bool shader_set_enabled{};
++    std::string ShaderSetDeviceIdentity() const;
++    bool MapShaderSetState(std::span<const u8> state, std::array<u64, 6> hashes,
++                           u32 vertex_read_mask, std::vector<u8>& bytes) const;
++    void StartShaderSet(const std::filesystem::path& title_dir);
++    void PrepareShaderSet(const std::filesystem::path& file, std::stop_token stop);
++    /// The audit line, every 60 s from TickFrame and at shutdown.
++    void LogShaderSetAudit(bool final);
++    /// The audit's counters (programs: native programs registered this session and those whose
++    /// lowered hash the set holds; keys: graphics pipelines made at runtime and those made from a
++    /// shader-set record). Rare events only: no per-draw cost.
++    std::atomic<u64> audit_programs_total{};
++    std::atomic<u64> audit_programs_in_set{};
++    std::atomic<u64> audit_keys_total{};
++    std::atomic<u64> audit_keys_hit{};
++    std::mutex shader_set_mutex;
++    std::shared_ptr<const std::unordered_set<u64>> shader_set_programs; ///< lowered hashes
++    std::vector<u64> audit_pending; ///< programs seen before the set was loaded
++    std::chrono::steady_clock::time_point audit_logged{};
++
+     Common::ThreadWorker workers;
+     Common::ThreadWorker serialization_thread;
+     DynamicFeatures dynamic_features;
++    /// Last: stopped and joined first (its jobs on the workers end inside it, before the workers
++    /// are destroyed).
++    std::jthread shader_set_thread;
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.h b/src/video_core/renderer_vulkan/vk_pipeline_prep.h
+index 32f700b..36fe70d 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.h
+@@ -96,6 +96,9 @@ public:
+     static constexpr u32 FlagNotKeepable = 1;
+     /// From prep_predicted.bin: its answers were guessed, not recorded from a draw.
+     static constexpr u32 FlagPredicted = 2;
++    /// EDEN_UP_SHADER_SET: from prep_shader_set.bin (always with FlagPredicted); the audit line
++    /// counts draws that hit one.
++    static constexpr u32 FlagShaderSet = 4;
+ 
+     struct Record {
+         std::array<u32, NumStages> infos{NoBlob, NoBlob, NoBlob, NoBlob, NoBlob};
+diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
+index e20fb2f..638d465 100644
+--- a/src/video_core/shader_cache.cpp
++++ b/src/video_core/shader_cache.cpp
+@@ -16,9 +16,11 @@
+ 
+ #include "common/assert.h"
+ #include "common/cityhash.h"
++#include "common/pe_switch.h"
+ #include "shader_recompiler/frontend/maxwell/control_flow.h"
+ #include "shader_recompiler/exception.h"
+ #include "shader_recompiler/object_pool.h"
++#include "shader_recompiler/program_header.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/kepler_compute.h"
+@@ -26,12 +28,49 @@
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2_fast_draw.h"
++#include "video_core/pipeline_cache_policy.h"
+ #include "video_core/shader_cache.h"
+ #include "video_core/shader_environment.h"
+ #include "video_core/texture_cache/util.h"
+ 
+ namespace VideoCommon {
+ 
++bool CanonicalKeys() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_CANONICAL_KEYS");
++    return enabled;
++}
++
++// Ported from Fritchii v5.5 shader_cache.cpp (without its EDEN_NX2_KEY_ALL_ATTRIBUTES escape).
++u64 VertexAttributeMaskOf(const Shader::Environment& env) {
++    const Shader::Stage stage{env.ShaderStage()};
++    if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
++        // No vertex input (Ocarina of Time: 191 keys for 31 sets of shaders, split only by the
++        // attribute registers).
++        return 0;
++    }
++    if (stage != Shader::Stage::VertexB || !env.IsNativeProgram()) {
++        return ~u64{0};
++    }
++    // The hardware only fetches the attributes in the input map, so a read outside it is never
++    // valid (none of Ocarina of Time's 1,250 cached vertex programs makes one).
++    std::array<std::array<bool, 4>, Tegra::Engines::Maxwell3D::Regs::NumVertexAttributes>
++        input_generic{};
++    for (size_t index = 0; index < input_generic.size(); ++index) {
++        input_generic[index] = env.SPH().vtg.InputGeneric(index);
++    }
++    return VertexAttributeMask(input_generic);
++}
++
++u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept {
++    u32 mask = 0;
++    for (size_t index = 0; index < 32; ++index) {
++        if ((sph.vtg.imap_generic_vector[index >> 1] >> ((index % 2) * 4)) & 0xF) {
++            mask |= 1U << index;
++        }
++    }
++    return mask;
++}
++
+ void ShaderCache::InvalidateRegion(VAddr addr, size_t size) {
+     std::scoped_lock lock{invalidation_mutex};
+     InvalidatePagesInRegion(addr, size);
+@@ -148,6 +187,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
+         }
+         shader_infos[index] = shader_info;
+         unique_hashes[index] = shader_info->unique_hash;
++        vertex_attribute_masks[index] = shader_info->vertex_attribute_mask;
+         if (mesh && (program == Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB ||
+                      program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Tessellation)) {
+             unique_hashes[index] ^= MeshStateHash();
+@@ -394,6 +434,15 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
+         info->size_bytes = env.ReadSizeBytes();
+     }
+     info->lowered_native = env.LoweredNative();
++    if (CanonicalKeys()) {
++        info->vertex_attribute_mask = VertexAttributeMaskOf(env);
++    }
++    if (on_native_program && env.IsNativeProgram() &&
++        (env.ShaderStage() == Shader::Stage::VertexB ||
++         env.ShaderStage() == Shader::Stage::Fragment)) {
++        // The stages the shader set converts (ordinary graphics): the audit's denominator.
++        on_native_program(info->unique_hash);
++    }
+     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
+     const ShaderInfo* const result{info.get()};
+     Register(std::move(info), cpu_addr, size_bytes);
+diff --git a/src/video_core/shader_cache.h b/src/video_core/shader_cache.h
+index 0b6a23d..bf928ed 100644
+--- a/src/video_core/shader_cache.h
++++ b/src/video_core/shader_cache.h
+@@ -9,6 +9,7 @@
+ #include <array>
+ #include <atomic>
+ #include <exception>
++#include <functional>
+ #include <memory>
+ #include <mutex>
+ #include <span>
+@@ -41,8 +42,26 @@ struct ShaderInfo {
+     size_t size_bytes{};
+     /// Lowered code of a native program, reused when its pipelines are built.
+     std::shared_ptr<const LoweredNativeCode> lowered_native;
++    /// EDEN_UP_CANONICAL_KEYS=1: the vertex attributes this program reads, two bits per attribute
++    /// as in FixedPipelineState::attribute_types (VertexAttributeMaskOf); all ones otherwise.
++    u64 vertex_attribute_mask{~u64{0}};
+ };
+ 
++/// EDEN_UP_CANONICAL_KEYS=1 (Common::PeSwitch, read once): native graphics pipeline keys are
++/// canonical (FixedPipelineState::CanonicalizeNative and the attribute-type mask), ported from
++/// Fritchii v5.5's EDEN_NX2_CANONICAL_KEYS. Required by EDEN_UP_SHADER_SET: the recipe's keys
++/// are canonical, so live keys must be too for a prepared record to be found.
++[[nodiscard]] bool CanonicalKeys();
++
++/// Ported from Fritchii v5.5 shader_cache.cpp: attribute mask of a native vertex program from
++/// its header's input map (all ones for other stages and non-native programs, none for task and
++/// mesh programs, which have no vertex input).
++[[nodiscard]] u64 VertexAttributeMaskOf(const Shader::Environment& env);
++
++/// Ported from Fritchii v5.5 shader_cache.cpp: one bit per generic attribute the header's input
++/// map lists (what FixedPipelineState::CanonicalizeNative keeps).
++[[nodiscard]] u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept;
++
+ class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
+     static constexpr u64 YUZU_PAGEBITS = 14;
+     static constexpr u64 YUZU_PAGESIZE = u64(1) << YUZU_PAGEBITS;
+@@ -107,7 +126,12 @@ protected:
+                                  const std::array<u64, NUM_PROGRAMS>& unique_hashes);
+ 
+     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
++    /// ShaderInfo::vertex_attribute_mask of each bound stage (EDEN_UP_CANONICAL_KEYS=1).
++    std::array<u64, NUM_PROGRAMS> vertex_attribute_masks{};
+     bool last_shaders_valid = false;
++    /// EDEN_UP_SHADER_SET=1 audit: called once per native program the cache registers, with its
++    /// unique hash (the lowered hash pipelines are keyed by). Null otherwise.
++    std::function<void(u64)> on_native_program;
+ 
+ private:
+     friend struct ShaderCacheTestAccess;
+diff --git a/src/video_core/shader_set.cpp b/src/video_core/shader_set.cpp
+new file mode 100644
+index 0000000..e303bc2
+--- /dev/null
++++ b/src/video_core/shader_set.cpp
+@@ -0,0 +1,677 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "video_core/shader_set.h"
++#include "video_core/shader_set_recipe.h"
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <map>
++#include <optional>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <unordered_set>
++#include <fmt/format.h>
++#include <openssl/evp.h>
++#include <zstd.h>
++#if defined(__linux__)
++#include <sys/sysinfo.h>
++#elif defined(__FreeBSD__)
++#include <sys/types.h>
++#include <sys/sysctl.h>
++#include <unistd.h>
++#endif
++#ifndef _WIN32
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++#include "common/cityhash.h"
++#include "common/fs/file.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "common/polyfill_thread.h"
++#include "core/file_sys/nx2_shader_extract.h"
++#include "core/file_sys/shader_set_source.h"
++#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++#include "shader_recompiler/frontend/ampere/program_address_map.h"
++#include "shader_recompiler/frontend/ampere/program_capture.h"
++#include "shader_recompiler/program_header.h"
++#include "video_core/shader_cache.h"
++
++namespace VideoCommon::ShaderSet {
++namespace {
++constexpr u32 FormatVersion = 3; // of the generated file and its stamp (v3: stamp and reuse)
++constexpr const char* RecordsName = "prep_shader_set.bin";
++constexpr const char* ProgramsName = "prep_shader_set.programs";
++constexpr const char* StampName = "prep_shader_set.stamp";
++constexpr u32 PipelineCacheVersion = 23; // the records' format (vk_pipeline_cache.cpp)
++
++template<class T> T Load(Bytes b, size_t at) {
++    if (at > b.size() || sizeof(T) > b.size() - at) throw std::runtime_error("short shader data");
++    T v; std::memcpy(&v, b.data() + at, sizeof(T)); return v;
++}
++template<class T> void Patch(std::vector<u8>& b, size_t at, T v) {
++    if (at > b.size() || sizeof(T) > b.size() - at) throw std::runtime_error("short shader data");
++    std::memcpy(b.data() + at, &v, sizeof(T));
++}
++size_t SwitchNumber(const char* name, size_t fallback) {
++    const char* const text = std::getenv(name);
++    const unsigned long long value = text ? std::strtoull(text, nullptr, 10) : 0;
++    return value != 0 ? static_cast<size_t>(value) : fallback;
++}
++std::string Sha256Hex(Bytes bytes) {
++    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
++    std::array<u8, 32> digest{};
++    unsigned length = 0;
++    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1 ||
++        EVP_DigestUpdate(ctx.get(), bytes.data(), bytes.size()) != 1 ||
++        EVP_DigestFinal_ex(ctx.get(), digest.data(), &length) != 1) {
++        throw std::runtime_error("SHA-256 failed");
++    }
++    std::string hex;
++    for (const u8 byte : digest) hex += fmt::format("{:02x}", byte);
++    return hex;
++}
++std::vector<u8> ReadWhole(const std::filesystem::path& p, size_t most) {
++    std::ifstream f{p, std::ios::binary | std::ios::ate};
++    if (!f) throw std::runtime_error("file cannot be opened");
++    const auto n = f.tellg();
++    if (n < 0 || static_cast<u64>(n) > most) throw std::runtime_error("file size");
++    std::vector<u8> b(static_cast<size_t>(n)); f.seekg(0);
++    f.read(reinterpret_cast<char*>(b.data()), static_cast<std::streamsize>(b.size()));
++    if (!f) throw std::runtime_error("file cannot be read");
++    return b;
++}
++/// The recipe's body from its NX2RCP01 wrapper (zstd, one frame).
++std::vector<u8> Unwrap(Bytes b) {
++    if (b.size() < 16 || std::memcmp(b.data(), "NX2RCP01", 8) || Load<u32>(b, 12))
++        throw std::runtime_error("recipe wrapper");
++    const auto size = Load<u32>(b, 8);
++    if (size > 128 * 1024 * 1024) throw std::runtime_error("recipe body size");
++    auto packed = b.subspan(16);
++    const auto frame = ZSTD_findFrameCompressedSize(packed.data(), packed.size());
++    if (ZSTD_isError(frame) || frame != packed.size()) throw std::runtime_error("recipe zstd frame");
++    std::vector<u8> body(size);
++    const auto result = ZSTD_decompress(body.data(), body.size(), packed.data(), packed.size());
++    if (ZSTD_isError(result) || result != size) throw std::runtime_error("recipe decompression");
++    return body;
++}
++
++/// The directory entries themselves reach the disk (a rename is durable only once they do).
++void SyncDirectory(const std::filesystem::path& dir) {
++#ifndef _WIN32
++    const int fd = ::open(dir.string().c_str(), O_RDONLY);
++    if (fd >= 0) {
++        (void)::fsync(fd);
++        ::close(fd);
++    }
++#endif
++}
++
++/// EDEN_UP_SHADER_SET_MAX_MB as the extractor reads it (nx2_shader_extract.cpp MaxBlob).
++size_t ContainerCapMiB() {
++    const size_t mib = SwitchNumber("EDEN_UP_SHADER_SET_MAX_MB", 256);
++    return std::clamp<size_t>(mib, 16, 4096);
++}
++
++/// EDEN_NUP_CACHE_MIB as the NUP container reads it (nup_container.cpp ChosenCacheCap).
++size_t NupCacheCapMiB() {
++    const char* const chosen = std::getenv("EDEN_NUP_CACHE_MIB");
++    const unsigned long long mib = chosen ? std::strtoull(chosen, nullptr, 10) : 0;
++    return mib == 0 ? 512 : std::max<size_t>(static_cast<size_t>(mib), 16);
++}
++
++/// Written whole under a temporary name, committed to disk, then renamed over the final name:
++/// a kill at any moment leaves the final name as it was (absent, or the last complete file).
++class AtomicFile {
++public:
++    explicit AtomicFile(std::filesystem::path final_) : final{std::move(final_)}, temporary{final} {
++        temporary += ".tmp";
++        file = Common::FS::IOFile{temporary, Common::FS::FileAccessMode::Write};
++        if (!file.IsOpen()) throw std::runtime_error("cannot create " + temporary.filename().string());
++    }
++    ~AtomicFile() {
++        if (!done) {
++            file.Close();
++            std::error_code ec;
++            std::filesystem::remove(temporary, ec);
++        }
++    }
++    void Write(Bytes b) {
++        if (file.WriteSpan<u8>(b) != b.size()) throw std::runtime_error("short write");
++        bytes += b.size();
++    }
++    template<class T> void Write(const T& v) {
++        Write(Bytes{reinterpret_cast<const u8*>(&v), sizeof(v)});
++    }
++    void Commit() {
++        if (!file.Flush() || !file.Commit()) throw std::runtime_error("cannot commit " + temporary.filename().string());
++        file.Close();
++        std::filesystem::rename(temporary, final); // same directory: atomic
++        SyncDirectory(final.parent_path());
++        done = true;
++    }
++    [[nodiscard]] u64 Written() const noexcept { return bytes; }
++private:
++    std::filesystem::path final;
++    std::filesystem::path temporary;
++    Common::FS::IOFile file;
++    u64 bytes{};
++    bool done{};
++};
++
++std::string StampText(const Identity& identity, u64 title, u32 version,
++                      const std::string& recipe_name, u64 recipe_size,
++                      const std::string& recipe_digest) {
++    // Everything a generated file depends on, one fact a line; the "files" line is added when
++    // it is written. Any other difference is another file. v3.1: the prepared store's stamp
++    // (build, settings, translation and lowering switches) and the extractor's container cap.
++    return fmt::format("shaderset {}\ntitle {:016X} version {}\nrecipe {} {} {}\n"
++                       "cache {} lowering {:016x} state {}\ndevice {}\ntranslation {}\n"
++                       "extractor cap {} MiB\n",
++                       FormatVersion, title, version, recipe_name, recipe_size, recipe_digest,
++                       identity.cache_version, identity.lowering_tag, 1008, identity.device,
++                       identity.translation, ContainerCapMiB());
++}
++
++/// Whether the stamp beside the generated files says they were made from `expected`, and they
++/// are whole (their sizes as the stamp says). `why`: the first reason they cannot be reused.
++bool StampHolds(const std::filesystem::path& dir, const std::string& expected, u64& records,
++                u64& programs, std::string& why) {
++    std::error_code ec;
++    std::ifstream f{dir / StampName, std::ios::binary};
++    if (!f) { why = "no stamp"; return false; }
++    std::string text{std::istreambuf_iterator<char>(f), {}};
++    const auto files = text.find("files ");
++    if (files == std::string::npos || files == 0 || text[files - 1] != '\n') {
++        why = "stamp without its files line"; return false;
++    }
++    if (text.substr(0, files) != expected) {
++        // The first differing line says what changed (game, recipe, build, device).
++        std::string line;
++        size_t a = 0, b = 0;
++        while (a < expected.size() && b < files) {
++            const auto ea = expected.find('\n', a), eb = text.find('\n', b);
++            const auto la = expected.substr(a, ea - a), lb = text.substr(b, eb - b);
++            if (la != lb) { line = "'" + lb + "' is now '" + la + "'"; break; }
++            a = ea + 1; b = eb + 1;
++        }
++        why = "stamp changed: " + (line.empty() ? std::string{"another line count"} : line);
++        return false;
++    }
++    unsigned long long records_bytes = 0, records_count = 0, programs_bytes = 0, programs_count = 0;
++    if (std::sscanf(text.c_str() + files, "files %llu %llu %llu %llu", &records_bytes,
++                    &records_count, &programs_bytes, &programs_count) != 4) {
++        why = "stamp files line unreadable"; return false;
++    }
++    records = records_count;
++    programs = programs_count;
++    const auto size_r = std::filesystem::file_size(dir / RecordsName, ec);
++    if (ec || size_r != records_bytes) { why = "records file size differs from the stamp"; return false; }
++    const auto size_p = std::filesystem::file_size(dir / ProgramsName, ec);
++    if (ec || size_p != programs_bytes) { why = "programs file size differs from the stamp"; return false; }
++    return true;
++}
++
++struct Guest { u8 stage; std::vector<u8> code, control; };
++u8 Stage(FileSys::Nx2ShaderExtract::Stage s) {
++    const auto stage = static_cast<u8>(s);
++    return stage >= 6 ? stage + 1 : stage; // Shader::Stage reserves 6 for compute's end marker
++}
++struct Lowered { std::vector<u64> code; u64 hash; u32 bound; u32 read_mask; };
++std::optional<Lowered> Lower(const Guest& p, std::stop_token stop) {
++    using namespace Shader::Ampere;
++    // This first port feeds only ordinary graphics into PrepareKept. No compute/mesh guesses.
++    if ((p.stage != 0 && p.stage != 4) || p.code.size() <= 128) return {};
++    Shader::ProgramHeader sph{};
++    static_assert(sizeof(sph) == 80);
++    std::memcpy(&sph, p.code.data(), sizeof(sph));
++    std::vector<Instruction> native;
++    ProgramCaptureState capture;
++    bool complete = false;
++    for (u32 i = 0; i < ProgramCaptureState::MaximumInstructions; ++i) {
++        if (stop.stop_requested()) return {};
++        const size_t at = 128 + size_t{i} * sizeof(Instruction);
++        if (at > p.code.size() || sizeof(Instruction) > p.code.size() - at) break;
++        const auto instruction = Load<Instruction>(p.code, at);
++        // v2: a trap (0x95c) is lowered as the live path lowers it (lower_to_maxwell.h:1558,
++        // the same words from the same instruction, no live data); rejecting it here only lost records.
++        native.push_back(instruction);
++        const auto status = capture.Observe(instruction, i);
++        if (status == ProgramCaptureState::Result::InvalidTarget) return {};
++        if (status == ProgramCaptureState::Result::Complete) { complete = true; break; }
++    }
++    if (!complete) return {};
++    // Matches our GraphicsEnvironment (native_tensor defaults false); LEPC/geometry excluded.
++    const auto lowered = LowerToMaxwell(native, {.geometry = false, .tensor = false,
++                                                .native_code_address = 0});
++    if (!lowered) return {};
++    Lowered out{};
++    out.bound = lowered.required_texture_buffer;
++    // v3: the canonical key keeps only the attribute types the vertex program's header lists
++    // (VideoCommon::GenericReadMask, as the live key is masked).
++    out.read_mask = p.stage == 0 ? VideoCommon::GenericReadMask(sph) : ~0U;
++    out.code.resize(sizeof(sph) / 8);
++    std::memcpy(out.code.data(), &sph, sizeof(sph));
++    for (u64 instruction : lowered.instructions) {
++        if ((out.code.size() * 8) % 32 == 0) out.code.push_back(0);
++        out.code.push_back(instruction);
++    }
++    out.code.push_back(0);
++    AppendNativeAddressMap(out.code, lowered.source_instruction_offsets);
++    out.hash = Common::CityHash64(reinterpret_cast<const char*>(out.code.data()), out.code.size() * 8) ^
++               0x4f554e4345000003ULL;
++    return out;
++}
++std::vector<u8> Hydrate(const Facts& f, const Lowered& p) {
++    // Facts are cached answers. Read addresses belong to the *target* lowered vector.
++    if (Load<u32>(f.bytes, 56) != 0 || Load<u32>(f.bytes, 60) != 0) return {};
++    if (p.bound != ~0U && Load<u32>(f.bytes, 52) != p.bound) return {};
++    std::vector<u8> out(f.bytes.begin(), f.bytes.begin() + 76);
++    Patch(out, 0, u64{p.code.size() * 8});
++    Patch(out, 60, u32{0});
++    Patch(out, 64, static_cast<u32>((p.code.size() - 1) * 8));
++    const auto* code = reinterpret_cast<const u8*>(p.code.data());
++    out.insert(out.end(), code, code + p.code.size() * 8);
++    out.insert(out.end(), f.bytes.begin() + 76, f.bytes.begin() + f.tables_end);
++    out.insert(out.end(), code, code + 80); // graphics ProgramHeader is absent from facts
++    return out;
++}
++} // namespace
++
++u64 FreeMemoryBytes() {
++#if defined(__linux__)
++    struct sysinfo info {};
++    if (sysinfo(&info) == 0) {
++        return (u64{info.freeram} + info.bufferram) * info.mem_unit;
++    }
++#elif defined(__FreeBSD__)
++    u32 free_pages = 0, inactive_pages = 0;
++    size_t length = sizeof(u32);
++    if (sysctlbyname("vm.stats.vm.v_free_count", &free_pages, &length, nullptr, 0) == 0) {
++        length = sizeof(u32);
++        (void)sysctlbyname("vm.stats.vm.v_inactive_count", &inactive_pages, &length, nullptr, 0);
++        return (u64{free_pages} + inactive_pages) * static_cast<u64>(getpagesize());
++    }
++#endif
++    return 0;
++}
++
++u64 MinimumFreeBytes() {
++    static const u64 floor = u64{SwitchNumber("EDEN_UP_SHADER_SET_MIN_FREE_MB", 384)} << 20;
++    return floor;
++}
++
++u64 MinimumFreeDiskBytes() {
++    static const u64 floor =
++        u64{SwitchNumber("EDEN_UP_SHADER_SET_MIN_FREE_DISK_MB", 2048)} << 20;
++    return floor;
++}
++
++unsigned DutyPercent() {
++    static const unsigned duty =
++        static_cast<unsigned>(std::clamp<size_t>(SwitchNumber("EDEN_UP_SHADER_SET_DUTY", 50), 1, 100));
++    return duty;
++}
++
++bool MemoryCheckWaived() {
++    static const bool waived = Common::PeSwitch("EDEN_UP_SHADER_SET_NO_MEMORY_CHECK");
++    return waived;
++}
++
++bool Rest(std::stop_token stop, std::chrono::steady_clock::duration rest) {
++    if (rest <= std::chrono::steady_clock::duration::zero()) {
++        return !stop.stop_requested();
++    }
++    return Common::StoppableTimedWait(stop, rest);
++}
++
++std::vector<u64> ReadPrograms(const std::filesystem::path& programs) {
++    try {
++        const auto bytes = ReadWhole(programs, 64 * 1024 * 1024);
++        if (bytes.size() % sizeof(u64) != 0) return {};
++        std::vector<u64> hashes(bytes.size() / sizeof(u64));
++        std::memcpy(hashes.data(), bytes.data(), bytes.size());
++        return hashes;
++    } catch (const std::exception&) {
++        return {};
++    }
++}
++
++Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
++                const std::filesystem::path& output_dir, const Identity& identity,
++                const MapState& map_state, std::stop_token stop) {
++    Outputs out;
++    if (!Common::PeSwitch("EDEN_UP_SHADER_SET")) return out;
++    std::error_code ec;
++    // A temporary left by a kill is never a file to use.
++    for (const char* name : {RecordsName, ProgramsName, StampName}) {
++        auto leftover = output_dir / name;
++        leftover += ".tmp";
++        std::filesystem::remove(leftover, ec);
++    }
++    const auto source = FileSys::ShaderSetSource::Snapshot();
++    // Snapshot owns the VFS roots throughout extraction; no borrowed loader callback.
++    try {
++        std::vector<std::filesystem::path> paths;
++        for (std::filesystem::directory_iterator it{title_dir, ec}, end; !ec && it != end; it.increment(ec))
++            if (it->is_regular_file() && it->path().extension() == ".nx2recipe") paths.push_back(it->path());
++        std::ranges::sort(paths);
++        std::vector<u8> wrapped, body;
++        std::optional<Recipe> recipe;
++        std::string recipe_name;
++        size_t recipes_read = 0;
++        std::string expected, why;
++        for (const auto& path : paths) {
++            try {
++                auto candidate_wrapped = ReadWhole(path, 128 * 1024 * 1024);
++                ++recipes_read;
++                // The stamp is checked on the wrapped bytes first: a recipe whose generated
++                // file is reused is not inflated and parsed (~70 MB) at every boot. The stamp
++                // names the game version the loader registered (the recipe's must equal it).
++                std::string candidate_expected, candidate_why;
++                if (source.title == title) {
++                    candidate_expected =
++                        StampText(identity, title, source.version, path.filename().string(),
++                                  candidate_wrapped.size(), Sha256Hex(candidate_wrapped));
++                    if (StampHolds(output_dir, candidate_expected, out.record_count,
++                                   out.program_count, candidate_why)) {
++                        out.records = output_dir / RecordsName;
++                        out.programs = output_dir / ProgramsName;
++                        out.reused = true;
++                        LOG_INFO(Render_Vulkan, "Shader set: reusing {} ({} records, {} MB, {} "
++                                 "programs); its stamp holds, nothing is extracted",
++                                 RecordsName, out.record_count,
++                                 std::filesystem::file_size(out.records, ec) >> 20,
++                                 out.program_count);
++                        return out;
++                    }
++                }
++                auto candidate = Unwrap(candidate_wrapped);
++                auto parsed = ReadBody(candidate);
++                if (parsed.title != title) continue;
++                if (source.title == title && parsed.game_version != source.version) continue;
++                wrapped = std::move(candidate_wrapped);
++                body = std::move(candidate); // vector move preserves the parsed spans
++                recipe = std::move(parsed);
++                recipe_name = path.filename().string();
++                expected = std::move(candidate_expected);
++                why = std::move(candidate_why);
++                break;
++            } catch (const std::exception& e) {
++                LOG_WARNING(Render_Vulkan, "Shader set: rejected {}: {}", path.filename().string(), e.what());
++            }
++        }
++        LOG_INFO(Render_Vulkan, "Shader set: recipes read {}, selected {}", recipes_read, recipe ? 1 : 0);
++        if (!recipe || stop.stop_requested()) return out;
++        auto& r = *recipe;
++        if (source.title != title || source.roots.empty()) {
++            LOG_WARNING(Render_Vulkan, "Shader set: fingerprints found 0, not found 0, unresolved {} "
++                        "(game-files provider unavailable); converted 0, dropped provider-unavailable {}",
++                        r.programs.size(), r.records.size());
++            return out;
++        }
++        // The stamp: what the generated file was made from. While it holds, nothing is read
++        // again (above); a changed game version, recipe, cache version, lowering, build, switch
++        // or device makes a new one.
++        LOG_INFO(Render_Vulkan, "Shader set: converting the recipe ({})", why);
++        // The game's files are read through the NUP container: without lazy decoding every
++        // read, even a 64 KiB peek, decodes the whole member into the cache the game shares,
++        // and a member over half the cap is written whole to a temporary file that lasts the
++        // session (a failed spill leaves it unreadable for the game). Refused rather than risked.
++        if (!Common::PeSwitch("EDEN_UP_NUP_LAZY_DECODE") || NupCacheCapMiB() > 128) {
++            LOG_WARNING(Render_Vulkan, "Shader set: extraction needs EDEN_UP_NUP_LAZY_DECODE=1 and "
++                        "EDEN_NUP_CACHE_MIB of 128 or less (now {} MiB, lazy decode {}): the game's "
++                        "files would fill the shared NUP cache and spill to disk; nothing extracted",
++                        NupCacheCapMiB(), Common::PeSwitch("EDEN_UP_NUP_LAZY_DECODE") ? "on" : "off");
++            return out;
++        }
++        // The output duplicates environments per record (Fritchii measured 1.17 GB for Ocarina
++        // of Time); a full disk must not end with half a file beside the pipeline cache.
++        const u64 disk_floor = MinimumFreeDiskBytes();
++        if (const auto space = std::filesystem::space(output_dir, ec);
++            !ec && space.available < disk_floor) {
++            LOG_WARNING(Render_Vulkan, "Shader set: {} MB free beside the pipeline cache, under "
++                        "the {} MB floor (EDEN_UP_SHADER_SET_MIN_FREE_DISK_MB); nothing converted",
++                        space.available >> 20, disk_floor >> 20);
++            return out;
++        }
++        // Extraction holds one container inflated (up to EDEN_UP_SHADER_SET_MAX_MB) plus the
++        // wanted programs: it waits for memory rather than taking the game's. Where free memory
++        // cannot be read, nothing runs (the floor is the only guard), unless waived.
++        const u64 floor = MinimumFreeBytes();
++        const bool memory_known = FreeMemoryBytes() != 0;
++        if (!memory_known && !MemoryCheckWaived()) {
++            LOG_WARNING(Render_Vulkan, "Shader set: free memory is unknown on this platform; "
++                        "nothing extracted (EDEN_UP_SHADER_SET_NO_MEMORY_CHECK=1 extracts anyway)");
++            return out;
++        }
++        if (memory_known) {
++            bool said = false;
++            for (int waited = 0; FreeMemoryBytes() < floor; ++waited) {
++                if (stop.stop_requested() || waited >= 120) {
++                    LOG_WARNING(Render_Vulkan, "Shader set: {} MB free, under the {} MB floor "
++                                "(EDEN_UP_SHADER_SET_MIN_FREE_MB) for 10 minutes; nothing extracted "
++                                "this boot", FreeMemoryBytes() >> 20, floor >> 20);
++                    return out;
++                }
++                if (!said) {
++                    LOG_INFO(Render_Vulkan, "Shader set: {} MB free, under the {} MB floor; "
++                             "extraction waits", FreeMemoryBytes() >> 20, floor >> 20);
++                    said = true;
++                }
++                if (!Rest(stop, std::chrono::seconds{5})) return out;
++            }
++        } else {
++            LOG_INFO(Render_Vulkan, "Shader set: free memory unknown on this platform; the "
++                     "memory floor is not checked (EDEN_UP_SHADER_SET_NO_MEMORY_CHECK=1)");
++        }
++        const auto begin = std::chrono::steady_clock::now();
++        const auto seconds = [&begin] {
++            return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
++        };
++        // Exact upstream decoder/fingerprint/dedup rules. One worker (EDEN_UP_SHADER_SET_THREADS,
++        // 1-4) bounds concurrent blobs and makes first-file payload retention deterministic.
++        // Only the recipe's fingerprints are kept in memory (v2): the rest are counted.
++        std::unordered_set<u64> wanted;
++        for (auto program : r.programs) wanted.insert(program.fingerprint);
++        const unsigned threads =
++            static_cast<unsigned>(std::clamp<size_t>(SwitchNumber("EDEN_UP_SHADER_SET_THREADS", 1), 1, 4));
++        FileSys::Nx2ShaderExtract::Progress progress;
++        progress.low_priority = true;
++        progress.every = std::chrono::seconds{10};
++        progress.on_progress = [&](const FileSys::Nx2ShaderExtract::Progress& p) {
++            LOG_INFO(Render_Vulkan, "Shader set: extracting: {} of {} files scanned, {} of {} "
++                     "fingerprints found, {} MB read, {:.0f} s elapsed",
++                     p.files_done.load(std::memory_order_relaxed), p.files_total,
++                     p.wanted_found.load(std::memory_order_relaxed), wanted.size(),
++                     p.bytes_read.load(std::memory_order_relaxed) >> 20, seconds());
++        };
++        // Thread priorities do nothing for the console's SCHED_OTHER threads: the workers rest
++        // after each file for the duty cycle, wait under the memory floor (up to 10 minutes,
++        // then the extraction is cancelled), and end it when the disk fills.
++        const unsigned duty = DutyPercent();
++        std::atomic<const char*> cancelled{nullptr};
++        std::atomic<bool> said_memory{false};
++        progress.after_file = [&](std::chrono::steady_clock::duration took) {
++            const auto rest = took * static_cast<s64>(100 - duty) / static_cast<s64>(duty);
++            if (!Rest(stop, std::min<std::chrono::steady_clock::duration>(rest, std::chrono::seconds{10}))) return;
++            if (memory_known) {
++                for (int waited = 0; FreeMemoryBytes() < floor; ++waited) {
++                    if (stop.stop_requested()) return;
++                    if (waited >= 120) {
++                        cancelled.store("under the memory floor for 10 minutes");
++                        progress.cancel.store(true);
++                        return;
++                    }
++                    if (!said_memory.exchange(true)) {
++                        LOG_INFO(Render_Vulkan, "Shader set: {} MB free, under the {} MB floor; "
++                                 "extraction waits between files", FreeMemoryBytes() >> 20, floor >> 20);
++                    }
++                    if (!Rest(stop, std::chrono::seconds{5})) return;
++                }
++            }
++            std::error_code space_ec;
++            if (const auto space = std::filesystem::space(output_dir, space_ec);
++                !space_ec && space.available < disk_floor) {
++                cancelled.store("under the disk floor");
++                progress.cancel.store(true);
++            }
++        };
++        LOG_INFO(Render_Vulkan, "Shader set: extracting {} wanted programs from the game's files "
++                 "on {} thread(s), duty {}%", wanted.size(), threads, duty);
++        auto extracted = FileSys::Nx2ShaderExtract::Extract(source.roots, threads, &progress, stop, &wanted);
++        if (stop.stop_requested()) return out;
++        if (const char* const reason = cancelled.load()) {
++            LOG_WARNING(Render_Vulkan, "Shader set: extraction cancelled ({}) after {} of {} files; "
++                        "nothing converted this boot", reason,
++                        progress.files_done.load(std::memory_order_relaxed), progress.files_total);
++            return out;
++        }
++        const size_t errors = extracted.errors.size();
++        const auto candidates = extracted.stats.occurrences;
++        const auto extracted_stats = extracted.stats;
++        for (const auto& error : extracted.errors) LOG_WARNING(Render_Vulkan, "Shader set: {}", error);
++        std::unordered_map<u64, Guest> guests;
++        for (auto& program : extracted.programs) {
++            guests.emplace(program.fingerprint, Guest{Stage(program.stage),
++                std::move(program.code), std::move(program.control)});
++        }
++        extracted = {}; // release variation metadata before lowering
++        LOG_INFO(Render_Vulkan, "Shader set: extraction read {} files ({} MB, {} MB inflated, {} "
++                 "containers, {} peeked only) in {:.1f} s", extracted_stats.files,
++                 extracted_stats.file_bytes >> 20, extracted_stats.inflated_bytes >> 20,
++                 extracted_stats.containers, extracted_stats.peeked_only, seconds());
++        std::vector<std::optional<Lowered>> lowered(r.programs.size());
++        std::unordered_set<u64> have;
++        size_t found = 0, missing = 0, failed = 0;
++        auto chunk_began = std::chrono::steady_clock::now();
++        for (size_t i = 0; i < r.programs.size(); ++i) {
++            if (stop.stop_requested()) return out;
++            if (i % 64 == 63) {
++                // The duty cycle, and memory: the lowered vectors grow while the guests shrink.
++                const auto took = std::chrono::steady_clock::now() - chunk_began;
++                if (!Rest(stop, took * static_cast<s64>(100 - duty) / static_cast<s64>(duty))) return out;
++                if (memory_known && FreeMemoryBytes() < floor) {
++                    LOG_WARNING(Render_Vulkan, "Shader set: {} MB free, under the {} MB floor while "
++                                "lowering; nothing converted this boot", FreeMemoryBytes() >> 20, floor >> 20);
++                    return out;
++                }
++                chunk_began = std::chrono::steady_clock::now();
++            }
++            const auto& p = r.programs[i];
++            const auto it = guests.find(p.fingerprint);
++            if (it == guests.end()) { ++missing; continue; }
++            ++found;
++            have.insert(p.fingerprint);
++            if (it->second.stage == p.stage) lowered[i] = Lower(it->second, stop);
++            if (!lowered[i]) ++failed;
++            guests.erase(it); // one fingerprint per recipe program: its guest code is done with
++        }
++        guests.clear(); // the guest code is lowered or rejected; only the lowered vectors stay
++        LOG_INFO(Render_Vulkan, "Shader set: candidates {}, archive errors {}, fingerprints found {}, "
++                 "not found {} (search incomplete if archive errors), not lowered {}; {:.1f} s so far",
++                 candidates, errors, found, missing, failed, seconds());
++        // Stream duplicate environments per record, as ReadPipelines expects. Do not hold a GB output in RAM.
++        AtomicFile file{output_dir / RecordsName};
++        file.Write(Bytes{reinterpret_cast<const u8*>("yuzucach"), 8});
++        file.Write(PipelineCacheVersion);
++        std::map<std::string, size_t> dropped;
++        std::vector<u64> used_programs; // lowered hashes with at least one converted record
++        std::unordered_set<u64> used_seen;
++        size_t converted = 0;
++        for (const auto& p : r.records) {
++            if (stop.stop_requested()) return out; // the temporary is removed with `file`
++            if (p.kind == 1) { ++dropped["compute-predicted-unsupported"]; continue; }
++            bool mesh = false, absent = false, lower_failed = false;
++            for (auto id : p.facts) {
++                const auto pi = r.facts[id].program;
++                mesh |= r.programs[pi].stage == 7 || r.programs[pi].stage == 8;
++                absent |= !have.contains(r.programs[pi].fingerprint);
++                lower_failed |= !lowered[pi].has_value();
++            }
++            if (mesh) { ++dropped["mesh-predicted-unsupported"]; continue; }
++            if (absent) { ++dropped["fingerprint-not-found"]; continue; }
++            if (lower_failed) { ++dropped["stage-or-lowering"]; continue; }
++            if (std::ranges::any_of(p.xors, [](u64 x) { return x != 0; })) {
++                ++dropped["unexpected-hash-xor"]; continue;
++            }
++            std::vector<std::vector<u8>> envs;
++            std::array<u64, 6> hashes{};
++            bool valid = true;
++            for (auto id : p.facts) {
++                const auto& f = r.facts[id];
++                envs.push_back(Hydrate(f, *lowered[f.program]));
++                valid &= !envs.back().empty();
++            }
++            if (!valid) { ++dropped["incompatible-facts"]; continue; }
++            u32 read_mask = ~0U;
++            for (size_t s = 0; s < 6; ++s) {
++                if (p.slots[s] == 0xff) continue;
++                const auto& program = *lowered[r.facts[p.facts[p.slots[s]]].program];
++                hashes[s] = program.hash;
++                if (s == 1) read_mask = program.read_mask; // the vertex B slot
++            }
++            std::vector<u8> key;
++            if (!map_state(r.states[p.state], hashes, read_mask, key)) { ++dropped["device-or-key-state"]; continue; }
++            const auto count = static_cast<u32>(envs.size());
++            file.Write(count);
++            for (const auto& env : envs) file.Write(Bytes{env});
++            file.Write(Bytes{key});
++            ++converted;
++            for (size_t s = 0; s < 6; ++s) {
++                if (hashes[s] != 0 && used_seen.insert(hashes[s]).second) used_programs.push_back(hashes[s]);
++            }
++        }
++        size_t total_dropped = 0;
++        for (const auto& [reason, count] : dropped) {
++            total_dropped += count;
++            LOG_INFO(Render_Vulkan, "Shader set: dropped {}: {}", reason, count);
++        }
++        LOG_INFO(Render_Vulkan, "Shader set: pipelines read {}, converted {}, dropped {} (exclusive reasons); "
++                 "{:.1f} s in all", r.records.size(), converted, total_dropped, seconds());
++        if (!converted || stop.stop_requested()) return out;
++        // The old stamp goes first (it must never sit beside the new files), then records, then
++        // programs, then the stamp: a stamp is only ever beside whole files.
++        std::filesystem::remove(output_dir / StampName, ec);
++        SyncDirectory(output_dir);
++        file.Commit();
++        AtomicFile programs{output_dir / ProgramsName};
++        programs.Write(Bytes{reinterpret_cast<const u8*>(used_programs.data()), used_programs.size() * sizeof(u64)});
++        programs.Commit();
++        out.records = output_dir / RecordsName;
++        out.programs = output_dir / ProgramsName;
++        out.record_count = converted;
++        out.program_count = used_programs.size();
++        // A partial extraction (an archive error, or over 5% of the recipe's programs not
++        // found) is used this boot but not stamped: the next start converts the recipe again,
++        // so a raised container cap or a repaired game copy is picked up.
++        const bool partial = errors != 0 || missing * 20 > r.programs.size();
++        if (partial) {
++            LOG_WARNING(Render_Vulkan, "Shader set: {} written ({} records, {} MB, {} programs) but "
++                        "NOT stamped: {} archive errors, {} of {} fingerprints not found; it is used "
++                        "this boot and the recipe is converted again at the next start "
++                        "(EDEN_UP_SHADER_SET_MAX_MB raises the container cap)",
++                        RecordsName, converted, file.Written() >> 20, used_programs.size(), errors,
++                        missing, r.programs.size());
++            return out;
++        }
++        AtomicFile stamp{output_dir / StampName};
++        const std::string text = expected + fmt::format("files {} {} {} {}\n", file.Written(), converted,
++                                                        programs.Written(), used_programs.size());
++        stamp.Write(Bytes{reinterpret_cast<const u8*>(text.data()), text.size()});
++        stamp.Commit();
++        LOG_INFO(Render_Vulkan, "Shader set: {} written ({} records, {} MB, {} programs) with its stamp",
++                 RecordsName, converted, file.Written() >> 20, used_programs.size());
++        return out;
++    } catch (const std::exception& e) {
++        LOG_WARNING(Render_Vulkan, "Shader set: no generated records used: {}", e.what());
++        return {};
++    }
++}
++} // namespace VideoCommon::ShaderSet
+diff --git a/src/video_core/shader_set.h b/src/video_core/shader_set.h
+new file mode 100644
+index 0000000..069be4b
+--- /dev/null
++++ b/src/video_core/shader_set.h
+@@ -0,0 +1,93 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// EDEN_UP_SHADER_SET=1 (default off; needs EDEN_UP_CANONICAL_KEYS=1): the whole game's shader
++// pipelines are prepared ahead of play from a public recipe (<title>/<name>.nx2recipe, Fritchii's
++// NX2RCP01 wrapper: format 1, facts v54). The game's own files are read with Fritchii's extractor
++// (core/file_sys/nx2_shader_extract.h), the programs the recipe names are lowered with our lowerer
++// and converted into prep_shader_set.bin, a predicted-records file (cache version 23) the pipeline
++// preparation (vk_pipeline_prep.h) builds from.
++//
++// v3: the conversion runs once. prep_shader_set.stamp beside the file says what it was made from
++// (game title and version, the recipe's digest, our cache version and lowering tag, the device
++// and its dynamic state); while the stamp holds, the file is reused at every boot. Both are
++// written to a temporary name, committed to disk and renamed, so a kill leaves nothing partial
++// under the final names. Extraction runs on the caller's thread (the pipeline cache's background
++// thread, low priority), reporting a progress line about every 10 s.
++
++#pragma once
++
++#include <array>
++#include <chrono>
++#include <filesystem>
++#include <functional>
++#include <span>
++#include <stop_token>
++#include <string>
++#include <vector>
++
++#include "common/common_types.h"
++
++namespace VideoCommon::ShaderSet {
++
++/// Maps one recipe state (1008 bytes, v54) and the lowered hashes of its stages to a key of this
++/// device (the GraphicsPipelineCacheKey bytes); `vertex_read_mask`: the generic attributes the
++/// vertex program's header lists (what the canonical key keeps). False: not for this device.
++using MapState = std::function<bool(std::span<const u8> state, std::array<u64, 6> hashes,
++                                    u32 vertex_read_mask, std::vector<u8>& bytes)>;
++
++struct Outputs {
++    std::filesystem::path records;  ///< prep_shader_set.bin, empty when there is none to use
++    std::filesystem::path programs; ///< prep_shader_set.programs: u64 lowered hashes, in order
++    bool reused{};                  ///< the stamp held: nothing was extracted this boot
++    u64 record_count{};
++    u64 program_count{};
++};
++
++/// What a generated file depends on besides the recipe and the game: the pipeline cache version,
++/// the lowering tag of our shader environments, the device as the pipeline cache describes it
++/// (driver, model, dynamic state, canonical keys), and the prepared store's stamp (the installed
++/// build, the settings and every switch the translation and the lowerer read). Any change makes
++/// a new stamp.
++struct Identity {
++    u32 cache_version{};
++    u64 lowering_tag{};
++    std::string device;
++    std::string translation;
++};
++
++/// Reuses prep_shader_set.bin in `output_dir` when its stamp holds, else extracts, lowers and
++/// converts (minutes on a base PS5), writes the file and its stamp. Empty `records` on
++/// cancellation, failure, no recipe for this title and version, or nothing converted; a stale or
++/// partial file is never returned.
++[[nodiscard]] Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
++                              const std::filesystem::path& output_dir, const Identity& identity,
++                              const MapState& map_state, std::stop_token stop);
++
++/// The lowered program hashes a generated file was made from (its .programs sidecar).
++[[nodiscard]] std::vector<u64> ReadPrograms(const std::filesystem::path& programs);
++
++/// Free physical memory, or 0 when the platform does not say (Linux: sysinfo; FreeBSD: the free
++/// and inactive page counts).
++[[nodiscard]] u64 FreeMemoryBytes();
++
++/// EDEN_UP_SHADER_SET_MIN_FREE_MB (384): below this much free memory the background work waits
++/// (extraction) or stops for this boot (preparation, which resumes at the next start).
++[[nodiscard]] u64 MinimumFreeBytes();
++
++/// EDEN_UP_SHADER_SET_MIN_FREE_DISK_MB (2048): below this much free disk beside the pipeline
++/// cache nothing is converted, extraction ends, and preparation stops for this boot.
++[[nodiscard]] u64 MinimumFreeDiskBytes();
++
++/// EDEN_UP_SHADER_SET_DUTY (50, 1-100): the share of wall time the background work may take.
++/// Extraction, lowering and preparation rest after each piece of work for the remainder.
++[[nodiscard]] unsigned DutyPercent();
++
++/// EDEN_UP_SHADER_SET_NO_MEMORY_CHECK=1: run even where free memory cannot be read. Without it
++/// the work is refused there (the floor is the only guard on a base PS5's few hundred MB).
++[[nodiscard]] bool MemoryCheckWaived();
++
++/// Sleeps `rest` unless the stop token is signalled first; false when it was.
++[[nodiscard]] bool Rest(std::stop_token stop, std::chrono::steady_clock::duration rest);
++
++} // namespace VideoCommon::ShaderSet
+diff --git a/src/video_core/shader_set_recipe.cpp b/src/video_core/shader_set_recipe.cpp
+new file mode 100644
+index 0000000..6a12658
+--- /dev/null
++++ b/src/video_core/shader_set_recipe.cpp
+@@ -0,0 +1,139 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "video_core/shader_set_recipe.h"
++#include <bit>
++#include <cstring>
++#include <stdexcept>
++
++namespace VideoCommon::ShaderSet {
++namespace {
++[[noreturn]] void Bad() { throw std::runtime_error("invalid/unsupported shader-set recipe"); }
++struct Reader {
++    Bytes bytes;
++    size_t at{};
++    Bytes Take(size_t n) {
++        if (n > bytes.size() - at) Bad();
++        auto out = bytes.subspan(at, n);
++        at += n;
++        return out;
++    }
++    template<class T> T Get() {
++        T value;
++        auto p = Take(sizeof(T));
++        std::memcpy(&value, p.data(), sizeof(T));
++        return value;
++    }
++    void Zero(size_t n) { for (u8 b : Take(n)) if (b) Bad(); }
++    u32 Count(size_t minimum) {
++        auto n = Get<u32>();
++        if (n > (bytes.size() - at) / minimum) Bad();
++        return n;
++    }
++};
++}
++Recipe ReadBody(Bytes body) {
++    static_assert(std::endian::native == std::endian::little);
++    if (body.size() > 128U * 1024 * 1024) Bad();
++    Reader r{body};
++    if (r.Get<u32>() != 1) Bad();
++    Recipe out{};
++    out.title = r.Get<u64>();
++    out.game_version = r.Get<u32>();
++    out.cache_version = r.Get<u32>();
++    if (out.cache_version != 54) Bad();
++    const auto np = r.Count(12);
++    out.programs.reserve(np);
++    for (u32 i = 0; i < np; ++i) {
++        Program p{r.Get<u64>(), r.Get<u8>()};
++        r.Zero(3);
++        if (p.stage > 8) Bad();
++        out.programs.push_back(p);
++    }
++    const auto nf = r.Count(12);
++    out.facts.reserve(nf);
++    for (u32 i = 0; i < nf; ++i) {
++        Facts f{};
++        f.program = r.Get<u32>();
++        f.flags = r.Get<u8>();
++        r.Zero(3);
++        f.bytes = r.Take(r.Get<u32>());
++        if (f.program >= np || (f.flags & ~2U)) Bad();
++        Reader e{f.bytes};
++        if (e.Get<u64>() % 8) Bad(); // original code length, not bytes present here
++        std::array<u64, 5> counts;
++        for (auto& n : counts) n = e.Get<u64>();
++        e.Take(24);
++        const auto stage = e.Get<u32>();
++        if (stage != out.programs[f.program].stage || (f.flags && stage != 7 && stage != 8)) Bad();
++        constexpr size_t widths[]{8, 8, 12, 9, 12};
++        for (size_t j = 0; j < counts.size(); ++j) {
++            if (counts[j] > (e.bytes.size() - e.at) / widths[j]) Bad();
++            const auto table = e.Take(static_cast<size_t>(counts[j]) * widths[j]);
++            Reader entries{table};
++            for (u64 k = 0; k < counts[j]; ++k) {
++                if (j == 0 || j == 1) {
++                    entries.Get<u32>();
++                    const auto v = entries.Get<u32>();
++                    // Texture enums are validated by the target translator; preserve raw values.
++                    (void)v;
++                } else {
++                    entries.Get<u64>();
++                    if (j == 3) { if (entries.Get<u8>() > 1) Bad(); }
++                    else entries.Get<u32>();
++                }
++            }
++        }
++        f.tables_end = e.at;
++        const size_t tail = stage == 5 ? 16 : stage == 3 ? 32 :
++                            (stage == 7 || stage == 8) ? 12 + (f.flags ? 0 : 80) : 0;
++        e.Take(tail);
++        if (e.at != e.bytes.size()) Bad();
++        out.facts.push_back(f);
++    }
++    const auto ns = r.Count(1008);
++    out.states.reserve(ns);
++    for (u32 i = 0; i < ns; ++i) out.states.push_back(r.Take(1008));
++    const auto nr = r.Count(8);
++    out.records.reserve(nr);
++    constexpr u8 slot_stage[]{6, 0, 1, 2, 3, 4};
++    for (u32 i = 0; i < nr; ++i) {
++        Record p{};
++        p.kind = r.Get<u8>();
++        const auto n = r.Get<u8>();
++        r.Zero(2);
++        if (p.kind > 1 || n == 0 || n > 6 || (p.kind == 1 && n != 1)) Bad();
++        for (u8 j = 0; j < n; ++j) {
++            const auto id = r.Get<u32>();
++            if (id >= nf) Bad();
++            p.facts.push_back(id);
++        }
++        if (p.kind == 1) {
++            if (out.programs[out.facts[p.facts[0]].program].stage != 5) Bad();
++        } else {
++            p.state = r.Get<u32>();
++            if (p.state >= ns) Bad();
++            for (auto& s : p.slots) s = r.Get<u8>();
++            const auto has_xor = r.Get<u8>();
++            r.Zero(1);
++            if (has_xor > 1) Bad();
++            if (has_xor) for (auto& x : p.xors) x = r.Get<u64>();
++            std::array<bool, 6> used{};
++            size_t expected = 0;
++            for (size_t s = 0; s < 6; ++s) {
++                const auto id = p.slots[s];
++                if (id == 0xff) { if (p.xors[s]) Bad(); continue; }
++                if (id >= n || used[id] || id != expected++) Bad();
++                used[id] = true;
++                const auto stage = out.programs[out.facts[p.facts[id]].program].stage;
++                // Task/mesh reuse vertex-B and tess-eval slots, or vertex-B alone for mesh.
++                if (stage != slot_stage[s] && !(s == 1 && (stage == 7 || stage == 8)) &&
++                    !(s == 3 && stage == 8)) Bad();
++            }
++            if (expected != n) Bad();
++        }
++        out.records.push_back(std::move(p));
++    }
++    if (r.at != body.size()) Bad();
++    return out;
++}
++} // namespace VideoCommon::ShaderSet
+diff --git a/src/video_core/shader_set_recipe.h b/src/video_core/shader_set_recipe.h
+new file mode 100644
+index 0000000..693d60a
+--- /dev/null
++++ b/src/video_core/shader_set_recipe.h
+@@ -0,0 +1,32 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <array>
++#include <span>
++#include <vector>
++#include "common/common_types.h"
++
++namespace VideoCommon::ShaderSet {
++using Bytes = std::span<const u8>;
++struct Program { u64 fingerprint; u8 stage; };
++struct Facts { u32 program; u8 flags; Bytes bytes; size_t tables_end; };
++struct Record {
++    u8 kind;
++    std::vector<u32> facts;
++    u32 state{};
++    std::array<u8, 6> slots{};
++    std::array<u64, 6> xors{};
++};
++// All spans borrow the caller's decompressed body. No game bytes are stored in a recipe.
++struct Recipe {
++    u64 title;
++    u32 game_version;
++    u32 cache_version;
++    std::vector<Program> programs;
++    std::vector<Facts> facts;
++    std::vector<Bytes> states;
++    std::vector<Record> records;
++};
++// Strict format-1 / facts-v54 reader. Throws on malformed, oversized or unsupported input.
++Recipe ReadBody(Bytes body);
++} // namespace VideoCommon::ShaderSet

@@ -1,0 +1,963 @@
+Subject: [PATCH] Fritchii DownloadLanding: guest CPU writes wait for a buffer download landing under them, without the async read-back; fence downloads land per copy group (EDEN_UP_FRITCHII_DOWNLOAD_LANDING, _STATS; off by default)
+
+Port of Frizti/Fritchii 8f09b0fd90 (Frizti, branch oot-gather-fix; "core, video_core: let guest
+writes wait for a download landing under them"), itself a port of zortos293/Lichii #805 4942eb8a39
+(jpkto). On top of T85 (0001..0486); applies with 0487 (lichii-1094) and 0488 (lichii-1016) in
+either order.
+
+Why 7 of 10 hunks failed on T83: 0486 (Lichii #1028) brought the same protocol afterwards
+(#1028's df0b5f6bde is #805's 4942eb8a39), but only inside EDEN_UP_L1028_ASYNC_READBACK. Hunk by
+hunk, by intent (T85 line numbers):
+- core/memory.cpp, DownloadLanding::Await after Collect: have (memory.cpp:927, :974, L1028 only,
+  and only when Collect stored new bits). Here: also with this switch.
+- rasterizer_download_area.h, the DownloadLanding class: have, same code (rasterizer_download_area.h:
+  38-108). Here: a wait time for the stats.
+- buffer_cache.h include, buffer_cache_base.h comment: have / updated.
+- DownloadRangesMemory (landing, look after the wait): have (buffer_cache.h:572, L1028 only), but it
+  looks with GuardedCpuWriteRanges (empty unless EDEN_NX2_DOWNLOAD_GUARDS >= 1, 0240). Here: with
+  this switch too, and it looks at every collected write (CollectedCpuWriteRanges).
+- DownloadMemoryRanges (2 hunks): we have no such function; its job (a read's download) is
+  0486's read path (DownloadMemoryForRead/WriteReadDownloads), which always lands in a landing.
+- PopAsyncBuffers (per copy, copies within a page together): partly; T85 lands a fence's downloads
+  in one landing over their hull (buffer_cache.h:2337, L1028 only). Here: Fritchii's per group
+  landings, each with its own look at every collected write, with this switch.
+- DownloadBuffersMemory: have (buffer_cache.h:4639, L1028 only). Here: also with this switch,
+  looking at every collected write.
+- DownloadBufferMemory (look after the wait, mapped/staged/immediate): have as #1028 shaped it
+  (begin_landing, buffer_cache.h:4695: the look before the wait is kept and the one after it is
+  added). Here: also with this switch.
+- Not in Fritchii, ours: FinishDownloadPieces (no staging buffer) lands like DownloadRangesMemory;
+  GPU::GatherAndApply keeps gathered writes pending until applied (#1028's applying list,
+  gpu.cpp:189/258, which Fritchii lacks: a fence download popped between a gather and its apply
+  would not see those writes).
+Other paths named in the task: EDEN_NX2_DMA_SNAPSHOT reads guest memory these landings write (no
+change needed); 0471's copy barrier orders host transfers, not guest memory (no overlap); 0477
+GRHAND's handed reads flush through DownloadMemory (covered); texture cache downloads
+(PopAsyncFlushes, SwizzleImage) write guest memory under texture_cache.mutex with no look and are
+NOT covered: DownloadLanding publishes one landing at a time and relies on buffer_cache.mutex for
+that; EDEN_NX2_TC_KEEP_ASYNC concerns CPU texture decodes, not downloads.
+
+What each switch does (Common::PeSwitch, exactly "1"; read once):
+EDEN_UP_FRITCHII_DOWNLOAD_LANDING=1: the protocol of L1028 without the async read-back: every buffer
+  cache download writes guest memory inside a DownloadLanding after its host GPU wait and takes its
+  look at the collected guest CPU writes inside it; a guest CPU write collected in a landing's
+  range stores its bytes once the landing ended; gathered writes stay in the look until applied.
+  A fence's downloads land per group of copies within a page of each other. Every look keeps every
+  collected write, whatever EDEN_NX2_DOWNLOAD_GUARDS says, as Fritchii's always does (without the
+  switch T85's looks find nothing at 0, play env v2.4's level; the hull path, taken only without
+  it, is unchanged). The looks keep whole 64-byte blocks: GPU bytes sharing a block with a newer
+  guest write are not written (guards >= 1 did the same; watch the "Download kept off newer CPU
+  writes ... on command list pages" line, now also logged with this switch). Logs one line at the
+  first use.
+EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS=1 (no behaviour change; give it to control arms): every 10 s
+  "Download landing (S s; landing on|off, L1028 on|off, guards G): landed F fence downloads (C copy
+  group landings), Y synchronous, D read downloads, B KiB | late, kept off a newer guest CPU write:
+  K downloads, K KiB skipped | late, lost, written over a guest CPU write collected before: L
+  downloads, L KiB | late, raced, written under one collected since (upper bound): R downloads,
+  R KiB | guest CPU writes held by a landing: N, T ms | early (lower bound): E area lookups of
+  bytes whose fence download had not landed (KiB), W guest CPU writes over such bytes (KiB of
+  fence downloads dropped)". Counts per window (not per second). Lost: the download's look did not
+  keep a write already collected when it wrote (the guest's bytes were replaced by older GPU
+  ones); 0 with the landing switch by construction (its looks keep them all), so compare the
+  control's lost with the landing arm's kept off. Raced: written under a write collected after
+  the look and still collected at the end (in a landing's range it waited; without one it is lost
+  if stored first; writes made after the download wrote count too). Early lookups: only the first
+  read into an area the core then keeps. Without either landing switch, writes gathered and not
+  yet applied are invisible to the stats (GPU::ForEachPendingCpuWrite): lost and raced are lower
+  bounds there.
+
+Unset (both): T85 behaviour. What still runs: one static bool per Active()/StatsEnabled() test at
+the sites L1028 already tests, the PopAsyncBuffers loop body moved into a lambda (same steps in the
+same order; the hull landing, L1028 only, still lives to the end of the function), one static
+bool test per WriteDownloadedMemory/ClaimCpuWrites/EndLandingStats/NoteLandingLook call and per
+look (LandingCpuWriteRanges, LandingLookRanges). EDEN_UP_L1028_ASYNC_READBACK alone: T85 too.
+
+Credit: Frizti (Fritchii 8f09b0fd90), jpkto (Lichii #805 4942eb8a39), zortos293 (Lichii #1028).
+
+After review (first version sha256 9caf8499b8f72f6a): the looks of this switch keep every collected
+write at any guard level (they found nothing at guards 0); the stats tell lost bytes from raced ones
+and call the early reads area lookups, a lower bound; the unused MaybeReportIfEnabled was removed.
+
+Checks (VM scratch, fritchii-download-landing_fix_checks.sh, log
+fritchii-download-landing.fix-checks.log): git apply --check on T85 and a reverse dry run: OK. With
+0487 (lichii-1094) and 0488 (lichii-1016) in either order, and with ubo-ahead.diff in either order:
+line offsets only, same tree either way; the full stack 0487 + 0488 + this + ubo-ahead: no fuzz or
+rejects. Shared files: buffer_cache.h and buffer_cache_base.h, no shared hunks. The derived gpu.cpp
+and memory.cpp (headless/CMakeLists.txt) take the same change, their CMake anchors unchanged.
+prepare-vulkan-port.py: 6 anchor skips before and after, the generated buffer_cache.h carries the
+same change. -fsyntax-only with the build's flags: 51 TUs rc=0 (every TU that directly includes a
+touched header, rasterizer_interface.h, gpu.h, fence_manager.h or renderer_base.h, from the tree,
+the generated copies or the derived ones), and 11 TUs of the tree with ubo-ahead. Injected errors:
+all 51 rc=1; the four buffer cache TUs reach all 20 buffer_cache.h markers. Host test of the patched
+DownloadLanding (g++, 2 threads): a write under a landing waits for it, one elsewhere or after it
+does not, WaitNs only with _STATS. Log format strings: 1/1 and 21/21 placeholders/arguments. Not
+built, not run on the PS5.
+
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -39,6 +39,7 @@
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/nx2_async_readback.h"
++#include "video_core/nx2_download_landing.h"
+ #include "video_core/rasterizer_download_area.h"
+ 
+ namespace Core::Memory {
+@@ -922,8 +923,8 @@ struct Memory::Impl {
+                     address, size, address >> YUZU_PAGEBITS, rasterizer_reported_pages[core], [&] {
+                         return address != 0 && size != 0 && system.GPU().OnCPUWrite(address, size);
+                     });
+-                // EDEN_UP_L1028_ASYNC_READBACK: as below.
+-                if (VideoCore::AsyncReadback::Enabled()) {
++                // EDEN_UP_L1028_ASYNC_READBACK or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: as below.
++                if (VideoCore::LandingPort::Active()) {
+                     VideoCore::DownloadLanding::Await(address, size);
+                 }
+             });
+@@ -969,8 +970,10 @@ struct Memory::Impl {
+             // after that one sees them (or, gathered since, in GPU::ForEachPendingCpuWrite's
+             // applying list, or applied, which took the range out of the read downloads under
+             // the buffer cache's lock); one that fenced before it was waited for there. Saves the
+-            // seq_cst fence on most writes of a run into the same 64-byte blocks. Off: nothing.
+-            if (stored && VideoCore::AsyncReadback::Enabled()) {
++            // seq_cst fence on most writes of a run into the same 64-byte blocks. Also with
++            // EDEN_UP_FRITCHII_DOWNLOAD_LANDING (Frizti/Fritchii 8f09b0fd90, the same protocol
++            // without the async read-back). Off (both): nothing.
++            if (stored && VideoCore::LandingPort::Active()) {
+                 VideoCore::DownloadLanding::Await(address, size);
+             }
+         });
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -427,6 +427,20 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
+         // The core keeps this area: a later GPU write to its unmarked pages must arm them again.
+         read_trapped_ranges.Subtract(device_addr_start_aligned,
+                                      device_addr_end_aligned - device_addr_start_aligned);
++        // EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: the read takes guest memory's bytes as they
++        // are; an early area lookup when a fence download of them has not landed yet (count
++        // only). A lower bound of early reads: the core keeps the area, and its reads inside it
++        // (Core::Memory's HandleRasterizerRead) do not come here again.
++        if (VideoCore::LandingPort::StatsEnabled() && area->preemtive) {
++            const u64 not_landed = NotLandedBytes(
++                device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
++            if (not_landed != 0) {
++                VideoCore::LandingPort::Add(VideoCore::LandingPort::g_counters.early_reads, 1);
++                VideoCore::LandingPort::Add(VideoCore::LandingPort::g_counters.early_read_bytes,
++                                            not_landed);
++            }
++            VideoCore::LandingPort::MaybeReport(DownloadGuards());
++        }
+         return area;
+     };
+     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
+@@ -568,10 +582,11 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
+     }
+     FinishForDownload();
+     const u8* const mapped_memory = download_staging.mapped_span.data();
+-    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): the CPU writes collected from here on store
+-    // their bytes once these are in guest memory (VideoCore::DownloadLanding).
++    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028) or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: the CPU
++    // writes collected from here on store their bytes once these are in guest memory
++    // (VideoCore::DownloadLanding).
+     std::optional<VideoCore::DownloadLanding> landing;
+-    if (VideoCore::AsyncReadback::Enabled()) {
++    if (VideoCore::LandingPort::Active()) {
+         DAddr landing_begin = ~DAddr{0};
+         DAddr landing_end = 0;
+         for (const Download& download : downloads) {
+@@ -582,13 +597,15 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
+         }
+         landing.emplace(landing_begin, landing_end);
+     }
+-    const Common::RangeSet<DAddr> cpu_written = GuardedCpuWriteRanges();
++    const Common::RangeSet<DAddr> cpu_written = LandingCpuWriteRanges();
++    NoteLandingLook(VideoCore::LandingPort::Enabled());
+     for (const Download& download : downloads) {
+         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+         WriteDownloadedMemory(cpu_written, device_addr,
+                               mapped_memory + (download.copy.dst_offset - download_staging.offset),
+                               download.copy.size);
+     }
++    EndLandingStats(VideoCore::LandingPort::Site::Sync);
+ }
+ 
+ template <class P>
+@@ -1073,6 +1090,7 @@ void BufferCache<P>::WriteReadDownloads(u64 tick, VideoCore::AsyncReadback::Land
+                 // read download lands later than a synchronous flush did, while the apply of a
+                 // write it overlaps can land it (CachedWriteMemory's ClearDownload).
+                 const Common::RangeSet<DAddr> cpu_written = CollectedCpuWriteRanges();
++                NoteLandingLook(true);
+                 if (download.has_staging) {
+                     const u8* const base = download.staging.mapped_span.data();
+                     for (const BufferCopy& copy : download.copies) {
+@@ -1085,6 +1103,7 @@ void BufferCache<P>::WriteReadDownloads(u64 tick, VideoCore::AsyncReadback::Land
+                             });
+                     }
+                 }
++                EndLandingStats(VideoCore::LandingPort::Site::Read);
+                 if (download.check) {
+                     CheckReadDownload(*download.check, pass_first, landed_by);
+                     async_buffers_death_ring.push_back(download.check->staging);
+@@ -2102,10 +2121,10 @@ void BufferCache<P>::FinishDownloadPieces() {
+         }
+         FinishForDownload();
+         const u8* const mapped = runtime.ReservedDownloadBuffer().mapped_span.data();
+-        // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): CPU writes collected from here on store
+-        // their bytes once these are in guest memory.
++        // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028) or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: CPU
++        // writes collected from here on store their bytes once these are in guest memory.
+         std::optional<VideoCore::DownloadLanding> landing;
+-        if (VideoCore::AsyncReadback::Enabled()) {
++        if (VideoCore::LandingPort::Active()) {
+             DAddr landing_begin = ~DAddr{0};
+             DAddr landing_end = 0;
+             for (const DownloadPiece& piece : download_pieces) {
+@@ -2114,7 +2133,8 @@ void BufferCache<P>::FinishDownloadPieces() {
+             }
+             landing.emplace(landing_begin, landing_end);
+         }
+-        const Common::RangeSet<DAddr> cpu_written = GuardedCpuWriteRanges();
++        const Common::RangeSet<DAddr> cpu_written = LandingCpuWriteRanges();
++        NoteLandingLook(VideoCore::LandingPort::Enabled());
+         for (const DownloadPiece& piece : download_pieces) {
+             WriteDownloadedMemory(cpu_written, piece.device_addr, mapped + piece.offset, piece.size);
+             // Older downloads of these bytes must not land over them when their fences pop. A
+@@ -2123,6 +2143,7 @@ void BufferCache<P>::FinishDownloadPieces() {
+             ClearReplacedDownload(piece.device_addr, piece.size);
+             gpu_modified_ranges.Subtract(piece.device_addr, piece.size);
+         }
++        EndLandingStats(VideoCore::LandingPort::Site::Sync);
+         download_pieces.clear();
+         download_pieces_bytes = 0;
+     }
+@@ -2140,13 +2161,26 @@ void BufferCache<P>::PopAsyncFlushes() {
+ 
+ template <class P>
+ void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges) {
++    const bool landing_stats = VideoCore::LandingPort::StatsEnabled();
+     for (const auto& [device_addr, size] : ranges) {
+         if (IsRegionGpuModified(device_addr, size)) {
++            // EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: an early write when a fence download of
++            // these bytes has not landed: the drop below keeps it from landing over them.
++            if (landing_stats) {
++                if (const u64 not_landed = NotLandedBytes(device_addr, size); not_landed != 0) {
++                    VideoCore::LandingPort::Add(VideoCore::LandingPort::g_counters.early_writes, 1);
++                    VideoCore::LandingPort::Add(VideoCore::LandingPort::g_counters.dropped_bytes,
++                                                not_landed);
++                }
++            }
+             // Guest CPU writes (Lichii #1028: read downloads leave the range).
+             ClearReplacedDownload(device_addr, size);
+             gpu_modified_ranges.Subtract(device_addr, size);
+         }
+     }
++    if (landing_stats) {
++        VideoCore::LandingPort::MaybeReport(DownloadGuards());
++    }
+ }
+ 
+ template <class P>
+@@ -2269,15 +2303,124 @@ Common::RangeSet<DAddr> BufferCache<P>::GuardedCpuWriteRanges() {
+     return {};
+ }
+ 
++template <class P>
++Common::RangeSet<DAddr> BufferCache<P>::LandingCpuWriteRanges() {
++    // EDEN_UP_FRITCHII_DOWNLOAD_LANDING (Frizti/Fritchii 8f09b0fd90, whose downloads always look):
++    // every collected CPU write, whatever EDEN_NX2_DOWNLOAD_GUARDS says. Off:
++    // GuardedCpuWriteRanges, as before.
++    return VideoCore::LandingPort::Enabled() ? CollectedCpuWriteRanges() : GuardedCpuWriteRanges();
++}
++
++template <class P>
++Common::RangeSet<DAddr> BufferCache<P>::LandingLookRanges() {
++    // EDEN_UP_FRITCHII_DOWNLOAD_LANDING: as LandingCpuWriteRanges. Off: PendingCpuWriteRanges, as
++    // before (empty at EDEN_NX2_DOWNLOAD_GUARDS=0).
++    return VideoCore::LandingPort::Enabled() ? CollectedCpuWriteRanges() : PendingCpuWriteRanges();
++}
++
++template <class P>
++void BufferCache<P>::NoteLandingLook(bool full_look) {
++    if (!VideoCore::LandingPort::StatsEnabled()) {
++        return;
++    }
++    if (full_look) {
++        // The download writes over none of the writes collected by now: nothing can be lost.
++        landing_stats_seen.Clear();
++        return;
++    }
++    landing_stats_seen = CollectedCpuWriteRanges();
++}
++
++template <class P>
++u64 BufferCache<P>::NotLandedBytes(DAddr device_addr, u64 size) {
++    Common::RangeSet<DAddr> not_landed;
++    const auto add = [&](DAddr start, DAddr end) { not_landed.Add(start, end - start); };
++    uncommitted_gpu_modified_ranges.ForEachInRange(device_addr, size, add);
++    for (const auto& range_set : committed_gpu_modified_ranges) {
++        range_set.ForEachInRange(device_addr, size, add);
++    }
++    for (const auto& range_set : pending_download_ranges) {
++        range_set.ForEachInRange(device_addr, size, add);
++    }
++    u64 bytes = 0;
++    not_landed.ForEach([&](DAddr start, DAddr end) { bytes += end - start; });
++    return bytes;
++}
++
++template <class P>
++void BufferCache<P>::EndLandingStats(VideoCore::LandingPort::Site site) {
++    if (!VideoCore::LandingPort::StatsEnabled()) {
++        return;
++    }
++    if (landing_stats_bytes == 0) {
++        landing_stats_seen.Clear();
++        return;
++    }
++    namespace LandingPort = VideoCore::LandingPort;
++    auto& counters = LandingPort::g_counters;
++    LandingPort::Add(counters.landings[static_cast<size_t>(site)], 1);
++    LandingPort::Add(counters.bytes[static_cast<size_t>(site)], landing_stats_bytes);
++    if (landing_stats_kept != 0) {
++        LandingPort::Add(counters.kept_landings, 1);
++        LandingPort::Add(counters.kept_bytes, landing_stats_kept);
++    }
++    // Lost: bytes written over a guest CPU write already collected when the download wrote
++    // (NoteLandingLook) that its look did not keep off (empty or guarded): the guest stored its
++    // bytes first, the GPU's older ones replaced them.
++    u64 lost_bytes = 0;
++    landing_stats_lost.ForEach([&](DAddr start, DAddr end) { lost_bytes += end - start; });
++    if (lost_bytes != 0) {
++        LandingPort::Add(counters.lost_landings, 1);
++        LandingPort::Add(counters.lost_bytes, lost_bytes);
++    }
++    // Raced: bytes written under a guest CPU write collected now, whatever EDEN_NX2_DOWNLOAD_GUARDS
++    // says, but not yet when the download wrote: collected while it wrote (in a landing's range
++    // such a write waited for it; without one its bytes are lost if stored before the download's)
++    // or after it (safe either way): an upper bound.
++    if (pending_cpu_writes) {
++        Common::RangeSet<DAddr> raced;
++        pending_cpu_writes([&](DAddr device_addr, size_t size) {
++            landing_stats_written.ForEachInRange(
++                device_addr, size, [&](DAddr start, DAddr end) { raced.Add(start, end - start); });
++        });
++        landing_stats_lost.ForEach(
++            [&](DAddr start, DAddr end) { raced.Subtract(start, end - start); });
++        u64 raced_bytes = 0;
++        raced.ForEach([&](DAddr start, DAddr end) { raced_bytes += end - start; });
++        if (raced_bytes != 0) {
++            LandingPort::Add(counters.raced_landings, 1);
++            LandingPort::Add(counters.raced_bytes, raced_bytes);
++        }
++    }
++    landing_stats_written.Clear();
++    landing_stats_seen.Clear();
++    landing_stats_lost.Clear();
++    landing_stats_bytes = 0;
++    landing_stats_kept = 0;
++    LandingPort::MaybeReport(DownloadGuards());
++}
++
+ template <class P>
+ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
+                                            DAddr device_addr, const u8* data, u64 size) {
+     // EDEN_UP_HELD_VS_DOWNLOAD: nor over a page whose CPU write is held back (not yet applied).
+     const bool held = HeldVsDownload() && !held_download_bypass &&
+                       cpu_held_ranges.Intersects(device_addr, size);
++    // EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: what the download brought, wrote and kept off,
++    // until EndLandingStats.
++    const bool landing_stats = VideoCore::LandingPort::StatsEnabled();
++    if (landing_stats) {
++        landing_stats_bytes += size;
++    }
+     if (!held && !cpu_written.Intersects(device_addr, size)) {
+         device_memory.WriteBlockUnsafe(device_addr, data, size);
+         UboSnapshot::OnGpuWrite(device_addr, data, size);
++        if (landing_stats) {
++            landing_stats_written.Add(device_addr, size);
++            landing_stats_seen.ForEachInRange(device_addr, size, [&](DAddr start, DAddr end) {
++                landing_stats_lost.Add(start, end - start);
++            });
++        }
+         return;
+     }
+     Common::RangeSet<DAddr> parts;
+@@ -2293,11 +2436,23 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
+             parts.Subtract(start, end - start);
+         });
+     }
++    u64 written_bytes = 0;
+     parts.ForEach([&](DAddr start, DAddr end) {
+         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+         UboSnapshot::OnGpuWrite(start, data + (start - device_addr), end - start);
++        if (landing_stats) {
++            landing_stats_written.Add(start, end - start);
++            written_bytes += end - start;
++            landing_stats_seen.ForEachInRange(start, end - start, [&](DAddr lower, DAddr upper) {
++                landing_stats_lost.Add(lower, upper - lower);
++            });
++        }
+     });
+-    if (DownloadGuards() >= 1) {
++    if (landing_stats) {
++        landing_stats_kept += size - written_bytes;
++    }
++    // EDEN_UP_FRITCHII_DOWNLOAD_LANDING: its looks keep writes off at any guard level.
++    if (DownloadGuards() >= 1 || VideoCore::LandingPort::Enabled()) {
+         static std::atomic<u64> kept{};
+         static std::atomic<u64> kept_on_lists{};
+         const u64 list_step = on_list_page ? 1 : 0;
+@@ -2334,25 +2489,13 @@ void BufferCache<P>::PopAsyncBuffers() {
+     auto& async_buffer = async_buffers.front();
+     u8* base = async_buffer->mapped_span.data();
+     const size_t base_offset = async_buffer->offset;
+-    std::optional<VideoCore::DownloadLanding> landing;
+-    if (VideoCore::AsyncReadback::Enabled()) {
+-        DAddr landing_begin = ~DAddr{0};
+-        DAddr landing_end = 0;
+-        for (const auto& copy : downloads) {
+-            landing_begin = (std::min)(landing_begin, static_cast<DAddr>(copy.src_offset));
+-            landing_end = (std::max)(landing_end, static_cast<DAddr>(copy.src_offset + copy.size));
+-        }
+-        landing.emplace(landing_begin, landing_end);
+-    }
+-    // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since the
+-    // copy was taken are newer than it, and the GPU thread hasn't dropped them from `ranges` yet.
+-    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+     // EDEN_NX2_READBACK_WAIT only (null otherwise).
+     const Common::RangeSet<DAddr>* const superseded =
+         VideoCore::Readback::Mode() != 0 && !pending_download_superseded.empty()
+             ? &pending_download_superseded.front()
+             : nullptr;
+-    for (const auto& copy : downloads) {
++    const auto land_copy = [&](const BufferCopy& copy,
++                               const Common::RangeSet<DAddr>& cpu_written) {
+         const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
+         const u64 dst_offset = copy.dst_offset - base_offset;
+         const u8* read_mapped_memory = base + dst_offset;
+@@ -2376,7 +2519,64 @@ void BufferCache<P>::PopAsyncBuffers() {
+                 gpu_modified_ranges.Subtract(lower, upper - lower);
+             });
+         });
++    };
++    std::optional<VideoCore::DownloadLanding> landing;
++    if (!VideoCore::LandingPort::Enabled()) {
++        if (VideoCore::AsyncReadback::Enabled()) {
++            DAddr landing_begin = ~DAddr{0};
++            DAddr landing_end = 0;
++            for (const auto& copy : downloads) {
++                landing_begin = (std::min)(landing_begin, static_cast<DAddr>(copy.src_offset));
++                landing_end =
++                    (std::max)(landing_end, static_cast<DAddr>(copy.src_offset + copy.size));
++            }
++            landing.emplace(landing_begin, landing_end);
++        }
++        // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since
++        // the copy was taken are newer than it, and the GPU thread hasn't dropped them from
++        // `ranges` yet.
++        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
++        NoteLandingLook(false);
++        for (const auto& copy : downloads) {
++            land_copy(copy, cpu_written);
++        }
++    } else {
++        // EDEN_UP_FRITCHII_DOWNLOAD_LANDING (Frizti/Fritchii 8f09b0fd90): landed per copy, copies
++        // within a page of each other together, each group inside a VideoCore::DownloadLanding
++        // that it looks at the collected CPU writes in. With preflush a fence's copies span
++        // unrelated pages: one landing over their hull would hold guest writes anywhere in it
++        // until all of them landed.
++        size_t first = 0;
++        while (first < downloads.size()) {
++            DAddr landing_begin = static_cast<DAddr>(downloads[first].src_offset);
++            DAddr landing_end = landing_begin + downloads[first].size;
++            size_t last = first + 1;
++            for (; last < downloads.size(); ++last) {
++                const DAddr begin = static_cast<DAddr>(downloads[last].src_offset);
++                const DAddr end = begin + downloads[last].size;
++                if (end + Core::DEVICE_PAGESIZE < landing_begin ||
++                    begin > landing_end + Core::DEVICE_PAGESIZE) {
++                    break;
++                }
++                landing_begin = (std::min)(landing_begin, begin);
++                landing_end = (std::max)(landing_end, end);
++            }
++            const VideoCore::DownloadLanding group_landing{landing_begin, landing_end};
++            // On the fencing thread while the CPU keeps writing, as above, but taken inside the
++            // landing: the writes collected after it wait for it instead. Every collected write,
++            // whatever EDEN_NX2_DOWNLOAD_GUARDS says, as Fritchii's look.
++            const Common::RangeSet<DAddr> cpu_written = CollectedCpuWriteRanges();
++            NoteLandingLook(true);
++            for (size_t index = first; index < last; ++index) {
++                land_copy(downloads[index], cpu_written);
++            }
++            if (VideoCore::LandingPort::StatsEnabled()) {
++                VideoCore::LandingPort::Add(VideoCore::LandingPort::g_counters.fence_groups, 1);
++            }
++            first = last;
++        }
+     }
++    EndLandingStats(VideoCore::LandingPort::Site::Fence);
+     async_buffers_death_ring.emplace_back(*async_buffer);
+     async_buffers.pop_front();
+     pending_downloads.pop_front();
+@@ -4634,10 +4834,10 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
+     }
+     FinishForDownload();
+     const u8* const mapped_memory = download_staging.mapped_span.data();
+-    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): CPU writes collected from here on store their
+-    // bytes once these are in guest memory.
++    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028) or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: CPU writes
++    // collected from here on store their bytes once these are in guest memory.
+     std::optional<VideoCore::DownloadLanding> landing;
+-    if (VideoCore::AsyncReadback::Enabled()) {
++    if (VideoCore::LandingPort::Active()) {
+         DAddr landing_begin = ~DAddr{0};
+         DAddr landing_end = 0;
+         for (const Download& download : downloads) {
+@@ -4648,13 +4848,15 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
+         }
+         landing.emplace(landing_begin, landing_end);
+     }
+-    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
++    const Common::RangeSet<DAddr> cpu_written = LandingLookRanges();
++    NoteLandingLook(VideoCore::LandingPort::Enabled());
+     for (const Download& download : downloads) {
+         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+         WriteDownloadedMemory(cpu_written, device_addr,
+                               mapped_memory + (download.copy.dst_offset - download_staging.offset),
+                               download.copy.size);
+     }
++    EndLandingStats(VideoCore::LandingPort::Site::Sync);
+ }
+ 
+ template <class P>
+@@ -4688,13 +4890,16 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+     if (total_size_bytes == 0) {
+         return;
+     }
+-    Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+-    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028): guest memory is written once the host GPU ran
+-    // the copies; the CPU writes collected meanwhile keep their bytes too, and those collected
+-    // from then on store theirs once these are in guest memory. Off: nothing.
++    Common::RangeSet<DAddr> cpu_written = LandingLookRanges();
++    // EDEN_UP_L1028_ASYNC_READBACK (Lichii #1028) or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: guest
++    // memory is written once the host GPU ran the copies; the CPU writes collected meanwhile keep
++    // their bytes too, and those collected from then on store theirs once these are in guest
++    // memory. Off (both): nothing.
+     std::optional<VideoCore::DownloadLanding> landing;
+     const auto begin_landing = [&] {
+-        if (!VideoCore::AsyncReadback::Enabled()) {
++        if (!VideoCore::LandingPort::Active()) {
++            // EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: after the host GPU wait, as below.
++            NoteLandingLook(false);
+             return;
+         }
+         DAddr landing_begin = ~DAddr{0};
+@@ -4704,8 +4909,9 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+             landing_end = (std::max)(landing_end, buffer.CpuAddr() + copy.src_offset + copy.size);
+         }
+         landing.emplace(landing_begin, landing_end);
+-        PendingCpuWriteRanges().ForEach(
++        LandingLookRanges().ForEach(
+             [&](DAddr start, DAddr end) { cpu_written.Add(start, end - start); });
++        NoteLandingLook(VideoCore::LandingPort::Enabled());
+     };
+ 
+     if constexpr (requires { buffer.Mapped(); }) {
+@@ -4722,6 +4928,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+                 WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
+                                       mapped.data() + copy.src_offset, copy.size);
+             }
++            EndLandingStats(VideoCore::LandingPort::Site::Sync);
+             return;
+         }
+     }
+@@ -4767,6 +4974,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+             const u8* copy_mapped_memory = mapped_memory + dst_offset;
+             WriteDownloadedMemory(cpu_written, copy_device_addr, copy_mapped_memory, copy.size);
+         }
++        EndLandingStats(VideoCore::LandingPort::Site::Sync);
+     } else {
+         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
+         begin_landing();
+@@ -4775,6 +4983,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
+             WriteDownloadedMemory(cpu_written, copy_device_addr, immediate_buffer.data(), copy.size);
+         }
++        EndLandingStats(VideoCore::LandingPort::Site::Sync);
+     }
+ }
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -49,6 +49,7 @@
+ #include "video_core/nx2_async_readback.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/rasterizer_download_area.h"
++#include "video_core/nx2_download_landing.h"
+ #include "video_core/surface.h"
+ #include "video_core/texture_cache/types.h"
+ 
+@@ -877,10 +878,38 @@ private:
+     /// to v1.219.020 left writing everything: empty unless DownloadGuards is 1 or more.
+     [[nodiscard]] Common::RangeSet<DAddr> GuardedCpuWriteRanges();
+ 
+-    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
++    /// What those two sites look at: EDEN_UP_FRITCHII_DOWNLOAD_LANDING, every collected write
++    /// (CollectedCpuWriteRanges, as Frizti/Fritchii 8f09b0fd90 always looks); without it
++    /// GuardedCpuWriteRanges.
++    [[nodiscard]] Common::RangeSet<DAddr> LandingCpuWriteRanges();
++
++    /// What the other synchronous downloads look at: EDEN_UP_FRITCHII_DOWNLOAD_LANDING, every
++    /// collected write; without it PendingCpuWriteRanges.
++    [[nodiscard]] Common::RangeSet<DAddr> LandingLookRanges();
++
++    /// EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS (no-op without it): called after a download's
++    /// look, right before it writes guest memory. `full_look`: the look holds every collected CPU
++    /// write. Otherwise notes the writes collected now (landing_stats_seen), for
++    /// WriteDownloadedMemory and EndLandingStats to tell lost bytes from raced ones.
++    void NoteLandingLook(bool full_look);
++
++    /// Writes downloaded bytes to guest memory, except over `cpu_written`. With a
++    /// VideoCore::DownloadLanding (LandingPort::Active), callers take `cpu_written` inside one over
++    /// the bytes and write in it: the CPU writes collected after it store their bytes once the
++    /// landing has ended.
+     void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
+                                const u8* data, u64 size);
+ 
++    /// EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS (no-op without it): the download whose
++    /// WriteDownloadedMemory calls noted their bytes since the last call wrote guest memory at
++    /// `site`. Counts it, what it kept off, the bytes it wrote over a guest CPU write collected
++    /// before it wrote (lost) and under one collected since and still collected now (raced).
++    void EndLandingStats(VideoCore::LandingPort::Site site);
++
++    /// EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: the bytes of [device_addr, device_addr + size)
++    /// whose fence download has not landed (GPU-modified for one, committed, or not popped yet).
++    [[nodiscard]] u64 NotLandedBytes(DAddr device_addr, u64 size);
++
+     bool InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
+                                     std::span<const u8> inlined_buffer);
+ 
+@@ -1110,6 +1139,15 @@ private:
+     };
+     OverwriteSummary overwrite_summary{};
+     PendingCpuWrites pending_cpu_writes;
++    /// EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: what the current download's WriteDownloadedMemory
++    /// calls wrote, brought and kept off, until EndLandingStats. Empty without it.
++    Common::RangeSet<DAddr> landing_stats_written;
++    /// EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: the CPU writes collected at the current download's
++    /// look when it did not keep them all off (NoteLandingLook), and the bytes written over them.
++    Common::RangeSet<DAddr> landing_stats_seen;
++    Common::RangeSet<DAddr> landing_stats_lost;
++    u64 landing_stats_bytes{};
++    u64 landing_stats_kept{};
+     std::optional<Async_Buffer> current_buffer;
+ 
+     /// EDEN_UP_L1028_VERIFY: what a synchronous flush of the read would have copied, copied again
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -45,6 +45,7 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_async_readback.h"
++#include "video_core/nx2_download_landing.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/rasterizer_download_area.h"
+ #include "video_core/renderer_base.h"
+@@ -185,10 +186,13 @@ struct GPU::Impl {
+     /// Gathers the collected guest writes and applies them. EDEN_UP_L1028_ASYNC_READBACK
+     /// (zortos293/Lichii #1028): they stay pending (ForEachPendingCpuWrite) until applied, so a
+     /// read download written to guest memory meanwhile, on another thread or by the apply itself
+-    /// (BufferCache::ClearDownload), keeps their bytes. Off: as before.
++    /// (BufferCache::ClearDownload), keeps their bytes. EDEN_UP_FRITCHII_DOWNLOAD_LANDING: the
++    /// same for every download's look (a fence download popped between this gather and the
++    /// apply's ClaimCpuWrites would not see these writes and land over them). Off (both): as
++    /// before.
+     void GatherAndApply(std::vector<std::pair<DAddr, u64>>& writes,
+                         std::function<void(PAddr, size_t)>& callback_writes) {
+-        if (!VideoCore::AsyncReadback::Enabled()) {
++        if (!VideoCore::LandingPort::Active()) {
+             system.GatherGPUDirtyMemory(callback_writes);
+             if (!writes.empty()) {
+                 renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+@@ -259,8 +263,9 @@ struct GPU::Impl {
+         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+             manager.ForEachPending(callback);
+         }
+-        // EDEN_UP_L1028_ASYNC_READBACK: the gathered writes being applied (GatherAndApply).
+-        if (VideoCore::AsyncReadback::Enabled()) {
++        // EDEN_UP_L1028_ASYNC_READBACK or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: the gathered writes
++        // being applied (GatherAndApply).
++        if (VideoCore::LandingPort::Active()) {
+             std::scoped_lock lock{applying_writes_mutex};
+             for (const auto* writes : applying_writes) {
+                 for (const auto& [address, size] : *writes) {
+@@ -617,8 +622,8 @@ struct GPU::Impl {
+     std::mutex sync_request_mutex;
+     std::condition_variable sync_request_cv;
+ 
+-    /// EDEN_UP_L1028_ASYNC_READBACK: the writes GatherAndApply gathered and is applying, on each
+-    /// thread doing so.
++    /// EDEN_UP_L1028_ASYNC_READBACK or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: the writes
++    /// GatherAndApply gathered and is applying, on each thread doing so.
+     std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
+     std::mutex applying_writes_mutex;
+ 
+diff --git a/src/video_core/nx2_download_landing.h b/src/video_core/nx2_download_landing.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/nx2_download_landing.h
+@@ -0,0 +1,179 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstdlib>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "video_core/nx2_async_readback.h"
++#include "video_core/rasterizer_download_area.h"
++
++// Port of Frizti/Fritchii 8f09b0fd90 (Frizti; "core, video_core: let guest writes wait for a
++// download landing under them", itself a port of zortos293/Lichii #805 4942eb8a39 by jpkto).
++// T85 has that commit's protocol already (0486, Lichii #1028's df0b5f6bde), but only inside
++// EDEN_UP_L1028_ASYNC_READBACK. Off unless exactly "1" (Common::PeSwitch, read once):
++// - EDEN_UP_FRITCHII_DOWNLOAD_LANDING: the same protocol without the async read-back: every buffer
++//   cache download writes guest memory inside a VideoCore::DownloadLanding and looks at the
++//   collected guest CPU writes inside it, after any host GPU wait; a guest CPU write collected in a
++//   landing's range stores its bytes once it ended (core/memory.cpp); writes being applied stay
++//   pending (GPU::GatherAndApply). Fritchii's own parts: a fence's downloads land per copy (copies
++//   within a page of each other together) instead of in one landing over their hull, and every
++//   look keeps every collected guest CPU write, whatever EDEN_NX2_DOWNLOAD_GUARDS says (Fritchii
++//   has no such switch; without this one the looks find nothing at 0, play env v2.4's level).
++//   The looks keep whole 64-byte blocks: GPU bytes sharing a block with a newer guest write are
++//   not written.
++// - EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: one line every 10 s, no behaviour change (give it to
++//   the control arm too): what the buffer cache's downloads did to guest memory and what the guest
++//   did to them before they landed. Late: a download came after a newer guest CPU write: kept off
++//   by its look, lost (written over one collected before the download wrote) or raced (written
++//   under one collected since). Early: the guest looked up an area, or wrote over bytes, whose
++//   fence download had not landed yet. Without either landing switch, writes gathered and not yet
++//   applied are not seen (GPU::ForEachPendingCpuWrite): lost and raced are lower there.
++namespace VideoCore::LandingPort {
++
++/// EDEN_UP_FRITCHII_DOWNLOAD_LANDING=1
++[[nodiscard]] inline bool Enabled() {
++    static const bool on = [] {
++        const bool value = Common::PeSwitch("EDEN_UP_FRITCHII_DOWNLOAD_LANDING");
++        if (value) {
++            const char* const guards = std::getenv("EDEN_NX2_DOWNLOAD_GUARDS");
++            LOG_INFO(HW_GPU,
++                     "EDEN_UP_FRITCHII_DOWNLOAD_LANDING=1: buffer downloads land inside a "
++                     "DownloadLanding (fence downloads per copy group) and keep every collected "
++                     "guest CPU write, whatever EDEN_NX2_DOWNLOAD_GUARDS (={}) says; guest CPU "
++                     "writes collected under a landing wait for it",
++                     guards != nullptr ? guards : "unset");
++        }
++        return value;
++    }();
++    return on;
++}
++
++/// Downloads land inside a DownloadLanding and guest CPU writes await it: with this port's switch
++/// or with EDEN_UP_L1028_ASYNC_READBACK (which has the protocol since 0486).
++[[nodiscard]] inline bool Active() {
++    static const bool on = Enabled() || AsyncReadback::Enabled();
++    return on;
++}
++
++/// EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS=1
++[[nodiscard]] inline bool StatsEnabled() {
++    static const bool on = Common::PeSwitch("EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS");
++    return on;
++}
++
++/// Where a buffer cache download wrote guest memory.
++enum class Site : u8 {
++    Fence, ///< PopAsyncBuffers: a fence's downloads, on the fencing thread
++    Sync,  ///< DownloadBufferMemory, DownloadBuffersMemory, DownloadRangesMemory, pieces
++    Read,  ///< EDEN_UP_L1028_ASYNC_READBACK's read downloads (WriteReadDownloads)
++    Count,
++};
++
++/// Totals for the 10 s line, from every thread (the buffer cache's under its lock).
++struct Counters {
++    /// Download calls that wrote guest memory, and the bytes they brought
++    std::array<std::atomic<u64>, static_cast<size_t>(Site::Count)> landings{};
++    std::array<std::atomic<u64>, static_cast<size_t>(Site::Count)> bytes{};
++    /// EDEN_UP_FRITCHII_DOWNLOAD_LANDING: the per copy group landings PopAsyncBuffers made
++    std::atomic<u64> fence_groups{};
++    /// Late, kept off: downloads whose look (or EDEN_UP_HELD_VS_DOWNLOAD) kept bytes of a newer
++    /// guest CPU write out of their write, and those bytes
++    std::atomic<u64> kept_landings{};
++    std::atomic<u64> kept_bytes{};
++    /// Late, lost: downloads that wrote over a guest CPU write collected before they wrote (their
++    /// look was empty or guarded), and those bytes: the guest's bytes were replaced by older ones
++    std::atomic<u64> lost_landings{};
++    std::atomic<u64> lost_bytes{};
++    /// Late, raced: downloads that wrote under a guest CPU write collected after they looked and
++    /// still collected when they ended, and those bytes. In a landing's range such a write waited;
++    /// without one its bytes are lost if stored before the download's. An upper bound: writes
++    /// collected after the download wrote count too.
++    std::atomic<u64> raced_landings{};
++    std::atomic<u64> raced_bytes{};
++    /// Early, a lower bound: Preflushable area lookups (GetFlushArea) answered from guest memory
++    /// while a fence download of their bytes had not landed, and those bytes. Reads inside an area
++    /// the core keeps do not look it up again.
++    std::atomic<u64> early_reads{};
++    std::atomic<u64> early_read_bytes{};
++    /// Early: guest CPU writes applied (ClaimCpuWrites) over bytes whose fence download had not
++    /// landed, and the bytes of fence downloads they dropped
++    std::atomic<u64> early_writes{};
++    std::atomic<u64> dropped_bytes{};
++    /// DownloadLanding's totals at the last line
++    std::atomic<u64> waits_reported{};
++    std::atomic<u64> wait_ns_reported{};
++    std::atomic<u64> window_start{};
++};
++
++inline Counters g_counters;
++
++inline void Add(std::atomic<u64>& counter, u64 amount) {
++    counter.fetch_add(amount, std::memory_order_relaxed);
++}
++
++/// Logs the totals every 10 s and resets them, on whichever thread counts first after that.
++/// `guards`: the buffer cache's EDEN_NX2_DOWNLOAD_GUARDS level (below 0: unset).
++inline void MaybeReport(int guards) {
++    auto& c = g_counters;
++    const u64 now = AsyncReadback::Now();
++    u64 start = c.window_start.load(std::memory_order_relaxed);
++    if (start == 0) {
++        c.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
++        return;
++    }
++    if (now - start < 10'000'000'000ULL ||
++        !c.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
++        return;
++    }
++    const auto take = [](std::atomic<u64>& counter) {
++        return counter.exchange(0, std::memory_order_relaxed);
++    };
++    const auto kib = [](u64 bytes) { return static_cast<double>(bytes) / 1024.0; };
++    constexpr auto fence = static_cast<size_t>(Site::Fence);
++    constexpr auto sync = static_cast<size_t>(Site::Sync);
++    constexpr auto read = static_cast<size_t>(Site::Read);
++    const u64 fence_landings = take(c.landings[fence]);
++    const u64 sync_landings = take(c.landings[sync]);
++    const u64 read_landings = take(c.landings[read]);
++    const u64 landed_bytes = take(c.bytes[fence]) + take(c.bytes[sync]) + take(c.bytes[read]);
++    const u64 fence_groups = take(c.fence_groups);
++    const u64 kept_landings = take(c.kept_landings);
++    const u64 kept_bytes = take(c.kept_bytes);
++    const u64 lost_landings = take(c.lost_landings);
++    const u64 lost_bytes = take(c.lost_bytes);
++    const u64 raced_landings = take(c.raced_landings);
++    const u64 raced_bytes = take(c.raced_bytes);
++    const u64 early_reads = take(c.early_reads);
++    const u64 early_read_bytes = take(c.early_read_bytes);
++    const u64 early_writes = take(c.early_writes);
++    const u64 dropped_bytes = take(c.dropped_bytes);
++    const u64 waits_total = DownloadLanding::Waits();
++    const u64 wait_ns_total = DownloadLanding::WaitNs();
++    const u64 waits =
++        waits_total - c.waits_reported.exchange(waits_total, std::memory_order_relaxed);
++    const u64 wait_ns =
++        wait_ns_total - c.wait_ns_reported.exchange(wait_ns_total, std::memory_order_relaxed);
++    LOG_INFO(HW_GPU,
++             "Download landing ({:.1f} s; landing {}, L1028 {}, guards {}): landed {} fence "
++             "downloads ({} copy group landings), {} synchronous, {} read downloads, {:.1f} KiB "
++             "| late, kept off a newer guest CPU write: {} downloads, {:.1f} KiB skipped | late, "
++             "lost, written over a guest CPU write collected before: {} downloads, {:.1f} KiB | "
++             "late, raced, written under one collected since (upper bound): {} downloads, {:.1f} "
++             "KiB | guest CPU writes held by a landing: {}, {:.2f} ms | early (lower bound): {} "
++             "area lookups of bytes whose fence download had not landed ({:.1f} KiB), {} guest "
++             "CPU writes over such bytes ({:.1f} KiB of fence downloads dropped)",
++             static_cast<double>(now - start) / 1e9, Enabled() ? "on" : "off",
++             AsyncReadback::Enabled() ? "on" : "off", guards, fence_landings, fence_groups,
++             sync_landings, read_landings, kib(landed_bytes), kept_landings, kib(kept_bytes),
++             lost_landings, kib(lost_bytes), raced_landings, kib(raced_bytes), waits,
++             static_cast<double>(wait_ns) / 1e6, early_reads, kib(early_read_bytes), early_writes,
++             kib(dropped_bytes));
++}
++
++} // namespace VideoCore::LandingPort
+diff --git a/src/video_core/rasterizer_download_area.h b/src/video_core/rasterizer_download_area.h
+--- a/src/video_core/rasterizer_download_area.h
++++ b/src/video_core/rasterizer_download_area.h
+@@ -4,9 +4,11 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <thread>
+ 
+ #include "common/common_types.h"
++#include "common/pe_switch.h"
+ 
+ namespace VideoCore {
+ 
+@@ -44,16 +46,19 @@ struct DownloadLandingState {
+     std::atomic<DAddr> begin{};
+     std::atomic<DAddr> end{};
+     std::atomic<u64> waits{};
++    /// EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS only: the time those writes waited.
++    std::atomic<u64> wait_ns{};
+ };
+ 
+-/// EDEN_UP_L1028_ASYNC_READBACK: the buffer cache writing downloaded GPU bytes to guest memory
++/// EDEN_UP_L1028_ASYNC_READBACK or EDEN_UP_FRITCHII_DOWNLOAD_LANDING (LandingPort::Active in
++/// nx2_download_landing.h): the buffer cache writing downloaded GPU bytes to guest memory
+ /// [begin, end). A download keeps the bytes of the guest CPU writes collected and not yet applied
+ /// when it looks at them (BufferCache::PendingCpuWriteRanges). A guest core collects a write
+ /// (Core::GPUDirtyMemoryManager::Collect) and stores its bytes right after, without the buffer
+ /// cache's lock: a write collected after the download looked had its bytes written over with the
+ /// GPU's older ones. Downloads look only inside a landing, and a write collected in the landing's
+ /// range stores its bytes once the landing has ended (Await, from Core::Memory's
+-/// HandleRasterizerWrite, only with the switch).
++/// HandleRasterizerWrite, only with either switch).
+ ///
+ /// Each side fences between its store (the landing, the collected write) and its load (the
+ /// collected writes, the landing): either the download finds the write, or the write finds the
+@@ -87,6 +92,11 @@ public:
+         return state.waits.load(std::memory_order_relaxed);
+     }
+ 
++    /// EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: their wait so far in ns (0 without the switch).
++    [[nodiscard]] static u64 WaitNs() noexcept {
++        return state.wait_ns.load(std::memory_order_relaxed);
++    }
++
+ private:
+     static void Wait(u64 sequence, DAddr addr, u64 size) noexcept {
+         const DAddr begin = state.begin.load(std::memory_order_relaxed);
+@@ -99,9 +109,20 @@ private:
+             return;
+         }
+         state.waits.fetch_add(1, std::memory_order_relaxed);
++        // EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS: how long the guest core waited (10 s line).
++        static const bool timed = Common::PeSwitch("EDEN_UP_FRITCHII_DOWNLOAD_LANDING_STATS");
++        const auto wait_start =
++            timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         while (state.sequence.load(std::memory_order_acquire) == sequence) {
+             std::this_thread::yield();
+         }
++        if (timed) {
++            const auto waited = std::chrono::steady_clock::now() - wait_start;
++            state.wait_ns.fetch_add(
++                static_cast<u64>(
++                    std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
++                std::memory_order_relaxed);
++        }
+     }
+ 
+     static inline DownloadLandingState state;

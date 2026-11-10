@@ -1,0 +1,159 @@
+Subject: [PATCH] EDEN_UP_AHEAD_GUARD_ALL_WRITES=1: while a guard is up, a guest write to any page the caches track is copied first; off by default
+
+T91 and T94, six door runs with EDEN_UP_AHEAD_GUARD=3 (three plain, two with 16-page granules,
+one with 64): fade in order in 6 of 6, the cut to Link's house clean in 5 of 6, speed as the
+control (17.1-18.1 fps against 17.4), but three single dark frames were left (50 ms, 70-109
+cells each); the controls have two to four longer moments a run. Wider granules did not change
+that.
+
+The guard copies the pages it guessed. A clean page the guess missed is not copied, although its
+write comes through HandleRasterizerWrite anyway (the caches trap the pages they hold clean).
+With this switch such a write copies its page first too: the copy serves the GPU thread's
+buffer reads, and with =3 the write then reaches the caches (buffer mark, inline upload, texture
+re-upload) only after the frame's fence. No extra trap; a page of this kind takes no room once
+the pool is full.
+
+---
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index cdee51d..c300aea 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -927,6 +927,12 @@ struct Memory::Impl {
+                 const bool copy = VideoCommon::AheadGuard::CopyMode();
+                 gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+                     if (!VideoCommon::AheadGuard::Guarded(address, size)) {
++                        // EDEN_UP_AHEAD_GUARD_ALL_WRITES: a page the caches track that the guard
++                        // did not guess is copied too (this write came here for their trap).
++                        if (copy && VideoCommon::AheadGuard::AllWrites()) {
++                            VideoCommon::AheadGuard::CopyOtherBeforeWrite(address, size,
++                                                                           *gpu_device_memory);
++                        }
+                         return;
+                     }
+                     if (copy && VideoCommon::AheadGuard::CopyBeforeWrite(address, size,
+diff --git a/src/video_core/ahead_guard.h b/src/video_core/ahead_guard.h
+index 8bf3ccb..54ce911 100644
+--- a/src/video_core/ahead_guard.h
++++ b/src/video_core/ahead_guard.h
+@@ -70,6 +70,8 @@
+ ///   EDEN_UP_AHEAD_GUARD_COPY_PAGES=<n> the copy pool in pages (default 2048 = 8 MiB, 64 to 16384)
+ ///   EDEN_UP_AHEAD_GUARD_GRANULE=<n>   the guard takes the whole n-page granule of each page it
+ ///                                     guessed (a power of two; default 1: the page alone)
++///   EDEN_UP_AHEAD_GUARD_ALL_WRITES=1  while a guard is up, a write to any page the caches track
++///                                     is copied first, not only to the guessed pages
+ /// Covered: buffer uploads, streamed uniform blocks, and the texture handles and storage buffer
+ /// pointers read from constant buffers at a draw (ReadGpu). Not covered: texture data and
+ /// descriptor tables the texture cache reads.
+@@ -155,6 +157,22 @@ inline u32 Granule() {
+     return pages;
+ }
+ 
++/// EDEN_UP_AHEAD_GUARD_ALL_WRITES=1 (with =2 or =3): while a guard is up, a guest write to ANY
++/// page the caches track is copied first, not only to the pages the guard guessed. Such a write
++/// comes through HandleRasterizerWrite anyway (the buffer, texture and shader caches trap the
++/// pages they hold clean), so this costs the 4 KiB copy and no trap. It covers a clean page the
++/// guess missed: its copy serves the GPU thread's reads, and with =3 the write reaches the caches
++/// (buffer mark, inline upload, texture re-upload) only after the fence. T91/T94, six door runs
++/// with =3: three single dark frames were left (the control has two to four longer moments a
++/// run). A page of this kind takes no room once the pool is full: it is left as before.
++inline bool AllWrites() {
++    static const bool on = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_ALL_WRITES");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return on;
++}
++
+ inline u32 CopyCapacity() {
+     static const u32 pages = [] {
+         const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_COPY_PAGES");
+@@ -223,6 +241,7 @@ struct State {
+         std::array<Thread, 6> threads{}; ///< the first six guest threads that waited
+         u32 other_thread_holds{};
+         u64 copies{}, copy_reads{}, copy_read_bytes{}, value_reads{};
++        u64 other_copies{}, other_skipped{};
+         u32 most_copies{}, pool_full{};
+         u64 armed_new_pages{}, armed_unguarded_pages{};
+     } stats{};
+@@ -388,10 +407,11 @@ inline void LogWindowLocked(State& s, u64 present_number) {
+                  "EDEN_UP_AHEAD_GUARD copies: {} pages copied before a write ({} a guard, most "
+                  "{} of {}), the pool was full {} times; {} GPU thread reads took {} KiB from "
+                  "copies, and {} handle or pointer reads; of {} pages first read with a guard "
+-                 "up, {} were not in it",
++                 "up, {} were not in it; {} pages outside the guard copied before a write ({} "
++                 "left for a full pool)",
+                  st.copies, st.copies / arms, st.most_copies, CopyCapacity(), st.pool_full,
+                  st.copy_reads, st.copy_read_bytes >> 10, st.value_reads, st.armed_new_pages,
+-                 st.armed_unguarded_pages);
++                 st.armed_unguarded_pages, st.other_copies, st.other_skipped);
+     }
+     st = {};
+ }
+@@ -590,6 +610,67 @@ bool CopyBeforeWrite(u64 device_addr, u64 size, DeviceMemory& device_memory) {
+     return true;
+ }
+ 
++/// EDEN_UP_AHEAD_GUARD_ALL_WRITES: a guest thread is about to write pages the caches track that
++/// the guard did not guess. Each page without a copy gets one (while the pool has room); nothing
++/// else changes for it: the cache that tracks the page still collects the write.
++template <class DeviceMemory>
++void CopyOtherBeforeWrite(u64 device_addr, u64 size, DeviceMemory& device_memory) {
++    constexpr u64 limit = u64{1} << AddressBits;
++    if (size == 0 || device_addr >= limit) {
++        return;
++    }
++    State& s = Get();
++    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    bool wanted = false;
++    for (u64 page = device_addr >> PageBits; page <= last && !wanted; ++page) {
++        const u64 bit = u64{1} << (page % 64);
++        wanted = ((s.copied[page / 64].load(std::memory_order_relaxed) |
++                   s.guarded[page / 64].load(std::memory_order_relaxed)) &
++                  bit) == 0;
++    }
++    if (!wanted) {
++        return;
++    }
++    std::scoped_lock lk{s.mutex};
++    if (!s.active.load(std::memory_order_relaxed)) {
++        return;
++    }
++    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++        const u64 bit = u64{1} << (page % 64);
++        if (((s.copied[page / 64].load(std::memory_order_relaxed) |
++              s.guarded[page / 64].load(std::memory_order_relaxed)) &
++             bit) != 0) {
++            continue;
++        }
++        const u32 capacity = CopyCapacity();
++        if (s.copies_used == capacity) {
++            ++s.stats.other_skipped;
++            return;
++        }
++        if (!s.copy_bytes) {
++            s.copy_bytes.reset(new u8[u64{capacity} * PageSize]);
++            s.copy_page.assign(capacity, 0U);
++            size_t index_size = 256;
++            while (index_size < size_t{capacity} * 2) {
++                index_size *= 2;
++            }
++            s.copy_index.assign(index_size, 0U);
++        }
++        const u32 slot = s.copies_used++;
++        device_memory.ReadBlockUnsafe(page << PageBits, s.copy_bytes.get() + u64{slot} * PageSize,
++                                      PageSize);
++        s.copy_page[slot] = static_cast<u32>(page);
++        const size_t mask = s.copy_index.size() - 1;
++        size_t at = (page * 0x9E3779B97F4A7C15ULL >> 40) & mask;
++        while (s.copy_index[at] != 0) {
++            at = (at + 1) & mask;
++        }
++        s.copy_index[at] = slot + 1;
++        s.copied[page / 64].fetch_or(bit, std::memory_order_release);
++        ++s.stats.other_copies;
++    }
++}
++
+ /// Copy mode: the GPU thread's read of guest memory for a buffer. Bytes of a page copied for the
+ /// frame in flight come from its copy, the rest through `live(address, out, size)`. Under the
+ /// guard's lock, which a guest thread's CopyBeforeWrite takes before its write goes on: a read

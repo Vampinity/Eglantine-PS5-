@@ -1,0 +1,1120 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_ASYNC_TRANSLATION=1: new native graphics pipelines are translated on VkPipelineTranslator threads, the draw waits up to 2 ms (4 ms per frame) and is then skipped until a later draw adopts the pipeline (Djihads80/Eglantine 0f1ae99); off by default
+
+Port of Djihads80/Eglantine 0f1ae99 (branch fix/oot-map-change, based on Wael3rd/Eglantine-MKW
+6d8f95f08e and 9a876a744e): "OoT cold-cache boot and walk: ~3.4 s of GPU-thread pipeline time
+before, ~0.9 s after". A new graphics pipeline is translated (lowered code -> IR -> SPIR-V) on the
+GPU thread before its draw; at a first visit that is the GPU thread's time, frame by frame. It
+helps where pipelines are really new: cold caches, places the prep list misses, mesh pipelines.
+It is not expected to help the door hitch in the play env (see Falsify).
+
+With EDEN_UP_ASYNC_TRANSLATION=1 (Common::PeSwitch, exactly "1"):
+- CreateGraphicsPipeline() builds the environments on the GPU thread as now and tries the kept
+  translation first (EDEN_UP_SHADER_PREP, unchanged: fast, on the GPU thread). Only without one,
+  and only when every stage is a lowered native program and the draw may be skipped (depth on or
+  more than 6 elements, BuiltPipeline's test), the environments are copied and detached from the
+  3D engine (GraphicsEnvironment::Detach) and the translation is queued on VkPipelineTranslator
+  threads. The GPU thread waits up to EDEN_UP_ASYNC_TRANSLATION_WAIT_MS (default 2) per pipeline
+  and EDEN_UP_ASYNC_TRANSLATION_FRAME_MS (default 4) per frame, and not at all behind a backlog
+  (more pending than threads). Ready in time: the pipeline goes on like a kept one (disk cache
+  entry, runtime report). Not ready: the draw is skipped; the next slow-path lookup adopts finished
+  translations into graphics_cache, marks them used (so the eviction pass, every 600 frames past
+  frame 9000, does not take one as unused before its first draw) and writes them to the disk
+  cache. Compute pipelines, Switch 1 programs and programs not lowered yet stay on the GPU thread.
+- A draw that can't be skipped never waits behind the queue: if its key is queued and no worker
+  has started the job, the GPU thread takes it back (a claim flag per job, set once by whoever
+  translates it) and translates it as without the switch; the worker that reaches the job drops
+  it. Only a job a worker has already started is waited for whole (HangSite "waiting for a
+  pipeline translation").
+- Cap: at most 4 jobs per thread pending, and at most EDEN_UP_ASYNC_TRANSLATION_PENDING_MIB
+  (default 16, 1 to 1024) of copied constant buffers held by queued jobs (checked before a job's
+  copies are made, so at most one job, under 7 MiB, goes past it). Over the cap a new pipeline is
+  not copied or queued and its draw is skipped; its key is remembered, so its later draws are
+  skipped without building environments again until there is room, when it is made from the
+  start (or at once on the GPU thread for a draw that can't be skipped).
+- Out of memory: everything queueing needs (job node, environment copies, constant buffer
+  copies, the pending entry, the queued task) is made in one block before the job is queued. A
+  std::bad_alloc there leaves nothing queued or pending, and the pipeline is translated on the
+  GPU thread as without the switch, under its existing guard ("dropped" log, the session goes
+  on); EDEN_NX2_BAD_ALLOC_ENDS=1 still ends the session. The disk cache entry is written from the
+  job's own node, moved to the writer whole (no copy of the environments on the GPU thread); a
+  writer queue without memory leaves that pipeline out of the disk cache, as the writer does.
+- Threads: EDEN_UP_ASYNC_TRANSLATION_THREADS=<n> (1 to the builder count), default half the
+  builders, at least 1, at most 4 (upstream: half, no cap; each translation holds its shader pools
+  and copied constant buffers, and each thread its own heap arena). Background placement, i.e. the
+  builders' low priority; the take-back above keeps that off the GPU thread's critical path.
+- Not tied to the asynchronous shaders setting (upstream requires it; off on the PS5, rejected in
+  t77-s). Only translation is skipped over: once adopted, a pipeline whose driver build is not done
+  is waited for as before, by the scheduler worker in ConfigureDraw, not the GPU thread.
+
+Detach (shader_environment.*): enabled constant buffers are copied whole with ReadWordsUnsafe
+(reads as Read<u32> does: no flush, Switch 2 syncpoint shim included) at the moment the GPU thread
+would have read them; a buffer claiming more than 64 KiB is not detached (the copy could not answer
+reads past it). The texture pool is located, not copied: its descriptors are read on the worker
+through the same ReadTextureInfo with ReadBlockUnsafe (EDEN_NX2_TIC_NULL_PAST_POOL and the past-pool
+read behave as on the GPU thread; upstream reads by device address and zeroes past the pool). A pool
+the GPU wrote (IsMemoryDirty) or with a limit over 2^20 is not detached: translated on the GPU
+thread as before. The viewport flag and the HLE replacement table are copied. The copy is a
+shared_ptr, so copies of the environment don't copy the buffers, and it is freed on the worker
+right after translation. On the worker, storage pointer checks still read the GPU page table (and,
+for indirect ones, the guest word) through gpu_memory, as upstream; the native geometry check asks
+the environment (thread_local translating_detached), not the engine.
+
+Interplay checked:
+- EDEN_UP_SHADER_PREP: kept translations are tried first and are not changed; PrepareKept runs at
+  boot before any draw. Async only covers keys the kept store lacks or refuses (prep_rejected), the
+  places the prep list misses. Translations written to vulkan.bin are kept at the next boot as now.
+- 0494 (UB-056, EDEN_UP_FAST_CFG claim-once builds): the translator constructs the pipeline with
+  worker_thread = the builder workers, so the driver build (RADV's NIR compiler) is queued and
+  claimed on VkPipelineBuilder threads exactly as from the GPU thread; ConfigureDraw's BuildFirst
+  moves it to the front once the pipeline is adopted. vk_graphics_pipeline.* is not touched. The
+  job claim here is separate: it only decides who translates.
+- Heap wait (EDEN_UP_HEAP_WAIT_MS, headless/heap_arenas.inc): the translators are named
+  "VkPipelineTranslator" (heap record "VkPipelineTrans", prefix "VkPipeline"), so they may wait for
+  memory like the builders. Their RADV calls are only the checked object creations of the pipeline
+  constructor (shader modules, set and pipeline layouts, update templates, a new descriptor bank),
+  never the compiler. The GPU thread waits on them for at most the 2/4 ms budget, except a draw
+  that can't be skipped whose job a worker has already started: a translator waiting for memory
+  can hold that one for up to HEAP_WAIT_MS (the GPU thread's texture collector cannot help it
+  meanwhile). A worker never allocates after translating: its job node is made on the GPU thread
+  and handed back with a list splice.
+- Worker translation is CreateGraphicsPipeline(pools, ...), which boot already runs on several
+  builder threads at once; its shared state (descriptor banks, attributeless set, mesh allow list,
+  shader notify, Churn) is locked or atomic. The rasterizer looks the pipeline up before it takes
+  the buffer/texture cache locks, so no wait holds them.
+- 0499 (EDEN_UP_MESH_CACHE): a pipeline translated in time takes CreateGraphicsPipeline()'s own
+  tail, so its mesh report follows 0499's rule; only the disk write uses the job's copies.
+- 0501 canonical keys: graphics_key is used as the slow path has it. Ahead guard: environment
+  reads are not guarded in either path, and Detach reads when the GPU thread would.
+- tools/prepare-vulkan-port.py: every anchor and expression count it checks in vk_pipeline_cache.cpp
+  is unchanged (slow-path tail with is_new, CreateGraphicsPipeline() opening, main_pools 2,
+  TranslateProgram 3, EmitSPIRV 1+1, BuildShader 2, CFG 2+1, constructor end, destructor boundary),
+  on T88 and on T88 + the series below.
+
+Measuring: "Graphics pipeline built on the GPU thread in N ms" lines (the card's First-visit stutter
+section) keep reporting each new pipeline's GPU-thread time; with the switch that is environments +
+kept check + detach + queue + wait, also for one left translating or put off. New line every 10 s
+with activity: "EDEN_UP_ASYNC_TRANSLATION in the last 10 s: Q queued (K KiB copied, P ms preparing,
+at most N pending holding B KiB), R ready in time, S draws skipped, D not detached, C over the cap,
+M without memory; W ms waited, H whole waits (... ms), T taken back; A adopted (F failed), ... ms
+on the workers". Skipped draws also show in the rasterizer's first 64 "Draw skipped (no pipeline)"
+warnings. EDEN_PERF_COST shader_* costs now include worker time.
+
+Falsify: not on door-walk slots. The t94-a card (play env, prep and canonical keys) shows 0 new
+pipelines and 0-154 ms of GPU-thread pipeline time per run, worst frames 632-655 ms and ~3.8 s of
+texture decodes per run: translation is not the door hitch there. Test it on the cold arm
+(EDEN_UP_PIPELINE_COLD=1 with prep off): GPU-thread pipeline ms and worst frames with and without
+the switch, flashes per run (a skipped draw can show as a missing object for a few frames), and
+the 10 s line's over the cap, taken back and peak pending KiB. If peak pending sits at the cap
+for long, retry with EDEN_UP_ASYNC_TRANSLATION_PENDING_MIB=32; if memory is tight, with
+EDEN_UP_ASYNC_TRANSLATION_THREADS=2. Places the prep list misses and mesh pipelines (one mesh
+build took 65.9 ms in run783) are the other cases it can help.
+
+Unset or anything but "1": translation_workers stays null; the slow path, CreateGraphicsPipeline(),
+the destructor and the geometry check take the old branches (translation_reported stays false, so
+ReportNewPipelineKey runs as before; the tail's job list is empty, so the disk cache entry is
+written as before); GraphicsEnvironment's detached flag is never set, so every read goes to the
+engine as before; ReadTextureInfo flushes as before (its new parameter defaults to false). No cache
+key, file format or serialization change.
+
+Not ported: upstream's TakeBackgroundPipeline path (ours has no background pipelines) and its
+ShaderCache::device_memory move (descriptors are read by GPU address here).
+
+Checked: git apply --check clean on the T88 core, and on T88 + 0493, 0494, 0495,
+0498, 0499, 0500, 0501, 0503 (0496, 0497 and 0502 need files the T88 core copy lacks and touch
+none of these files); applied before or after those, both orders give the same tree. Not
+compiled, not run.
+
+Rebased onto T98 (0505-0507 and, for the later two, the drafts before it) with patch -F3; no hunk rejected.
+
+---
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 63068dd..0b1f335 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -504,6 +504,55 @@ void FreeIr(ShaderPools& pools, std::span<Shader::IR::Program> programs, IrFree
+     }
+ }
+ 
++// EDEN_UP_ASYNC_TRANSLATION: true on a VkPipelineTranslator thread while it translates a detached
++// pipeline (PipelineCache::TranslateGraphicsPipeline), where the GPU thread's engine is not read.
++thread_local bool translating_detached = false;
++
++// EDEN_UP_ASYNC_TRANSLATION_WAIT_MS / _FRAME_MS: how long the GPU thread waits for a queued
++// translation before it skips the draw, per pipeline and in total per frame. Unset or not a
++// number: the default; 0 or less: never waits.
++std::chrono::microseconds TranslationWaitFromEnv(const char* name, double default_ms) {
++    const char* const value = std::getenv(name);
++    double ms = default_ms;
++    if (value != nullptr) {
++        char* end = nullptr;
++        const double parsed = std::strtod(value, &end);
++        if (end != value) {
++            ms = parsed;
++        }
++    }
++    return std::chrono::microseconds{ms > 0.0 ? static_cast<s64>(ms * 1000.0) : 0};
++}
++
++// EDEN_UP_ASYNC_TRANSLATION_THREADS=<n>: that many translator threads, at most one per builder.
++// Unset, 0 or not a number: half the builders, at least 1 and at most 4 (each translation holds
++// its shader pools and the copied constant buffers while it runs).
++size_t TranslationThreads(size_t builders) {
++    if (const char* const value = std::getenv("EDEN_UP_ASYNC_TRANSLATION_THREADS");
++        value != nullptr) {
++        const size_t asked = static_cast<size_t>(std::strtoul(value, nullptr, 10));
++        if (asked != 0) {
++            return std::min(asked, std::max<size_t>(builders, 1));
++        }
++    }
++    return std::clamp<size_t>(builders / 2, 1, 4);
++}
++
++// EDEN_UP_ASYNC_TRANSLATION_PENDING_MIB=<n> (1 to 1024): the constant buffer copies the queued
++// translations may hold together; past it, new pipelines are not queued (TranslationQueueFull).
++// Unset, 0 or not a number: 16.
++size_t TranslationPendingBytes() {
++    size_t mib = 16;
++    if (const char* const value = std::getenv("EDEN_UP_ASYNC_TRANSLATION_PENDING_MIB");
++        value != nullptr) {
++        const size_t asked = static_cast<size_t>(std::strtoul(value, nullptr, 10));
++        if (asked != 0) {
++            mib = std::min<size_t>(asked, 1024);
++        }
++    }
++    return mib << 20;
++}
++
+ } // Anonymous namespace
+ 
+ size_t ComputePipelineCacheKey::Hash() const noexcept {
+@@ -573,6 +622,36 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+       serialization_thread(1, "VkPipelineSerialization", {},
+                            Common::ThreadPlacement::Background) {
++    // EDEN_UP_ASYNC_TRANSLATION=1 (exactly "1"): new native graphics pipelines are translated on
++    // worker threads (TranslateOnWorker). Unset: translation_workers stays null and none of it
++    // runs. The threads are "VkPipeline..." by name, so the heap lets them wait for memory
++    // (EDEN_UP_HEAP_WAIT_MS, headless/heap_arenas.inc) as it lets the builders, and they run at
++    // the builders' low priority: a draw that can't be skipped never waits behind their queue,
++    // it takes a job no worker has started back (TranslatedInTime).
++    if (Common::PeSwitch("EDEN_UP_ASYNC_TRANSLATION")) {
++        if (device.HasBrokenParallelShaderCompiling()) {
++            LOG_WARNING(Render_Vulkan, "EDEN_UP_ASYNC_TRANSLATION=1 ignored: the driver cannot "
++                                       "build pipelines in parallel");
++        } else {
++            num_translation_threads = TranslationThreads(GetTotalPipelineWorkers());
++            translation_wait = TranslationWaitFromEnv("EDEN_UP_ASYNC_TRANSLATION_WAIT_MS", 2.0);
++            translation_frame_budget =
++                TranslationWaitFromEnv("EDEN_UP_ASYNC_TRANSLATION_FRAME_MS", 4.0);
++            translation_frame_left = translation_frame_budget;
++            max_pending_translations = 4 * num_translation_threads;
++            translation_pending_cap = TranslationPendingBytes();
++            translation_workers = std::unique_ptr<Common::ThreadWorker>(new Common::ThreadWorker(
++                num_translation_threads, "VkPipelineTranslator", {},
++                Common::ThreadPlacement::Background));
++            LOG_INFO(Render_Vulkan,
++                     "EDEN_UP_ASYNC_TRANSLATION=1: new native graphics pipelines translate on {} "
++                     "VkPipelineTranslator threads (wait {:.1f} ms per pipeline, {:.1f} ms per "
++                     "frame; at most {} pending, {} MiB of copies)",
++                     num_translation_threads, translation_wait.count() / 1000.0,
++                     translation_frame_budget.count() / 1000.0, max_pending_translations,
++                     translation_pending_cap >> 20);
++        }
++    }
+     const auto& float_control{device.FloatControlProperties()};
+     const VkDriverId driver_id{device.GetDriverID()};
+     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
+@@ -1031,6 +1110,11 @@ PipelineCache::~PipelineCache() {
+     serialization_thread.WaitForRequests();
+     SaveUsedPipelines();
+     static const bool skip_unchanged = Common::PeSwitch("EDEN_PE_PIPELINE_CACHE_EXIT");
++    // EDEN_UP_ASYNC_TRANSLATION (null otherwise): the translators end here, while every member
++    // their translations use is alive; queued ones are dropped, a running one finishes. What they
++    // finished stays in translated_graphics, destroyed after the builder workers its driver
++    // builds may be queued on.
++    translation_workers.reset();
+     bool unchanged = false;
+     if (skip_unchanged && vulkan_pipeline_cache) {
+         // Unchanged only if a write succeeded, every pipeline counted since was in a write that
+@@ -2124,11 +2208,28 @@ void ReportNewPipelineKey(const GraphicsPipelineCacheKey& key) {
+ } // Anonymous namespace
+ 
+ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
++    // EDEN_UP_ASYNC_TRANSLATION=1 (translation_workers is null otherwise): what the translators
++    // finished joins graphics_cache, and a draw whose pipeline still translates is skipped.
++    if (translation_workers && !TranslatedInTime()) {
++        return nullptr;
++    }
++    // EDEN_UP_ASYNC_TRANSLATION: true only for a key TranslatedInTime let through that was
++    // reported when it was first queued or put off (false with the switch off).
++    const bool reported{std::exchange(translation_reported, false)};
+     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
+     auto& pipeline{pair->second};
+     if (is_new) {
+-        ReportNewPipelineKey(graphics_key);
++        if (!reported) {
++            ReportNewPipelineKey(graphics_key);
++        }
+         pipeline = CreateGraphicsPipeline();
++        if (translation_left) {
++            // EDEN_UP_ASYNC_TRANSLATION: left translating on a worker (a later draw adopts it),
++            // or not queued over the cap (a later draw makes it).
++            translation_left = false;
++            graphics_cache.erase(graphics_key);
++            return nullptr;
++        }
+     }
+     if (!pipeline) {
+         return nullptr;
+@@ -2267,9 +2368,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         if (key.unique_hashes[index] == 0) {
+             continue;
+         }
++        // EDEN_UP_ASYNC_TRANSLATION: a translator thread asks the (detached) environment, not
++        // the engine the GPU thread keeps using.
+         if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) &&
+-            !device.IsGeometryShaderSupported() && maxwell3d != nullptr &&
+-            maxwell3d->GetNativeMacroEngine().native_turing) {
++            !device.IsGeometryShaderSupported() &&
++            (translating_detached ? envs[env_index]->IsNativeProgram()
++                                  : maxwell3d != nullptr &&
++                                        maxwell3d->GetNativeMacroEngine().native_turing)) {
+             // A native (Switch 2) geometry program on a device without geometry shaders: the
+             // pipeline cannot run it, so its draws are skipped.
+             static std::atomic<bool> logged{};
+@@ -2600,6 +2705,24 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     auto kept{CreateKeptGraphicsPipeline(environments)};
+ 
+     main_pools.ReleaseContents();
++    // EDEN_UP_ASYNC_TRANSLATION=1: without a kept translation, programs that may be translated
++    // on a worker are (TranslateOnWorker). Its pipeline, when it came within the wait, goes on
++    // below like a kept one, and its disk cache entry is written from the job's copies; null
++    // otherwise (left translating or over the cap: the draw is skipped).
++    std::list<TranslationJob> translated;
++    if (!kept && translation_workers && CanTranslateAsynchronously()) {
++        switch (TranslateOnWorker(environments, translated)) {
++        case Translation::Here:
++            break;
++        case Translation::Done:
++            kept = std::move(translated.front().pipeline);
++            break;
++        case Translation::Failed:
++        case Translation::Left:
++        case Translation::Deferred:
++            return nullptr;
++        }
++    }
+     auto pipeline{kept ? std::move(kept)
+                        : CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(),
+                                                 nullptr, true)};
+@@ -2620,6 +2743,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+         return pipeline;
+     }
+     disk_pipelines.insert(graphics_key.Hash());
++    if (!translated.empty()) {
++        // EDEN_UP_ASYNC_TRANSLATION: the copies the worker's translation asked hold its answers.
++        SerializeTranslatedGraphicsPipeline(std::move(translated), is_mesh);
++        QueueVulkanPipelineCacheFlush();
++        return pipeline;
++    }
+     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs),
+                                     is_mesh] {
+         try {
+@@ -2641,6 +2770,445 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     return pipeline;
+ }
+ 
++// EDEN_UP_ASYNC_TRANSLATION=1: new native graphics pipelines translated on worker threads. Port
++// of Djihads80/Eglantine 0f1ae99 (fix/oot-map-change; "OoT cold-cache boot and walk: ~3.4 s of
++// GPU-thread pipeline time before, ~0.9 s after"), itself based on Wael3rd/Eglantine-MKW
++// 6d8f95f08e and 9a876a744e.
++//
++// A new pipeline was translated (lowered code -> IR -> SPIR-V) on the GPU thread before its draw.
++// With the switch, CreateGraphicsPipeline() still builds the environments here (the key needs the
++// lowered code) and tries the kept translation first (EDEN_UP_SHADER_PREP, unchanged); without
++// one, the environments are detached from the 3D engine (GraphicsEnvironment::Detach) and the
++// translation is queued on translation_workers, which queue the driver build on the builder
++// workers as the GPU thread does (with EDEN_UP_FAST_CFG, claimed once). The GPU thread waits
++// within translation_wait and what is left of translation_frame_budget; a pipeline not ready by
++// then skips the draw, and a later draw adopts it (TranslatedInTime) and writes it to the disk
++// cache. Draws that can't be skipped (CanSkipDraw) translate here; one that finds its key queued
++// and not started takes the job back (TranslationJob::claimed) and translates it here too, and
++// waits only for a job a worker has started. The queue is capped (TranslationQueueFull: pending
++// jobs and their copies); over the cap a pipeline is not queued, its draws are skipped until
++// there is room (translation_deferred), and nothing is copied. Copying for the queue never ends
++// the session on a full heap: without memory the pipeline is translated here as before. Compute
++// pipelines, Switch 1 programs (their code is read from guest memory while translating) and
++// programs not lowered yet stay on the GPU thread.
++// Unlike upstream it does not need the asynchronous shaders setting (off on the PS5): only the
++// translation is skipped over. Once adopted, a pipeline whose driver build is not done is waited
++// for as before (the scheduler worker waits, the GPU thread does not).
++bool PipelineCache::CanSkipDraw() const noexcept {
++    // As BuiltPipeline decides it: depth in use, or more than a full screen quad.
++    if (maxwell3d->regs.zeta_enable) {
++        return true;
++    }
++    return maxwell3d->draw_manager.draw_state.draw_element_count > 6;
++}
++
++bool PipelineCache::CanTranslateAsynchronously() const {
++    if (!maxwell3d->GetNativeMacroEngine().native_turing || !CanSkipDraw()) {
++        return false;
++    }
++    for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
++        if (graphics_key.unique_hashes[index] != 0 &&
++            (shader_infos[index] == nullptr || !shader_infos[index]->lowered_native)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++namespace {
++// GPU thread: what the translators did, logged every 10 s when anything happened.
++struct TranslationReport {
++    using Duration = std::chrono::steady_clock::duration;
++    u32 queued{};
++    u32 not_detached{};
++    u32 over_cap{};  ///< Not queued: TranslationQueueFull
++    u32 no_memory{}; ///< Not queued: no memory for the copies, translated on the GPU thread
++    u32 ready_in_time{};
++    u32 skipped{};
++    u32 whole_waits{};
++    u32 taken_back{}; ///< Not started, translated on the GPU thread for a draw that can't skip
++    u32 adopted{};
++    u32 failed{};
++    size_t copied_bytes{};
++    size_t peak_pending{};
++    size_t peak_pending_bytes{};
++    Duration preparation{};
++    Duration waited{};
++    Duration waited_whole{};
++    Duration worker{};
++    std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
++
++    void Log() {
++        const auto now = std::chrono::steady_clock::now();
++        if (now - window < std::chrono::seconds{10}) {
++            return;
++        }
++        const auto ms = [](Duration d) {
++            return std::chrono::duration<double, std::milli>(d).count();
++        };
++        if (queued != 0 || not_detached != 0 || adopted != 0 || skipped != 0 || no_memory != 0 ||
++            taken_back != 0) {
++            LOG_INFO(Render_Vulkan,
++                     "EDEN_UP_ASYNC_TRANSLATION in the last 10 s: {} queued ({} KiB copied, "
++                     "{:.1f} ms preparing, at most {} pending holding {} KiB), {} ready in time, "
++                     "{} draws skipped, {} not detached, {} over the cap, {} without memory; "
++                     "{:.1f} ms waited, {} whole waits ({:.1f} ms), {} taken back; {} adopted "
++                     "({} failed), {:.1f} ms on the workers",
++                     queued, copied_bytes / 1024, ms(preparation), peak_pending,
++                     peak_pending_bytes / 1024, ready_in_time, skipped, not_detached, over_cap,
++                     no_memory, ms(waited), whole_waits, ms(waited_whole), taken_back, adopted,
++                     failed, ms(worker));
++        }
++        *this = TranslationReport{};
++    }
++};
++
++TranslationReport& GetTranslationReport() {
++    static TranslationReport report;
++    return report;
++}
++} // Anonymous namespace
++
++bool PipelineCache::TranslationQueueFull() const noexcept {
++    // At most one job past the byte cap: it is checked before a job's copies are made (a job
++    // copies at most 6 programs x 18 buffers x 64 KiB, under 7 MiB).
++    return translating_graphics.size() >= max_pending_translations ||
++           translation_pending_bytes.load(std::memory_order_relaxed) >= translation_pending_cap;
++}
++
++bool PipelineCache::TranslatedInTime() {
++    if (num_translated.load(std::memory_order_acquire) != 0) {
++        AdoptTranslatedGraphicsPipelines();
++    }
++    if (!translation_deferred.empty()) {
++        if (const auto deferred{translation_deferred.find(graphics_key)};
++            deferred != translation_deferred.end()) {
++            // Not queued, over the cap: skipped while the queue is full, without building its
++            // environments again. With room, or for a draw that can't be skipped, the slow path
++            // makes it from the start (kept check, then queued or translated here).
++            if (CanSkipDraw() && TranslationQueueFull()) {
++                auto& report{GetTranslationReport()};
++                ++report.skipped;
++                report.Log();
++                return false;
++            }
++            translation_deferred.erase(deferred);
++            translation_reported = true;
++        }
++    }
++    const auto pending{translating_graphics.find(graphics_key)};
++    if (pending == translating_graphics.end()) {
++        return true; // made already, or new: the slow path goes on as without the switch
++    }
++    const std::shared_future<void> done{pending->second.done};
++    if (CanSkipDraw()) {
++        if (!WaitForGraphicsTranslation(done)) {
++            return false;
++        }
++    } else if (!pending->second.claimed->exchange(true, std::memory_order_acq_rel)) {
++        // A draw that can't be skipped, and no worker has started the job: the GPU thread takes
++        // it back and translates it now (the slow path goes on as without the switch); the
++        // worker that reaches the job drops it. It does not wait behind the queue.
++        translating_graphics.erase(pending);
++        translation_reported = true;
++        auto& report{GetTranslationReport()};
++        ++report.taken_back;
++        report.Log();
++        return true;
++    } else {
++        // Started on a worker: the draw waits for that one translation.
++        Common::HangSite site{"waiting for a pipeline translation"};
++        auto& report{GetTranslationReport()};
++        const auto begin = std::chrono::steady_clock::now();
++        done.wait();
++        report.waited_whole += std::chrono::steady_clock::now() - begin;
++        ++report.whole_waits;
++    }
++    // Done: its job is in translated_graphics (handed over before the promise was kept).
++    AdoptTranslatedGraphicsPipelines();
++    return true;
++}
++
++PipelineCache::Translation PipelineCache::TranslateOnWorker(
++    const GraphicsEnvironments& environments, std::list<TranslationJob>& translated) {
++    const auto begin = std::chrono::steady_clock::now();
++    auto& report{GetTranslationReport()};
++    if (TranslationQueueFull()) {
++        // Over the cap: nothing is copied or queued, and the draw is skipped. The key waits in
++        // translation_deferred, so its later draws are skipped without building its
++        // environments again until there is room (TranslatedInTime).
++        ++report.over_cap;
++        ++report.skipped;
++        try {
++            translation_deferred.insert(graphics_key);
++        } catch (const std::bad_alloc&) {
++            // Not remembered: its next draw comes here again.
++        }
++        report.Log();
++        translation_left = true;
++        return Translation::Deferred;
++    }
++    // Everything the queue needs is made in this block, before the job is queued; without
++    // memory for it the pipeline is translated here as before (which has its own guard), and
++    // nothing is left queued or pending.
++    std::shared_future<void> done;
++    size_t copied{};
++    bool pending{};
++    try {
++        // One node, made here: the worker hands it over with a splice, which cannot fail.
++        std::list<TranslationJob> job(1);
++        TranslationJob& work{job.front()};
++        work.key = graphics_key;
++        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
++            if (graphics_key.unique_hashes[index] == 0) {
++                continue;
++            }
++            // A copy: the environments here stay attached if one of them can't be detached.
++            work.envs[index] = environments.envs[index];
++            if (!work.envs[index].Detach()) {
++                ++report.not_detached;
++                report.Log();
++                return Translation::Here;
++            }
++            work.copied_bytes += work.envs[index].SnapshotSizeBytes();
++        }
++        work.claimed = std::make_shared<std::atomic<bool>>(false);
++        std::promise<void> promise;
++        done = promise.get_future().share();
++        // Pending before it is queued (only this thread adopts or takes jobs back), so a
++        // QueueWork without memory leaves nothing behind but this entry, erased below.
++        translating_graphics.emplace(graphics_key, PendingTranslation{done, work.claimed});
++        pending = true;
++        copied = work.copied_bytes;
++        translation_pending_bytes.fetch_add(copied, std::memory_order_relaxed);
++        translation_workers->QueueWork(
++            [this, job = std::move(job), promise = std::move(promise)]() mutable {
++                TranslateGraphicsPipeline(std::move(job), std::move(promise));
++            });
++    } catch (const std::bad_alloc&) {
++        // Nothing was queued: a QueueWork that throws has destroyed the job with its copies.
++        if (pending) {
++            translating_graphics.erase(graphics_key);
++            translation_pending_bytes.fetch_sub(copied, std::memory_order_relaxed);
++        }
++        if (BadAllocEnds()) {
++            throw;
++        }
++        ++report.no_memory;
++        report.Log();
++        return Translation::Here;
++    }
++    report.peak_pending = std::max(report.peak_pending, translating_graphics.size());
++    report.peak_pending_bytes = std::max(report.peak_pending_bytes,
++                                         translation_pending_bytes.load(std::memory_order_relaxed));
++    ++report.queued;
++    report.copied_bytes += copied;
++    report.preparation += std::chrono::steady_clock::now() - begin;
++    if (!WaitForGraphicsTranslation(done)) {
++        translation_left = true;
++        return Translation::Left;
++    }
++    // Only this key's job: adopting the others would insert into graphics_cache, whose entry
++    // for this key the slow path holds across CreateGraphicsPipeline().
++    {
++        std::scoped_lock lock{translated_mutex};
++        for (auto it = translated_graphics.begin(); it != translated_graphics.end(); ++it) {
++            if (it->key == graphics_key) {
++                translated.splice(translated.end(), translated_graphics, it);
++                num_translated.fetch_sub(1, std::memory_order_relaxed);
++                break;
++            }
++        }
++    }
++    translating_graphics.erase(graphics_key);
++    if (translated.empty()) {
++        // Unreachable: the promise is kept after the hand-over.
++        LOG_ERROR(Render_Vulkan, "EDEN_UP_ASYNC_TRANSLATION: pipeline {:016x} done but missing",
++                  graphics_key.Hash());
++        return Translation::Failed;
++    }
++    // The job stays in `translated` for CreateGraphicsPipeline(): its pipeline, and the copies
++    // its disk cache entry is written from (they hold the answers the translation got; nothing
++    // is copied back here).
++    const TranslationJob& result{translated.front()};
++    ++report.adopted;
++    report.worker += result.time;
++    if (!result.pipeline) {
++        ++report.failed;
++        report.Log();
++        return Translation::Failed;
++    }
++    report.Log();
++    return Translation::Done;
++}
++
++bool PipelineCache::WaitForGraphicsTranslation(const std::shared_future<void>& done) {
++    auto& report{GetTranslationReport()};
++    if (translation_frame != frame_count) {
++        // The budget is reset at the frame's first wait.
++        translation_frame = frame_count;
++        translation_frame_left = translation_frame_budget;
++    }
++    const auto wait{std::min(translation_wait, translation_frame_left)};
++    bool ready{done.wait_for(std::chrono::seconds{0}) == std::future_status::ready};
++    // Behind a backlog, waiting would spend the budget without getting the pipeline.
++    if (!ready && wait.count() > 0 && translating_graphics.size() <= num_translation_threads) {
++        const auto begin = std::chrono::steady_clock::now();
++        ready = done.wait_for(wait) == std::future_status::ready;
++        const auto spent{std::chrono::steady_clock::now() - begin};
++        translation_frame_left -= std::min(
++            translation_frame_left, std::chrono::duration_cast<std::chrono::microseconds>(spent));
++        report.waited += spent;
++        report.ready_in_time += ready ? 1 : 0;
++    }
++    report.skipped += ready ? 0 : 1;
++    report.Log();
++    return ready;
++}
++
++void PipelineCache::TranslateGraphicsPipeline(std::list<TranslationJob> job,
++                                              std::promise<void> done) {
++    TranslationJob& work{job.front()};
++    if (work.claimed->exchange(true, std::memory_order_acq_rel)) {
++        // Taken back by the GPU thread for a draw that couldn't be skipped (TranslatedInTime),
++        // which no longer waits for it: dropped, with its copies.
++        for (auto& env : work.envs) {
++            env.ReleaseSnapshot();
++        }
++        translation_pending_bytes.fetch_sub(work.copied_bytes, std::memory_order_relaxed);
++        done.set_value();
++        return;
++    }
++    const auto begin = std::chrono::steady_clock::now();
++    translating_detached = true;
++    try {
++        ShaderPools pools;
++        std::array<Shader::Environment*, Maxwell::MaxShaderProgram> env_ptrs{};
++        size_t num_envs{};
++        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
++            if (work.key.unique_hashes[index] != 0) {
++                env_ptrs[num_envs++] = &work.envs[index];
++            }
++        }
++        // Shader errors and its own allocations are handled inside, as on the GPU thread; the
++        // driver build is queued on the builder workers, never run here.
++        work.pipeline = CreateGraphicsPipeline(
++            pools, work.key, std::span<Shader::Environment* const>(env_ptrs.data(), num_envs),
++            nullptr, true);
++    } catch (const std::bad_alloc&) {
++        // The pools': EDEN_NX2_BAD_ALLOC_ENDS=1 ends the session, as on the GPU thread.
++        translating_detached = false;
++        SurviveBadAlloc("a graphics pipeline translation");
++    } catch (const std::exception& exception) {
++        // Nothing else may end the worker thread.
++        LOG_ERROR(Render_Vulkan, "EDEN_UP_ASYNC_TRANSLATION: pipeline {:016x} failed: {}",
++                  work.key.Hash(), exception.what());
++    }
++    translating_detached = false;
++    for (auto& env : work.envs) {
++        env.ReleaseSnapshot();
++    }
++    translation_pending_bytes.fetch_sub(work.copied_bytes, std::memory_order_relaxed);
++    work.time = std::chrono::steady_clock::now() - begin;
++    {
++        std::scoped_lock lock{translated_mutex};
++        translated_graphics.splice(translated_graphics.end(), job);
++        num_translated.fetch_add(1, std::memory_order_release);
++    }
++    done.set_value();
++}
++
++void PipelineCache::AdoptTranslatedGraphicsPipelines() {
++    std::list<TranslationJob> finished;
++    {
++        std::scoped_lock lock{translated_mutex};
++        finished.splice(finished.end(), translated_graphics);
++        num_translated.store(0, std::memory_order_relaxed);
++    }
++    auto& report{GetTranslationReport()};
++    while (!finished.empty()) {
++        // One node at a time: a built job goes on, node and all, to the disk cache writer.
++        std::list<TranslationJob> one;
++        one.splice(one.end(), finished, finished.begin());
++        TranslationJob& job{one.front()};
++        translating_graphics.erase(job.key);
++        ++report.adopted;
++        report.worker += job.time;
++        const bool built{job.pipeline != nullptr};
++        const bool is_mesh{built && job.pipeline->IsMeshPipeline()};
++        report.failed += built ? 0 : 1;
++        const auto [slot, inserted]{graphics_cache.try_emplace(job.key)};
++        if (!inserted) {
++            // Unreachable: a key being translated is never made elsewhere. Its driver build may
++            // still be queued, so it is not destroyed.
++            LOG_ERROR(Render_Vulkan, "EDEN_UP_ASYNC_TRANSLATION: pipeline {:016x} made twice",
++                      job.key.Hash());
++            static_cast<void>(job.pipeline.release());
++            continue;
++        }
++        slot->second = std::move(job.pipeline);
++        if (built) {
++            // Counted as used from now: the eviction pass (EvictUnusedPipelines) must not take
++            // it as unused since frame 0 before its first draw.
++            slot->second->MarkUsed(frame_count);
++            StoreTranslatedGraphicsPipeline(std::move(one), is_mesh);
++        }
++    }
++    if (translating_graphics.empty()) {
++        // Nothing pending: keys put off over the cap that came back were made already; the
++        // others are forgotten (a later draw starts them from the beginning).
++        translation_deferred.clear();
++    }
++    report.Log();
++}
++
++void PipelineCache::StoreTranslatedGraphicsPipeline(std::list<TranslationJob> job, bool is_mesh) {
++    // As CreateGraphicsPipeline() stores a new pipeline.
++    if (pipeline_cache_filename.empty()) {
++        return;
++    }
++    const u64 hash{job.front().key.Hash()};
++    if (disk_pipelines.contains(hash)) {
++        // In the disk cache already, only not built at boot.
++        QueueVulkanPipelineCacheFlush();
++        return;
++    }
++    disk_pipelines.insert(hash);
++    SerializeTranslatedGraphicsPipeline(std::move(job), is_mesh);
++    QueueVulkanPipelineCacheFlush();
++}
++
++void PipelineCache::SerializeTranslatedGraphicsPipeline(std::list<TranslationJob> job,
++                                                        bool is_mesh) {
++    // The job's node moves to the writer whole, environments and all: nothing is copied here.
++    const u64 hash{job.front().key.Hash()};
++    try {
++        serialization_thread.QueueWork([this, job = std::move(job), is_mesh] {
++            try {
++                const TranslationJob& work{job.front()};
++                boost::container::static_vector<const GenericEnvironment*,
++                                                Maxwell::MaxShaderProgram>
++                    env_ptrs;
++                for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
++                    if (work.key.unique_hashes[index] != 0) {
++                        env_ptrs.push_back(&work.envs[index]);
++                    }
++                }
++                SerializePipeline(work.key, env_ptrs,
++                                  is_mesh ? mesh_pipeline_cache_filename : pipeline_cache_filename,
++                                  CACHE_VERSION, is_mesh);
++            } catch (const std::bad_alloc&) {
++                SurviveBadAlloc("a graphics pipeline's disk cache entry");
++            }
++        });
++    } catch (const std::bad_alloc&) {
++        // Not written: made again (and written) at the next start, as when the writer has no
++        // memory.
++        disk_pipelines.erase(hash);
++        SurviveBadAlloc("a graphics pipeline's disk cache entry");
++    }
++}
++
+ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     const ComputePipelineCacheKey& key, const ShaderInfo* shader,
+     const ComputePipeline* previous) {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 11ca8cf..e638ac2 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -12,6 +12,8 @@
+ #include <cstddef>
+ #include <deque>
+ #include <filesystem>
++#include <future>
++#include <list>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <memory>
+@@ -23,6 +25,7 @@
+ #include <type_traits>
+ #include <utility>
+ #include "common/container/unordered_map.h"
++#include "common/container/unordered_set.h"
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -286,6 +289,86 @@ private:
+ 
+     ShaderPools main_pools;
+ 
++    /// EDEN_UP_ASYNC_TRANSLATION=1 (exactly "1"): a new graphics pipeline whose programs are all
++    /// lowered native ones, without a kept translation, is translated on a VkPipelineTranslator
++    /// thread instead of the GPU thread; the draw waits a little or is skipped. GPU thread
++    /// unless said otherwise. All of it is idle with the switch off (translation_workers null).
++    struct TranslationJob {
++        GraphicsPipelineCacheKey key;
++        /// Detached from the 3D engine (GraphicsEnvironment::Detach); for the disk cache after.
++        std::array<VideoCommon::GraphicsEnvironment, Maxwell::MaxShaderProgram> envs;
++        std::unique_ptr<GraphicsPipeline> pipeline; ///< Null when the translation failed
++        std::chrono::steady_clock::duration time{}; ///< Spent on the worker
++        /// Set once, by whoever translates the job: the worker when it starts it, or the GPU
++        /// thread for a draw that can't be skipped while the job still waits in the queue. The
++        /// other side drops it. Shared with its PendingTranslation.
++        std::shared_ptr<std::atomic<bool>> claimed;
++        size_t copied_bytes{}; ///< Detach's copies, in translation_pending_bytes until freed
++    };
++    struct PendingTranslation {
++        std::shared_future<void> done;
++        std::shared_ptr<std::atomic<bool>> claimed; ///< The job's
++    };
++    enum class Translation {
++        Here,     ///< Not detached, or no memory to queue it: translated on the GPU thread
++        Done,     ///< Translated on a worker within the wait
++        Failed,   ///< Translated on a worker, and failed like a translation on the GPU thread
++        Left,     ///< Still translating: translation_left is set and the draw is skipped
++        Deferred, ///< Over the cap, not queued: translation_left is set and the draw is skipped
++    };
++    /// Whether the current draw may be skipped while its pipeline is made (BuiltPipeline's test).
++    [[nodiscard]] bool CanSkipDraw() const noexcept;
++    [[nodiscard]] bool CanTranslateAsynchronously() const;
++    /// Whether the queue is at its cap (max_pending_translations, translation_pending_cap).
++    [[nodiscard]] bool TranslationQueueFull() const noexcept;
++    /// Slow path entry: adopts what the workers finished; false while graphics_key translates
++    /// or waits for room.
++    [[nodiscard]] bool TranslatedInTime();
++    /// CreateGraphicsPipeline: detaches the environments and queues the translation. Done: the
++    /// finished job (pipeline and the copies it asked) is in `translated`.
++    [[nodiscard]] Translation TranslateOnWorker(const GraphicsEnvironments& environments,
++                                                std::list<TranslationJob>& translated);
++    /// Waits within the per-pipeline and per-frame budgets. True when the translation is done.
++    [[nodiscard]] bool WaitForGraphicsTranslation(const std::shared_future<void>& done);
++    /// VkPipelineTranslator thread.
++    void TranslateGraphicsPipeline(std::list<TranslationJob> job, std::promise<void> done);
++    /// Moves the finished translations into graphics_cache.
++    void AdoptTranslatedGraphicsPipelines();
++    /// As CreateGraphicsPipeline() writes a new pipeline to the disk cache (one-node list).
++    void StoreTranslatedGraphicsPipeline(std::list<TranslationJob> job, bool is_mesh);
++    /// Queues the disk cache entry of a job whose hash is in disk_pipelines, from its copies.
++    void SerializeTranslatedGraphicsPipeline(std::list<TranslationJob> job, bool is_mesh);
++
++    std::chrono::microseconds translation_wait{};         ///< Per pipeline
++    std::chrono::microseconds translation_frame_budget{}; ///< Per frame
++    std::chrono::microseconds translation_frame_left{};
++    u64 translation_frame{}; ///< frame_count when translation_frame_left was last reset
++    size_t num_translation_threads{};
++    /// The queue's cap: jobs pending (4 per thread) and bytes their copies hold
++    /// (EDEN_UP_ASYNC_TRANSLATION_PENDING_MIB, default 16 MiB).
++    size_t max_pending_translations{};
++    size_t translation_pending_cap{};
++    /// Bytes the queued jobs' copies hold: added here when queued, taken off by the worker when
++    /// it frees them.
++    std::atomic<size_t> translation_pending_bytes{};
++    /// Set by CreateGraphicsPipeline() when the draw is skipped without a pipeline for its key:
++    /// left translating, or not queued over the cap.
++    bool translation_left{};
++    /// Set by TranslatedInTime for a key that was reported when first queued or put off.
++    bool translation_reported{};
++    /// Keys queued on the workers and not adopted yet.
++    ::Common::unordered_map<GraphicsPipelineCacheKey, PendingTranslation> translating_graphics;
++    /// Keys not queued over the cap, until a draw finds room (none are in translating_graphics).
++    ::Common::unordered_set<GraphicsPipelineCacheKey> translation_deferred;
++    std::mutex translated_mutex;
++    /// Finished, not adopted yet (translated_mutex). Declared before the builder workers, so it
++    /// is destroyed after them: a pipeline here may have its driver build queued there.
++    std::list<TranslationJob> translated_graphics;
++    std::atomic<size_t> num_translated{};
++    /// Null with the switch off. Reset (joined) in the destructor's body, before the members its
++    /// translations use go.
++    std::unique_ptr<Common::ThreadWorker> translation_workers;
++
+     Shader::Profile profile;
+     Shader::HostTranslateInfo host_info;
+ 
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index d006f9b..a27efbe 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -441,7 +441,8 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
+ }
+ 
+ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
+-                                                             bool via_header_index, u32 raw) {
++                                                             bool via_header_index, u32 raw,
++                                                             bool without_flush) {
+     const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
+     const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
+                                                        gpu_memory->UsesNativeTiling())};
+@@ -475,7 +476,11 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr,
+     }
+     ASSERT(index <= tic_limit);
+     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
+-    gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
++    if (without_flush) {
++        gpu_memory->ReadBlockUnsafe(descriptor_addr, &entry, sizeof(entry));
++    } else {
++        gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
++    }
+     return entry;
+ }
+ 
+@@ -819,6 +824,18 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
+ }
+ 
+ u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
++    if (detached) {
++        ASSERT(snapshot != nullptr);
++        const auto& cbuf{snapshot->const_buffers[cbuf_index]};
++        ASSERT(cbuf.enabled);
++        u32 value{};
++        if (cbuf_offset < cbuf.size) {
++            std::memcpy(&value, reinterpret_cast<const u8*>(cbuf.words.data()) + cbuf_offset,
++                        sizeof(value));
++        }
++        cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
++        return value;
++    }
+     const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
+     ASSERT(cbuf.enabled);
+     u32 value{};
+@@ -835,8 +852,9 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
+         return std::nullopt;
+     }
+     const u64 key = (static_cast<u64>(bank) << 32) | static_cast<u64>(offset);
+-    auto it = maxwell3d->replace_table.find(key);
+-    if (it == maxwell3d->replace_table.end()) {
++    const auto& replace_table{detached ? snapshot->replace_table : maxwell3d->replace_table};
++    auto it = replace_table.find(key);
++    if (it == replace_table.end()) {
+         return std::nullopt;
+     }
+     const auto converted_value = [](Tegra::Engines::Maxwell3D::HLEReplacementAttributeType name) {
+@@ -856,6 +874,13 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
+ }
+ 
+ Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
++    if (detached) {
++        const auto entry{ReadTextureInfo(snapshot->tic_address, snapshot->tic_limit,
++                                         snapshot->via_header_index, handle, true)};
++        const Shader::TextureType result{ConvertTextureType(entry)};
++        texture_types.emplace(handle, result);
++        return result;
++    }
+     const auto& regs{maxwell3d->regs};
+     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+     auto entry =
+@@ -866,6 +891,13 @@ Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
+ }
+ 
+ Shader::TexturePixelFormat GraphicsEnvironment::ReadTexturePixelFormat(u32 handle) {
++    if (detached) {
++        const auto entry{ReadTextureInfo(snapshot->tic_address, snapshot->tic_limit,
++                                         snapshot->via_header_index, handle, true)};
++        const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
++        texture_pixel_formats.emplace(handle, result);
++        return result;
++    }
+     const auto& regs{maxwell3d->regs};
+     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+     auto entry =
+@@ -881,11 +913,93 @@ bool GraphicsEnvironment::IsTexturePixelFormatInteger(u32 handle) {
+ }
+ 
+ u32 GraphicsEnvironment::ReadViewportTransformState() {
++    if (detached) {
++        viewport_transform_state = snapshot->viewport_scale_offset_enabled;
++        return viewport_transform_state;
++    }
+     const auto& regs{maxwell3d->regs};
+     viewport_transform_state = regs.viewport_scale_offset_enabled;
+     return viewport_transform_state;
+ }
+ 
++// EDEN_UP_ASYNC_TRANSLATION. Runs on the GPU thread, before the environment goes to a
++// VkPipelineTranslator thread (port of Djihads80/Eglantine 0f1ae99, GraphicsEnvironment::Detach).
++// - Enabled constant buffers are copied whole: translation folds some of their values into the
++//   shader (bindless handles, storage pointers, branch tables), and uniform memory is reused once
++//   the GPU is past the draw. The copy reads as Read<u32> does (ReadWordsUnsafe: no flush, the
++//   Switch 2 syncpoint shim included), at the moment the GPU thread would have read them.
++// - The texture pool is located, not copied, and its descriptors are read on the worker with
++//   ReadBlockUnsafe. A pool the GPU wrote is not detached (its entries would need a flush, which
++//   only the GPU thread may do). An entry the CPU rewrites meanwhile gives the newer descriptor:
++//   accepted, as upstream, since pools hold long-lived descriptors.
++// - The viewport transform flag and the HLE replacements are copied.
++// What stays on the worker as on the GPU thread: storage pointer checks read the GPU page table
++// (and, for indirect ones, the guest word they point at) through gpu_memory, as before.
++bool GraphicsEnvironment::Detach() {
++    if (detached) {
++        return true;
++    }
++    // A handle indexes at most 2^20 descriptors; a larger limit is not a real pool, and the
++    // dirty check below would walk gigabytes of page table.
++    constexpr u32 MaxTexturePoolLimit = (1U << 20) - 1;
++    const auto& regs{maxwell3d->regs};
++    if (regs.tex_header.limit > MaxTexturePoolLimit) {
++        return false;
++    }
++    const GPUVAddr pool_address{regs.tex_header.Address()};
++    const size_t pool_size{(size_t{regs.tex_header.limit} + 1) *
++                           sizeof(Tegra::Texture::TICEntry)};
++    if (gpu_memory->IsMemoryDirty(pool_address, pool_size)) {
++        return false;
++    }
++    const auto& live_buffers{maxwell3d->state.shader_stages[stage_index].const_buffers};
++    for (const auto& live : live_buffers) {
++        // A read past MaxConstBufferSize would need guest memory the copy lacks: not detached.
++        if (live.enabled && live.size > Maxwell::MaxConstBufferSize) {
++            return false;
++        }
++    }
++    auto copy{std::make_shared<EngineSnapshot>()};
++    for (size_t index = 0; index < live_buffers.size(); ++index) {
++        const auto& live{live_buffers[index]};
++        auto& copied{copy->const_buffers[index]};
++        copied.enabled = live.enabled;
++        if (!live.enabled || live.size == 0) {
++            continue;
++        }
++        copied.size = live.size;
++        const size_t words{(size_t{live.size} + sizeof(u32) - 1) / sizeof(u32)};
++        copied.words.resize(words + 1);
++        gpu_memory->ReadWordsUnsafe(live.address, copied.words.data(), words);
++    }
++    copy->tic_address = pool_address;
++    copy->tic_limit = regs.tex_header.limit;
++    copy->via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
++    copy->viewport_scale_offset_enabled = regs.viewport_scale_offset_enabled;
++    if (has_hle_engine_state) {
++        copy->replace_table = maxwell3d->replace_table;
++    }
++    snapshot = std::move(copy);
++    detached = true;
++    maxwell3d = nullptr;
++    return true;
++}
++
++size_t GraphicsEnvironment::SnapshotSizeBytes() const noexcept {
++    if (!snapshot) {
++        return 0;
++    }
++    size_t total{};
++    for (const auto& cbuf : snapshot->const_buffers) {
++        total += cbuf.words.size() * sizeof(u32);
++    }
++    return total;
++}
++
++void GraphicsEnvironment::ReleaseSnapshot() noexcept {
++    snapshot.reset();
++}
++
+ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
+                                        Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
+                                        u32 start_address_,
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+index b9dd176..5334542 100644
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -128,8 +128,11 @@ protected:
+     bool native_tensor{};
+     std::shared_ptr<const LoweredNativeCode> lowered_native;
+ 
++    /// without_flush (EDEN_UP_ASYNC_TRANSLATION, a detached environment): the descriptor is read
++    /// with ReadBlockUnsafe, as only the GPU thread may flush.
+     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
+-                                             bool via_header_index, u32 raw);
++                                             bool via_header_index, u32 raw,
++                                             bool without_flush = false);
+ 
+     Tegra::MemoryManager* gpu_memory{};
+     GPUVAddr program_base{};
+@@ -182,9 +185,45 @@ public:
+ 
+     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
+ 
++    /// EDEN_UP_ASYNC_TRANSLATION (GPU thread): copies the 3D engine state translation reads and
++    /// stops reading the engine, so the program can be translated on another thread while the
++    /// GPU thread goes on. False, the environment unchanged, when the texture pool is too large
++    /// to check or the GPU wrote it (its descriptors would need a flush), or a constant buffer
++    /// claims more than one can hold.
++    [[nodiscard]] bool Detach();
++
++    /// Bytes of constant buffer contents Detach copied (0 if not detached).
++    [[nodiscard]] size_t SnapshotSizeBytes() const noexcept;
++
++    /// After the translation of a detached environment: frees the copied constant buffers. Only
++    /// Serialize and Dump may be used after this.
++    void ReleaseSnapshot() noexcept;
++
+ private:
++    /// What a detached environment reads instead of the engine. Shared, so a copy of the
++    /// environment does not copy the constant buffers.
++    struct EngineSnapshot {
++        struct ConstBuffer {
++            bool enabled{};
++            u32 size{};
++            /// `size` bytes read as Read<u32> reads them, then one zero word, so a read at any
++            /// offset below `size` stays inside.
++            std::vector<u32> words;
++        };
++        std::array<ConstBuffer, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> const_buffers;
++        /// The texture pool is located, not copied; its descriptors are read on the worker.
++        GPUVAddr tic_address{};
++        u32 tic_limit{};
++        bool via_header_index{};
++        u32 viewport_scale_offset_enabled{};
++        ::Common::unordered_map<u64, Tegra::Engines::Maxwell3D::HLEReplacementAttributeType>
++            replace_table;
++    };
++
+     Tegra::Engines::Maxwell3D* maxwell3d{};
+     size_t stage_index{};
++    std::shared_ptr<const EngineSnapshot> snapshot;
++    bool detached{};
+ };
+ 
+ class ComputeEnvironment final : public GenericEnvironment {

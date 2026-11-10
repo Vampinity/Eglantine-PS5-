@@ -1,0 +1,344 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] UB-128: opt-in stale and wholly overwritten texture uploads, safe a frame ahead
+
+Port of EdGlantine-PS5 df66705be6 / 99zzzz3-skip-stale-texture-uploads.diff.
+EDEN_UP_SKIP_STALE_UPLOADS=1 (Common::PeSwitch, exact 1, first use) enables our
+existing stale-page protocol and a corrected whole-alias-copy decision. Reuse
+StalePages, ClearStaleGpu and StaleNx2MayBeGpuWritten: this tree already has the
+original buffer-written bitmap, so it needs no GpuWrittenPages replacement.
+
+Two fixes over the first draft, both only with the switch on:
+
+1. A frame run ahead (EDEN_NX2_FRAMES_AHEAD=1), a guest write W can be applied
+   (GatherAndApply -> OnCacheInvalidations -> WriteMemory) before an older image A's
+   draws: A uploads W, is drawn over, the collector drops it and MarkStale marked its
+   pages, so the next image at those pages skipped its upload and showed undefined
+   data while guest memory held W, the newest bytes. New ImageFlagBits::GuestBytes:
+   set in RefreshContents once an image goes on to take guest bytes (now, by layer,
+   or by a queued decode or unswizzle) and in WriteMemory when a CPU write lands on
+   a live image (a full clear that drops the upload still leaves W in guest memory).
+   MarkStale refuses an image carrying it, counted (tc_stale_refused). The flag is
+   never cleared: refusing a mark only costs an upload later, never a picture.
+   Sparse layer, sparse tile, unwritten sparse and remapped images are refused too.
+   Round 2: a joined image made without RefreshContents (whole alias copy, full
+   clear, StaleUploadOverDrawnTarget) lost the flag. A new image now takes it from
+   every alias and overlap in join_copies_to_do, from every overlap it replaces
+   (join_ignore_textures) and, on the StaleUploadOverDrawnTarget path, from the
+   drawn bad overlaps it stands in for (tc_guest_bytes_joined). With
+   EDEN_NX2_FRAMES_AHEAD=1 (read as nx2_gsv.h reads it: unset -1, a value starting
+   with '1' is 1, else 0) MarkStale marks nothing (tc_stale_ahead_refused): that
+   also covers a write W that lands on pages with no live image.
+
+2. The whole-alias-copy rule checked copy geometry only (CopiesWriteWholeImage), but
+   CopyImage copies the source's host image as it is, with no RefreshContents or
+   PrepareImage: a source with a pending upload (CpuModified, dirty layers) or a
+   decode or unswizzle still queued (IsDecoding, async_decodes) handed the new image
+   old bytes. Such a copy now counts as partial and the upload stays
+   (tc_whole_copy_stale_src); taken ones are counted (tc_whole_copy_skips).
+
+The whole-copy path still rejects scaling, compressed formats, partial coverage,
+non-2D images, rescaled/trimmed/sparse/unbacked/remapped images and multisampling.
+The counters go into the existing 600-frame texture cache log line.
+Do not change old EDEN_NX2_SKIP_OVERWRITTEN_UPLOADS or EDEN_UP_NO_STALE_UPLOAD
+behavior when the new switch is unset: the flag is only set with the switch on and
+only read by MarkStale under it. No shader cache key or format changes.
+See front-ub128.diff for the Vulkan frontend post-write-back hook (unchanged: the
+front clears stale pages after a write-back; the flag needs nothing from the front).
+Base: T88 core (patches through 0492) with 0493 and 0494; also applies without them.
+
+---
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index 3c66304..33f26f0 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -62,6 +62,12 @@ enum class ImageFlagBits : u32 {
+     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
+     /// the parts written are uploaded.
+     SparseTiles = 1 << 23,
++    /// EDEN_UP_SKIP_STALE_UPLOADS: guest memory under this image holds bytes the guest wrote
++    /// while the image existed (uploaded from there, or a CPU write landed on it). Run a frame
++    /// ahead, such a write can be applied before older draws into the image: the GPU's data is
++    /// then not the newest, so MarkStale leaves these pages alone. A new image joined from
++    /// others takes it from them (JoinImages). Never cleared; only set with the switch on.
++    GuestBytes = 1 << 24,
+ };
+ DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 94a8500..8d60d99 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -495,6 +495,36 @@ void TextureCache<P>::MarkStale(const ImageBase& image) {
+                             ImageFlagBits::Unbacked))) {
+         return;
+     }
++    if (SkipStaleUploads()) {
++        // UB-128, frames ahead: with EDEN_NX2_FRAMES_AHEAD=1 nothing is marked at all. A guest
++        // write W can be applied before older draws, also to pages no live image covers (then
++        // no image carries GuestBytes for it), so the GPU's data is never known to be the
++        // newest. Read as nx2_gsv.h's PresentClientBuffer reads it (frames_ahead_setting):
++        // unset -1, a value starting with '1' is 1, anything else 0.
++        static const int frames_ahead_setting = [] {
++            const char* const value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
++            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
++        }();
++        if (frames_ahead_setting >= 1) {
++            ++tc_stale_ahead_refused;
++            return;
++        }
++        // UB-128. Run a frame ahead (EDEN_NX2_FRAMES_AHEAD=1), a guest write to these pages can
++        // be applied before this image's older draws: the image uploads it, is drawn over, and
++        // the GPU's data is not the newest after all. Guest memory then holds what the next
++        // image here must show, so an image that ever took guest bytes keeps its pages unmarked.
++        // A new image joined from others inherits the flag (JoinImages). Sparse layer, tile and
++        // remapped images are left out as well: their pages are not one plain range the next
++        // image can be checked against.
++        if (True(image.flags & (ImageFlagBits::GuestBytes | ImageFlagBits::SparseLayers |
++                                ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
++                                ImageFlagBits::Remapped))) {
++            if (True(image.flags & ImageFlagBits::GuestBytes)) {
++                ++tc_stale_refused;
++            }
++            return;
++        }
++    }
+     // Tracked from here on so CPU writes reach WriteMemory. Marking before the image's own
+     // tracking goes keeps the pages' write protection from switching off and on again.
+     stale_pages.Mark(image.cpu_addr, image.guest_size_bytes, [this](DAddr addr, u64 size) {
+@@ -1210,6 +1240,16 @@ void TextureCache<P>::TickFrame() {
+                      (stale_pages.Count() << StalePages::STALE_PAGE_BITS) >> 20);
+             tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
+         }
++        if (SkipStaleUploads()) {
++            LOG_INFO(HW_GPU,
++                     "Texture cache last 600 frames: UB-128 marks refused {} (image holds guest "
++                     "bytes), {} (frames ahead), {} joined images took the guest bytes flag, "
++                     "whole alias copies {} skipped the upload, {} not taken (source not current)",
++                     tc_stale_refused, tc_stale_ahead_refused, tc_guest_bytes_joined,
++                     tc_whole_copy_skips, tc_whole_copy_stale_src);
++            tc_stale_refused = tc_stale_ahead_refused = tc_guest_bytes_joined = 0;
++            tc_whole_copy_skips = tc_whole_copy_stale_src = 0;
++        }
+         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+         astc_opaque_images = astc_alpha_images = 0;
+         std::vector<std::pair<u32, u64>> shapes;
+@@ -2385,6 +2425,11 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+         }
+         // EDEN_UP_FAST_DRAW: delta draws keep image views without preparing their images.
+         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
++        if (SkipStaleUploads()) {
++            // UB-128: the guest wrote under this image. Even a full clear that drops the upload
++            // leaves these bytes in guest memory, so the image is never marked stale (MarkStale).
++            image.flags |= ImageFlagBits::GuestBytes;
++        }
+         if (True(image.flags & ImageFlagBits::SparseTiles)) {
+             MarkRangeWritten(image, cpu_addr, size);
+             return;
+@@ -3274,7 +3319,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     // EDEN_UP_NO_STALE_UPLOAD: made where a dropped GPU-written image left stale bytes
+     // (MarkStale): nothing to upload. Pages the buffer cache wrote on the GPU may hold data
+     // written back since: upload those. Nothing is marked with the switch off.
++    // UB-128 (EDEN_UP_SKIP_STALE_UPLOADS) reuses this tracking; a remapped image is uploaded.
+     if (stale_pages.Count() != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
++        (!SkipStaleUploads() || False(image.flags & ImageFlagBits::Remapped)) &&
+         image.dirty_layers.empty() &&
+         False(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                              ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
+@@ -3287,6 +3334,12 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         }
+         ++tc_stale_gpu_written;
+     }
++    if (SkipStaleUploads()) {
++        // UB-128: from here on the host image takes guest bytes (now, by layer, or by a queued
++        // decode or unswizzle). Should the GPU draw over them, guest memory may still be the
++        // newer side when a frame runs ahead: MarkStale leaves this image's pages alone.
++        image.flags |= ImageFlagBits::GuestBytes;
++    }
+ 
+     // Vectors, staging and unswizzle scratch, as for a whole image further down.
+     try {
+@@ -5050,6 +5103,27 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+         new_image.flags |= ImageFlagBits::Sparse;
+     }
+ 
++    if (SkipStaleUploads()) {
++        // UB-128: three paths below make the new image without RefreshContents, which sets
++        // GuestBytes (a whole alias copy, a full clear, StaleUploadOverDrawnTarget). The new
++        // image holds what the images it joins held: it takes their flag, from every alias and
++        // overlap it copies and every overlap it replaces (join_ignore_textures), before those
++        // are deleted. Otherwise a frame run ahead, W taken by an old image could be marked
++        // stale through the new one (MarkStale).
++        const auto took_guest_bytes = [this](ImageId id) {
++            return True(slot_images[id].flags & ImageFlagBits::GuestBytes);
++        };
++        bool joined_guest_bytes = std::ranges::any_of(
++            join_copies_to_do, [&](const JoinCopy& copy) { return took_guest_bytes(copy.id); });
++        for (const ImageId overlap_id : join_ignore_textures) {
++            joined_guest_bytes |= took_guest_bytes(overlap_id);
++        }
++        if (joined_guest_bytes) {
++            new_image.flags |= ImageFlagBits::GuestBytes;
++            ++tc_guest_bytes_joined;
++        }
++    }
++
+     for (const ImageId overlap_id : join_ignore_textures) {
+         Image& overlap = slot_images[overlap_id];
+         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
+@@ -5158,11 +5232,42 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+         const char* const value = std::getenv("EDEN_NX2_SKIP_OVERWRITTEN_UPLOADS");
+         return value != nullptr && value[0] == '1';
+     }();
++    // UB-128 (EDEN_UP_SKIP_STALE_UPLOADS=1): the whole-copy rule checks the copy geometry on a
++    // plain, unscaled, single-sample 2D image (CopiesWriteWholeImage), and the source's host image
++    // must be current: CopyImage below copies it as it is, with no RefreshContents, so a source
++    // with a pending upload (CpuModified, dirty layers) or a decode or unswizzle still queued
++    // (IsDecoding, async_decodes) would hand the new image old bytes. Such a copy counts as
++    // partial and the upload stays.
++    const auto whole_copy_source_current = [&](const AliasedImage& aliased) {
++        const Image& source = slot_images[aliased.id];
++        if (True(source.flags & (ImageFlagBits::CpuModified | ImageFlagBits::IsDecoding)) ||
++            !source.dirty_layers.empty() ||
++            std::ranges::any_of(async_decodes, [&](const auto& decode) {
++                return decode->image_id == aliased.id && !decode->cancelled;
++            })) {
++            ++tc_whole_copy_stale_src;
++            return false;
++        }
++        return true;
++    };
+     size_t first_copy = 0;
+     bool copied_whole = false;
+-    for (size_t index = skip_overwritten_uploads ? join_copies_to_do.size() : 0; index-- > 0;) {
++    for (size_t index = (skip_overwritten_uploads || SkipStaleUploads())
++                            ? join_copies_to_do.size() : 0; index-- > 0;) {
+         const AliasedImage* const aliased = alias_copy(join_copies_to_do[index]);
+-        if (aliased != nullptr && writes_whole_image(*aliased)) {
++        if (aliased == nullptr) {
++            continue;
++        }
++        const bool whole = SkipStaleUploads()
++                               ? (!can_rescale &&
++                                  CopiesWriteWholeImage(new_image, slot_images[aliased->id],
++                                                        aliased->copies) &&
++                                  whole_copy_source_current(*aliased))
++                               : writes_whole_image(*aliased);
++        if (whole) {
++            if (SkipStaleUploads()) {
++                ++tc_whole_copy_skips;
++            }
+             first_copy = index;
+             copied_whole = true;
+             break;
+@@ -5220,6 +5325,15 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+         runtime.TransitionImageLayout(new_image);
+     } else if (StaleUploadOverDrawnTarget(new_image, new_info)) {
+         // What RefreshContents does, without the upload (as for copied_whole above).
++        if (SkipStaleUploads() && False(new_image.flags & ImageFlagBits::GuestBytes) &&
++            std::ranges::any_of(join_bad_overlap_ids, [this](ImageId id) {
++                return True(slot_images[id].flags & ImageFlagBits::GuestBytes);
++            })) {
++            // UB-128: this image replaces the same target at another size, a bad overlap (not
++            // in join_copies_to_do): it takes that overlap's GuestBytes flag too.
++            new_image.flags |= ImageFlagBits::GuestBytes;
++            ++tc_guest_bytes_joined;
++        }
+         new_image.flags &= ~ImageFlagBits::CpuModified;
+         if (False(new_image.flags & ImageFlagBits::Tracked)) {
+             TrackImage(new_image, new_image_id);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 757e149..2736eec 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -932,9 +932,18 @@ private:
+     /// write-backs clear them. An image made entirely on marked pages starts without an upload:
+     /// the upload would only copy stale bytes the GPU overwrites. Switch 2 titles only: the
+     /// buffer cache feeds the GPU-written page bitmap for them alone. Off: nothing is marked.
++    /// UB-128 (EDEN_UP_SKIP_STALE_UPLOADS=1): the same tracking, a corrected whole-alias-copy
++    /// rule (CopiesWriteWholeImage, and only from a source whose host image is current), and
++    /// guards for a frame run ahead: with EDEN_NX2_FRAMES_AHEAD=1 nothing is marked stale; else
++    /// an image that took guest bytes (ImageFlagBits::GuestBytes, inherited by a joined image)
++    /// is never marked stale, and sparse or remapped images are left out. Implies NoStaleUpload.
++    [[nodiscard]] static bool SkipStaleUploads() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_SKIP_STALE_UPLOADS");
++        return enabled;
++    }
+     [[nodiscard]] static bool NoStaleUpload() {
+         static const bool enabled = Common::PeSwitch("EDEN_UP_NO_STALE_UPLOAD");
+-        return enabled;
++        return enabled || SkipStaleUploads();
+     }
+     void MarkStale(const ImageBase& image);
+     void ClearStale(DAddr addr, size_t size);
+@@ -945,6 +954,11 @@ private:
+     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
+     u64 tc_stale_skip_bytes{};
+     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
++    u64 tc_stale_refused{};      ///< UB-128: marks refused, the image holds guest bytes
++    u64 tc_stale_ahead_refused{}; ///< UB-128: marks refused, EDEN_NX2_FRAMES_AHEAD=1
++    u64 tc_guest_bytes_joined{}; ///< UB-128: new images that took GuestBytes from joined images
++    u64 tc_whole_copy_skips{};   ///< UB-128: uploads skipped, a whole alias copy writes the image
++    u64 tc_whole_copy_stale_src{}; ///< UB-128: whole copies not taken, the source is not current
+ 
+     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
+     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index 78a07d5..fdb8055 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -1507,6 +1507,39 @@ Extent3D MipBlockSize(const ImageInfo& info, u32 level) {
+     return AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
+ }
+ 
++bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
++                           std::span<const ImageCopy> copies) {
++    constexpr ImageFlagBits excluded = ImageFlagBits::Rescaled | ImageFlagBits::TrimmedLevels |
++                                       ImageFlagBits::Unbacked | ImageFlagBits::Sparse |
++                                       ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
++                                       ImageFlagBits::UnwrittenSparse | ImageFlagBits::Remapped;
++    if (dst.info.type != ImageType::e2D || src.info.type != ImageType::e2D ||
++        src.info.num_samples != 1 || dst.info.num_samples != 1 ||
++        src.info.format != dst.info.format || src.info.astc_opaque != dst.info.astc_opaque ||
++        True((src.flags | dst.flags) & excluded)) {
++        return false;
++    }
++    // Alias copies count a compressed extent in blocks, but the backends copy it as texels, so
++    // such a copy writes only part of the image.
++    if (DefaultBlockWidth(dst.info.format) != 1 || DefaultBlockHeight(dst.info.format) != 1) {
++        return false;
++    }
++    for (s32 level = 0; level < dst.info.resources.levels; ++level) {
++        const Extent3D size = MipSize(dst.info.size, level);
++        const bool covered = std::ranges::any_of(copies, [&](const ImageCopy& copy) {
++            return copy.dst_subresource.base_level == level &&
++                   copy.dst_subresource.base_layer == 0 &&
++                   copy.dst_subresource.num_layers >= dst.info.resources.layers &&
++                   copy.dst_offset == Offset3D{} && copy.extent.width >= size.width &&
++                   copy.extent.height >= size.height;
++        });
++        if (!covered) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const ImageInfo& info) {
+     const Extent2D tile_size = DefaultBlockSize(info.format);
+     if (info.type == ImageType::Linear) {
+diff --git a/src/video_core/texture_cache/util.h b/src/video_core/texture_cache/util.h
+index 1737e7f..17da87e 100644
+--- a/src/video_core/texture_cache/util.h
++++ b/src/video_core/texture_cache/util.h
+@@ -140,6 +140,11 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
+ 
+ [[nodiscard]] Extent3D MipBlockSize(const ImageInfo& info, u32 level);
+ 
++/// UB-128: conservative full coverage for plain, unscaled, single-sample 2D images. Checks the
++/// copy geometry only; the caller checks that the source's host image is current.
++[[nodiscard]] bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
++                                        std::span<const ImageCopy> copies);
++
+ [[nodiscard]] boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(
+     const ImageInfo& info);
+ 

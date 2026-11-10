@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Tue, 10 Nov 2026 09:00:00 +0100
+Subject: [PATCH] EDEN_UP_GC_ONE_WAIT=1: the texture collector waits for the GPU
+ at most once a frame to copy GPU-written images back (Fritchii EXP57,
+ f93124a6b8); no cap while the pool is short; off by default
+
+Ported from Frizti/Fritchii f93124a6b8 (fritchii-v5.6, GPL-3.0-or-later), "texture_cache: EXP56
+skips a cleared depth target's upload; EXP57 caps collector GPU waits", the EXP57 half. Upstream:
+a 3 s stall as device memory crossed the expected line, the collector downloading image after
+image with runtime.Finish(); EDEN_NX2_EXP57 allows one such wait a frame unless an allocation
+failed, the rest wait for later frames ("downloads deferred").
+
+PS5 version. The Vulkan port already batches the collector's copies (headless/
+vulkan_gc_downloads.inc: one Finish per batch of up to 64 images / 64 MiB), but nothing caps the
+waits per frame: TakePrefetched starts another batch (another Finish) each time the batch runs
+out, the Configure(true) pass starts one more, and images the batch cannot take (aliased,
+overlapping, MSAA, over the byte budget) still wait one by one (gc_unbatched_drain). On the PS5
+these copies run when the pool's largest free block is under 1 GiB (KeepDirtyTextures), which is
+the fly-over and new-area case.
+
+EDEN_UP_GC_ONE_WAIT=1 (Common::PeSwitch, exactly "1"):
+- one collector wait for the GPU a frame: either one batch (port) or one image Cleanup copies
+  alone. After it, Cleanup leaves a GPU-written image whose copy is not made yet in place
+  (counted as deferred) and the port starts no new batch; copies already made stay usable;
+- no cap for the run while wait_exempt is set. The port's half (vulkan_gc_downloads.inc, a front
+  change shipped beside this patch) sets it while PoolPressure() is 2 (largest free block under
+  EDEN_NX2_TC_POOL_CRITICAL_MIB, 256, or a refusal in the last 120 frames) or any refusal came in
+  the last 120 frames (also with EDEN_NX2_TC_POOL_PRESSURE=1), as upstream exempts out_of_memory;
+- stderr every 600 frames: "EDEN_GC_ONE_WAIT frame=<n> deferred=<copies left for later>
+  waited_frames=<frames with a wait> extra_waits=<waits past the first while exempt>".
+Off (unset): WaitHeld() is false and Waited() returns at once; no line. Collector, batches and
+the "Texture cache last 600 frames" line as before. Layout only: four u64 in TextureCache.
+
+prepare-vulkan-port.py: every pinned GC anchor still occurs exactly once (checked on the text).
+The port replaces the Cleanup capture list with [&, this], so the front's code sees WaitHeld,
+Waited and wait_exempt. The front change needs this patch (it names those three); this patch
+alone builds and caps only Cleanup's own copies.
+
+Risk: memory. A deferred image keeps its memory a frame or more longer; clean images still go at
+the old rate, and the cap lifts at pressure 2. Picture: none (nothing is dropped, only later).
+
+PS5 test: EDEN_UP_GC_ONE_WAIT=1 vs the same build without it, same batch, 3 valid runs each,
+standard script (house, fly-over 102-117 s, door walk). Watch: fly-over worst frame and frames
+over 100 ms, first-visit stutter, EDEN_DEV_GC_DRAIN (batched_calls, unbatched_calls, ns),
+EDEN_GC_ONE_WAIT deferred/extra_waits, refusals, pool largest block, out-of-memory crashes.
+---
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index cd2d143..4e8b23b 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -194,6 +194,18 @@ constexpr u64 KeepRemadeWindow = 600;
+     return enabled;
+ }
+ 
++/// EDEN_UP_GC_ONE_WAIT=1 (Common::PeSwitch, exact 1; off unless set): Fritchii f93124a6b8 by
++/// Frizti (upstream EDEN_NX2_EXP57). The collector waits for the GPU at most once a frame to copy
++/// GPU-written images back before it deletes them; the images after that wait for a later frame
++/// ("deferred"). One wait is one runtime.Finish(): the Vulkan port's batch of copies
++/// (vulkan_gc_downloads.inc, PrefetchDownloads) or one image Cleanup copies alone. No cap while
++/// the port says the pool is short (RunGarbageCollector's wait_exempt), as upstream lets a failed
++/// allocation through. A stderr line every 600 frames: "EDEN_GC_ONE_WAIT".
++[[nodiscard]] inline bool GcOneWait() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_GC_ONE_WAIT");
++    return enabled;
++}
++
+ /// EDEN_UP_FRITCHII_RELOCATE=1 (off unless set; Fritchii c98e63520a + 07b38b3caf, EXP43=3 of
+ /// 1735a6fd13): a render target a clear overwrites whole, which drifted a little off one or more
+ /// images of its own single-level, single-layer 2D shape (Ocarina of Time's bump-allocated
+@@ -426,8 +438,27 @@ void TextureCache<P>::RunGarbageCollector() {
+         // Each pass gets its own scan budget, so the aggressive pass is not starved by earlier ones.
+         num_scanned = 0;
+     };
++    // EDEN_UP_GC_ONE_WAIT (GcOneWait): once this frame's wait for the GPU is spent, a GPU-written
++    // image whose copy is not made yet stays for a later frame. wait_exempt lifts the cap for this
++    // run: the Vulkan port sets it while its PoolPressure() is 2 or the pool refused an allocation
++    // in the last 120 frames (vulkan_gc_downloads.inc). Off: WaitHeld is false, Waited does nothing.
++    bool wait_exempt = false;
++    const auto WaitHeld = [this, &wait_exempt] {
++        return GcOneWait() && !wait_exempt && gc_waited_frame == frame_tick;
++    };
++    const auto Waited = [this] {
++        if (!GcOneWait()) {
++            return;
++        }
++        if (gc_waited_frame == frame_tick) {
++            ++gc_extra_waits; // a second wait this frame: the cap was lifted
++        } else {
++            gc_waited_frame = frame_tick;
++            ++gc_waited_frames;
++        }
++    };
+     const auto Cleanup = [this, &num_iterations, &num_scanned, &high_priority_mode, &aggressive_mode,
+-                          &evict_old_costly](ImageId image_id) {
++                          &evict_old_costly, &WaitHeld, &Waited](ImageId image_id) {
+         if (num_iterations == 0 || (count_evictions && num_scanned >= 8192)) {
+             return true;
+         }
+@@ -466,12 +497,18 @@ void TextureCache<P>::RunGarbageCollector() {
+             return false;
+         }
+         if (must_download) {
++            // EDEN_UP_GC_ONE_WAIT: this frame's wait is spent; the image stays, nothing is lost.
++            if (WaitHeld()) {
++                ++gc_downloads_deferred;
++                return false;
++            }
+             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+             const auto copies = FullDownloadCopies(image.info);
+             image.DownloadMemory(map, copies);
+             runtime.Finish();
+             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+             ++gc_download_deletes;
++            Waited();
+         }
+         // EDEN_UP_NO_STALE_UPLOAD. Kept apart from the download above: the Vulkan port
+         // (prepare-vulkan-port.py) also writes such an image back from a prefetched copy.
+@@ -1522,6 +1559,19 @@ void TextureCache<P>::TickFrame() {
+                  churn[Churn::StagingBytes] >> 20, churn[Churn::DeviceAllocations],
+                  churn[Churn::DeviceFrees], churn[Churn::DescriptorPools], slot_images.size());
+     }
++    if (GcOneWait() && frame_tick % 600 == 0) {
++        // EDEN_UP_GC_ONE_WAIT, the last 600 frames: deferred = copies left for a later frame;
++        // waited_frames = frames with a collector wait for the GPU; extra_waits = waits past the
++        // first while the pool was short (no cap then).
++        std::fprintf(stderr,
++                     "EDEN_GC_ONE_WAIT frame=%llu deferred=%llu waited_frames=%llu "
++                     "extra_waits=%llu\n",
++                     static_cast<unsigned long long>(frame_tick),
++                     static_cast<unsigned long long>(gc_downloads_deferred),
++                     static_cast<unsigned long long>(gc_waited_frames),
++                     static_cast<unsigned long long>(gc_extra_waits));
++        gc_downloads_deferred = gc_waited_frames = gc_extra_waits = 0;
++    }
+     if (RefusalEvictEnabled()) {
+         // EDEN_NX2_REFUSAL_EVICT=1: a refusal anywhere since the last frame's end (an image here,
+         // or the allocator: staging and other buffers, decode images, an image placed in host
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index e6055b0..07a0e9c 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -188,6 +188,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     u64 gc_deletes{};
+     u64 gc_costly_deletes{};
+     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
++    u64 gc_downloads_deferred{}; ///< EDEN_UP_GC_ONE_WAIT: copies left for a later frame
++    u64 gc_waited_frames{};      ///< EDEN_UP_GC_ONE_WAIT: frames with a collector wait
++    u64 gc_extra_waits{};        ///< EDEN_UP_GC_ONE_WAIT: waits past the first (pool short)
++    u64 gc_waited_frame{~0ULL};  ///< EDEN_UP_GC_ONE_WAIT: the frame of the collector's last wait
+     u64 async_decodes_queued{};
+     u64 images_created{};
+     u64 area_images_created{};  ///< Images created since the start (AreaEvict; never reset)
+-- 
+2.47.0

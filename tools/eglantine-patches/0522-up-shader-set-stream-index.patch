@@ -1,0 +1,907 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_SHADER_SET_STREAM=1: the shader-set extractor no longer cuts zstd content silently at its 256 MiB cap; BNSH data over the cap is cut in streamed passes (Ocarina's Model.Product.110 bfsha.zs: the 11,788 missing programs); EDEN_UP_SHADER_SET_STREAM_VERIFY=1 cross-checks; EDEN_UP_SHADER_SET_INDEX=1 reads only the files nxnative's shader map names; all off by default
+
+Not a Fritchii port: a fix to our 0501 extractor, using data from nxnative
+(github.com/seedds/nxnative 47773ed1d2, MIT, Copyright (c) 2026 seedds, dm/gfx shader_map.tsv).
+Fritchii v5.6 has no EXP number for this; the switch names are ours.
+
+Why 29,381 of 41,216: nxnative's map joins 41,169 of the recipe's fingerprints to their RomFS
+source. 11,788 come from /Shader/Model.Product.110.product.Nin_Ounce_NVN2.bfsha.zs, and
+41,169 - 11,788 = 29,381 is our "found" count exactly (11,788 + 47 unmapped = 11,835 "not found").
+That file holds two BNSH, at 0xf7d000 and 0x11543000 (277 MiB into the inflated content). 0501's
+Inflate(..., MaxBlob) stops at exactly 256 MiB with no error (it throws only when limit > MaxBlob),
+so EmbeddedBnsh saw the first BNSH run past the end (not bounded, skipped) and never saw the second.
+The "over the cap" error in File() compares the compressed size, so nothing was logged.
+
+EDEN_UP_SHADER_SET_STREAM=1 (Top() and Walk()'s zstd branch go through InflateMember):
+- Content under the cap: inflated and walked exactly as before.
+- Content over the cap (declared in the frame header, or found when Inflate stops at the cap with
+  the frame unfinished: one more byte is asked for): counted, then
+  - BNSH data (content Walk() would only search for BNSH: not zstd/Yaz0/SARC/BAHS/NDSR/NDVE) is
+    cut in passes over the compressed bytes already in memory: (1) BNSH magic positions and the
+    content size, (2) each hit's first 4 KiB, (3..6) the reads a line-for-line copy of Bnsh()
+    still misses (variation table, program records, stage records, control sections), (7) every
+    planned program's code, held only while it streams by and handed to Emit() with its control
+    section. EmbeddedBnsh's bounds, skip rule, error text and origin labels are kept, so the
+    found programs are the ones a whole-buffer Bnsh() would cut. About 7 inflate passes of
+    ~300 MiB for this file; peak memory is the kept tables and control sections plus a 4 MiB
+    window, instead of today's 256 MiB buffer for this file.
+  - Anything else over the cap is an archive error ("is a container, not BNSH data").
+- Programs from a streamed member come in code order, not variation order. The set keys
+  programs by fingerprint and uses neither origin nor variations.
+- The stamp gains "extractor stream 1".
+
+EDEN_UP_SHADER_SET_STREAM_VERIFY=1 (needs _STREAM=1): every BNSH member under the cap is walked
+as usual and also cut the streamed way; the two lists (stage, fingerprint, origin, as multisets)
+must match, else an archive error "stream verify: ..." (the set is then not stamped).
+One extra log line counts members over the cap, streamed, passes and verified.
+
+EDEN_UP_SHADER_SET_INDEX=1: reads shader_set_index.txt beside the .nx2recipe (one RomFS source per
+line, as nxnative's map names them; prefixes up to each '/' match the container file). Only those
+RomFS files are read (OoT: 1,140 sources, against 186,587 files, 23.5 GB, 826 s today); the zstd
+dictionaries are always read. A missing or empty index logs a warning and reads every file. The
+stamp gains "extractor index 1". The data file is claude-out/shader_set_index.oot.txt (with
+nxnative's MIT notice); it is not part of this patch.
+
+With all three unset: Inflate's new out-parameter is null, Top() and Walk() take the old branch,
+Extract() gets no index, the Stats fields stay 0, no log line is added and StampText() appends ""
+(byte for byte the old stamp).
+
+Applies after 0501 + 0503 (no later patch touches these files). Not compiled, not run.
+
+v2 (review): StreamOn/StreamVerify are read at first use, not at namespace scope; a
+namespace-scope value is set before main applies env.txt, so the switch could never turn on
+from env.txt while the stamp still said "extractor stream 1".
+
+---
+ src/core/file_sys/nx2_shader_extract.cpp | 617 ++++++++++++++++++++++++++++++-
+ src/core/file_sys/nx2_shader_extract.h   |  11 +-
+ src/video_core/shader_set.cpp            |  58 ++-
+ 3 files changed, 680 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/file_sys/nx2_shader_extract.cpp b/src/core/file_sys/nx2_shader_extract.cpp
+index 75a7e46..578d031 100644
+--- a/src/core/file_sys/nx2_shader_extract.cpp
++++ b/src/core/file_sys/nx2_shader_extract.cpp
+@@ -8,6 +8,7 @@
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstring>
++#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -22,6 +23,7 @@
+ #include <openssl/evp.h>
+ #include <zstd.h>
+ 
++#include "common/pe_switch.h"
+ #include "common/thread.h"
+ #include "core/file_sys/vfs/vfs.h"
+ 
+@@ -43,6 +45,35 @@ constexpr std::array<u8, 4> ControlMagic{0x34, 0x12, 0x76, 0x98};
+ constexpr std::array<u8, 8> BnshMagic{'B', 'N', 'S', 'H', 0, 0, 0, 0};
+ constexpr u32 KeyControl = 0x48;                  // control bytes in a fingerprint
+ 
++// EDEN_UP_SHADER_SET_STREAM=1 (PS5 port, not upstream; off by default). Inflate(..., MaxBlob)
++// stops at the cap without an error, so a zstd member whose content is larger was searched only
++// up to the cap. Ocarina of Time's /Shader/Model.Product.110.product.Nin_Ounce_NVN2.bfsha.zs
++// holds two BNSH, at 0xf7d000 (over 240 MiB long, so it never fit) and at 0x11543000 (277 MiB
++// in): 11,788 of the recipe's 41,216 programs, every one of them "not found". The offsets are
++// from nxnative's shader_map.tsv (github.com/seedds/nxnative, MIT, Copyright (c) 2026 seedds),
++// which names each program's file and BNSH. With the switch a cut is never silent: BNSH data over
++// the cap is inflated again in passes that keep only what the BNSH parser reads (headers,
++// variation tables, program and stage records, control sections), then a last pass cuts each
++// program's code as it streams by. Other content over the cap is an archive error. Peak memory is
++// the kept pieces plus a 4 MiB window, not MaxBlob.
++// EDEN_UP_SHADER_SET_STREAM_VERIFY=1 (with the above): every BNSH member under the cap is also cut
++// the streamed way and the two compared (stage, fingerprint, origin); a difference is an archive
++// error, so the set is not stamped.
++// Both are read at first use: a namespace-scope value is set before main applies env.txt.
++bool StreamOn() {
++    static const bool on = Common::PeSwitch("EDEN_UP_SHADER_SET_STREAM");
++    return on;
++}
++bool StreamVerify() {
++    static const bool on = StreamOn() && Common::PeSwitch("EDEN_UP_SHADER_SET_STREAM_VERIFY");
++    return on;
++}
++constexpr size_t StreamChunk = 4 * 1024 * 1024;  // output window of a pass
++constexpr u64 StreamMost = u64{4} << 30;          // content a pass inflates at most
++constexpr u64 StreamGap = 64;                     // kept pieces this close are merged
++constexpr u64 StreamAsk = 0x100;                  // a missed read asks for at least this much
++constexpr int StreamMaxPasses = 12;
++
+ struct Bad : std::runtime_error {
+     using std::runtime_error::runtime_error;
+ };
+@@ -171,7 +202,9 @@ bool IsZstd(Bytes data) {
+ }
+ 
+ /// Inflates `frame`, or only its first `limit` bytes. Per thread: the context is reused.
+-std::vector<u8> Inflate(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, size_t limit) {
++/// `cut` (EDEN_UP_SHADER_SET_STREAM): set when the content goes on past `limit`.
++std::vector<u8> Inflate(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, size_t limit,
++                        bool* cut = nullptr) {
+     ZSTD_DCtx_reset(context, ZSTD_reset_session_and_parameters);
+     if (const ZSTD_DDict* dict = zstd.Dictionary(frame)) {
+         ZSTD_DCtx_refDDict(context, dict);
+@@ -187,6 +220,7 @@ std::vector<u8> Inflate(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, size_
+     std::vector<u8> out(std::min(reserve, MaxBlob));
+     ZSTD_inBuffer in{frame.data(), frame.size(), 0};
+     size_t produced = 0;
++    bool stopped = false;
+     while (produced < limit) {
+         if (produced == out.size()) {
+             if (out.size() >= MaxBlob) {
+@@ -201,13 +235,141 @@ std::vector<u8> Inflate(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, size_
+         }
+         produced += o.pos;
+         if (status == 0 || (in.pos == in.size && o.pos == 0)) {
++            stopped = true;
+             break; // end of frame, or no more input
+         }
+     }
++    if (cut) {
++        // The loop ran into `limit` with the frame unfinished. A frame that ends exactly there
++        // gives no further byte; one that goes on gives one (or a zstd error, read in passes).
++        *cut = false;
++        if (!stopped) {
++            u8 probe = 0;
++            ZSTD_outBuffer o{&probe, 1, 0};
++            const size_t status = ZSTD_decompressStream(context, &o, &in);
++            *cut = ZSTD_isError(status) || o.pos != 0;
++        }
++    }
+     out.resize(produced);
+     return out;
+ }
+ 
++/// EDEN_UP_SHADER_SET_STREAM: inflates `frame` from its start once more; `chunk(at, bytes)` sees
++/// the content in order, up to StreamChunk bytes at a time, from `window`. Stops as Inflate does
++/// (end of frame, or no more input). Returns the content size.
++u64 StreamFrame(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, std::vector<u8>& window,
++                const std::function<void(u64 at, Bytes chunk)>& chunk) {
++    ZSTD_DCtx_reset(context, ZSTD_reset_session_and_parameters);
++    if (const ZSTD_DDict* dict = zstd.Dictionary(frame)) {
++        ZSTD_DCtx_refDDict(context, dict);
++    }
++    window.resize(StreamChunk);
++    ZSTD_inBuffer in{frame.data(), frame.size(), 0};
++    u64 at = 0;
++    for (;;) {
++        ZSTD_outBuffer o{window.data(), window.size(), 0};
++        const size_t status = ZSTD_decompressStream(context, &o, &in);
++        if (ZSTD_isError(status)) {
++            throw Bad(fmt::format("zstd: {}", ZSTD_getErrorName(status)));
++        }
++        if (o.pos != 0) {
++            chunk(at, Bytes{window.data(), o.pos});
++            at += o.pos;
++            if (at > StreamMost) {
++                throw Bad(fmt::format("zstd content over {} GiB", StreamMost >> 30));
++            }
++        }
++        if (status == 0 || (in.pos == in.size && o.pos == 0)) {
++            return at;
++        }
++    }
++}
++
++/// [start, end) byte ranges of streamed content, sorted and merged (pieces StreamGap apart join).
++using Ranges = std::vector<std::pair<u64, u64>>;
++
++void Merge(Ranges& ranges) {
++    std::sort(ranges.begin(), ranges.end());
++    Ranges merged;
++    for (const auto& [start, end] : ranges) {
++        if (start >= end) {
++            continue;
++        }
++        if (!merged.empty() && start <= merged.back().second + StreamGap) {
++            merged.back().second = std::max(merged.back().second, end);
++        } else {
++            merged.emplace_back(start, end);
++        }
++    }
++    ranges = std::move(merged);
++}
++
++/// EDEN_UP_SHADER_SET_STREAM: the pieces of streamed content a pass kept, by start.
++class Held {
++public:
++    /// [at, at + size) if one kept piece holds all of it.
++    std::optional<Bytes> Find(u64 at, u64 size) const {
++        auto it = pieces.upper_bound(at);
++        if (it == pieces.begin()) {
++            return std::nullopt;
++        }
++        --it;
++        const u64 into = at - it->first;
++        const auto& bytes = it->second;
++        if (into > bytes.size() || size > bytes.size() - into) {
++            return std::nullopt;
++        }
++        return Bytes{bytes}.subspan(static_cast<size_t>(into), static_cast<size_t>(size));
++    }
++
++    /// One more pass: keeps what is kept now plus `asked`, and nothing else.
++    void Refill(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, std::vector<u8>& window,
++                Ranges asked) {
++        for (const auto& [start, bytes] : pieces) {
++            asked.emplace_back(start, start + bytes.size());
++        }
++        Merge(asked);
++        u64 total = 0;
++        for (const auto& [start, end] : asked) {
++            total += end - start;
++        }
++        if (total > MaxBlob) {
++            throw Bad(fmt::format("BNSH tables and control sections of {} MiB are over the {} MiB "
++                                  "cap", total >> 20, MaxBlob >> 20));
++        }
++        pieces.clear();
++        std::vector<std::vector<u8>*> into;
++        for (const auto& [start, end] : asked) {
++            auto& bytes = pieces[start];
++            bytes.resize(static_cast<size_t>(end - start));
++            into.push_back(&bytes);
++        }
++        size_t first = 0;
++        const u64 size = StreamFrame(zstd, context, frame, window, [&](u64 at, Bytes chunk) {
++            const u64 end = at + chunk.size();
++            while (first < asked.size() && asked[first].second <= at) {
++                ++first;
++            }
++            for (size_t i = first; i < asked.size() && asked[i].first < end; ++i) {
++                const u64 from = std::max(at, asked[i].first);
++                const u64 to = std::min(end, asked[i].second);
++                if (from < to) {
++                    std::memcpy(into[i]->data() + (from - asked[i].first),
++                                chunk.data() + (from - at), static_cast<size_t>(to - from));
++                }
++            }
++        });
++        for (size_t i = 0; i < asked.size(); ++i) {
++            if (asked[i].second > size) { // the content ended early: keep what came
++                into[i]->resize(static_cast<size_t>(size > asked[i].first ? size - asked[i].first : 0));
++            }
++        }
++    }
++
++private:
++    std::map<u64, std::vector<u8>> pieces;
++};
++
+ std::vector<u8> Yaz0(Bytes data) {
+     const u32 size = LoadBE<u32>(data, 4);
+     if (size > MaxBlob) {
+@@ -366,6 +528,10 @@ private:
+                 ++stats.peeked_only;
+                 return;
+             }
++            if (StreamOn()) {
++                InflateMember(data, label, 1);
++                return;
++            }
+             const auto inner = Inflate(zstd, context, data, MaxBlob);
+             stats.inflated_bytes += inner.size();
+             Walk(inner, label, 1);
+@@ -378,7 +544,9 @@ private:
+         if (depth > MaxDepth || data.size() < 8) {
+             return;
+         }
+-        if (IsZstd(data)) {
++        if (IsZstd(data) && StreamOn()) {
++            InflateMember(data, label, depth + 1);
++        } else if (IsZstd(data)) {
+             const auto inner = Inflate(zstd, context, data, MaxBlob);
+             stats.inflated_bytes += inner.size();
+             Walk(inner, label, depth + 1);
+@@ -411,9 +579,439 @@ private:
+ 
+     void Emit(Stage stage, Bytes control, Bytes code, std::string origin, std::string variation) {
+         ++stats.occurrences;
++        if (tap) {
++            tap->push_back({stage, Fingerprint(control, code), origin});
++        }
+         found(stage, control, code, std::move(origin), std::move(variation));
+     }
+ 
++    // ---- EDEN_UP_SHADER_SET_STREAM (see StreamOn) ----
++
++    /// What a member cut gives, for _VERIFY's comparison.
++    struct Cutout {
++        Stage stage;
++        u64 fingerprint;
++        std::string origin;
++        bool operator<(const Cutout& other) const {
++            return std::tie(origin, fingerprint, stage) <
++                   std::tie(other.origin, other.fingerprint, other.stage);
++        }
++        bool operator==(const Cutout& other) const {
++            return stage == other.stage && fingerprint == other.fingerprint &&
++                   origin == other.origin;
++        }
++    };
++
++    /// Content Walk() would only search for BNSH (and sead's drawer, which needs under 1 MiB).
++    static bool Streamable(Bytes data) {
++        return data.size() >= 8 && !IsZstd(data) && !Starts(data, "Yaz0") &&
++               !Starts(data, "SARC") && !Starts(data, "BAHS") && !Starts(data, "NDSR") &&
++               !Starts(data, "NDVE");
++    }
++
++    /// A zstd member as Top() and Walk() inflate it, except that content over the cap is never
++    /// searched cut short: BNSH data is cut in passes, anything else is an error.
++    void InflateMember(Bytes frame, const std::string& label, int depth) {
++        const unsigned long long declared = ZSTD_getFrameContentSize(frame.data(), frame.size());
++        const bool over = declared != ZSTD_CONTENTSIZE_UNKNOWN &&
++                          declared != ZSTD_CONTENTSIZE_ERROR && declared > MaxBlob;
++        if (!over) {
++            bool cut = false;
++            const auto inner = Inflate(zstd, context, frame, MaxBlob, &cut);
++            if (!cut) {
++                stats.inflated_bytes += inner.size();
++                if (StreamVerify() && depth <= MaxDepth && Streamable(inner)) {
++                    VerifyStreamed(frame, inner, label, depth);
++                } else {
++                    Walk(inner, label, depth);
++                }
++                return;
++            }
++        }
++        ++stats.cut_at_cap;
++        if (depth > MaxDepth) {
++            return; // Walk() would not look at it
++        }
++        const auto head = Inflate(zstd, context, frame, PeekBytes);
++        if (!Streamable(head)) {
++            throw Bad(fmt::format("zstd content over the {} MiB cap is a container, not BNSH "
++                                  "data, and was not read (EDEN_UP_SHADER_SET_MAX_MB)",
++                                  MaxBlob >> 20));
++        }
++        auto cut = Streamed(frame, label, [&](Stage stage, Bytes control, Bytes code,
++                                              const std::string& origin) {
++            Emit(stage, control, code, origin, origin);
++        });
++        ++stats.streamed;
++        stats.stream_passes += cut.passes;
++        stats.inflated_bytes += cut.size;
++        stats.containers += cut.containers;
++        errors.insert(errors.end(), cut.errors.begin(), cut.errors.end());
++    }
++
++    /// _VERIFY: Walk() as usual, watched, then the same member cut in passes; the two must give
++    /// the same programs from the same BNSH variations.
++    void VerifyStreamed(Bytes frame, Bytes inner, const std::string& label, int depth) {
++        std::vector<Cutout> whole;
++        tap = &whole;
++        try {
++            Walk(inner, label, depth);
++        } catch (...) {
++            tap = nullptr;
++            throw;
++        }
++        tap = nullptr;
++        std::erase_if(whole, [](const Cutout& c) { return c.origin.ends_with("#SEADPRIM"); });
++        std::vector<Cutout> streamed;
++        u64 passes = 0;
++        std::string failed;
++        try {
++            const auto cut = Streamed(frame, label, [&](Stage stage, Bytes control, Bytes code,
++                                                        const std::string& origin) {
++                streamed.push_back({stage, Fingerprint(control, code), origin});
++            });
++            passes = cut.passes;
++        } catch (const Bad& e) {
++            failed = e.what();
++        }
++        ++stats.verified;
++        stats.stream_passes += passes;
++        std::sort(whole.begin(), whole.end()); // as multisets: one per stage record, both ways
++        std::sort(streamed.begin(), streamed.end());
++        if (failed.empty() && whole == streamed) {
++            return;
++        }
++        std::string first = failed;
++        if (first.empty()) {
++            const auto [a, b] = std::mismatch(whole.begin(), whole.end(), streamed.begin(),
++                                              streamed.end());
++            const auto& c = a != whole.end() ? *a : *b;
++            first = fmt::format("{} {:016x} {} only {}", StageName(c.stage), c.fingerprint,
++                                c.origin, a != whole.end() ? "whole" : "streamed");
++        }
++        errors.push_back(fmt::format("{}: stream verify: whole cut {} programs, streamed {}; {}",
++                                     label, whole.size(), streamed.size(), first));
++    }
++
++    using Sink = std::function<void(Stage, Bytes control, Bytes code, const std::string& origin)>;
++
++    struct StreamedCut {
++        u64 size{};       ///< the content's
++        u64 passes{};
++        u64 containers{}; ///< BNSH parsed without an error, as EmbeddedBnsh counts them
++        std::vector<std::string> errors;
++    };
++
++    /// A read of one BNSH (offsets from its start, as Bnsh() reads them) not kept yet: asked for.
++    struct Missing {};
++
++    /// One BNSH read from kept pieces with Bnsh()'s bounds checks and messages; a read that is
++    /// not kept yet is asked for (at least StreamAsk bytes) and throws Missing.
++    struct View {
++        const Held& held;
++        Ranges& asked;
++        u64 base;
++        u64 size;
++
++        void Ask(u64 at, u64 n) const {
++            if (at < size) {
++                asked.emplace_back(base + at, base + at + std::min(n, size - at));
++            }
++        }
++        Bytes Get(u64 at, u64 n) const {
++            if (n == 0) {
++                return {};
++            }
++            if (const auto bytes = held.Find(base + at, n)) {
++                return *bytes;
++            }
++            Ask(at, std::max(n, StreamAsk));
++            throw Missing{};
++        }
++        template <typename T>
++        T Load(u64 at) const {
++            if (at > size || sizeof(T) > size - at) {
++                throw Bad(fmt::format("read past the end at {:#x}", at));
++            }
++            T value;
++            std::memcpy(&value, Get(at, sizeof(T)).data(), sizeof(T));
++            return value;
++        }
++        Bytes Sub(u64 at, u64 n) const {
++            if (at > size || n > size - at) {
++                throw Bad(fmt::format("range {:#x}+{:#x} past the end", at, n));
++            }
++            return Get(at, n);
++        }
++    };
++
++    /// A program Bnsh() would emit: where its pieces are in the content.
++    struct Piece {
++        Stage stage;
++        u64 base;      ///< the BNSH's offset
++        u32 variation;
++        u64 control_at;
++        u32 control_size;
++        u64 code_at;
++        u32 code_size;
++    };
++
++    struct Plan {
++        std::vector<Piece> pieces; ///< in Bnsh()'s order
++        bool complete = true;      ///< no read was missing up to the end (or the error)
++        std::optional<std::string> bad;
++    };
++
++    /// Bnsh() line for line over kept pieces, recording instead of emitting. While reads are
++    /// missing the plan is not complete; it is used only once a pass leaves none missing, and
++    /// then it is exactly what Bnsh() emits, up to the Bad that ends the BNSH.
++    Plan PlanBnsh(const View& d) {
++        Plan plan;
++        try {
++            if (!Starts(d.Sub(0x60, 4), "grsc")) {
++                throw Bad("no grsc block");
++            }
++            const u32 count = d.Load<u32>(0x7c);
++            const u64 table = d.Load<u64>(0x80);
++            if (table < d.size) {
++                d.Ask(table, std::min<u64>(u64{count} * 0x40, d.size - table));
++            }
++            static constexpr std::array slots{Stage::Vertex,   Stage::TessControl,
++                                              Stage::TessEval, Stage::Geometry,
++                                              Stage::Fragment, Stage::Compute};
++            // A missing read ends only its own stage, so one pass asks for every stage's reads.
++            const auto attempt = [&](auto&& step) {
++                try {
++                    step();
++                } catch (const Missing&) {
++                    plan.complete = false;
++                }
++            };
++            for (u32 v = 0; v < count; ++v) {
++                u64 program = 0;
++                attempt([&] { program = d.Load<u64>(table + 0x40 * u64{v} + 0x10); });
++                if (program == 0) {
++                    continue; // none, or not kept yet
++                }
++                const auto stage_at = [&](u64 record, Stage stage, bool optional) {
++                    const u64 control_at = d.Load<u64>(record + 0x08);
++                    const u64 code_at = d.Load<u64>(record + 0x10);
++                    const u32 code_size = d.Load<u32>(record + 0x18);
++                    const u32 control_size = d.Load<u32>(record + 0x1c);
++                    if (optional && (control_size < KeyControl || control_size >= 0x10000 ||
++                                     control_at + control_size > d.size ||
++                                     code_at + code_size > d.size)) {
++                        return;
++                    }
++                    const auto control = d.Sub(control_at, control_size);
++                    if (code_at > d.size || code_size > d.size - code_at) {
++                        throw Bad(fmt::format("range {:#x}+{:#x} past the end", code_at,
++                                              code_size));
++                    }
++                    if (optional) {
++                        const u8 expected = stage == Stage::Task ? 6 : 7;
++                        if (!IsNvn2Control(control) || control.size() <= 0x56 ||
++                            control[0x56] != expected) {
++                            return;
++                        }
++                    }
++                    if (!IsNvn2Control(control) || Load<u32>(control, 0x44) != code_size) {
++                        throw Bad(fmt::format("variation {} {}: control +0x44 does not "
++                                              "match the code", v, StageName(stage)));
++                    }
++                    plan.pieces.push_back({stage, d.base, v, d.base + control_at,
++                                           control_size, d.base + code_at, code_size});
++                };
++                for (size_t slot = 0; slot < slots.size(); ++slot) {
++                    attempt([&] {
++                        const u64 record = d.Load<u64>(program + 8 + 8 * slot);
++                        if (record != 0) {
++                            stage_at(record, slots[slot], false);
++                        }
++                    });
++                }
++                static constexpr std::array tails{std::pair{u64{0x40}, Stage::Task},
++                                                  std::pair{u64{0x48}, Stage::Mesh}};
++                for (const auto& tail : tails) {
++                    if (program + tail.first + 8 > d.size) {
++                        continue;
++                    }
++                    attempt([&] {
++                        const u64 record = d.Load<u64>(program + tail.first);
++                        if (record != 0 && record + 0x20 <= d.size) {
++                            stage_at(record, tail.second, true);
++                        }
++                    });
++                }
++            }
++        } catch (const Missing&) {
++            plan.complete = false;
++        } catch (const Bad& e) {
++            plan.bad = e.what();
++        }
++        return plan;
++    }
++
++    /// BNSH data over the cap (or, for _VERIFY, under it), as Walk() -> EmbeddedBnsh() -> Bnsh()
++    /// would cut it whole. Passes: (1) where the BNSH magic is and the content size; (2) each
++    /// hit's header; (3..) the reads PlanBnsh() still misses, until none is; (last) the code of
++    /// every planned program, handed to `sink` as soon as its last byte is out, with its control
++    /// section from the kept pieces. Programs come in code order, not variation order (the set
++    /// keeps a program by fingerprint, whichever variation names it first).
++    StreamedCut Streamed(Bytes frame, const std::string& label, const Sink& sink) {
++        StreamedCut out;
++        std::vector<u8> window;
++        std::vector<u64> hits;
++        std::vector<u8> joined;
++        size_t tail = 0; // bytes of the previous chunk at the front of `joined`
++        out.size = StreamFrame(zstd, context, frame, window, [&](u64 at, Bytes chunk) {
++            // A magic may start in the last 7 bytes of the previous chunk.
++            joined.erase(joined.begin(), joined.end() - static_cast<std::ptrdiff_t>(tail));
++            joined.insert(joined.end(), chunk.begin(), chunk.end());
++            for (auto it = joined.begin();
++                 (it = std::search(it, joined.end(), BnshMagic.begin(), BnshMagic.end())) !=
++                 joined.end();
++                 ++it) {
++                const u64 hit = at - tail + static_cast<u64>(it - joined.begin());
++                if (hits.empty() || hits.back() < hit) {
++                    hits.push_back(hit);
++                }
++            }
++            tail = std::min<size_t>(joined.size(), BnshMagic.size() - 1);
++            if (hits.size() > (1u << 20)) {
++                throw Bad("over a million BNSH magics");
++            }
++        });
++        out.passes = 1;
++        const u64 total = out.size;
++        Held held;
++        Ranges asked;
++        for (const u64 hit : hits) {
++            asked.emplace_back(hit, std::min<u64>(hit + 0x1000, total));
++        }
++        if (!hits.empty()) {
++            held.Refill(zstd, context, frame, window, std::move(asked));
++            ++out.passes;
++        }
++        std::vector<Piece> pieces;
++        for (;;) {
++            asked.clear();
++            pieces.clear();
++            out.errors.clear();
++            out.containers = 0;
++            bool complete = true;
++            u64 next = 0; // EmbeddedBnsh's search position
++            for (const u64 base : hits) {
++                if (base < next) {
++                    continue;
++                }
++                u64 size = 0;
++                if (base + 0x20 <= total) {
++                    const auto bytes = held.Find(base + 0x1c, 4);
++                    if (!bytes) {
++                        throw Bad(fmt::format("BNSH header at {:#x} was not kept", base));
++                    }
++                    size = Load<u32>(*bytes, 0);
++                }
++                const bool bounded = size >= 0x98 && size <= total - base;
++                next = base + (bounded ? size : 8);
++                if (!bounded) {
++                    continue;
++                }
++                const View view{held, asked, base, size};
++                auto plan = PlanBnsh(view);
++                complete &= plan.complete;
++                pieces.insert(pieces.end(), plan.pieces.begin(), plan.pieces.end());
++                if (plan.bad) {
++                    out.errors.push_back(fmt::format("{}#BNSH@{:#x}: {}", label, base, *plan.bad));
++                } else {
++                    ++out.containers;
++                }
++            }
++            if (complete) {
++                break;
++            }
++            if (out.passes >= StreamMaxPasses) {
++                throw Bad(fmt::format("BNSH tables still incomplete after {} passes", out.passes));
++            }
++            held.Refill(zstd, context, frame, window, std::move(asked));
++            ++out.passes;
++        }
++        // The last pass: each distinct code window, kept only while it streams by.
++        Ranges codes;
++        for (const auto& p : pieces) {
++            codes.emplace_back(p.code_at, p.code_at + p.code_size);
++        }
++        std::sort(codes.begin(), codes.end());
++        codes.erase(std::unique(codes.begin(), codes.end()), codes.end());
++        std::multimap<std::pair<u64, u64>, const Piece*> users;
++        for (const auto& p : pieces) {
++            users.emplace(std::pair{p.code_at, p.code_at + p.code_size}, &p);
++        }
++        const auto deliver = [&](const std::pair<u64, u64>& range, Bytes code) {
++            const auto [from, to] = users.equal_range(range);
++            for (auto it = from; it != to; ++it) {
++                const Piece& p = *it->second;
++                const auto control = held.Find(p.control_at, p.control_size);
++                if (!control) {
++                    throw Bad(fmt::format("control section at {:#x} was not kept", p.control_at));
++                }
++                sink(p.stage, *control, code,
++                     fmt::format("{}#BNSH@{:#x}#var{}", label, p.base, p.variation));
++            }
++        };
++        struct Open {
++            size_t range;
++            std::vector<u8> bytes;
++        };
++        // Empty code areas need no pass; a code area is held whole while it streams by.
++        std::erase_if(codes, [&](const std::pair<u64, u64>& range) {
++            if (range.first == range.second) {
++                deliver(range, {});
++                return true;
++            }
++            if (range.second - range.first > MaxBlob) {
++                throw Bad(fmt::format("code area of {} MiB at {:#x} is over the {} MiB cap",
++                                      (range.second - range.first) >> 20, range.first,
++                                      MaxBlob >> 20));
++            }
++            return false;
++        });
++        std::vector<Open> open;
++        size_t next_range = 0;
++        if (next_range < codes.size()) {
++            StreamFrame(zstd, context, frame, window, [&](u64 at, Bytes chunk) {
++                const u64 end = at + chunk.size();
++                while (next_range < codes.size() && codes[next_range].first < end) {
++                    const auto& range = codes[next_range];
++                    open.push_back({next_range, std::vector<u8>(static_cast<size_t>(
++                                                    range.second - range.first))});
++                    ++next_range;
++                }
++                for (auto it = open.begin(); it != open.end();) {
++                    const auto& range = codes[it->range];
++                    const u64 from = std::max(at, range.first);
++                    const u64 to = std::min(end, range.second);
++                    if (from < to) {
++                        std::memcpy(it->bytes.data() + (from - range.first),
++                                    chunk.data() + (from - at), static_cast<size_t>(to - from));
++                    }
++                    if (range.second <= end) {
++                        deliver(range, it->bytes);
++                        it = open.erase(it);
++                    } else {
++                        ++it;
++                    }
++                }
++            });
++            ++out.passes;
++        }
++        if (!open.empty() || next_range < codes.size()) {
++            throw Bad("the content ended before the last code area");
++        }
++        return out;
++    }
++
+     bool EmbeddedBnsh(Bytes data, const std::string& label) {
+         bool any = false;
+         auto it = data.begin();
+@@ -785,6 +1383,7 @@ private:
+     std::vector<std::string>& errors;
+     Stats& stats;
+     ZSTD_DCtx* context;
++    std::vector<Cutout>* tap{}; ///< _VERIFY: Emit() also notes each program here
+ };
+ 
+ struct FileItem {
+@@ -868,7 +1467,8 @@ u64 Fingerprint(std::span<const u8> control, std::span<const u8> code) {
+ }
+ 
+ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* progress,
+-               std::stop_token stop, const std::unordered_set<u64>* wanted) {
++               std::stop_token stop, const std::unordered_set<u64>* wanted,
++               const std::unordered_set<std::string>* only) {
+     Zstd zstd;
+     LoadDictionaries(roots, zstd);
+     std::vector<FileItem> files;
+@@ -877,6 +1477,12 @@ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* pr
+             Collect(root, "", files);
+         }
+     }
++    u64 skipped_by_index = 0;
++    if (only) {
++        // EDEN_UP_SHADER_SET_INDEX: the files the index names (nxnative's shader sources).
++        skipped_by_index = std::erase_if(
++            files, [only](const FileItem& item) { return !only->contains(item.path); });
++    }
+     if (progress) {
+         progress->files_total = files.size();
+     }
+@@ -988,7 +1594,12 @@ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* pr
+         result.stats.peeked_only += stats[i].peeked_only;
+         result.stats.containers += stats[i].containers;
+         result.stats.occurrences += stats[i].occurrences;
++        result.stats.cut_at_cap += stats[i].cut_at_cap;
++        result.stats.streamed += stats[i].streamed;
++        result.stats.stream_passes += stats[i].stream_passes;
++        result.stats.verified += stats[i].verified;
+     }
++    result.stats.skipped_by_index = skipped_by_index;
+     if (zstd.Count() == 0) {
+         result.errors.push_back("Pack/ZsDic.pack.zs: no zstd dictionaries (files that need one "
+                                 "are reported as missing their dictionary)");
+diff --git a/src/core/file_sys/nx2_shader_extract.h b/src/core/file_sys/nx2_shader_extract.h
+index 54fdd97..0af43a4 100644
+--- a/src/core/file_sys/nx2_shader_extract.h
++++ b/src/core/file_sys/nx2_shader_extract.h
+@@ -55,6 +55,12 @@ struct Stats {
+     u64 peeked_only{};         ///< compressed files whose content held no container
+     u64 containers{};          ///< SARC, BNSH, BAHS, NDSR, NDVE, sead files parsed
+     u64 occurrences{};         ///< programs found, before removing duplicates
++    // PS5 port, all 0 unless their switch is on:
++    u64 cut_at_cap{};          ///< EDEN_UP_SHADER_SET_STREAM: zstd members over the cap
++    u64 streamed{};            ///< ... of them cut in passes instead (BNSH data)
++    u64 stream_passes{};       ///< inflate passes those took
++    u64 verified{};            ///< EDEN_UP_SHADER_SET_STREAM_VERIFY: members cut both ways
++    u64 skipped_by_index{};    ///< EDEN_UP_SHADER_SET_INDEX: RomFS files not read
+ };
+ 
+ struct Result {
+@@ -87,9 +93,12 @@ struct Progress {
+ /// Directories are scanned in order (base game first, then updates and add-ons); a program found
+ /// in several keeps its first origin. `threads` 0 uses the hardware's. PS5 port: with `wanted`,
+ /// only programs whose fingerprint is in it are kept (the others are counted, not stored).
++/// With `only` (EDEN_UP_SHADER_SET_INDEX), a RomFS file is read only if its path
++/// ("/dir/name") is in it; the zstd dictionaries are always read.
+ [[nodiscard]] Result Extract(std::span<const VirtualDir> roots, unsigned threads = 0,
+                              Progress* progress = nullptr, std::stop_token stop = {},
+-                             const std::unordered_set<u64>* wanted = nullptr);
++                             const std::unordered_set<u64>* wanted = nullptr,
++                             const std::unordered_set<std::string>* only = nullptr);
+ 
+ /// The fingerprint of one program (see the file comment).
+ [[nodiscard]] u64 Fingerprint(std::span<const u8> control, std::span<const u8> code);
+diff --git a/src/video_core/shader_set.cpp b/src/video_core/shader_set.cpp
+index c356172..48ca98b 100644
+--- a/src/video_core/shader_set.cpp
++++ b/src/video_core/shader_set.cpp
+@@ -165,6 +165,36 @@ private:
+     bool done{};
+ };
+ 
++/// EDEN_UP_SHADER_SET_STREAM / _INDEX change what a search can find, so a set made with either
++/// says so in its stamp; with both off this is empty and the stamp is as before.
++std::string ExtractorLines() {
++    std::string lines;
++    if (Common::PeSwitch("EDEN_UP_SHADER_SET_STREAM")) lines += "extractor stream 1\n";
++    if (Common::PeSwitch("EDEN_UP_SHADER_SET_INDEX")) lines += "extractor index 1\n";
++    return lines;
++}
++
++/// EDEN_UP_SHADER_SET_INDEX=1: shader_set_index.txt beside the recipe lists the RomFS sources of
++/// the game's shaders, one per line ("/dir/file[/member...]", anything from a '#' on ignored),
++/// as nxnative's shader_map.tsv names them (github.com/seedds/nxnative, MIT, Copyright (c) 2026
++/// seedds). Each line and every '/'-prefix of it goes into `only`, so a RomFS file is read when
++/// a source lies in it. False when the file is missing or names nothing (then all files are read).
++constexpr const char* IndexName = "shader_set_index.txt";
++bool ReadIndex(const std::filesystem::path& path, std::unordered_set<std::string>& only, size_t& sources) {
++    std::ifstream f{path};
++    sources = 0;
++    for (std::string line; f && std::getline(f, line);) {
++        if (const auto hash = line.find('#'); hash != std::string::npos) line.resize(hash);
++        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
++        if (line.size() < 2 || line.front() != '/') continue;
++        ++sources;
++        for (size_t slash = line.find('/', 1); slash != std::string::npos; slash = line.find('/', slash + 1))
++            only.insert(line.substr(0, slash));
++        only.insert(line);
++    }
++    return sources != 0;
++}
++
+ std::string StampText(const Identity& identity, u64 title, u32 version,
+                       const std::string& recipe_name, u64 recipe_size,
+                       const std::string& recipe_digest) {
+@@ -176,7 +206,8 @@ std::string StampText(const Identity& identity, u64 title, u32 version,
+                        "extractor cap {} MiB\n",
+                        FormatVersion, title, version, recipe_name, recipe_size, recipe_digest,
+                        identity.cache_version, identity.lowering_tag, 1008, identity.device,
+-                       identity.translation, ContainerCapMiB());
++                       identity.translation, ContainerCapMiB()) +
++           ExtractorLines();
+ }
+ 
+ /// Whether the stamp beside the generated files says they were made from `expected`, and they
+@@ -535,9 +566,25 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+                 progress.cancel.store(true);
+             }
+         };
++        // EDEN_UP_SHADER_SET_INDEX: only the files nxnative's map names (about 1,140 of 186,587
++        // for Ocarina of Time). Without the index file every file is read, as before.
++        std::unordered_set<std::string> only;
++        size_t index_sources = 0;
++        const bool indexed = Common::PeSwitch("EDEN_UP_SHADER_SET_INDEX") &&
++                             ReadIndex(title_dir / IndexName, only, index_sources);
++        if (Common::PeSwitch("EDEN_UP_SHADER_SET_INDEX")) {
++            if (indexed) {
++                LOG_INFO(Render_Vulkan, "Shader set: index {} names {} sources; only their files are read",
++                         IndexName, index_sources);
++            } else {
++                LOG_WARNING(Render_Vulkan, "Shader set: EDEN_UP_SHADER_SET_INDEX=1 but {} is missing or "
++                            "empty beside the recipe; every file is read", IndexName);
++            }
++        }
+         LOG_INFO(Render_Vulkan, "Shader set: extracting {} wanted programs from the game's files "
+                  "on {} thread(s), duty {}%", wanted.size(), threads, duty);
+-        auto extracted = FileSys::Nx2ShaderExtract::Extract(source.roots, threads, &progress, stop, &wanted);
++        auto extracted = FileSys::Nx2ShaderExtract::Extract(source.roots, threads, &progress, stop, &wanted,
++                                                            indexed ? &only : nullptr);
+         if (stop.stop_requested()) return out;
+         if (const char* const reason = cancelled.load()) {
+             LOG_WARNING(Render_Vulkan, "Shader set: extraction cancelled ({}) after {} of {} files; "
+@@ -559,6 +606,13 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+                  "containers, {} peeked only) in {:.1f} s", extracted_stats.files,
+                  extracted_stats.file_bytes >> 20, extracted_stats.inflated_bytes >> 20,
+                  extracted_stats.containers, extracted_stats.peeked_only, seconds());
++        if (Common::PeSwitch("EDEN_UP_SHADER_SET_STREAM") || indexed) {
++            LOG_INFO(Render_Vulkan, "Shader set: {} members over the {} MiB cap, {} of them cut in {} "
++                     "passes; {} members verified (_VERIFY); {} files skipped by the index",
++                     extracted_stats.cut_at_cap, ContainerCapMiB(), extracted_stats.streamed,
++                     extracted_stats.stream_passes, extracted_stats.verified,
++                     extracted_stats.skipped_by_index);
++        }
+         std::vector<std::optional<Lowered>> lowered(r.programs.size());
+         std::unordered_set<u64> have;
+         size_t found = 0, missing = 0, failed = 0;

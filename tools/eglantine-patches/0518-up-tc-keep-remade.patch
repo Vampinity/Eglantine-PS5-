@@ -1,0 +1,537 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_TC_KEEP_REMADE=1: the collectors keep large converted ASTC, and converted ASTC the game makes again after a collector deleted it, as EDEN_NX2_TC_KEEP_ASYNC keeps AsynchronousDecode images (Lichii #1129's alternative); EDEN_UP_TC_TRACE=1 logs each image made and deleted (Lichii #1130); off by default
+
+Lossless: no texture changes format, size or levels. Only when an image is deleted changes.
+
+Credits. EDEN_UP_TC_KEEP_REMADE is the alternative liomaroliveira names at the end of
+zortos293/Lichii #1129 (open, head 49a1cd23f9, "scale the collector's ceiling with the device
+budget on 10+ GiB cards"): exempt CostlyLoad images the collector evicted and the game re-created
+within N frames. #1129's own change (raise the critical ceiling from a 10 GiB budget on) does
+nothing on the PS5, whose budget is 6 GiB; its alternative is written here from the PR text, not
+from code. EDEN_UP_TC_TRACE is a port of zortos293/Lichii #1130 (open, head 92b29fb513, by
+liomaroliveira, upstream name EDEN_NX2_TC_TRACE). Neither is compiled or run upstream by us.
+
+Why. EDEN_NX2_TC_KEEP_ASYNC (0232, live switch since 0478) only covers AsynchronousDecode images,
+and vk_texture_cache.cpp sets that flag only when the RGBA8 decode is over
+EDEN_NX2_GPU_TRANSCODE_MIB. The play env sets 256, so Ocarina of Time's 6144x6144 ASTC ground
+texture (13 levels, 192 MiB decode, 48 MiB as BC3, flags 0x1073: AcceleratedUpload, Converted,
+CostlyLoad) goes to the GPU transcode and is protected only as CostlyLoad. That ends in aggressive
+mode, which PoolPressure level 2 turns on. Each new copy then needs the 192 MiB decode image and
+a 48 MiB BC3 output again. t85-f run704: four refusals of that decode image in 20 s. Runs
+739/742/743: made 3 times each. batch-t89-b run759 (pool hog 1024): decode images for the 6144 at
+83.2 s and again at 91.0 s, the second together with two 3072x3072 ones (48 MiB decode each), then
+"Out of device memory: keeping 1536 MiB more free". run761 (hog 1280) made the 6144 once at 81.4 s
+and ran out of device memory at 90.5 s, about where run759 made it again. #1129 saw the same set on a 12 GB card: the 6144 and three 3072x3072
+ASTC 5x5 textures deleted by the aggressive collector and made again ~128 frames later.
+
+EDEN_UP_TC_KEEP_REMADE=1 (Common::PeSwitch, exact 1).
+- Candidates: ASTC the host does not sample as ASTC (Converted), CostlyLoad, not
+  AsynchronousDecode (those stay KEEP_ASYNC's, whatever it is set to, so this switch changes
+  nothing for the CPU-decoded 1365x1365x90 arrays), backed whole (not Unbacked, UnwrittenSparse,
+  SparseLayers or SparseTiles), holding at most 256 MiB of device memory (the >1 GiB RGBA8 huge
+  arrays are never kept).
+- Kept from creation when the RGBA8 decode (every level and layer, the sum
+  TranscodeScratchTooLarge uses) is over EDEN_UP_TC_KEEP_REMADE_MIB (digits 0..4096, default
+  128 = the default GPU transcode limit, so with GPU_TRANSCODE_MIB=256 it covers exactly the images
+  KEEP_ASYNC lost; 0: none this way). In Ocarina: the 6144x6144.
+- Kept when made again: a collector (any reason starting with "gc", below) deleted a candidate at
+  the same GPU address with the same format, width, height, levels and layers at most 600 frames
+  before, and its decode is at least EDEN_UP_TC_KEEP_REMADE_MIN_MIB (digits 0..4096, default 32;
+  0: none this way). In Ocarina: the 3072x3072 ASTC (48 MiB decode, 12 MiB as BC3), from their
+  second creation on. Up to 64 deletes are remembered; older than 600 frames go first.
+- A kept image is skipped at every place KEEP_ASYNC's images are skipped: RunGarbageCollector
+  (except its old pass: unused for EDEN_NX2_TC_OLD_AGE frames, 1800 unset, under high priority, as
+  KEEP_ASYNC), CollectForBuffer, AreaEvict, RefusalEvict and RefusalDownloadEvict. Unmaps and
+  joins delete it as before (the Fritchii cold sweep never takes Converted images). Guest writes
+  still mark it CpuModified and upload it again (new decode image and all), as before: keeping is
+  only about the collectors.
+- New ImageBase fields tc_keep_remade / tc_keep_remade_frame, set only here, only with the
+  switch on. No new ImageFlagBits bit (0495 adds GuestBytes = 1 << 24 at the same place).
+- HW_GPU lines, the first 64 of each kind and then each power of two:
+  "EDEN_UP_TC_KEEP_REMADE: keeping <addr> WxHxL (n levels, format F): decode D MiB, over N
+  MiB; holds H MiB; K kept now, T so far" or "...: made again F frames after a collector deleted
+  it, decode D MiB; ...", and "EDEN_UP_TC_KEEP_REMADE: kept <addr> WxHxL deleted (reason) F
+  frames after it was kept; K kept now, D deleted so far".
+
+EDEN_UP_TC_TRACE=1 (Common::PeSwitch, exact 1). As #1130: LOG_WARNING HW_GPU "TCTRACE create
+id= gpu= type= fmt= WxHxD lv= ly= guest=KiB joined= found= ms= frame=" after JoinImages (format
+as upstream) and "TCTRACE delete id= gpu= fmt= WxHxD guest=KiB immediate= reason= frame=" in
+DeleteImage. Reasons: gc, gc-high-priority, gc-aggressive (as upstream), and ours: gc-old (the old
+pass), gc-buffer (CollectForBuffer), gc-area (AreaEvict), gc-refusal (RefusalEvict),
+gc-refusal-copied (RefusalDownloadEvict), cold (EDEN_UP_FRITCHII_COLD), unmap, join, join-ignored
+(as upstream), other. Also ours: "TCTRACE refused gpu= type= fmt= WxHxD lv= ly= guest=KiB frame="
+when JoinImages makes nothing, so a refused first creation is told apart from a delete and a new
+make. EDEN_UP_TC_TRACE_MIB=<N> (digits 0..4096; unset or 0: every image, as upstream): only
+images of at least N MiB of guest memory. Ocarina makes ~6500 images per 600 frames in the
+village, so use =4 on the console (the 6144 is 31 MiB of guest data, a 3072x3072 about 8 MiB).
+The reason pointer is set before each DeleteImage call even with both switches off (a pointer
+store, nothing read); DeleteImage reads it and puts back "other".
+
+Interplay.
+- EDEN_NX2_TC_KEEP_ASYNC: separate rule for separate images, same exemption sites. With
+  GPU_TRANSCODE_MIB at its default (128) the large rule finds nothing (every ASTC over 128 MiB is
+  AsynchronousDecode) and only the made-again rule acts.
+- EDEN_NX2_GPU_TRANSCODE_MIB / TRANSCODE_KEEP_MIB / TRANSCODE_WAIT: routing is untouched. A kept
+  6144 needs its 192 MiB decode image once per area visit instead of once per collector delete.
+  EDEN_UP_ASTC_BATCH_MIB (separate draft) shrinks each decode; this one cuts how many there are.
+  No file in common.
+- Ahead guard (0491-0504, 0511): no texture cache code there; texture data is "not covered" by
+  the guard and guest writes still upload kept images (0502).
+- Skip-stale uploads (0495): a kept image is not deleted, so the collector does not MarkStale it;
+  ASTC images carry GuestBytes with 0495 on, which MarkStale refuses anyway. When a kept image
+  does go (old pass), the old path runs.
+- AREA_EVICT (play env =40): kept images are skipped as KEEP_ASYNC's are. This keeps the 6144
+  through a door (house and back), which is where its remake hit. It goes after 1800 unused
+  frames under pressure (old pass).
+- Port script (prepare-vulkan-port.py): no anchor changes. The pinned RunGarbageCollector anchors
+  ("(!high_priority_mode && must_download)) {", the Configure lines, the drain block,
+  "if (must_download) {", the Cleanup capture), "namespace VideoCommon {" and the DeleteImage
+  accounting segment (HasScaled to gpu_addr) each still occur once and are unchanged; the new
+  DeleteImage block sits before that segment.
+
+Expected memory effect (not measured). Per remake of the 6144 that this avoids: a 192 MiB decode
+image + 48 MiB BC3 output (+ the 31 MiB guest upload), ~240 MiB at the moment it happened, 3 to 4
+times per walk in t85-f and run739-743. Per 3072x3072 remake: ~60 MiB (48 + 12). In run759 at
+91.0 s the 6144 and two 3072s came together: ~360 MiB. Cost: the kept images stay while unused,
+48 MiB for the 6144, 12 MiB per 3072 (84 MiB with EDEN_UP_TC_KEEP_REMADE_MIB=32, which keeps the
+3072s from their first creation too). It does not help a first creation the pool refuses
+(run759's 32 EDEN_REFUSED_IMAGE lines for the 48 MiB BC3 image itself).
+
+Unset (or anything but exactly "1"): KeepRemadeCandidate is false, no ImageBase field is ever
+set, KeptRemade is false at every site, nothing is remembered or logged; collectors, InsertImage
+and DeleteImage behave as before. EDEN_UP_TC_TRACE unset: no line. The size variables are only
+read with their switch on.
+
+Not built, not run. git apply --check passes on T88 core and on T88 with the series 0491-0515
+(texture cache files; 0495 and 0498 touch them), also on top of draft-memory-census.patch.
+Checked by reading only.
+---
+ src/video_core/texture_cache/image_base.h         |    5 
+ src/video_core/texture_cache/texture_cache.h      |  249 +++++++++++++++++++++
+ src/video_core/texture_cache/texture_cache_base.h |   17 +
+ 3 files changed, 268 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index 3c66304..7487f0b 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -119,6 +119,11 @@ struct ImageBase {
+     std::vector<std::pair<u64, u64>> dirty_ranges;
+     u64 scale_tick = 0;
+     bool has_scaled = false;
++    /// EDEN_UP_TC_KEEP_REMADE (texture_cache.h KeptRemade): the collectors leave this image alone
++    /// as EDEN_NX2_TC_KEEP_ASYNC leaves AsynchronousDecode images. Only ever set with the switch
++    /// on; tc_keep_remade_frame is the frame it was set.
++    bool tc_keep_remade = false;
++    u64 tc_keep_remade_frame = 0;
+ 
+     size_t channel = 0;
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 94a8500..0bc25b1 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -65,6 +65,113 @@ namespace VideoCommon {
+         Common::LiveSwitch::Value<Common::LiveSwitch::Id::TcKeepAsync>());
+ }
+ 
++/// EDEN_UP_TC_KEEP_REMADE=1 (Common::PeSwitch, exact 1; off unless set): converted ASTC that a
++/// collector would delete and the game would make again is left alone the way
++/// EDEN_NX2_TC_KEEP_ASYNC leaves AsynchronousDecode images. Every collector skips it
++/// (RunGarbageCollector, CollectForBuffer, AreaEvict, RefusalEvict, RefusalDownloadEvict) until it
++/// has gone unused for EDEN_NX2_TC_OLD_AGE frames (the collector's old pass, under pressure);
++/// unmaps and joins delete it as before, and guest writes upload it again as before. Lichii #1129's
++/// alternative, from its PR text (liomaroliveira: exempt CostlyLoad images the collector evicted
++/// and the game re-created within N frames), not its code. Why here: EDEN_NX2_GPU_TRANSCODE_MIB=256
++/// sends Ocarina of Time's 6144x6144 ground texture (192 MiB decode image) to the GPU transcode, so
++/// it loses AsynchronousDecode and with it KEEP_ASYNC; the pool-pressure collector then deletes it,
++/// and each new copy needs the 192 MiB decode image and a 48 MiB BC3 output again (t85-f run704:
++/// four refusals of it in 20 s, runs 739/742/743: made 3 times each). A candidate is ASTC the host
++/// does not sample as ASTC (Converted), CostlyLoad, not AsynchronousDecode (those stay KEEP_ASYNC's,
++/// whatever it is set to), backed whole (not Unbacked, UnwrittenSparse, SparseLayers or SparseTiles)
++/// and holding at most 256 MiB of device memory. It is kept
++///  - from its creation when its RGBA8 decode (every level and layer) is over
++///    EDEN_UP_TC_KEEP_REMADE_MIB (default 128, the default GPU transcode limit: what KEEP_ASYNC
++///    covered before the limit was raised; 0: none this way), or
++///  - when a collector deleted a candidate at the same address with the same format, size, levels
++///    and layers at most 600 frames before, and its decode is at least
++///    EDEN_UP_TC_KEEP_REMADE_MIN_MIB (default 32: Ocarina's 3072x3072 ASTC, 48 MiB; 0: none).
++/// Sizes are digits, 0..4096, read once; anything else means the default. HW_GPU lines:
++/// "EDEN_UP_TC_KEEP_REMADE: keeping ..." and "EDEN_UP_TC_KEEP_REMADE: kept ... deleted (reason)",
++/// the first 64 of each, then each power of two.
++[[nodiscard]] inline bool KeepRemade() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_TC_KEEP_REMADE");
++    return enabled;
++}
++
++/// A size in MiB from `name`: digits only, 0..4096; unset, empty or anything else: `fallback`.
++[[nodiscard]] inline u64 KeepRemadeEnvBytes(const char* name, u64 fallback) {
++    const char* const value = std::getenv(name);
++    if (value == nullptr || *value == '\0') {
++        return fallback << 20;
++    }
++    u64 mib = 0;
++    for (const char* c = value; *c != '\0'; ++c) {
++        if (*c < '0' || *c > '9') {
++            return fallback << 20;
++        }
++        mib = mib * 10 + static_cast<u64>(*c - '0');
++        if (mib > 4096) {
++            return fallback << 20;
++        }
++    }
++    return mib << 20;
++}
++
++[[nodiscard]] inline u64 KeepRemadeLargeBytes() {
++    static const u64 bytes = KeepRemadeEnvBytes("EDEN_UP_TC_KEEP_REMADE_MIB", 128);
++    return bytes;
++}
++
++[[nodiscard]] inline u64 KeepRemadeMinBytes() {
++    static const u64 bytes = KeepRemadeEnvBytes("EDEN_UP_TC_KEEP_REMADE_MIN_MIB", 32);
++    return bytes;
++}
++
++/// How long EDEN_UP_TC_KEEP_REMADE remembers a collector's delete, in frames.
++constexpr u64 KeepRemadeWindow = 600;
++
++/// What ASTC decodes to as RGBA8, every level and layer: TranscodeAstcToBcn's decode image
++/// (vk_texture_cache.cpp TranscodeScratchTooLarge sums the same).
++[[nodiscard]] inline u64 AstcDecodeBytes(const ImageInfo& info) {
++    u64 bytes = 0;
++    for (s32 level = 0; level < info.resources.levels; ++level) {
++        bytes += u64{(std::max)(info.size.width >> level, 1U)} *
++                 (std::max)(info.size.height >> level, 1U) * 4;
++    }
++    return bytes * static_cast<u64>(info.resources.layers);
++}
++
++/// Whether EDEN_UP_TC_KEEP_REMADE looks at the image at all (sizes aside). False with it off.
++[[nodiscard]] inline bool KeepRemadeCandidate(const ImageBase& image) {
++    return KeepRemade() && VideoCore::Surface::IsPixelFormatASTC(image.info.format) &&
++           True(image.flags & ImageFlagBits::Converted) &&
++           True(image.flags & ImageFlagBits::CostlyLoad) &&
++           False(image.flags & (ImageFlagBits::AsynchronousDecode | ImageFlagBits::Unbacked |
++                                ImageFlagBits::UnwrittenSparse | ImageFlagBits::SparseLayers |
++                                ImageFlagBits::SparseTiles));
++}
++
++/// Kept by EDEN_UP_TC_KEEP_REMADE: the collectors skip it as they skip AsynchronousDecode images
++/// with EDEN_NX2_TC_KEEP_ASYNC. Only ever true with the switch on (InsertImage sets it).
++[[nodiscard]] inline bool KeptRemade(const ImageBase& image) {
++    return image.tc_keep_remade;
++}
++
++/// EDEN_UP_TC_TRACE=1 (Common::PeSwitch, exact 1; off unless set): Lichii #1130 by liomaroliveira
++/// (upstream EDEN_NX2_TC_TRACE). One HW_GPU line per image the cache makes ("TCTRACE create": id,
++/// GPU address, type, format, size, levels and layers of the image made, guest KiB, overlaps joined
++/// and found, JoinImages ms, frame) and per image it deletes ("TCTRACE delete", with the reason:
++/// gc, gc-high-priority, gc-aggressive, gc-old (unused for EDEN_NX2_TC_OLD_AGE frames), gc-buffer
++/// (CollectForBuffer), gc-area (AreaEvict), gc-refusal (RefusalEvict), gc-refusal-copied
++/// (RefusalDownloadEvict), cold (EDEN_UP_FRITCHII_COLD), unmap, join, join-ignored, other). Ours
++/// also: "TCTRACE refused" when JoinImages makes nothing. EDEN_UP_TC_TRACE_MIB=<N> (digits,
++/// 0..4096; unset or 0: every image, as upstream): only images of at least N MiB of guest memory.
++[[nodiscard]] inline bool TcTrace() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_TC_TRACE");
++    return enabled;
++}
++
++[[nodiscard]] inline u64 TcTraceMinBytes() {
++    static const u64 bytes = TcTrace() ? KeepRemadeEnvBytes("EDEN_UP_TC_TRACE_MIB", 0) : 0;
++    return bytes;
++}
++
+ /// EDEN_NX2_TC_LOG, read once: also a line when an asynchronous decode is queued and when it lands.
+ [[nodiscard]] inline bool AsyncDecodeLog() {
+     static const bool enabled = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
+@@ -338,6 +445,7 @@ void TextureCache<P>::RunGarbageCollector() {
+         if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
+             (KeepAsyncDecodedFrames() != 0 && !evict_old_costly &&
+              True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
++            (!evict_old_costly && KeptRemade(image)) ||
+             (!high_priority_mode && must_download)) {
+             return false;
+         }
+@@ -364,6 +472,10 @@ void TextureCache<P>::RunGarbageCollector() {
+         }
+         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+         UnregisterImage(image_id);
++        trace_delete_reason = evict_old_costly     ? "gc-old"
++                              : aggressive_mode    ? "gc-aggressive"
++                              : high_priority_mode ? "gc-high-priority"
++                                                   : "gc";
+         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+         if (aggressive_mode && total_used_memory < critical_memory) {
+             num_iterations >>= 2;
+@@ -581,6 +693,7 @@ void TextureCache<P>::CollectForBuffer(u64 wanted) {
+         if (True(image.flags & ImageFlagBits::IsDecoding) ||
+             (KeepAsyncDecodedFrames() != 0 &&
+              True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
++            KeptRemade(image) ||
+             (IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap))) {
+             return false;
+         }
+@@ -595,6 +708,7 @@ void TextureCache<P>::CollectForBuffer(u64 wanted) {
+             UntrackImage(image, image_id);
+         }
+         UnregisterImage(image_id);
++        trace_delete_reason = "gc-buffer";
+         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+     }
+     std::fprintf(stderr, "EDEN_BUFFER_REFUSED %zu images, %llu MiB, deleted for %llu MiB\n",
+@@ -737,7 +851,8 @@ void TextureCache<P>::AreaEvict() {
+         const Image& image = slot_images[image_id];
+         if (True(image.flags & ImageFlagBits::IsDecoding) ||
+             (KeepAsyncDecodedFrames() != 0 &&
+-             True(image.flags & ImageFlagBits::AsynchronousDecode))) {
++             True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
++            KeptRemade(image)) {
+             return false;
+         }
+         // What the GPU wrote and the guest may still read: the collector's download path.
+@@ -767,6 +882,7 @@ void TextureCache<P>::AreaEvict() {
+             UntrackImage(image, image_id);
+         }
+         UnregisterImage(image_id);
++        trace_delete_reason = "gc-area";
+         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+     }
+     area_evicted_images += doomed.size();
+@@ -866,7 +982,7 @@ u64 TextureCache<P>::RefusalEvict(u64 wanted, bool in_join) {
+         if (True(image.flags & ImageFlagBits::IsDecoding) ||
+             (KeepAsyncDecodedFrames() != 0 &&
+              True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
+-            joining(image_id)) {
++            KeptRemade(image) || joining(image_id)) {
+             return false;
+         }
+         if (IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap)) {
+@@ -886,6 +1002,7 @@ u64 TextureCache<P>::RefusalEvict(u64 wanted, bool in_join) {
+             UntrackImage(image, image_id);
+         }
+         UnregisterImage(image_id);
++        trace_delete_reason = "gc-refusal";
+         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+     }
+     if (dirty != 0) {
+@@ -959,7 +1076,8 @@ void TextureCache<P>::RefusalDownloadEvict() {
+         if (True(image.flags & ImageFlagBits::IsDecoding) ||
+             (KeepAsyncDecodedFrames() != 0 &&
+              True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
+-            !IsDownloadable(image) || True(image.flags & ImageFlagBits::BadOverlap)) {
++            KeptRemade(image) || !IsDownloadable(image) ||
++            True(image.flags & ImageFlagBits::BadOverlap)) {
+             return false;
+         }
+         const u64 size = image.unswizzled_size_bytes;
+@@ -1005,6 +1123,7 @@ void TextureCache<P>::RefusalDownloadEvict() {
+             UntrackImage(image, entry.image_id);
+         }
+         UnregisterImage(entry.image_id);
++        trace_delete_reason = "gc-refusal-copied";
+         DeleteImage(entry.image_id, image.scale_tick > frame_tick + 5);
+     }
+     std::fprintf(stderr,
+@@ -1443,6 +1562,7 @@ void TextureCache<P>::SweepColdImages() {
+             UntrackImage(image, image_id);
+         }
+         UnregisterImage(image_id);
++        trace_delete_reason = "cold";
+         DeleteImage(image_id); // also takes it out of cold_watch_set
+         ++deleted;
+         cold_watch[index] = cold_watch.back();
+@@ -2529,6 +2649,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
+             UntrackImage(image, id);
+         }
+         UnregisterImage(id);
++        trace_delete_reason = "unmap";
+         DeleteImage(id);
+     }
+     ClearStale(cpu_addr, size);
+@@ -4597,11 +4718,85 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
+                  gpu_addr, info.size.width, info.size.height, info.size.depth, info.resources.levels,
+                  static_cast<u32>(info.format), info.block.width, info.block.height, info.block.depth);
+     }
++    // EDEN_UP_TC_TRACE: JoinImages' time for the "TCTRACE create" line.
++    const auto trace_start =
++        TcTrace() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     const ImageId image_id = JoinImages(storage_info, gpu_addr, *cpu_addr);
+     if (!image_id) {
++        if (TcTrace() && CalculateGuestSizeInBytes(info) >= TcTraceMinBytes()) {
++            LOG_WARNING(HW_GPU,
++                        "TCTRACE refused gpu={:#x} type={} fmt={} {}x{}x{} lv={} ly={} guest={}KiB "
++                        "frame={}",
++                        gpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
++                        info.size.width, info.size.height, info.size.depth, info.resources.levels,
++                        info.resources.layers, CalculateGuestSizeInBytes(info) / 1024, frame_tick);
++        }
+         return ImageId{}; // Refused (JoinImages): nothing was made.
+     }
+     const Image& image = slot_images[image_id];
++    if (TcTrace() && image.guest_size_bytes >= TcTraceMinBytes()) {
++        const double ms = std::chrono::duration<double, std::milli>(
++                              std::chrono::steady_clock::now() - trace_start)
++                              .count();
++        LOG_WARNING(HW_GPU,
++                    "TCTRACE create id={} gpu={:#x} type={} fmt={} {}x{}x{} lv={} ly={} guest={}KiB "
++                    "joined={} found={} ms={:.2f} frame={}",
++                    image_id.index, image.gpu_addr, static_cast<u32>(info.type),
++                    static_cast<u32>(info.format), info.size.width, info.size.height,
++                    info.size.depth, image.info.resources.levels, image.info.resources.layers,
++                    image.guest_size_bytes / 1024, join_overlap_ids.size(),
++                    join_overlaps_found.size(), ms, frame_tick);
++    }
++    if (KeepRemadeCandidate(image)) {
++        // EDEN_UP_TC_KEEP_REMADE: large from the start, or made again after a collector's delete.
++        const u64 decode = AstcDecodeBytes(image.info);
++        const u64 held = ImageMemoryBytes(image);
++        const u64 large = KeepRemadeLargeBytes();
++        const u64 remade = KeepRemadeMinBytes();
++        u64 since = ~u64{0};
++        if (held <= 256_MiB && !(large != 0 && decode > large) && remade != 0 && decode >= remade) {
++            const auto it = keep_remade_deleted.find(image.gpu_addr);
++            if (it != keep_remade_deleted.end()) {
++                const KeepRemadeDeleted& gone = it->second;
++                if (frame_tick - gone.frame <= KeepRemadeWindow &&
++                    gone.format == static_cast<u32>(image.info.format) &&
++                    gone.width == image.info.size.width && gone.height == image.info.size.height &&
++                    gone.levels == image.info.resources.levels &&
++                    gone.layers == image.info.resources.layers) {
++                    since = frame_tick - gone.frame;
++                }
++                keep_remade_deleted.erase(it);
++            }
++        }
++        const bool keep_large = held <= 256_MiB && large != 0 && decode > large;
++        if (keep_large || since != ~u64{0}) {
++            Image& kept = slot_images[image_id];
++            kept.tc_keep_remade = true;
++            kept.tc_keep_remade_frame = frame_tick;
++            ++keep_remade_images;
++            ++keep_remade_total;
++            if (keep_remade_total <= 64 || (keep_remade_total & (keep_remade_total - 1)) == 0) {
++                if (keep_large) {
++                    LOG_INFO(HW_GPU,
++                             "EDEN_UP_TC_KEEP_REMADE: keeping {:#x} {}x{}x{} ({} levels, format {}): "
++                             "decode {} MiB, over {} MiB; holds {} MiB; {} kept now, {} so far",
++                             kept.gpu_addr, kept.info.size.width, kept.info.size.height,
++                             kept.info.resources.layers, kept.info.resources.levels,
++                             static_cast<u32>(kept.info.format), decode >> 20, large >> 20,
++                             held >> 20, keep_remade_images, keep_remade_total);
++                } else {
++                    LOG_INFO(HW_GPU,
++                             "EDEN_UP_TC_KEEP_REMADE: keeping {:#x} {}x{}x{} ({} levels, format {}): "
++                             "made again {} frames after a collector deleted it, decode {} MiB; "
++                             "holds {} MiB; {} kept now, {} so far",
++                             kept.gpu_addr, kept.info.size.width, kept.info.size.height,
++                             kept.info.resources.layers, kept.info.resources.levels,
++                             static_cast<u32>(kept.info.format), since, decode >> 20, held >> 20,
++                             keep_remade_images, keep_remade_total);
++                }
++            }
++        }
++    }
+     // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
+     const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
+     if (is_new) {
+@@ -5059,6 +5254,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             UntrackImage(overlap, overlap_id);
+         }
+         UnregisterImage(overlap_id);
++        trace_delete_reason = "join-ignored";
+         DeleteImage(overlap_id);
+     }
+ 
+@@ -5267,6 +5463,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             UntrackImage(overlap, copy_object.id);
+         }
+         UnregisterImage(copy_object.id);
++        trace_delete_reason = "join";
+         DeleteImage(copy_object.id);
+     }
+ 
+@@ -5885,6 +6082,52 @@ template <class P>
+ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     ImageBase& image = slot_images[image_id];
+     ++images_deleted;
++    {
++        // EDEN_UP_TC_TRACE / EDEN_UP_TC_KEEP_REMADE: why this image goes, as the caller set it
++        // ("other" when it set none); put back for the next delete.
++        const char* const reason = trace_delete_reason;
++        trace_delete_reason = "other";
++        if (TcTrace() && image.guest_size_bytes >= TcTraceMinBytes()) {
++            LOG_WARNING(HW_GPU,
++                        "TCTRACE delete id={} gpu={:#x} fmt={} {}x{}x{} guest={}KiB immediate={} "
++                        "reason={} frame={}",
++                        image_id.index, image.gpu_addr, static_cast<u32>(image.info.format),
++                        image.info.size.width, image.info.size.height, image.info.size.depth,
++                        image.guest_size_bytes / 1024, immediate_delete, reason, frame_tick);
++        }
++        if (KeptRemade(image)) {
++            keep_remade_images -= (std::min)(keep_remade_images, u64{1});
++            ++keep_remade_deletes;
++            if (keep_remade_deletes <= 64 || (keep_remade_deletes & (keep_remade_deletes - 1)) == 0) {
++                LOG_INFO(HW_GPU,
++                         "EDEN_UP_TC_KEEP_REMADE: kept {:#x} {}x{}x{} deleted ({}) {} frames after "
++                         "it was kept; {} kept now, {} deleted so far",
++                         image.gpu_addr, image.info.size.width, image.info.size.height,
++                         image.info.resources.layers, reason,
++                         frame_tick - image.tc_keep_remade_frame, keep_remade_images,
++                         keep_remade_deletes);
++            }
++        }
++        if (reason[0] == 'g' && reason[1] == 'c' && KeepRemadeCandidate(image) &&
++            KeepRemadeMinBytes() != 0 && AstcDecodeBytes(image.info) >= KeepRemadeMinBytes()) {
++            if (keep_remade_deleted.size() >= 64) {
++                std::erase_if(keep_remade_deleted, [this](const auto& entry) {
++                    return frame_tick - entry.second.frame > KeepRemadeWindow;
++                });
++                if (keep_remade_deleted.size() >= 64) {
++                    keep_remade_deleted.clear();
++                }
++            }
++            keep_remade_deleted[image.gpu_addr] = KeepRemadeDeleted{
++                frame_tick,
++                static_cast<u32>(image.info.format),
++                image.info.size.width,
++                image.info.size.height,
++                image.info.resources.levels,
++                image.info.resources.layers,
++            };
++        }
++    }
+     if (!cold_watch_set.empty()) {
+         cold_watch_set.erase(image_id); // EDEN_UP_FRITCHII_COLD: its id may be reused
+     }
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 757e149..99367ce 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -239,6 +239,23 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     u64 astc_alpha_images{};
+     std::vector<u8> astc_scan_buffer;
+     u64 images_deleted{};
++    /// EDEN_UP_TC_TRACE (Lichii #1130): why the next DeleteImage happens, set by its caller;
++    /// DeleteImage reads it and puts back "other". Reasons that start with "gc" are collectors'.
++    const char* trace_delete_reason = "other";
++    /// EDEN_UP_TC_KEEP_REMADE: candidates a collector deleted, by GPU address (DeleteImage), so
++    /// InsertImage can tell that the game made the same image again. At most 64 entries.
++    struct KeepRemadeDeleted {
++        u64 frame;
++        u32 format;
++        u32 width;
++        u32 height;
++        s32 levels;
++        s32 layers;
++    };
++    std::map<GPUVAddr, KeepRemadeDeleted> keep_remade_deleted;
++    u64 keep_remade_images{};  ///< Images kept now
++    u64 keep_remade_total{};   ///< Images kept so far (the log lines)
++    u64 keep_remade_deletes{}; ///< Kept images deleted so far (old pass, unmap, join)
+     u64 scale_epoch{}; ///< InvalidateScale calls (EDEN_UP_L949_DESC_REPLAY)
+     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
+     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+-- 
+2.43.0
+

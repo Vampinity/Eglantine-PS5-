@@ -1,0 +1,911 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_ASTC_BATCH_MIB=<N>: ASTC to BC1/BC3 conversion through at most N MiB of scratch, in layer batches (Lichii #1083) or row bands, same output bytes; EDEN_UP_ASTC_BATCH_VERIFY=1 compares batched with whole; off by default
+
+Layer batches are a port of zortos293/Lichii #1083 (open, by marcochiusso-lgtm, head d4f48aad92,
+"vulkan: decode an ASTC array a few layers at a time when it does not fit"; not compiled or run
+upstream). The row bands, the bounded output buffer, the CPU bands and VERIFY are new.
+
+Where the scratch is on T88. TranscodeAstcToBcn decodes the whole texture into one RGBA8 image
+(four bytes a texel, every level and layer), then encodes all of it into one BC1/BC3 buffer.
+TranscodeScratchTooLarge (EDEN_NX2_GPU_TRANSCODE_MIB, 128 unset) sends textures over it to the CPU
+path, which already decodes one slice at a time. The recent runs set GPU_TRANSCODE_MIB=256:
+- the 1365x1365x90 arrays (853 MiB decode image) stay on the CPU path and TEX_TRIM_MIB=64 trims
+  them there. #1083's 890 MiB image does not exist in our build;
+- the single-layer 6144x6144 ASTC 5x5 ground texture (13 levels) goes to the GPU path: a 192 MiB
+  decode image (144 MiB of it level 0) plus a 48 MiB BC3 output. Runs 739, 742 and 743 each made
+  it 3 times ("Image 6144x6144x1 (13 levels, 1 layers, format 51) is over the memory budget";
+  format 51 is the decode format). Each time "Out of device memory: keeping N MiB more free"
+  followed within 0.2 s. Layer batches cannot split it. Row bands can.
+PS5_Lichii's patches (0002, 0027, 0202-0211) have no converter of their own: 0002 caps an
+integrated GPU's budget, which keeps ASTC re-compressed, and 0027 retries staging allocations.
+Fritchii v5.5's TranscodeAstcToBcn is the whole-texture path, as ours. Nothing to port there.
+
+EDEN_UP_ASTC_BATCH_MIB=<N> (1..4096, digits only; it is a size, so it is not read with PeSwitch;
+unset, 0 or anything else: off). Routing does not change: WillUseGpuBcnTranscode and
+TranscodeScratchTooLarge are untouched, so TEX_TRIM keeps working on the CPU-path arrays.
+- GPU path: a texture whose decode image plus BC output pass N MiB is planned (PlanAstcBatches).
+  If one layer with all its levels fits, it goes in layer batches: the decode image is the
+  texture's own shape with floor(N / per-layer cost) layers, and each batch is the same ImageInfo
+  with fewer layers, read from map.offset + base * layer_stride (#1083's reasoning: the swizzles
+  do not depend on the layer count). Otherwise it goes in row bands: one layer and one level at a
+  time, through a decode image as wide as level 0 with one level and one layer. A band starts on a
+  row of GOB blocks (8 << block height tile rows): its input is bound at block_row * block_size,
+  so the decoder's addressing from there on is the whole level's less that offset. Its height is
+  a multiple of 8, so it is whole BC blocks. Only the last band ends with the level, where the
+  whole path's edge is. Levels that fit go in one piece. If not even one row of GOB blocks fits,
+  the texture stays whole (old path) and that is logged.
+- One output buffer of the largest batch's size, reused. Each batch: decode (from the second
+  batch on, the decode barrier waits for the previous encode to read the decode image), barrier
+  copy->encode, encode, barrier encode->copy, then Image::UploadMemory for that batch's
+  levels/layers or rows (BC copies at y multiples of 4). Before the first batch,
+  TransitionImageLayout moves the image out of UNDEFINED once, so no batch's copy throws away
+  another's. Everything goes into the current tick, so the staging pool frees the output only
+  after the last copy. The decode image goes into pending_transcodes with its own shape. That
+  keeps TickFrame, EDEN_NX2_TRANSCODE_KEEP_MIB and free_transcodes reuse right, and it is reused
+  when the GPU is past it, as before. Then one Flush, as the old path's AssembleInto does once per
+  texture, unless HoldSubmissionForZpass. Refusals behave as before: no decode image, or an
+  unbacked one with TRANSCODE_WAIT, or no output, gives upload_refused.
+- With EDEN_PE_TRANSCODE_BOUND, a batched texture counts only its decode image as incoming.
+- CPU path (ConvertImage, the async decode): a slice whose RGBA8 scratch passes N MiB goes in
+  bands of rows. A band is a multiple of both the ASTC block height and 4, so Decompress and
+  CompressBC1/3 see the same blocks and edges and write the same bytes. On T88 with
+  GPU_TRANSCODE_MIB=256 this path is idle for Ocarina (the arrays' slices are 7 MiB, or 1.8 MiB
+  trimmed). It covers the 6144 texture's 144 MiB level-0 slice when the threshold is the default.
+
+Expected for the 6144 texture at N=64 (block height 16 GOBs): level 0 in 4 bands of up to 1920
+rows, level 1 in 2, the 11 smaller levels whole, so 17 batches. Peak about 45 MiB decode image
+plus 11.25 MiB output (5.6 MiB if BC1) instead of 240 MiB. With 32-GOB blocks: 1280-row bands,
+37.5 MiB. At N=32 a 32-GOB texture stays whole, so test N=64 first. The 3072x3072 (60 MiB) and
+smaller decode images in the same runs fit 64 and do not change. N=32 would band them too. With
+TRANSCODE_KEEP_MIB=32 a decode image over 32 MiB is dropped after use and made again for the next
+texture (about 263 us), as before.
+
+Log lines (Render_Vulkan, first 32, then each power of two):
+"EDEN_UP_ASTC_BATCH: <addr> WxHxL (n levels, BC3|BC1): B batches of up to R rows|K layers, peak
+scratch X MiB (decode image D, output O) instead of F MiB, recorded in T us (C so far)". D is the
+driver's size for the decode image. O is what was asked of the staging pool, which may round it
+up (powers of two, or 8 MiB steps with EDEN_UP_STAGING_STEPS). T is the GPU thread's recording
+time. CPU path (HW_GPU): "EDEN_UP_ASTC_BATCH: CPU WxH level l (s slices): b bands of R rows, peak
+scratch X MiB instead of Y MiB, T us". Textures that stay whole: "... needs F MiB to convert, over
+N MiB, and stays whole: <reason>".
+
+EDEN_UP_ASTC_BATCH_VERIFY=1 (PeSwitch): the first texture in layer batches and the first in row
+bands (8 tries each while memory is refused) are also converted whole. That is the old decode
+into a full decode image and the old encode into a readable buffer. Each batch's output is also
+copied into a second readable buffer at its final place. Then one Finish (VERIFY only) and a
+byte compare: "the B row bands|layer batches wrote the same X bytes as the whole conversion (GPU
+wait T us)", or an error with the count of bytes that differ and the first one's level and layer.
+It needs the whole decode image and twice the output on top, so on the console verify with N=8:
+the first batched textures are then small ones.
+
+Frontend (prepare-vulkan-port.py): no anchor changes. The TranscodeAstcToBcn function-head
+anchor, the single "pending_transcodes.push_back(std::move(pending));" and the include anchor
+each still occur once, and the wait-site count stays 2 (the VERIFY Finish line carries a
+comment). The mkw_transcode timer covers the batched path, which is called from inside
+TranscodeAstcToBcn. The PS5 memory-short pending wait after the old push_back does not run for a
+batched texture, whose scratch is bounded instead. The next whole-path texture counts the
+batched decode image in it.
+
+Known deviations and risks. When a level is narrower than level 0 in band mode, the decoder's
+padding threads (up to 7 tiles past a row) decode into the wider image instead of stopping at its
+edge. The encoder never reads there. Their reads stay inside the level's GOB padding, except at
+the very end of the guest data, where RADV's buffer bounds check returns zero. The batched path
+gives more barriers and dispatches for one texture (17 batches for the ground texture), so it
+can take more GPU time than one big dispatch. It does not add to AssembleInto's per-5-s decode
+count or time statistics. Not ported from #1083: halving the batch after a failed full-size
+allocation. Here the budget decides before allocating. Not built, not run: git apply --check
+passes on T88 and on T88 with 0495's util hunks; checked by reading only.
+
+Unset, or anything but 1..4096 digits: PlanAstcBatches is not called, TranscodeAstcToBcn and the
+BOUND block run as before, and ConvertImage takes its old branch. That branch's statements are
+re-indented inside "if (band_rows == 0)" with no other change. VERIFY does nothing without
+BATCH_MIB.
+
+---
+ src/video_core/renderer_vulkan/vk_texture_cache.cpp | 562 ++++++++++++++++++++++++++++++++++++++++
+ src/video_core/renderer_vulkan/vk_texture_cache.h   |  21 ++
+ src/video_core/texture_cache/util.cpp               | 107 +++++++-
+ src/video_core/texture_cache/util.h                 |   4 +
+ 4 files changed, 685 insertions(+), 9 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index f1766f2..9626b65 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -17,6 +17,7 @@
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+ #include <bit>
++#include <chrono>
+ #include <numeric>
+ #include "common/alignment.h"
+ #include "common/bit_util.h"
+@@ -37,6 +38,7 @@
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/surface.h"
++#include "video_core/texture_cache/accelerated_swizzle.h"
+ #include "video_core/texture_cache/formatter.h"
+ #include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/texture_cache/util.h"
+@@ -409,6 +411,122 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+     return bytes * static_cast<u64>(info.resources.layers) > limit;
+ }
+ 
++// EDEN_UP_ASTC_BATCH_MIB: the ASTC tile rows in one band of a level (TranscodeAstcBatched), at
++// most `rows` texel rows; the whole level when it fits. A band starts on a row of GOB blocks (8 <<
++// block height tile rows, block_size bytes of guest data), so the decoder's block-linear addressing
++// from there on is its addressing of the whole level less that offset. 0: not one row fits.
++[[nodiscard]] u32 AstcBandTiles(const VideoCommon::SwizzleParameters& swizzle, u32 level_height,
++                                u32 tile_height, u32 rows) {
++    if (level_height <= rows) {
++        return swizzle.num_tiles.height;
++    }
++    const u32 granule = 1U << (Tegra::Texture::GOB_SIZE_Y_SHIFT + swizzle.block.height);
++    return rows / tile_height / granule * granule;
++}
++
++// EDEN_UP_ASTC_BATCH_MIB: how TranscodeAstcBatched splits `info`; nothing when the switch is off,
++// when the whole decode image and BC output fit the budget (TranscodeAstcToBcn as before), or when
++// it cannot be split (also as before, logged). Layer batches when one layer with all its levels
++// fits: the decode image is the texture's shape with fewer layers (zortos293/Lichii #1083).
++// Otherwise row bands, one layer and level at a time, through a decode image as wide as level 0
++// and as tall as the budget allows: Ocarina of Time's single-layer 6144x6144 ASTC 5x5 ground
++// texture (13 levels) has a 192 MiB decode image, 144 MiB of it level 0, which layers can't split.
++[[nodiscard]] std::optional<TextureCacheRuntime::AstcBatchPlan> PlanAstcBatches(
++    const ImageInfo& info, std::span<const VideoCommon::SwizzleParameters> swizzles, bool bc3) {
++    const u64 budget = VideoCommon::AstcBatchBudgetBytes();
++    if (budget == 0) {
++        return std::nullopt;
++    }
++    const u32 width = info.size.width;
++    const u32 height = info.size.height;
++    const u32 levels = static_cast<u32>(info.resources.levels);
++    const u32 layers = static_cast<u32>(info.resources.layers);
++    const u64 block_bytes = bc3 ? 16 : 8;
++    const auto output_bytes = [block_bytes](u32 w, u32 rows) {
++        return u64{Common::DivCeil(w, 4U)} * Common::DivCeil(rows, 4U) * block_bytes;
++    };
++    u64 layer_decode = 0;
++    u64 layer_output = 0;
++    for (u32 level = 0; level < levels; ++level) {
++        const u32 w = (std::max)(width >> level, 1U);
++        const u32 h = (std::max)(height >> level, 1U);
++        layer_decode += u64{w} * h * 4;
++        layer_output += output_bytes(w, h);
++    }
++    TextureCacheRuntime::AstcBatchPlan plan{};
++    plan.bc3 = bc3;
++    plan.full_bytes = (layer_decode + layer_output) * layers;
++    if (plan.full_bytes <= budget) {
++        return std::nullopt;
++    }
++    const auto stays_whole = [&](const char* reason) {
++        static std::atomic<u32> logged{0};
++        const u32 count = ++logged;
++        if (count <= 8 || (count & (count - 1)) == 0) {
++            LOG_INFO(Render_Vulkan,
++                     "EDEN_UP_ASTC_BATCH: {}x{}x{} ({} levels) needs {} MiB to convert, over {} "
++                     "MiB, and stays whole: {} ({} so far)",
++                     width, height, layers, levels, plan.full_bytes >> 20, budget >> 20, reason,
++                     count);
++        }
++        return std::optional<TextureCacheRuntime::AstcBatchPlan>{};
++    };
++    if (swizzles.size() != levels) {
++        return stays_whole("its upload is not every level");
++    }
++    for (u32 level = 0; level < levels; ++level) {
++        if (swizzles[level].level != static_cast<s32>(level)) {
++            return stays_whole("its upload levels are out of order");
++        }
++    }
++    if (layer_decode + layer_output <= budget) {
++        const u32 per_batch = static_cast<u32>(
++            (std::min)(u64{layers}, budget / (layer_decode + layer_output)));
++        plan.bands = false;
++        plan.scratch_width = width;
++        plan.scratch_height = height;
++        plan.scratch_levels = levels;
++        plan.scratch_layers = per_batch;
++        plan.band_rows = 0;
++        plan.scratch_bytes = layer_decode * per_batch;
++        plan.output_bytes = layer_output * per_batch;
++        plan.batches = Common::DivCeil(layers, per_batch);
++        return plan;
++    }
++    const u32 tile_height = VideoCore::Surface::DefaultBlockHeight(info.format);
++    // Four rows of level 0, decoded and encoded.
++    const u64 four_rows = u64{width} * 4 * 4 + output_bytes(width, 4);
++    const u32 rows = static_cast<u32>((std::min)(u64{height}, budget / four_rows * 4));
++    u32 scratch_rows = 0;
++    u64 largest_output = 0;
++    u32 batches = 0;
++    for (u32 level = 0; level < levels; ++level) {
++        const u32 w = (std::max)(width >> level, 1U);
++        const u32 h = (std::max)(height >> level, 1U);
++        const u32 band_tiles = AstcBandTiles(swizzles[level], h, tile_height, rows);
++        if (band_tiles == 0) {
++            return stays_whole("one row of GOB blocks is over the budget");
++        }
++        const u32 band_rows = (std::min)(band_tiles * tile_height, h);
++        scratch_rows = (std::max)(scratch_rows, band_rows);
++        largest_output = (std::max)(largest_output, output_bytes(w, band_rows));
++        batches += Common::DivCeil(swizzles[level].num_tiles.height, band_tiles);
++    }
++    plan.bands = true;
++    plan.scratch_width = width;
++    plan.scratch_height = scratch_rows;
++    plan.scratch_levels = 1;
++    plan.scratch_layers = 1;
++    plan.band_rows = rows;
++    plan.scratch_bytes = u64{width} * scratch_rows * 4;
++    plan.output_bytes = largest_output;
++    plan.batches = batches * layers;
++    if (plan.scratch_bytes + plan.output_bytes > budget) {
++        return stays_whole("its rounded rows are over the budget");
++    }
++    return plan;
++}
++
+ // ASTC that the GPU decodes and re-compresses to BC1/BC3 itself (TranscodeAstcToBcn): no CPU
+ // decode, so streamed textures are ready the frame they are first used instead of seconds later.
+ [[nodiscard]] bool WillUseGpuBcnTranscode(const Device& device, const ImageInfo& info) {
+@@ -5215,6 +5333,15 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+         upload_refused = true;
+         return;
+     }
++    // EDEN_UP_ASTC_BATCH_MIB: a texture whose decode image and output pass the budget goes through
++    // TranscodeAstcBatched below. Off: nothing is planned.
++    std::optional<AstcBatchPlan> batch_plan;
++    if (VideoCommon::AstcBatchBudgetBytes() != 0) {
++        batch_plan = PlanAstcBatches(
++            info, swizzles,
++            !IsOpaqueBc1Astc(device, info) &&
++                Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1);
++    }
+     static const bool bounded = Common::PeSwitch("EDEN_PE_TRANSCODE_BOUND");
+     if (bounded) {
+         const auto bytes = [](const PendingTranscode& t) {
+@@ -5230,6 +5357,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+             incoming += u64{(std::max)(width >> level, 1U)} *
+                         (std::max)(height >> level, 1U) * 4 * layers;
+         }
++        if (batch_plan) {
++            incoming = batch_plan->scratch_bytes; // only the batches' decode image is new
++        }
+         static const u64 limit = [] {
+             const char* value = std::getenv("EDEN_PS5_TRANSCODE_PENDING_MIB");
+             return value ? std::strtoull(value, nullptr, 10) << 20 : u64{256} << 20;
+@@ -5259,6 +5389,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+         }
+         staging_buffer_pool.CarryTick(old_tick, scheduler.CurrentTick());
+     }
++    if (batch_plan) {
++        TranscodeAstcBatched(image, map, swizzles, *batch_plan);
++        return;
++    }
+     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
+     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
+     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
+@@ -5383,6 +5517,434 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+     pending_transcodes.push_back(std::move(pending));
+ }
+ 
++// EDEN_UP_ASTC_BATCH_MIB=<N>: TranscodeAstcToBcn with its decode image and its output buffer kept
++// to N MiB together. The layer batches follow zortos293/Lichii #1083 (a batch is the same info with
++// fewer layers, read from its first layer on); the row bands are new. Each batch
++// decodes into the one decode image, encodes into the one output buffer and copies that into its
++// part of the image; barriers order a batch's decode after the previous encode read the decode
++// image, and its encode after the previous copy read the output. Everything is recorded in this
++// tick, so the staging pool frees the output only once the GPU is past the last copy, and the
++// decode image waits in pending_transcodes as before.
++void TextureCacheRuntime::TranscodeAstcBatched(
++    Image& image, const StagingBufferRef& map,
++    std::span<const VideoCommon::SwizzleParameters> swizzles, const AstcBatchPlan& plan) {
++    const auto start = std::chrono::steady_clock::now();
++    const ImageInfo& info = image.info;
++    const u32 width = info.size.width;
++    const u32 height = info.size.height;
++    const u32 levels = static_cast<u32>(info.resources.levels);
++    const u32 layers = static_cast<u32>(info.resources.layers);
++    constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
++    static const bool wait_for_memory = [] {
++        const char* const value = std::getenv("EDEN_NX2_TRANSCODE_WAIT");
++        return value != nullptr && value[0] == '1';
++    }();
++    const u64 block_bytes = plan.bc3 ? 16 : 8;
++    const size_t guest_size = image.guest_size_bytes;
++    const auto level_width = [width](u32 level) { return (std::max)(width >> level, 1U); };
++    const auto level_height = [height](u32 level) { return (std::max)(height >> level, 1U); };
++    const auto make_decode_image = [this](u32 w, u32 h, u32 mips, u32 count) {
++        const VkImageCreateInfo decode_ci{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = 0,
++            .imageType = VK_IMAGE_TYPE_2D,
++            .format = DecodeFormat,
++            .extent = {w, h, 1},
++            .mipLevels = mips,
++            .arrayLayers = count,
++            .samples = VK_SAMPLE_COUNT_1_BIT,
++            .tiling = VK_IMAGE_TILING_OPTIMAL,
++            .usage = VK_IMAGE_USAGE_STORAGE_BIT,
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++            .queueFamilyIndexCount = 0,
++            .pQueueFamilyIndices = nullptr,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        };
++        vk::Image result;
++        try {
++            result = memory_allocator.CreateImage(decode_ci, true);
++        } catch (const vk::Exception& refused) {
++            if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++                throw;
++            }
++        }
++        return result;
++    };
++
++    // The batches' decode image: one of its shape the GPU is done with, or a new one (refused as
++    // TranscodeAstcToBcn refuses its own).
++    const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
++        return t.width == plan.scratch_width && t.height == plan.scratch_height &&
++               t.levels == plan.scratch_levels && t.layers == plan.scratch_layers;
++    });
++    PendingTranscode scratch;
++    if (reusable != free_transcodes.end()) {
++        scratch = std::move(*reusable);
++        free_transcodes.erase(reusable);
++    } else {
++        vk::Image scratch_image = make_decode_image(plan.scratch_width, plan.scratch_height,
++                                                    plan.scratch_levels, plan.scratch_layers);
++        if (!scratch_image || (wait_for_memory && scratch_image.IsUnbacked())) {
++            upload_refused = true;
++            return;
++        }
++        scratch = PendingTranscode{
++            .tick = 0,
++            .image = std::move(scratch_image),
++            .views = {},
++            .width = plan.scratch_width,
++            .height = plan.scratch_height,
++            .levels = plan.scratch_levels,
++            .layers = plan.scratch_layers,
++            .unused_frames = 0,
++        };
++        for (u32 level = 0; level < plan.scratch_levels; ++level) {
++            scratch.views.push_back(
++                MakeStorageView(device.GetLogical(), level, *scratch.image, DecodeFormat));
++        }
++    }
++
++    // The image's BC1/BC3 data as TranscodeAstcToBcn lays it out: every layer of level 0, then of
++    // level 1, and so on. Only VERIFY puts it in one buffer.
++    boost::container::small_vector<u64, 16> level_offsets;
++    boost::container::small_vector<u64, 16> layer_bytes;
++    u64 total = 0;
++    for (u32 level = 0; level < levels; ++level) {
++        level_offsets.push_back(total);
++        layer_bytes.push_back(u64{Common::DivCeil(level_width(level), 4U)} *
++                              Common::DivCeil(level_height(level), 4U) * block_bytes);
++        total += layer_bytes.back() * layers;
++    }
++    const auto output = staging_buffer_pool.TryRequest(plan.output_bytes, MemoryUsage::DeviceLocal);
++    if (!output) {
++        // Nothing was recorded with it; TickFrame keeps it or lets it go as any other.
++        scratch.tick = scheduler.CurrentTick();
++        pending_transcodes.emplace_back(std::move(scratch));
++        upload_refused = true;
++        return;
++    }
++
++    // EDEN_UP_ASTC_BATCH_VERIFY=1: the first texture this path converts in layer batches and the
++    // first in row bands (up to 8 tries each while memory for the whole path is refused) are also
++    // converted the old way, whole, into a readable buffer; each batch's output is copied into
++    // another at its place; once the GPU is done both are compared. It needs the whole decode image
++    // and twice the output on top: on the console run it with a small EDEN_UP_ASTC_BATCH_MIB (8) so
++    // the first batched textures are small ones.
++    static const bool verify = Common::PeSwitch("EDEN_UP_ASTC_BATCH_VERIFY");
++    static std::array<u32, 2> verify_tries{};
++    static std::array<bool, 2> verified{};
++    const size_t mode = plan.bands ? 1 : 0;
++    std::optional<StagingBufferRef> verify_whole;
++    std::optional<StagingBufferRef> verify_batched;
++    vk::Image verify_image;
++    std::vector<vk::ImageView> verify_views;
++    if (verify && !verified[mode] && verify_tries[mode] < 8) {
++        ++verify_tries[mode];
++        verify_whole = staging_buffer_pool.TryRequest(total, MemoryUsage::Download);
++        if (verify_whole) {
++            verify_batched = staging_buffer_pool.TryRequest(total, MemoryUsage::Download);
++        }
++        if (verify_batched) {
++            verify_image = make_decode_image(width, height, levels, layers);
++        }
++        if (!verify_image || verify_image.IsUnbacked() ||
++            verify_whole->mapped_span.size() < total ||
++            verify_batched->mapped_span.size() < total) {
++            LOG_WARNING(Render_Vulkan,
++                        "EDEN_UP_ASTC_BATCH_VERIFY: no memory to convert {:#x} ({}x{}x{}) whole "
++                        "next to its {}, try {} of 8",
++                        image.gpu_addr, width, height, layers,
++                        plan.bands ? "row bands" : "layer batches", verify_tries[mode]);
++            verify_image = vk::Image{};
++            verify_whole.reset();
++            verify_batched.reset();
++        } else {
++            for (u32 level = 0; level < levels; ++level) {
++                verify_views.push_back(
++                    MakeStorageView(device.GetLogical(), level, *verify_image, DecodeFormat));
++            }
++        }
++    }
++    const bool verifying = static_cast<bool>(verify_image);
++    if (verifying) {
++        // TranscodeAstcToBcn's decode and encode, into the readable buffer instead of the image.
++        astc_decoder_pass->AssembleInto(
++            info, 0, image.guest_size_bytes,
++            ASTCDecoderPass::Target{
++                .image = *verify_image,
++                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
++                .initialized = false,
++                .level_view = [&verify_views](s32 level) { return *verify_views[level]; },
++                .wait = false,
++            },
++            map, swizzles);
++        for (u32 level = 0; level < levels; ++level) {
++            bc_encoder_pass->Encode(*verify_views[level], level_width(level), level_height(level),
++                                    layers, plan.bc3, verify_whole->buffer, verify_whole->offset,
++                                    total, level_offsets[level]);
++        }
++    }
++
++    // Each batch's copy must keep what the others wrote, so the image leaves UNDEFINED once, here.
++    TransitionImageLayout(image);
++    const auto encode_before_copy = [this] {
++        scheduler.Record([](vk::CommandBuffer cmdbuf) {
++            const VkMemoryBarrier barrier{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++            };
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
++        });
++    };
++    // The next encode writes the output buffer the last copy read.
++    const auto copy_before_encode = [this] {
++        scheduler.Record([](vk::CommandBuffer cmdbuf) {
++            const VkMemoryBarrier barrier{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++                .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++            };
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
++        });
++    };
++    boost::container::small_vector<VkBufferCopy, 16> verify_copies;
++    const auto copy_for_verify = [&] {
++        if (!verifying || verify_copies.empty()) {
++            return;
++        }
++        scheduler.Record([src = output->buffer, dst = verify_batched->buffer,
++                          regions = verify_copies](vk::CommandBuffer cmdbuf) {
++            cmdbuf.CopyBuffer(src, dst, regions);
++        });
++        verify_copies.clear();
++    };
++
++    u32 batch = 0;
++    if (!plan.bands) {
++        boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
++        for (u32 base = 0; base < layers; base += plan.scratch_layers, ++batch) {
++            const u32 count = (std::min)(plan.scratch_layers, layers - base);
++            // The swizzles describe one layer's levels and the decoder steps layer_stride per layer
++            // from the start of its input, so a batch is the same info with fewer layers, read from
++            // its first layer on.
++            ImageInfo batch_info = info;
++            batch_info.resources.layers = static_cast<s32>(count);
++            StagingBufferRef batch_map = map;
++            batch_map.offset += u64{base} * info.layer_stride;
++            const size_t skipped = static_cast<size_t>(u64{base} * info.layer_stride);
++            const size_t batch_size =
++                (std::min)(static_cast<size_t>(u64{count} * info.layer_stride),
++                           guest_size - (std::min)(guest_size, skipped));
++            astc_decoder_pass->AssembleInto(
++                batch_info, 0, batch_size,
++                ASTCDecoderPass::Target{
++                    .image = *scratch.image,
++                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
++                    // From the second batch on, after the previous encode read the decode image.
++                    .initialized = batch != 0,
++                    .level_view = [&scratch](s32 level) { return *scratch.views[level]; },
++                    .wait = false,
++                },
++                batch_map, swizzles);
++            if (batch != 0) {
++                copy_before_encode();
++            }
++            copies.clear();
++            u64 offset = 0;
++            for (u32 level = 0; level < levels; ++level) {
++                const u32 w = level_width(level);
++                const u32 h = level_height(level);
++                const u64 size = layer_bytes[level] * count;
++                bc_encoder_pass->Encode(*scratch.views[level], w, h, count, plan.bc3,
++                                        output->buffer, output->offset, plan.output_bytes, offset);
++                copies.push_back({
++                    .buffer_offset = offset,
++                    .buffer_size = size,
++                    .buffer_row_length = Common::DivCeil(w, 4U) * 4,
++                    .buffer_image_height = Common::DivCeil(h, 4U) * 4,
++                    .image_subresource{
++                        .base_level = static_cast<s32>(level),
++                        .base_layer = static_cast<s32>(base),
++                        .num_layers = static_cast<s32>(count),
++                    },
++                    .image_offset{0, 0, 0},
++                    .image_extent{w, h, 1},
++                });
++                if (verifying) {
++                    verify_copies.push_back(VkBufferCopy{
++                        .srcOffset = output->offset + offset,
++                        .dstOffset = verify_batched->offset + level_offsets[level] +
++                                     layer_bytes[level] * base,
++                        .size = size,
++                    });
++                }
++                offset += size;
++            }
++            encode_before_copy();
++            image.UploadMemory(output->buffer, output->offset, copies);
++            copy_for_verify();
++        }
++    } else {
++        const u32 tile_height = VideoCore::Surface::DefaultBlockHeight(info.format);
++        ImageInfo layer_info = info;
++        layer_info.resources.layers = 1;
++        for (u32 layer = 0; layer < layers; ++layer) {
++            StagingBufferRef layer_map = map;
++            layer_map.offset += u64{layer} * info.layer_stride;
++            const size_t skipped = static_cast<size_t>(u64{layer} * info.layer_stride);
++            // One layer is the whole guest data, as the whole path binds it (a single layer's
++            // layer_stride is padded, and 0 would bind nothing).
++            const size_t layer_size =
++                layers == 1 ? guest_size
++                            : (std::min)(static_cast<size_t>(info.layer_stride),
++                                         guest_size - (std::min)(guest_size, skipped));
++            for (u32 level = 0; level < levels; ++level) {
++                const VideoCommon::SwizzleParameters& swizzle = swizzles[level];
++                const u32 w = level_width(level);
++                const u32 h = level_height(level);
++                const u32 band_tiles = AstcBandTiles(swizzle, h, tile_height, plan.band_rows);
++                const u32 block_row_bytes =
++                    VideoCommon::Accelerated::MakeBlockLinearSwizzle2DParams(swizzle, info)
++                        .block_size;
++                for (u32 first = 0; first < swizzle.num_tiles.height;
++                     first += band_tiles, ++batch) {
++                    const u32 tiles = (std::min)(band_tiles, swizzle.num_tiles.height - first);
++                    const u32 y = first * tile_height;
++                    const u32 rows = (std::min)(tiles * tile_height, h - y);
++                    // From its row of GOB blocks on: the decoder writes it from row 0 of the
++                    // decode image, the encoder reads `rows` rows (a multiple of 4 but the last
++                    // band, which ends with the level) and `w` columns of it. Levels narrower than
++                    // level 0 decode into a wider image: the decoder's threads past the last tile
++                    // of a row (up to 7) then decode too, outside what the encoder reads.
++                    VideoCommon::SwizzleParameters band = swizzle;
++                    band.num_tiles.height = tiles;
++                    band.buffer_offset +=
++                        size_t{first >> (Tegra::Texture::GOB_SIZE_Y_SHIFT + swizzle.block.height)} *
++                        block_row_bytes;
++                    astc_decoder_pass->AssembleInto(
++                        layer_info, 0, layer_size,
++                        ASTCDecoderPass::Target{
++                            .image = *scratch.image,
++                            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
++                            .initialized = batch != 0,
++                            .level_view = [&scratch](s32) { return *scratch.views[0]; },
++                            .wait = false,
++                        },
++                        layer_map, std::span<const VideoCommon::SwizzleParameters>(&band, 1));
++                    if (batch != 0) {
++                        copy_before_encode();
++                    }
++                    const u64 size = u64{Common::DivCeil(w, 4U)} * Common::DivCeil(rows, 4U) *
++                                     block_bytes;
++                    bc_encoder_pass->Encode(*scratch.views[0], w, rows, 1, plan.bc3,
++                                            output->buffer, output->offset, plan.output_bytes, 0);
++                    const VideoCommon::BufferImageCopy copy{
++                        .buffer_offset = 0,
++                        .buffer_size = size,
++                        .buffer_row_length = Common::DivCeil(w, 4U) * 4,
++                        .buffer_image_height = Common::DivCeil(rows, 4U) * 4,
++                        .image_subresource{
++                            .base_level = static_cast<s32>(level),
++                            .base_layer = static_cast<s32>(layer),
++                            .num_layers = 1,
++                        },
++                        .image_offset{0, static_cast<s32>(y), 0},
++                        .image_extent{w, rows, 1},
++                    };
++                    if (verifying) {
++                        verify_copies.push_back(VkBufferCopy{
++                            .srcOffset = output->offset,
++                            .dstOffset = verify_batched->offset + level_offsets[level] +
++                                         layer_bytes[level] * layer +
++                                         u64{y / 4} * Common::DivCeil(w, 4U) * block_bytes,
++                            .size = size,
++                        });
++                    }
++                    encode_before_copy();
++                    image.UploadMemory(output->buffer, output->offset,
++                                       std::span<const VideoCommon::BufferImageCopy>(&copy, 1));
++                    copy_for_verify();
++                }
++            }
++        }
++    }
++    const VkDeviceSize scratch_memory = scratch.image.MemorySize();
++    scratch.tick = scheduler.CurrentTick();
++    pending_transcodes.emplace_back(std::move(scratch));
++    const auto recorded = std::chrono::steady_clock::now();
++    const auto to_mib = [](u64 bytes) { return static_cast<double>(bytes) / (1 << 20); };
++    static u32 logged = 0;
++    ++logged;
++    if (logged <= 32 || (logged & (logged - 1)) == 0) {
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_ASTC_BATCH: {:#x} {}x{}x{} ({} levels, {}): {} batches of up to {} {}, "
++                 "peak scratch {:.1f} MiB (decode image {:.1f}, output {:.1f}) instead of {:.1f} "
++                 "MiB, recorded in {} us ({} so far)",
++                 image.gpu_addr, width, height, layers, levels, plan.bc3 ? "BC3" : "BC1", batch,
++                 plan.bands ? plan.scratch_height : plan.scratch_layers,
++                 plan.bands ? "rows" : "layers",
++                 to_mib(scratch_memory + plan.output_bytes), to_mib(scratch_memory),
++                 to_mib(plan.output_bytes), to_mib(plan.full_bytes),
++                 std::chrono::duration_cast<std::chrono::microseconds>(recorded - start).count(),
++                 logged);
++    }
++    if (!verifying) {
++        // One submit per texture, as AssembleInto's after the whole decode.
++        if (!scheduler.HoldSubmissionForZpass()) {
++            scheduler.Flush();
++        }
++        return;
++    }
++    verified[mode] = true;
++    scheduler.Record([](vk::CommandBuffer cmdbuf) {
++        const VkMemoryBarrier barrier{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++        };
++        cmdbuf.PipelineBarrier(
++            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++            VK_PIPELINE_STAGE_HOST_BIT, 0, barrier);
++    });
++    scheduler.Finish(); // EDEN_UP_ASTC_BATCH_VERIFY only
++    const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
++                            std::chrono::steady_clock::now() - recorded)
++                            .count();
++    const std::span<const u8> whole = verify_whole->mapped_span.first(total);
++    const std::span<const u8> batched = verify_batched->mapped_span.first(total);
++    const auto whole_it = std::ranges::mismatch(whole, batched).in1;
++    if (whole_it == whole.end()) {
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_ASTC_BATCH_VERIFY: {:#x} {}x{}x{} ({} levels, {}): the {} {} wrote the "
++                 "same {} bytes as the whole conversion (GPU wait {} us)",
++                 image.gpu_addr, width, height, layers, levels, plan.bc3 ? "BC3" : "BC1", batch,
++                 plan.bands ? "row bands" : "layer batches", total, waited);
++        return;
++    }
++    const u64 at = static_cast<u64>(whole_it - whole.begin());
++    u32 level = 0;
++    while (level + 1 < levels && level_offsets[level + 1] <= at) {
++        ++level;
++    }
++    u64 differing = 0;
++    for (u64 i = at; i < total; ++i) {
++        differing += whole[i] != batched[i] ? 1 : 0;
++    }
++    LOG_ERROR(Render_Vulkan,
++              "EDEN_UP_ASTC_BATCH_VERIFY: {:#x} {}x{}x{} ({} levels, {}): {} of {} bytes differ "
++              "from the whole conversion, the first at byte {} (level {}, layer {}), {} {}",
++              image.gpu_addr, width, height, layers, levels, plan.bc3 ? "BC3" : "BC1", differing,
++              total, at, level, (at - level_offsets[level]) / layer_bytes[level], batch,
++              plan.bands ? "row bands" : "layer batches");
++}
++
+ void TextureCacheRuntime::TransitionImageLayout(Image& image) {
+     if (!image.ExchangeInitialization()) {
+         VkImageMemoryBarrier barrier{
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 86b5c8d..d81f565 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -308,6 +308,27 @@ public:
+     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
+                             std::span<const VideoCommon::SwizzleParameters> swizzles);
+ 
++    /// EDEN_UP_ASTC_BATCH_MIB: how TranscodeAstcBatched splits one texture's decode and encode.
++    struct AstcBatchPlan {
++        bool bc3;            ///< BC3 output, else BC1 (as TranscodeAstcToBcn chooses).
++        bool bands;          ///< One layer and level at a time, in row bands; else layer batches.
++        u32 scratch_width;   ///< The decode image every batch goes through.
++        u32 scratch_height;
++        u32 scratch_levels;
++        u32 scratch_layers;
++        u32 band_rows;       ///< Bands: the most texel rows of any level in one band.
++        u64 scratch_bytes;   ///< The decode image, four bytes a texel.
++        u64 output_bytes;    ///< The largest batch's BC1/BC3 output (one buffer, reused).
++        u64 full_bytes;      ///< Decode image and output of the whole texture at once.
++        u32 batches;
++    };
++
++    /// TranscodeAstcToBcn through a decode image and an output buffer of at most
++    /// EDEN_UP_ASTC_BATCH_MIB together. Same BC1/BC3 bytes in the image.
++    void TranscodeAstcBatched(Image& image, const StagingBufferRef& map,
++                              std::span<const VideoCommon::SwizzleParameters> swizzles,
++                              const AstcBatchPlan& plan);
++
+     /// See TakeUploadRefused.
+     bool upload_refused = false;
+ 
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index 78a07d5..87d2472 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
+ #include <cstring>
+ #include <numeric>
+ #include <optional>
+@@ -22,6 +24,7 @@
+ #include "common/bit_util.h"
+ #include "common/common_types.h"
+ #include "common/div_ceil.h"
++#include "common/logging.h"
+ #include "common/pe_switch.h"
+ #include "common/scratch_buffer.h"
+ #include "common/settings.h"
+@@ -1336,6 +1339,45 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
+     }
+ }
+ 
++u64 AstcBatchBudgetBytes() {
++    static const u64 budget = [] {
++        const char* const value = std::getenv("EDEN_UP_ASTC_BATCH_MIB");
++        if (value == nullptr || value[0] == '\0') {
++            return u64{0};
++        }
++        u64 mib = 0;
++        for (const char* c = value; *c != '\0'; ++c) {
++            if (*c < '0' || *c > '9' || mib > 4096) {
++                return u64{0};
++            }
++            mib = mib * 10 + static_cast<u64>(*c - '0');
++        }
++        if (mib == 0 || mib > 4096) {
++            return u64{0};
++        }
++        LOG_INFO(HW_GPU, "EDEN_UP_ASTC_BATCH_MIB={}: ASTC to BC conversion scratch kept to {} MiB",
++                 mib, mib);
++        return mib << 20;
++    }();
++    return budget;
++}
++
++namespace {
++// EDEN_UP_ASTC_BATCH_MIB: rows per band for a slice whose RGBA8 scratch would pass the budget; 0
++// when it fits, when the switch is off, or when not even one band fits (the slice goes whole).
++// A band is a multiple of the ASTC block height and of 4 (one BC block row).
++[[nodiscard]] u32 AstcCpuBandRows(u32 width, u32 height, u32 tile_height) {
++    const u64 budget = AstcBatchBudgetBytes();
++    const u64 row_bytes = u64{width} * BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
++    if (budget == 0 || row_bytes * height <= budget) {
++        return 0;
++    }
++    const u64 step = std::lcm(tile_height, 4U);
++    const u64 rows = budget / row_bytes / step * step;
++    return rows != 0 && rows < height ? static_cast<u32>(rows) : 0;
++}
++} // Anonymous namespace
++
+ void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
+     // Same offsets and sizes as ConvertImage below.
+     const auto recompression = Settings::GetAstcRecompression();
+@@ -1416,15 +1458,62 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
+             const size_t input_slice = size_t{Common::DivideUp(copy.image_extent.width, tile_size.width)} *
+                                        Common::DivideUp(copy.image_extent.height, tile_size.height) * 16;
+             const size_t output_slice = aligned_plane_dim / bpp_div;
+-            decode_scratch.resize_destructive(plane_dim * BytesPerBlock(PixelFormat::A8B8G8R8_UNORM));
+-
+-            for (u32 slice = 0; slice < slices; ++slice) {
+-                Tegra::Texture::ASTC::Decompress(
+-                    input_offset.subspan(slice * input_slice), copy.image_extent.width,
+-                    copy.image_extent.height, 1, tile_size.width, tile_size.height, decode_scratch);
+-
+-                compress(decode_scratch, copy.image_extent.width, copy.image_extent.height, 1,
+-                         output.subspan(output_offset + slice * output_slice));
++            const u32 band_rows = AstcCpuBandRows(copy.image_extent.width,
++                                                  copy.image_extent.height, tile_size.height);
++            if (band_rows == 0) {
++                decode_scratch.resize_destructive(plane_dim *
++                                                  BytesPerBlock(PixelFormat::A8B8G8R8_UNORM));
++
++                for (u32 slice = 0; slice < slices; ++slice) {
++                    Tegra::Texture::ASTC::Decompress(
++                        input_offset.subspan(slice * input_slice), copy.image_extent.width,
++                        copy.image_extent.height, 1, tile_size.width, tile_size.height,
++                        decode_scratch);
++
++                    compress(decode_scratch, copy.image_extent.width, copy.image_extent.height, 1,
++                             output.subspan(output_offset + slice * output_slice));
++                }
++            } else {
++                // EDEN_UP_ASTC_BATCH_MIB: band_rows rows of a slice at a time, through scratch of
++                // that many rows (the 6144x6144 ASTC 5x5 ground texture's level 0 asked for 144 MiB
++                // in one piece). A band starts on an ASTC block row and a BC block row and ends on
++                // both, but the last, which ends where the slice does: both functions see the same
++                // blocks and the same edges as for the whole slice, so the output is the same.
++                const auto start = std::chrono::steady_clock::now();
++                const u32 width = copy.image_extent.width;
++                const u32 height = copy.image_extent.height;
++                const size_t input_row =
++                    size_t{Common::DivideUp(width, tile_size.width)} * 16; // ASTC blocks
++                const size_t output_row = size_t{Common::AlignUp(width, 4U)} * 4 / bpp_div;
++                decode_scratch.resize_destructive(size_t{width} * band_rows *
++                                                  BytesPerBlock(PixelFormat::A8B8G8R8_UNORM));
++                u32 bands = 0;
++                for (u32 slice = 0; slice < slices; ++slice) {
++                    for (u32 y = 0; y < height; y += band_rows, ++bands) {
++                        const u32 rows = (std::min)(band_rows, height - y);
++                        Tegra::Texture::ASTC::Decompress(
++                            input_offset.subspan(slice * input_slice +
++                                                 (y / tile_size.height) * input_row),
++                            width, rows, 1, tile_size.width, tile_size.height, decode_scratch);
++                        compress(decode_scratch, width, rows, 1,
++                                 output.subspan(output_offset + slice * output_slice +
++                                                (y / 4) * output_row));
++                    }
++                }
++                static std::atomic<u32> logged{0};
++                const u32 count = ++logged;
++                if (count <= 16 || (count & (count - 1)) == 0) {
++                    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                        std::chrono::steady_clock::now() - start)
++                                        .count();
++                    LOG_INFO(HW_GPU,
++                             "EDEN_UP_ASTC_BATCH: CPU {}x{} level {} ({} slices): {} bands of "
++                             "{} rows, peak scratch {:.1f} MiB instead of {:.1f} MiB, {} us ({} "
++                             "so far)",
++                             width, height, level, slices, bands, band_rows,
++                             static_cast<double>(size_t{width} * band_rows * 4) / (1 << 20),
++                             static_cast<double>(u64{plane_dim} * 4) / (1 << 20), us, count);
++                }
+             }
+ 
+             copy.buffer_size =
+diff --git a/src/video_core/texture_cache/util.h b/src/video_core/texture_cache/util.h
+index 1737e7f..92de801 100644
+--- a/src/video_core/texture_cache/util.h
++++ b/src/video_core/texture_cache/util.h
+@@ -133,6 +133,10 @@ void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies);
+ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
+                   std::span<BufferImageCopy> copies);
+ 
++/// EDEN_UP_ASTC_BATCH_MIB=<N> (1..4096, digits only; unset, 0 or anything else: off): the most an
++/// ASTC to BC1/BC3 conversion may take as scratch, in bytes; 0 when off.
++[[nodiscard]] u64 AstcBatchBudgetBytes();
++
+ [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> FullDownloadCopies(
+     const ImageInfo& info);
+ 

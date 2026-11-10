@@ -254,7 +254,52 @@ static void CheckShots() {
     REQUIRE(ShotsFor("/roms/Zelda.nup", 0x0400486024DEC000ULL).empty());
 }
 
+static void CheckSteer() {
+    // A STEER line ends its section as a WAIT does, and carries its points.
+    const Script script = Parse("1 A 100\n2 STEER 90 500,500 600,700 r=8\n0.5 B 100\n3 END\n");
+    REQUIRE(script.error.empty());
+    REQUIRE(script.waits.size() == 2 && script.waits[0].steer && !script.waits[1].steer && script.waits[1].end);
+    REQUIRE(script.waits[0].points.size() == 2);
+    REQUIRE((script.waits[0].points[1] == std::pair<unsigned, unsigned>{600, 700}));
+    REQUIRE(script.waits[0].radius == 8 && script.waits[0].timeout == 90000u && script.waits[0].at == 2000u);
+    REQUIRE(script.events.size() == 2 && script.events[0].section == 0 && script.events[1].section == 1);
+    REQUIRE(Parse("0 STEER 30 1,2\n1 END\n").waits[0].radius == 6);
+    REQUIRE(!Parse("0 WAIT 5 LOOK 0 0 10 10 2x1:00ff\n").waits[0].steer);
+    Fails("0 STEER 30\n", "line 1: wrong number of fields");
+    Fails("0 STEER 0 1,2\n", "line 1: bad timeout");
+    Fails("0 STEER 30 1001,2\n", "line 1: bad point");
+    Fails("0 STEER 30 12\n", "line 1: bad point");
+    Fails("0 STEER 30 1,2 r=0\n", "line 1: bad radius");
+    Fails("0 STEER 30 r=5\n", "line 1: bad point");  // a radius alone is not a walk
+    Fails("0 STEER 30 1,2 r=5 3,4\n", "line 1: bad point");  // the radius comes last
+    std::string many = "0 STEER 30";
+    for (int i = 0; i < 64; ++i) many += " 1,2";
+    REQUIRE(Parse(many + "\n").error.empty());
+    Fails(many + " 1,2\n", "line 1: 1 to 64 points");
+    // The player holds the stick a STEER sets from one look to the next, and lets go when the
+    // section passes (one neutral sample, then the controller again).
+    Player player{{}, script.waits};
+    REQUIRE(!player.Sample(10));
+    player.Steer(std::pair<std::uint8_t, std::uint8_t>{200, 40});
+    auto sample = player.Sample(20);
+    REQUIRE(sample && sample->left_stick.x == 200 && sample->left_stick.y == 40 && sample->buttons == 0);
+    sample = player.Sample(5000);
+    REQUIRE(sample && sample->left_stick.x == 200);
+    player.Pass(6000);
+    sample = player.Sample(6010);
+    REQUIRE(sample && sample->left_stick.x == 128 && sample->left_stick.y == 128);
+    REQUIRE(!player.Sample(6020));
+    player.Steer(std::pair<std::uint8_t, std::uint8_t>{1, 1});
+    sample = player.Sample(6030);
+    REQUIRE(sample && sample->left_stick.x == 1 && sample->left_stick.y == 1);
+    player.Stop();  // a timeout: the stick is let go
+    sample = player.Sample(6040);
+    REQUIRE(sample && sample->left_stick.x == 128);
+    REQUIRE(!player.Sample(6050));
+}
+
 int main() {
+    CheckSteer();
     CheckTimes();
     CheckScript();
     CheckPlayer();

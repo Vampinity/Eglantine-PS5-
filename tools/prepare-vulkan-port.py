@@ -1567,7 +1567,8 @@ shader_source = shader_source.replace('    auto it{graphics_cache.find(graphics_
 for expression, index, count in (
     ('main_pools.ReleaseContents()', 19, 2),
     ('TranslateProgram(pools.inst, pools.block, env, cfg, host_info)', 21, 3),
-    ('EmitSPIRV(profile, runtime_info, program, binding)', 22, 1),
+    # 2 since 0509 (EDEN_UP_STAGE_CACHE): its verify path emits the stage again.
+    ('EmitSPIRV(profile, runtime_info, program, binding)', 22, 2),
     ('EmitSPIRV(profile, program)', 22, 1),
     ('BuildShader(device, code)', 23, 2),
 ):
@@ -1580,7 +1581,8 @@ for statement in (
     'Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);',
     'Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};',
 ):
-    expected = 2 if 'cfg_offset' in statement else 1  # graphics exception dump too
+    # graphics exception dump too; 3 since 0509 (EDEN_UP_STAGE_CACHE verifies a stage again)
+    expected = 3 if 'cfg_offset' in statement else 1
     if shader_source.count(statement) != expected:
         raise RuntimeError(f'Shader CFG anchor changed: {statement}')
     shader_source = shader_source.replace(statement,

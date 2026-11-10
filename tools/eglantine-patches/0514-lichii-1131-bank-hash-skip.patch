@@ -1,0 +1,465 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_BANK_HASH_SKIP=1: the once-per-frame upload of a native 64 KiB uniform bank is skipped while its bytes match its last upload and nothing else wrote its host range (Lichii #1131); off by default
+
+Port of zortos293/Lichii PR #1131 by liomaroliveira ("buffer_cache: skip re-uploading native
+uniform banks whose bytes did not change", commit 1d8e4e2db6, open on 10 Nov). Upstream measured
+Ocarina of Time in Kokiri Forest on an RX 6700 XT with RADV: ~212 banks a frame, 83% unchanged and
+skipped, 42.3 -> 42.7/43.1 fps over two runs (within noise). That number does not carry over to
+the console.
+
+What it does. Native programs read their 64 KiB banks with indirect offsets, and writes to that
+memory can be missed by the memory tracker, so each bank is uploaded again once a frame (0039;
+EDEN_NX2_BANK_REUPLOAD unset or 1). With EDEN_UP_BANK_HASH_SKIP=1 (Common::PeSwitch, exactly "1")
+that upload first hashes the bank's guest bytes, page by page (CityHash64 chained per page;
+upstream uses XXH3, which this tree does not carry). When the hash, size and buffer equal the
+bank's entry, the host buffer holds those bytes already and the upload is skipped. A write the
+tracker missed changes the hash, so the bank is still uploaded. Unset: nothing is hashed, no entry
+is kept, every path is as before.
+
+This keeps the re-upload; it only skips identical bytes. The ledger's EDEN_NX2_BANK_REUPLOAD=4 and
+EDEN_NX2_UBO_BANK_DIRECT (flash tests, off) are different switches and are left as they are. Modes
+0, 2, 3 and 4 are untouched; only mode 1 (the default) skips.
+
+Changes from upstream:
+
+1. Our mode 1 marks the bank CPU-modified and SynchronizeBuffer uploads it (upstream copies it
+   directly, which is our EDEN_NX2_UBO_BANK_DIRECT=1). Both are covered. On the mark path the
+   entry is kept only after SynchronizeBuffer in the same bind uploaded something (it then took
+   every marked page). A bank this bind streams from guest memory (at most 4 KiB with the skip
+   cache, or misaligned) is marked as before and not hashed: nothing reaches the host buffer
+   there, so an entry could not be kept.
+
+2. Upstream keeps an entry until the bank's bytes change or its buffer is deleted. That misses one
+   case: after the entry, the host range changed (a tracked write was uploaded, or a GPU, DMA or
+   inline write), and a write the tracker missed then put the entry's bytes back. The hash
+   matches, the host holds the newer bytes, the bank is skipped and shows stale uniforms.
+   Per-draw material data that the game rewrites between draws comes back to the same
+   frame-start bytes every frame in a still scene, which is the white-material flash Eglantine
+   031e07436c chased. Here every write into a host buffer drops the entries it overlaps
+   (Nx2BankHashForget): UploadMemory (every tracker upload and both bank paths),
+   InlineMemoryImplementation (inline memory and inline page writes), DMACopy and DMAClear
+   destinations, MarkWrittenBuffer (shader, transform feedback, image-to-buffer and query writes
+   the cache marks), DiscardWrite, inline index uploads, the query cache's value copies
+   (SyncValues, which the cache does not record) and DeleteBuffer (slot ids are reused, as
+   upstream). An entry stands only while nothing but the bank's own upload wrote its range.
+   Unlike EDEN_UP_L949_UBO_KEEP (UNSAFE in the ledger), nothing here trusts guest write
+   notifications: the hash reads guest memory itself at every check. The hooks are for host
+   buffer writes, which only the buffer cache makes.
+
+3. EDEN_UP_AHEAD_GUARD=2 or 3 (0491-0504): an upload reads a page that has a copy from the copy
+   (the bytes the frame in flight was presented with), while the hash reads guest memory. An
+   entry kept then would name bytes the host buffer does not hold; after the fence the bank would
+   be skipped and show the older bytes until the redirty gather. So a bank with a copied page
+   (AheadGuard::HasCopy, lock-free) is uploaded as before and its entry dropped, and HasCopy is
+   checked again after the upload, before an entry is kept. With no copy in the bank the old
+   upload also reads guest memory, so a skip gives the frame in flight the same bytes. Held
+   writes (=3) reach guest memory while a copy stands, so they meet the HasCopy rule; after the
+   guard is lifted they differ from the entry's bytes and the bank is uploaded. Needs 0496
+   (HasCopy, CopyMode).
+
+4. Before an entry is kept the bank is hashed again. A guest write that landed while it was
+   uploaded (the upload may hold the bytes from before or after it) leaves no entry. Upstream
+   keeps the first hash, so a missed write in that window, later undone by another, was skipped.
+
+5. At most 16384 entries (all dropped when reached; an entry less only costs an upload), and a
+   bitmap of 1 MiB regions (8 KiB, made at the first entry) so a write elsewhere skips the map.
+
+6. Log, with the switch only, every 600 frames: "EDEN_UP_BANK_HASH_SKIP: native banks in 600
+   frames: U uploaded (K KiB), S unchanged skipped, F entries dropped by another write, C uploads
+   left to the ahead guard (a copied page), M written while uploaded, T streamed (marked,
+   unhashed); E entries".
+
+Left as it is:
+- A guest write and its exact undo, both inside the few microseconds between the first hash and
+  the second, both missed by the tracker.
+- A GPU write the cache does not mark (a shader writing a buffer bound read-only) is no longer
+  overwritten by the once-per-frame upload.
+- A 64-bit hash collision.
+
+Runs on the PS5: same core path. Pool memory: up to 16384 map nodes (~1.5 MiB) and 8 KiB, only
+with the switch. Cost with it: one CityHash64 over each hashed bank once a frame (upstream averaged
+3.5 KiB a bank, so about 0.75 MiB a frame at 212 banks) and a second one over each bank uploaded,
+a map lookup per bank, and a bitmap test on each host buffer write (a map walk only when it
+hits). Saved: for each skipped bank the mark
+(page protection flips), the staging copy and the transfer.
+v2 (review): a skipped bank still notes its pages for EDEN_UP_AHEAD_GUARD (OverwriteNoteRead,
+as the mark path's upload did in SynchronizeBufferPages). Without it, three skipped frames took
+the bank out of the guard's guess, so a later frame's write to it was neither copied nor waited
+for, and the next upload gave the frame in flight the later bytes. And the copy check is made
+again after the hash: a page copied while it was hashed is uploaded as before, no skip.
+
+Hang: no new wait. Not compiled, not run.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 5fb21e2..4c6a698 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include "common/cityhash.h"
+ #include "common/pe_switch.h"
+ #include "video_core/readback_wait.h"
+ #include <algorithm>
+@@ -162,6 +163,17 @@ void BufferCache<P>::TickFrame() {
+     }
+     runtime.TickFrame(slot_buffers);
+     native_indirect_uniforms_this_frame.clear();
++    if (Nx2BankHashSkip() && frame_tick % 600 == 0) [[unlikely]] {
++        const Nx2BankHashStats& st = nx2_bank_hash_stats;
++        LOG_INFO(HW_GPU,
++                 "EDEN_UP_BANK_HASH_SKIP: native banks in 600 frames: {} uploaded ({} KiB), {} "
++                 "unchanged skipped, {} entries dropped by another write, {} uploads left to the "
++                 "ahead guard (a copied page), {} written while uploaded, {} streamed (marked, "
++                 "unhashed); {} entries",
++                 st.uploaded, st.bytes >> 10, st.skipped, st.forgotten, st.copied, st.moved,
++                 st.streamed, nx2_bank_hashes.size());
++        nx2_bank_hash_stats = {};
++    }
+     if (Nx2FastDraw::UboKeepEnabled() && frame_tick % 600 == 0) [[unlikely]] {
+         // EDEN_UP_L949_UBO_KEEP (Lichii #949).
+         UniformKeep& keep = uniform_keep;
+@@ -1295,6 +1307,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+ 
+     ClearDownload(*cpu_dest_address, amount);
+     MarkVertexBuffersStale(*cpu_dest_address, amount);
++    Nx2BankHashForget(*cpu_dest_address, amount); // EDEN_UP_BANK_HASH_SKIP; empty without it
+ 
+     BufferId buffer_a;
+     BufferId buffer_b;
+@@ -1403,6 +1416,7 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
+ 
+     ClearDownload(*cpu_dst_address, size);
+     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
++    Nx2BankHashForget(*cpu_dst_address, size); // EDEN_UP_BANK_HASH_SKIP; empty without it
+     if (fritchii_dma_list || VideoCommon::GpuSplit::L1094ListWords()) {
+         // The caller writes the cleared words to guest memory after this (WriteBlockUnsafe), as
+         // an inline write: command list pages read them from guest memory, their copies are stale.
+@@ -1465,6 +1479,7 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
+     case ObtainBufferOperation::DiscardWrite: {
+         ClearDownload(device_addr, size);
+         gpu_modified_ranges.Subtract(device_addr, size);
++        Nx2BankHashForget(device_addr, size); // EDEN_UP_BANK_HASH_SKIP; empty without it
+         break;
+     }
+     default:
+@@ -2642,6 +2657,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
+     if (draw_state.inline_index_draw_indexes.empty()) {
+         SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+     } else if (size != 0) {
++        Nx2BankHashForget(buffer.CpuAddr(), size); // EDEN_UP_BANK_HASH_SKIP; empty without it
+         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+             auto upload_staging = runtime.UploadStagingBuffer(size);
+             std::array<BufferCopy, 1> copies{{BufferCopy{.src_offset = upload_staging.offset, .dst_offset = 0, .size = size}}};
+@@ -3001,6 +3017,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000) {
+         Nx2CheckBankPages(device_addr, size, bank_mode == '4', bank_stats);
+     }
++    // EDEN_UP_BANK_HASH_SKIP: a bank the once-per-frame upload below just took from guest memory
++    // (size 0: none), kept as an entry once that upload has landed.
++    u64 bank_keep_size = 0;
++    u64 bank_keep_hash = 0;
+     if (bank_mode != '0' && bank_mode != '4' && native_bank &&
+         (bank_mode == '3' || (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000) &&
+         (bank_mode == '2' || bank_mode == '3' ||
+@@ -3019,13 +3039,65 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+             return value != nullptr && value[0] == '1';
+         }();
+         const u64 upload_size = (std::min<u64>)(mapped_size, size);
+-        if (upload_size != 0 && bank_direct) {
++        // EDEN_UP_BANK_HASH_SKIP=1 (zortos293/Lichii PR 1131, liomaroliveira): the once-per-frame
++        // upload (mode 1, the default) is skipped when the bank's bytes are the ones its entry
++        // hashed, so the host buffer holds them already. Any write the tracker missed changes
++        // the hash, so it is still uploaded. EDEN_UP_AHEAD_GUARD=2/3: with a page copied for the
++        // frame in flight the upload reads the copy, so it is made as before and no entry kept.
++        // Without EDEN_NX2_UBO_BANK_DIRECT the mark reaches the host buffer in this bind only on
++        // the cached path below (a bank streamed from guest memory is marked as before, unhashed).
++        bool bank_skip = false;
++        if (bank_mode == '1' && upload_size != 0 && Nx2BankHashSkip()) {
++            const bool synced_here =
++                bank_direct ||
++                !(needs_alignment_stream || size <= channel_state->uniform_buffer_skip_cache_size);
++            if (!synced_here) {
++                ++nx2_bank_hash_stats.streamed;
++            } else if (VideoCommon::AheadGuard::CopyMode() &&
++                       VideoCommon::AheadGuard::HasCopy(device_addr, upload_size)) {
++                Nx2BankHashForget(device_addr, upload_size);
++                ++nx2_bank_hash_stats.copied;
++            } else if (const std::optional<u64> hash = Nx2BankHashOf(device_addr, upload_size);
++                       VideoCommon::AheadGuard::CopyMode() &&
++                       VideoCommon::AheadGuard::HasCopy(device_addr, upload_size)) {
++                // A guest thread copied a page while it was hashed: the hash may hold its new
++                // bytes, the upload reads the copy. Uploaded as before, no entry.
++                Nx2BankHashForget(device_addr, upload_size);
++                ++nx2_bank_hash_stats.copied;
++            } else {
++                const auto entry = nx2_bank_hashes.find(device_addr);
++                bank_skip = hash && entry != nx2_bank_hashes.end() &&
++                            entry->second.hash == *hash && entry->second.size == upload_size &&
++                            entry->second.buffer_id == binding.buffer_id;
++                if (bank_skip) {
++                    ++nx2_bank_hash_stats.skipped;
++                } else {
++                    bank_keep_size = hash ? upload_size : 0;
++                    bank_keep_hash = hash.value_or(0);
++                    ++nx2_bank_hash_stats.uploaded;
++                    nx2_bank_hash_stats.bytes += upload_size;
++                }
++            }
++        }
++        if (bank_skip) {
++            // The host buffer holds these bytes: nothing to upload. The mark path's upload noted
++            // the bank's pages for EDEN_UP_AHEAD_GUARD (SynchronizeBufferPages); note them still,
++            // or after three skipped frames the guard no longer takes them and a later frame's
++            // write to the bank reaches the frame in flight uncopied.
++            if (!bank_direct) {
++                OverwriteNoteRead(device_addr, upload_size);
++            }
++        } else if (upload_size != 0 && bank_direct) {
+             std::array<BufferCopy, 1> copies{BufferCopy{
+                 .src_offset = 0,
+                 .dst_offset = buffer.Offset(device_addr),
+                 .size = upload_size,
+             }};
+             UploadMemory(buffer, upload_size, upload_size, copies);
++            if (bank_keep_size != 0) {
++                Nx2BankHashKeep(device_addr, bank_keep_hash, bank_keep_size, binding.buffer_id);
++                bank_keep_size = 0;
++            }
+         } else if (upload_size != 0) {
+             memory_tracker.MarkRegionAsCpuModified(device_addr, upload_size);
+         }
+@@ -3109,9 +3181,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+                   "streamed",
+                   stage, index, device_addr, size);
+     }
+-    if (SynchronizeBuffer(buffer, device_addr, size)) {
++    const bool nothing_uploaded = SynchronizeBuffer(buffer, device_addr, size);
++    if (nothing_uploaded) {
+         ++channel_state->uniform_cache_hits[0];
+     }
++    if (bank_keep_size != 0 && !nothing_uploaded) {
++        // EDEN_UP_BANK_HASH_SKIP: the bank marked above was uploaded just now.
++        Nx2BankHashKeep(device_addr, bank_keep_hash, bank_keep_size, binding.buffer_id);
++    }
+     // Skip binding if it's not needed and if the bound buffer is not the fast version
+     // This exists to avoid instances where the fast buffer is bound and a GPU write happens
+     needs_bind |= HasFastUniformBufferBound(stage, binding_index);
+@@ -3264,6 +3341,107 @@ bool BufferCache<P>::BindSnapshotUniformBuffer(size_t stage, u32 index, u32 bind
+     }
+ }
+ 
++template <class P>
++bool BufferCache<P>::Nx2BankHashSkip() {
++    static const bool on = [] {
++        const bool enabled = Common::PeSwitch("EDEN_UP_BANK_HASH_SKIP");
++        if (enabled) {
++            LOG_INFO(HW_GPU, "EDEN_UP_BANK_HASH_SKIP on: a native bank's once-per-frame upload "
++                             "is skipped while its bytes match its last upload");
++        }
++        return enabled;
++    }();
++    return on;
++}
++
++template <class P>
++std::optional<u64> BufferCache<P>::Nx2BankHashOf(DAddr device_addr, u64 size) {
++    u64 hash = 0;
++    for (u64 done = 0; done < size;) {
++        const DAddr at = device_addr + done;
++        const u64 piece =
++            (std::min<u64>)(Core::DEVICE_PAGESIZE - (at & Core::DEVICE_PAGEMASK), size - done);
++        const u8* const bytes = device_memory.template GetPointer<u8>(at);
++        if (bytes == nullptr) {
++            // Unmapped since the caller's walk: uploaded as before, no entry.
++            return std::nullopt;
++        }
++        hash = Common::CityHash64WithSeed(reinterpret_cast<const char*>(bytes), piece, hash);
++        done += piece;
++    }
++    return hash;
++}
++
++template <class P>
++void BufferCache<P>::Nx2BankHashKeep(DAddr device_addr, u64 hash, u64 size, BufferId buffer_id) {
++    // A page copied for the frame in flight since the hash: the upload may have read the copy.
++    if (VideoCommon::AheadGuard::CopyMode() &&
++        VideoCommon::AheadGuard::HasCopy(device_addr, size)) {
++        Nx2BankHashForget(device_addr, size);
++        ++nx2_bank_hash_stats.copied;
++        return;
++    }
++    // A guest write landed between the hash and now: the upload may hold either bytes.
++    const std::optional<u64> now = Nx2BankHashOf(device_addr, size);
++    if (!now || *now != hash) {
++        Nx2BankHashForget(device_addr, size);
++        ++nx2_bank_hash_stats.moved;
++        return;
++    }
++    if (!nx2_bank_hash_regions) {
++        nx2_bank_hash_regions.reset(new u64[NX2_BANK_HASH_REGIONS / 64]());
++    }
++    if (nx2_bank_hashes.size() >= 16384) {
++        // Banks long unused keep their entries until their range is written: start over (an
++        // entry less only costs an upload).
++        nx2_bank_hashes.clear();
++        std::fill_n(nx2_bank_hash_regions.get(), NX2_BANK_HASH_REGIONS / 64, u64{0});
++    }
++    nx2_bank_hashes.insert_or_assign(device_addr, Nx2BankHash{hash, size, buffer_id});
++    const u64 last = (device_addr + size - 1) >> NX2_BANK_HASH_REGION_BITS;
++    for (u64 region = device_addr >> NX2_BANK_HASH_REGION_BITS; region <= last; ++region) {
++        const u64 bit = region & (NX2_BANK_HASH_REGIONS - 1);
++        nx2_bank_hash_regions[bit / 64] |= u64{1} << (bit % 64);
++    }
++}
++
++template <class P>
++void BufferCache<P>::Nx2BankHashForget(DAddr device_addr, u64 size) {
++    if (nx2_bank_hashes.empty() || size == 0) {
++        return;
++    }
++    const DAddr end = device_addr + size;
++    const u64 last = (end - 1) >> NX2_BANK_HASH_REGION_BITS;
++    if (last - (device_addr >> NX2_BANK_HASH_REGION_BITS) < 64) {
++        // An entry that overlaps the range set the bit of a region the range covers.
++        bool kept_here = false;
++        for (u64 region = device_addr >> NX2_BANK_HASH_REGION_BITS; region <= last && !kept_here;
++             ++region) {
++            const u64 bit = region & (NX2_BANK_HASH_REGIONS - 1);
++            kept_here = ((nx2_bank_hash_regions[bit / 64] >> (bit % 64)) & 1) != 0;
++        }
++        if (!kept_here) {
++            return;
++        }
++    }
++    // Entries are at most 64 KiB long: those that can reach into the range start after
++    // device_addr - 64 KiB.
++    constexpr DAddr longest = 0x10000;
++    auto it = device_addr > longest ? nx2_bank_hashes.upper_bound(device_addr - longest)
++                                    : nx2_bank_hashes.begin();
++    while (it != nx2_bank_hashes.end() && it->first < end) {
++        if (it->first + it->second.size > device_addr) {
++            it = nx2_bank_hashes.erase(it);
++            ++nx2_bank_hash_stats.forgotten;
++        } else {
++            ++it;
++        }
++    }
++    if (nx2_bank_hashes.empty()) {
++        std::fill_n(nx2_bank_hash_regions.get(), NX2_BANK_HASH_REGIONS / 64, u64{0});
++    }
++}
++
+ template <class P>
+ void BufferCache<P>::Nx2BankFlagPages(DAddr device_addr, u64 size) {
+     // The flags must cover every device address (Frizti/Fritchii 9e8cb73ede).
+@@ -4027,6 +4205,7 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
+ 
+ template <class P>
+ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
++    Nx2BankHashForget(device_addr, size); // EDEN_UP_BANK_HASH_SKIP; empty without it
+     if constexpr (!IS_OPENGL) {
+         if (needs_sync) {
+             Buffer& buffer = slot_buffers[buffer_id];
+@@ -4841,6 +5020,12 @@ bool BufferCache<P>::SynchronizeBufferPages(Buffer& buffer, DAddr device_addr, u
+ template <class P>
+ void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
+                                   std::span<BufferCopy> copies) {
++    if (!nx2_bank_hashes.empty()) {
++        // EDEN_UP_BANK_HASH_SKIP: these bytes replace what a bank's entry hashed.
++        for (const BufferCopy& copy : copies) {
++            Nx2BankHashForget(buffer.CpuAddr() + copy.dst_offset, copy.size);
++        }
++    }
+     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+         MappedUploadMemory(buffer, total_size_bytes, copies);
+     } else {
+@@ -4982,6 +5167,7 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
+ template <class P>
+ bool BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
+                                                 std::span<const u8> inlined_buffer) {
++    Nx2BankHashForget(dest_address, copy_size); // EDEN_UP_BANK_HASH_SKIP; empty without it
+     ClearDownload(dest_address, copy_size);
+     gpu_modified_ranges.Subtract(dest_address, copy_size);
+     MarkVertexBuffersStale(dest_address, copy_size);
+@@ -5230,6 +5416,11 @@ template <class P>
+ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+     Churn::Add(Churn::BuffersDeleted);
+     ++uniform_keep.deletions; // EDEN_UP_L949_UBO_KEEP
++    if (!nx2_bank_hashes.empty()) {
++        // EDEN_UP_BANK_HASH_SKIP: the slot id goes to the next buffer made.
++        std::erase_if(nx2_bank_hashes,
++                      [buffer_id](const auto& entry) { return entry.second.buffer_id == buffer_id; });
++    }
+     nx2_synced_ranges.fill({});
+     nx2_synced_vertex_buffers.fill({});
+     if (buffer_id == inline_buffer_id) {
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index c3edce2..66c0244 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -14,6 +14,7 @@
+ #include <bit>
+ #include <bitset>
+ #include <functional>
++#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <numeric>
+@@ -522,6 +523,39 @@ public:
+     bool any_buffer_uploaded = false;
+     /// Indirectly read banks of native programs already uploaded this frame.
+     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
++    /// EDEN_UP_BANK_HASH_SKIP (zortos293/Lichii PR 1131): a native 64 KiB bank's bytes as its
++    /// last once-per-frame upload took them, by device address. An entry stands only while the
++    /// host buffer there still holds those bytes: every other write into its range drops it
++    /// (Nx2BankHashForget). Empty without the switch.
++    struct Nx2BankHash {
++        u64 hash{};
++        u64 size{};
++        BufferId buffer_id{};
++    };
++    std::map<DAddr, Nx2BankHash> nx2_bank_hashes;
++    /// One bit per 1 MiB of device addresses (modulo 64 GiB) that an entry was kept in, so a
++    /// write elsewhere skips the map. Made at the first entry; bits clear only when it empties.
++    std::unique_ptr<u64[]> nx2_bank_hash_regions;
++    static constexpr u64 NX2_BANK_HASH_REGION_BITS = 20;
++    static constexpr u64 NX2_BANK_HASH_REGIONS = u64{1} << 16;
++    struct Nx2BankHashStats {
++        u64 uploaded{};  ///< once-per-frame uploads made (no entry, or the bytes changed)
++        u64 bytes{};     ///< their bytes
++        u64 skipped{};   ///< skipped: same bytes, size and buffer as the entry
++        u64 forgotten{}; ///< entries dropped by another write into their range
++        u64 copied{};    ///< uploaded, no entry kept: a page had an ahead guard copy
++        u64 moved{};     ///< uploaded, no entry kept: the bytes changed while it was uploaded
++        u64 streamed{};  ///< marked as before, unhashed: the bind streams from guest memory
++    } nx2_bank_hash_stats;
++    [[nodiscard]] static bool Nx2BankHashSkip();
++    /// Hash of [device_addr, device_addr + size), page by page; nullopt: a page is unmapped.
++    [[nodiscard]] std::optional<u64> Nx2BankHashOf(DAddr device_addr, u64 size);
++    /// Keeps the entry for a bank its once-per-frame upload just took from guest memory, when
++    /// no page has an ahead guard copy and the bytes still hash to `hash`.
++    void Nx2BankHashKeep(DAddr device_addr, u64 hash, u64 size, BufferId buffer_id);
++    /// Drops the entries of banks that overlap [device_addr, device_addr + size): the host
++    /// buffer there may no longer hold the bytes they hashed.
++    void Nx2BankHashForget(DAddr device_addr, u64 size);
+     /// EDEN_UP_UBO_SNAPSHOT (ubo_snapshot.h): binds (stage, cbuf `index`) from the copy of this
+     /// frame's constant buffers taken at its present; false (nothing bound) when the copy lacks
+     /// the range.
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index 7b79d43..59685d0 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -1777,6 +1777,11 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
+             impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+         }
+     }
++    // EDEN_UP_BANK_HASH_SKIP: nor may a native bank's entry still stand for them (no entries
++    // without the switch).
++    for (const auto& value : values) {
++        impl->buffer_cache.Nx2BankHashForget(value.address, value.size);
++    }
+ 
+     VkBuffer src_buffer;
+     [[maybe_unused]] StagingBufferRef ref;

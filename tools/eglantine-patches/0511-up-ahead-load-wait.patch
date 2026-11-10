@@ -1,0 +1,111 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_AHEAD_LOAD_WAIT=1: a frame ahead, a present waits for its own frame around a fade to black, a load or a stall; off by default
+
+Door walk, cut to Link's house, all runs checked so far (check.py): with the full wait the cut is
+clean in 45 of 45 runs. A frame ahead (EDEN_NX2_FRAMES_AHEAD=1) it is over-bright in 8 of 20 runs
+without a guard and in 4 of 12 with EDEN_UP_AHEAD_GUARD=3; in 3 of 3 with the guard's front notes
+and 3 of 3 with EDEN_UP_UBO_AHEAD, the two that take a frame's constant buffers early. It is not
+one frame: whole-picture brightness per game frame after the black runs 9, 91, 81, 74, 72, 62 ...
+47 over about a second, against 9, 18, 33, 40, 43, 45 in a clean run. So the first frame is the
+same, the second has the exposure far too high, and it then comes down at the slow rate: the
+exposure was set from a wrong reading right after the cut.
+
+The reading this points to, not shown directly: the exposure meter, a sum the GPU writes and the
+game reads and clears every frame (the 'read the sum, then store 0' of EDEN_NX2_OVERWRITE_CHECK).
+Its download lands at the frame's fence, and a frame ahead the game reads before that.
+
+EDEN_UP_OOT_LOAD_WAIT already has the test for 'not steady gameplay' (under 300 draws twice in a
+row, or presents more than 250 ms apart) but does nothing with EDEN_NX2_FRAMES_AHEAD=1. This
+switch applies the same test there: while unsteady, and for EDEN_UP_OOT_LOAD_WAIT_HOLD_MS after
+(700 ms by default with this switch alone), the present also waits for its own frame, as it
+already does when the GPU is behind. Steady gameplay is untouched.
+
+diff --git a/src/common/nx2_load_wait.h b/src/common/nx2_load_wait.h
+index edff555..c4a5c5c 100644
+--- a/src/common/nx2_load_wait.h
++++ b/src/common/nx2_load_wait.h
+@@ -42,12 +42,33 @@ namespace Common::Nx2LoadWait {
+     return enabled;
+ }
+ 
++/// EDEN_UP_AHEAD_LOAD_WAIT=1 (exact "1", Ocarina of Time only, with EDEN_NX2_FRAMES_AHEAD=1, where
++/// EDEN_UP_OOT_LOAD_WAIT does nothing): the same test decides, present by present, whether a
++/// present that would return a frame ahead waits for its own frame instead. The hold after the
++/// last unsteady present is 700 ms by default here (EDEN_UP_OOT_LOAD_WAIT_HOLD_MS sets it).
++///
++/// Why: T91-T97, door walk, cut to Link's house: in 12 of 32 runs a frame ahead (with or
++/// without EDEN_UP_AHEAD_GUARD) the second frame after the black came out at about twice the
++/// brightness and took a second to settle (whole-picture brightness 9, 91, 81, 74 ... 47 against
++/// 9, 18, 33, 40, 43, 45), in 0 of 45 runs with the full wait. That is the exposure set from a
++/// wrong reading and then adapting at its slow rate. The reading it points to (not shown
++/// directly): the game's exposure meter, a sum the GPU writes and the game reads and clears each
++/// frame; a frame ahead the game reads it before the frame in flight has written it. In steady
++/// gameplay the exposure moves slowly and a frame of lag shows nothing; right after a cut the
++/// game sets it from one reading. The black before a cut draws next to nothing, so it is
++/// unsteady by the test above, and the hold carries the full wait over the first frames of the
++/// new scene.
++[[nodiscard]] inline bool AheadEnabled() {
++    static const bool enabled = PeSwitch("EDEN_UP_AHEAD_LOAD_WAIT");
++    return enabled;
++}
++
+ /// 3D draws run since the last present took the count. Any thread.
+ inline std::atomic<u64> g_draws{};
+ 
+ /// The thread that runs the 3D engine, for each draw it runs.
+ inline void NoteDraw() {
+-    if (Enabled()) {
++    if (Enabled() || AheadEnabled()) {
+         g_draws.fetch_add(1, std::memory_order_relaxed);
+     }
+ }
+@@ -70,7 +91,8 @@ inline void NoteDraw() {
+     static const auto slow =
+         std::chrono::milliseconds{Setting("EDEN_UP_OOT_LOAD_WAIT_SLOW_MS", 250, 1, 60'000)};
+     static const auto hold =
+-        std::chrono::milliseconds{Setting("EDEN_UP_OOT_LOAD_WAIT_HOLD_MS", 8000, 0, 600'000)};
++        std::chrono::milliseconds{Setting("EDEN_UP_OOT_LOAD_WAIT_HOLD_MS",
++                                          AheadEnabled() && !Enabled() ? 700 : 8000, 0, 600'000)};
+     static Clock::time_point last_present = Clock::now();
+     static Clock::time_point last_unsteady = last_present;
+     static bool steady = false;
+@@ -94,9 +116,10 @@ inline void NoteDraw() {
+     const bool now_steady = now - last_unsteady >= hold;
+     if (presents == 0) {
+         LOG_INFO(Service,
+-                 "EDEN_UP_OOT_LOAD_WAIT=1: full frame wait until every present has run at least "
++                 "{}=1: full frame wait until every present has run at least "
+                  "{} draws and come within {} ms of the one before for {} ms",
+-                 min_draws, slow.count(), hold.count());
++                 Enabled() ? "EDEN_UP_OOT_LOAD_WAIT" : "EDEN_UP_AHEAD_LOAD_WAIT", min_draws,
++                 slow.count(), hold.count());
+     }
+     if (now_steady != steady) {
+         steady = now_steady;
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index f29b66e..b224d69 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -1917,6 +1917,13 @@ private:
+         const bool load_wait = Common::Nx2LoadWait::Enabled() && frames_ahead == -1 &&
+                                app_program_id == OcarinaOfTimeProgramId &&
+                                !Common::Nx2LoadWait::SteadyAtPresent();
++        // EDEN_UP_AHEAD_LOAD_WAIT=1 (Ocarina only, common/nx2_load_wait.h): the same test with
++        // EDEN_NX2_FRAMES_AHEAD=1. While it says unsteady (a fade to black, a load, a stall, and
++        // a short while after), a present that would return a frame ahead waits for its own
++        // frame too, so the game reads its exposure meter after the frame that wrote it.
++        const bool ahead_load_wait = Common::Nx2LoadWait::AheadEnabled() && frames_ahead == 1 &&
++                                     app_program_id == OcarinaOfTimeProgramId &&
++                                     !Common::Nx2LoadWait::SteadyAtPresent();
+         const bool slack_wait = !load_wait && oot_slack && frames_ahead == -1 &&
+                                 app_program_id == OcarinaOfTimeProgramId;
+         const bool cap_wait = !load_wait && !slack_wait && oot_cap && frames_ahead == -1 &&
+@@ -1987,7 +1994,7 @@ private:
+                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
+                                         m_previous_fence_id, m_previous_fence_value);
+             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
+-            if (gpu_behind) {
++            if (gpu_behind || ahead_load_wait) {
+                 WaitForFrame(~w[22], w[24]);
+             }
+         } else if (slack_wait) {

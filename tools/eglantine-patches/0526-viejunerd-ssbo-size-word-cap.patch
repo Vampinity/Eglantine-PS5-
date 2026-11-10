@@ -1,0 +1,64 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_SSBO_SIZE_CAP=1: a word past 256 MiB after a storage buffer pointer is not a size (viejunerd/Eglantine-PS5- v1.219.029, patch 0082); off by default
+
+Port of viejunerd's 0082-implausible-storage-buffer-size-word.patch (release v1.219.029,
+commit 15cde68e7): StorageBufferBinding took the word after an SSBO pointer as the buffer's size
+whenever it fit the mapping. At Ocarina of Time's Kokiri Forest load that word is the float 1.0
+(0x3F800000) inside a larger mapping, so a 1,065,418,752-byte buffer was asked for and the
+session ended with VK_ERROR_OUT_OF_DEVICE_MEMORY while hundreds of MiB were free. With the
+switch such a word is bound as a bare pointer (up to 8 MiB, cut at the mapping's end) and the
+first 16 are logged as 'Storage buffer size word ... is not a size'.
+
+Upstream's change is unconditional. Here it sits behind a switch, merged by hand into our
+version of the function (EDEN_UP_FRITCHII_PROBECLAMP and the table pool sit between the two
+upstream hunks); with the switch unset nothing changes.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 5feadd8..21aeb11 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -5607,6 +5607,14 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+         }
+     }
+     const Binding binding = [&]() -> Binding {
++        // EDEN_UP_SSBO_SIZE_CAP=1 (viejunerd/Eglantine-PS5- v1.219.029, patch 0082): a word past
++        // 256 MiB after the pointer is another parameter, not a size. Ocarina of Time's Kokiri
++        // Forest load has the float 1.0 (0x3F800000) there inside a mapping larger than that,
++        // and the 1 GiB buffer it asked for ended the session out of device memory with
++        // hundreds of MiB still free. Such a word binds as a bare pointer (up to 8 MiB).
++        static const bool size_cap = Common::PeSwitch("EDEN_UP_SSBO_SIZE_CAP");
++        constexpr u32 MaxStorageSizeWord = static_cast<u32>(256_MiB);
++        bool bare_pointer = native_pointer;
+         u32 size = [&]() {
+             const u64 layout_size = static_cast<u64>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+             // EDEN_UP_FRITCHII_PROBECLAMP=1 (Fritchii 8193f926fa, zortos293/Lichii#351): the
+@@ -5647,9 +5655,19 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+             const u32 packed_size = static_cast<u32>(next_qword);
+             const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
+                                             packed_size != 0 && packed_size <= memory_layout_size;
+-            if (next_qword_is_size) {
++            if (next_qword_is_size && (!size_cap || packed_size <= MaxStorageSizeWord)) {
+                 return packed_size;
+             }
++            if (next_qword_is_size) {
++                bare_pointer = true;
++                static std::atomic<u32> reports{};
++                if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
++                    LOG_WARNING(HW_GPU,
++                                "Storage buffer size word {:#x} at {:#x} is not a size: bound as a "
++                                "bare pointer",
++                                packed_size, ssbo_addr + 8);
++                }
++            }
+             return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+         }();
+         if (native_written_binding_mode != 0) {
+@@ -5676,7 +5694,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+                 }
+             }
+         }
+-        if (native_pointer && size != 0) {
++        if (bare_pointer && size != 0) {
+             // Stop where the mapping or its device range does: the binding is one device range, and
+             // a written one isn't split into separate ranges without sparse sources.
+             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));

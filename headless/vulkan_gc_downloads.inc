@@ -25,6 +25,22 @@
         }
         return evict;
     };
+    // EDEN_UP_GC_ONE_WAIT=1 (texture_cache.h GcOneWait; Fritchii EXP57): one wait for the GPU a
+    // frame, a batch below or one image Cleanup copies alone. No cap while the pool is short:
+    // PoolPressure() 2 (largest free block under EDEN_NX2_TC_POOL_CRITICAL_MIB, or a refusal in
+    // the last 120 frames), or any refusal in the last 120 frames when PoolPressure is off
+    // (EDEN_NX2_TC_POOL_PRESSURE=1). Read once a run, as Configure reads the marks once a pass.
+    if (GcOneWait()) {
+        static unsigned long long one_wait_refusals = 0;
+        static u64 one_wait_refusal_frame = ~0ULL;
+        const auto refusals = ::Eden::Performance::graphics_refusals.load(std::memory_order_relaxed);
+        if (refusals != one_wait_refusals) {
+            one_wait_refusals = refusals;
+            one_wait_refusal_frame = frame_tick;
+        }
+        wait_exempt = PoolPressure() >= 2 ||
+                      (one_wait_refusal_frame != ~0ULL && frame_tick - one_wait_refusal_frame < 120);
+    }
     // One batch of copies behind a single wait for the GPU: this many images and bytes at most.
     // A pass frees up to 40 images at a time (num_iterations), and at a resolution above 1x most
     // of what the GPU wrote is a few MiB each.
@@ -42,6 +58,9 @@
     SCOPE_EXIT { ReleaseDownloads(); };
     const auto PrefetchDownloads = [&] {
         if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
+            // EDEN_UP_GC_ONE_WAIT: this frame's wait is spent. No new batch; copies the last one
+            // made stay usable, and Cleanup leaves the other images for a later frame.
+            if (WaitHeld()) return;
             ReleaseDownloads();
             size_t remaining = num_iterations;
             size_t bytes = 0;
@@ -92,6 +111,7 @@
                 const ::Eden::Performance::Timer drain(::Eden::Performance::gc_batched_drain,
                                                        gc_downloads.size());
                 runtime.Finish();
+                Waited();
             }
         }
     };

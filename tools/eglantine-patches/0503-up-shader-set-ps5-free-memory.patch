@@ -1,0 +1,32 @@
+Subject: [PATCH] EDEN_UP_SHADER_SET: free memory on the PS5 comes from the front (the pool's largest free block)
+
+T94, shader set run B: "Shader set: free memory is unknown on this platform; nothing extracted".
+The PS5 kernel has no vm.stats.vm.v_free_count sysctl. FreeMemoryBytes now first asks the front's
+eden_free_memory_bytes (headless/performance.cpp: the largest free block of the direct memory
+pool, the measure the caches there use), a weak symbol that other platforms do not have.
+
+---
+diff --git a/src/video_core/shader_set.cpp b/src/video_core/shader_set.cpp
+index e303bc2..c356172 100644
+--- a/src/video_core/shader_set.cpp
++++ b/src/video_core/shader_set.cpp
+@@ -284,7 +284,19 @@ std::vector<u8> Hydrate(const Facts& f, const Lowered& p) {
+ }
+ } // namespace
+ 
++} // namespace VideoCommon::ShaderSet
++// The PS5 front's answer (headless/performance.cpp): the largest free block of the pool the CPU
++// shares with the GPU, which is what the caches there measure memory by. The PS5 kernel has no
++// vm.stats counters (T94, run B: "free memory is unknown on this platform; nothing extracted").
++extern "C" unsigned long long eden_free_memory_bytes(void) __attribute__((weak));
++namespace VideoCommon::ShaderSet {
++
+ u64 FreeMemoryBytes() {
++    if (eden_free_memory_bytes != nullptr) {
++        if (const u64 bytes = eden_free_memory_bytes(); bytes != 0) {
++            return bytes;
++        }
++    }
+ #if defined(__linux__)
+     struct sysinfo info {};
+     if (sysinfo(&info) == 0) {

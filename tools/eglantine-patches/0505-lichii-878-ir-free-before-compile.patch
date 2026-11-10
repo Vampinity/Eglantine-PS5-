@@ -1,0 +1,242 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_IR_FREE=1: a boot pipeline build frees its shader IR before its driver compile (Lichii #878); EDEN_UP_IR_FREE_RUNTIME=1 also after a translation during play; EDEN_UP_IR_FREE_LOG=1 logs the sizes only; all off by default
+
+Port of zortos293/Lichii #878 ("vulkan: free compute IR before a synchronous driver compile", merged
+as fd4ce24c9b; commits 7bb2fc70e8 and 809b63b683). Our out-of-memory crashes die in RADV NIR's
+ralloc during a pipeline compile (nir_opt_copy_prop_vars.c:419, VkPipelineBuilder, 9 and 10 Nov). A
+build kept its translated IR (the inst and block pools, the program's block lists, and for compute
+the SPIR-V words) until it returned. The boot's disk cache (LoadDiskResources) and the shader
+preparation and its probes (PrepareKept) build with no thread worker, so the driver compile runs
+inside the pipeline's constructor and every builder held its IR through its compile. Lichii
+measured ~323 MiB of pool memory for one large Ocarina compute program and ~1077 MiB held across 24
+workers at its compute precache peak; with the PR, 35-41 MiB and an ~850 MiB lower peak commit,
+with no change in the phase's time.
+
+EDEN_UP_IR_FREE=1 acts at boot only. Every build whose compile runs on the calling thread is in
+LoadDiskResources or PrepareKept; during play nothing changes, so this switch alone does not reach
+the door crashes. (With the shader-set series stacked and EDEN_UP_SHADER_SET=1, PrepareShaderSet's
+background jobs build the same way and free too, and those may run during play.) Up to 15 builders
+compile at once at boot (hardware threads minus one, unless EDEN_NX2_PIPELINE_WORKERS caps it).
+Scaling Lichii's 1077 MiB to 15 builders gives roughly 650-700 MiB off the boot peak (about 180-190
+MiB at 4 builders). Unmeasured on PS5.
+
+With the switch, a build whose compile runs on the calling thread (graphics and compute) drops the
+programs' block lists, frees the block pool and then the instruction pool (blocks first: a block's
+instruction list unlinks its instructions as it goes) and, for compute, the SPIR-V words, right
+before the pipeline is constructed. Unlike Lichii, the programs' infos stay in place: the pipelines
+copy them (ComputePipeline's info{info_}, GraphicsPipeline's stage_infos) before the compile, which
+reads only the shader modules (the driver holds their SPIR-V) and those copies. Shader::Info holds
+no pointers into the IR. The flow-block pool stays: the compute CFG lives until the build returns,
+and the graphics error path walks a CFG with it. ObjectPool::Free() allocates nothing: the pool
+makes its next chunk at its next Create. So a free when memory is short cannot leave the pool
+pointing at a chunk it gave back (a failed new chunk would have, with SurviveBadAlloc letting the
+session go on), and a boot builder makes no new chunk right before its compile.
+
+Where the freed memory goes: an instruction chunk (8192 instructions, about 1 MiB) is over the
+heap's 256 KiB small-request line, so it lives in the heap's shared spaces, not in the builder's
+own arenas. Only a block of 32 MiB or more has memory of its own, and that goes back to the system
+when freed. RADV's small requests go to the thread's arenas first, so the freed room helps the
+compile only when they spill into the shared spaces, when a new 2 MiB arena fits in a freed hole,
+or when a trim gives back a 32 MiB piece that emptied.
+
+EDEN_UP_IR_FREE_RUNTIME=1 does the same for a build whose compile is queued on a builder: a
+pipeline translated during play in main_pools on the GPU thread. Lichii left this path alone to
+keep the pools' room for the next translation. Here ReleaseContents squashes a filled pool into one
+block of the largest translation so far, and PS5 direct memory is committed from its first byte, so
+main_pools holds that much for the session. With the switch it goes back after each build (to the
+system if 32 MiB or more, else to the shared spaces), and the next translation allocates its ~1 MiB
+chunks again. This is the only switch that acts at doors, and it saves one pool's room above the
+current translation, not that of many builders: likely tens of MiB. Graphics pipelines made during
+play from the shader-prep store skip translation, so there it helps only through compute builds and
+pipelines the store does not hold. Its cost is to be measured: each translation during play
+allocates its chunks again under the heap's shared lock, and the GPU thread does not wait for
+memory (EDEN_UP_HEAP_WAIT_MS covers builders only). Under pressure, a translation that used to
+reuse held room can be refused, its pipeline dropped and its draws skipped. Compare the "built on
+the GPU thread in N ms" and "No memory for" lines of a door run with the switch on and off.
+
+EDEN_UP_IR_FREE_LOG=1 frees nothing and logs sizes, for sizing before a door slot is spent on
+_RUNTIME: every build translated on the GPU thread (first 2000) logs its pools' size, which is
+main_pools' size, with the hash of its "built on the GPU thread" line. A builder's job whose pools
+hold 32 MiB or more logs too (first 100).
+
+Log line: "EDEN_UP_IR_FREE: <kind> <hash> (builder|GPU thread): U MiB of IR in use, H MiB held,
+freed|kept before its driver compile". With a free switch, a build whose pools held 32 MiB or more logs it
+(first 100); the gate is the held size, so main_pools' one release of its large block shows even
+when the build that releases it used little of it. A log line that finds no memory is skipped and
+the build goes on.
+
+The three names are not in TranslationSwitches (vk_pipeline_prep.cpp) on purpose: they change no
+SPIR-V or info, so test arms share one prep store. EDEN_UP_PIPELINE_LIST_KEEP is left out the same
+way.
+
+Unset, or anything but "1": nothing is freed early and no line is logged. The edits on that path:
+the compute SPIR-V vector loses its const, ObjectPool::FreeChunk checks node for null first (it is
+never null without Free), and three cached switch reads. Not ported: Lichii's ObjectPool::Free unit
+tests.
+
+---
+ src/shader_recompiler/object_pool.h                  | 30 ++++++++++++++-
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 81 +++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/src/shader_recompiler/object_pool.h b/src/shader_recompiler/object_pool.h
+index c39d352..841c273 100644
+--- a/src/shader_recompiler/object_pool.h
++++ b/src/shader_recompiler/object_pool.h
+@@ -23,6 +23,33 @@ public:
+         return std::construct_at(Memory(), std::forward<Args>(args)...);
+     }
+ 
++    /// Destroys the objects and returns their memory; ReleaseContents keeps it for reuse.
++    /// Allocates nothing: the next Create makes a fresh chunk, so a pool freed when memory is
++    /// short is never left pointing at a chunk it gave back.
++    void Free() noexcept {
++        node = nullptr;
++        chunks.clear();
++        chunks.shrink_to_fit();
++    }
++
++    /// Bytes of the objects made since the last release or free
++    [[nodiscard]] size_t UsedBytes() const noexcept {
++        size_t used{};
++        for (const Chunk& chunk : chunks) {
++            used += chunk.used_objects;
++        }
++        return used * sizeof(Storage);
++    }
++
++    /// Bytes the pool has allocated, used or not
++    [[nodiscard]] size_t HeldBytes() const noexcept {
++        size_t held{};
++        for (const Chunk& chunk : chunks) {
++            held += chunk.num_objects;
++        }
++        return held * sizeof(Storage);
++    }
++
+     void ReleaseContents() {
+         if (chunks.empty()) {
+             return;
+@@ -96,7 +123,8 @@ private:
+     }
+ 
+     [[nodiscard]] Chunk* FreeChunk() {
+-        if (node->used_objects != node->num_objects) {
++        // Null only after Free(), and only until a chunk is made: if that throws, still null.
++        if (node != nullptr && node->used_objects != node->num_objects) {
+             return node;
+         }
+         node = &chunks.emplace_back(new_chunk_size);
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 5f97bb0..081f571 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -434,6 +434,70 @@ size_t GetTotalPipelineWorkers() {
+ #endif
+ }
+ 
++// EDEN_UP_IR_FREE=1 (exact "1", Lichii #878): a build whose driver compile runs on the calling
++// thread frees its translated IR before that compile instead of when the build returns. Those
++// are a builder's jobs with their own pools: here only at boot (LoadDiskResources' disk cache,
++// PrepareKept's shader preparation and its probes), so a pipeline made during play is as
++// before. Up to 15 builders compile at once there, and each held its IR (up to hundreds of MiB
++// for one large program) beside the driver's own compile memory.
++// EDEN_UP_IR_FREE_RUNTIME=1: a build whose compile is queued on a builder (a pipeline made
++// during play, translated in main_pools on the GPU thread) frees it too, instead of main_pools
++// keeping the room of its largest translation so far; the next translation allocates again.
++// EDEN_UP_IR_FREE_LOG=1: sizing only, nothing freed. Every build translated on the GPU thread
++// logs its pools' size (main_pools at a door), and so does a builder's job holding 32 MiB+.
++// Unset, or anything but "1": all as before.
++enum class IrFree { Keep, Log, Free };
++[[nodiscard]] IrFree IrFreeMode(bool compiled_later) {
++    static const bool before_compile = Common::PeSwitch("EDEN_UP_IR_FREE");
++    static const bool runtime = Common::PeSwitch("EDEN_UP_IR_FREE_RUNTIME");
++    static const bool log_only = Common::PeSwitch("EDEN_UP_IR_FREE_LOG");
++    if (compiled_later ? runtime : before_compile) {
++        return IrFree::Free;
++    }
++    return log_only ? IrFree::Log : IrFree::Keep;
++}
++
++// Reads the pools' size, then (IrFree::Free) drops the translated programs' IR: their block
++// lists, which point into the pools, then the pools' blocks and instructions, blocks first (a
++// block's instruction list unlinks its instructions as it goes). The programs' infos stay, for
++// the pipeline to copy. The flow blocks stay too: a live CFG may still hold them, and they are
++// small. Nothing here allocates but the log line, and a log line that finds no memory is skipped.
++void FreeIr(ShaderPools& pools, std::span<Shader::IR::Program> programs, IrFree mode,
++            bool compiled_later, const char* kind, u64 hash) {
++    const size_t used{pools.inst.UsedBytes() + pools.block.UsedBytes()};
++    const size_t held{pools.inst.HeldBytes() + pools.block.HeldBytes()};
++    const bool frees{mode == IrFree::Free};
++    if (frees) {
++        for (Shader::IR::Program& program : programs) {
++            program.syntax_list = Shader::IR::AbstractSyntaxList{};
++            program.blocks = Shader::IR::BlockList{};
++            program.post_order_blocks = Shader::IR::BlockList{};
++        }
++        pools.block.Free();
++        pools.inst.Free();
++    }
++    // Gated on the held size, so the one release of main_pools' large block shows even when the
++    // build that releases it used little of it (first 100). Sizing only: every build translated on
++    // the GPU thread (first 2000), to compare with its "built on the GPU thread" line by hash.
++    static std::atomic<u32> large_lines{};
++    static std::atomic<u32> sizing_lines{};
++    const bool logs{(!frees && compiled_later)
++                        ? sizing_lines.fetch_add(1, std::memory_order_relaxed) < 2000
++                        : held >= (size_t{32} << 20) &&
++                              large_lines.fetch_add(1, std::memory_order_relaxed) < 100};
++    if (!logs) {
++        return;
++    }
++    try {
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_IR_FREE: {} {:016x} ({}): {:.1f} MiB of IR in use, {:.1f} MiB held, {} "
++                 "before its driver compile",
++                 kind, hash, compiled_later ? "GPU thread" : "builder", used / 1048576.0,
++                 held / 1048576.0, frees ? "freed" : "kept");
++    } catch (const std::bad_alloc&) {
++    }
++}
++
+ } // Anonymous namespace
+ 
+ size_t ComputePipelineCacheKey::Hash() const noexcept {
+@@ -2204,6 +2268,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+                                         ? prep_no_cache
+                                         : vulkan_pipeline_cache};
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
++    if (const IrFree ir_free{IrFreeMode(thread_worker != nullptr)}; ir_free != IrFree::Keep) {
++        // From here on the pipeline reads the modules (the driver holds their SPIR-V),
++        // mesh_compute (its own copies) and the infos, which stay in programs and are copied
++        // before the compile. kept_out holds copies too.
++        FreeIr(pools, programs, ir_free, thread_worker != nullptr, "graphics pipeline", hash);
++    }
+     return std::make_unique<GraphicsPipeline>(
+         scheduler, buffer_cache, texture_cache, driver_cache, &shader_notify, device,
+         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+@@ -2445,7 +2515,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+                     max_shared_memory / 1024);
+         program.shared_memory_size = max_shared_memory;
+     }
+-    const std::vector<u32> code{EmitSPIRV(profile, program)};
++    std::vector<u32> code{EmitSPIRV(profile, program)};
+     device.SaveShader(code);
+     vk::ShaderModule spv_module{BuildShader(device, code)};
+ 
+@@ -2474,6 +2544,15 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+         compute_null_slots[key].slots = env.NullStoragePointerSlots();
+     }
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
++    if (const IrFree ir_free{IrFreeMode(thread_worker != nullptr)}; ir_free != IrFree::Keep) {
++        // From here on the pipeline reads program.info, which stays and is copied first, and
++        // spv_module, whose SPIR-V the driver holds: the words and the IR are not read again.
++        FreeIr(pools, std::span{&program, 1}, ir_free, thread_worker != nullptr,
++               "compute shader", key.unique_hash);
++        if (ir_free == IrFree::Free) {
++            code = std::vector<u32>{};
++        }
++    }
+     return std::make_unique<ComputePipeline>(device, scheduler, vulkan_pipeline_cache, descriptor_pool,
+                                              guest_descriptor_queue, descriptor_buffer_ring,
+                                              thread_worker, statistics,

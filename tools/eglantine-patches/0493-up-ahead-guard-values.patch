@@ -1,0 +1,267 @@
+Subject: [PATCH] EDEN_UP_AHEAD_GUARD=2: texture handles and storage buffer pointers read from constant buffers at a draw also come from a page's copy; the guard takes the pages of three frames back by default; counts the pages its guess missed
+
+T88, batch t88-a (door walk): the copy mode kept the speed (control 20.2 16.8 14.7 20.9 fps per
+5 s, copy 19.3 16.1 14.8 20.5) and cut the glitches (control 3 / 3 moments; copy 0 / 1), but one
+copy run still had the over-bright frame at the cut and a fade out of order, and with
+EDEN_UP_AHEAD_ALWAYS it had 11 moments, where the waiting guard had none. The waiting guard
+stops a writer thread for good, so it also covers what the copies do not: reads that do not go
+through BufferCache::ReadGuestForBuffer, and pages the guess from earlier frames missed.
+
+- AheadGuard::ReadGpu: the six storage buffer pointer and size reads in the buffer cache and the
+  texture handle reads of the graphics and compute pipelines take a copied page's bytes from its
+  copy. A lock-free bit per page says whether a page has a copy, so only those reads take the
+  guard's lock.
+- EDEN_UP_AHEAD_GUARD_SETS defaults to 14 (one, two and three presents back; was 6): Ocarina
+  presents three images in turn, and its per-frame memory may follow them.
+- The log line adds: of the pages a frame first read with its guard up, how many were not in
+  the guard (the guess missed them: a guest write there goes unseen).
+
+---
+diff --git a/src/video_core/ahead_guard.h b/src/video_core/ahead_guard.h
+index f8b71ac..52e1d1b 100644
+--- a/src/video_core/ahead_guard.h
++++ b/src/video_core/ahead_guard.h
+@@ -45,8 +45,8 @@
+ ///      pool full a write waits as with =1.
+ ///
+ ///   EDEN_UP_AHEAD_GUARD_SETS=<mask>   which finished frames' pages are guarded, bit d = the frame
+-///                                     d presents back (default 6: one and two back; 4: only two
+-///                                     back, for a game with a two-deep ring)
++///                                     d presents back (default 14: one, two and three back;
++///                                     Ocarina presents three images in turn; 6 was T87/T88)
+ ///   EDEN_UP_AHEAD_GUARD_MAX_MS=<n>    longest wait of one write (default 500), after which the
+ ///                                     guard is lifted for that frame
+ ///   EDEN_UP_AHEAD_GUARD_GPU_ESCAPE=1  a wait also ends after 3 ms once a GPU channel is seen
+@@ -56,7 +56,9 @@
+ ///                                     blocked (EDEN_UP_OOT_FRAME_WAIT), so nothing a held writer
+ ///                                     does is needed for the fence.
+ ///   EDEN_UP_AHEAD_GUARD_COPY_PAGES=<n> the copy pool in pages (default 2048 = 8 MiB, 64 to 16384)
+-/// Not covered: texture data and descriptor tables the texture cache reads.
++/// Covered: buffer uploads, streamed uniform blocks, and the texture handles and storage buffer
++/// pointers read from constant buffers at a draw (ReadGpu). Not covered: texture data and
++/// descriptor tables the texture cache reads.
+ namespace VideoCommon::AheadGuard {
+ 
+ /// 0: off, 1: writers wait, 2: writers copy the page first.
+@@ -86,7 +88,7 @@ inline bool Enabled() {
+ inline u32 SetsMask() {
+     static const u32 mask = [] {
+         const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_SETS");
+-        const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 0) : 6UL;
++        const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 0) : 14UL;
+         return static_cast<u32>(parsed & 0xeUL);
+     }();
+     return mask;
+@@ -134,6 +136,8 @@ struct State {
+     std::unique_ptr<u64[]> seen{new u64[PageLimit / 64]()};
+     /// Pages guarded now: read by guest threads without the mutex.
+     std::unique_ptr<std::atomic<u64>[]> guarded{new std::atomic<u64>[PageLimit / 64]()};
++    /// Pages that have a copy now: read by the GPU thread without the mutex (ReadGpu).
++    std::unique_ptr<std::atomic<u64>[]> copied{new std::atomic<u64>[PageLimit / 64]()};
+     /// Pages the GPU thread read since the last frame end.
+     std::vector<u32> current;
+     struct Frame {
+@@ -174,8 +178,9 @@ struct State {
+         };
+         std::array<Thread, 6> threads{}; ///< the first six guest threads that waited
+         u32 other_thread_holds{};
+-        u64 copies{}, copy_reads{}, copy_read_bytes{};
++        u64 copies{}, copy_reads{}, copy_read_bytes{}, value_reads{};
+         u32 most_copies{}, pool_full{};
++        u64 armed_new_pages{}, armed_unguarded_pages{};
+     } stats{};
+     u32 hold_lines{};
+ };
+@@ -195,12 +200,23 @@ inline void NoteRead(u64 device_addr, u64 size) {
+     State& s = Get();
+     const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
+     std::scoped_lock lk{s.mutex};
++    const bool armed = s.active.load(std::memory_order_relaxed);
+     for (u64 page = device_addr >> PageBits; page <= last; ++page) {
+         u64& word = s.seen[page / 64];
+         const u64 bit = u64{1} << (page % 64);
+         if ((word & bit) == 0) {
+             word |= bit;
+             s.current.push_back(static_cast<u32>(page));
++            if (armed) {
++                // A page this frame reads for the first time while its guard is up: was it in
++                // the guard (still trapped, or copied)? If not, the guess from the frames
++                // before missed it and a guest write to it goes unseen.
++                ++s.stats.armed_new_pages;
++                if ((s.guarded[page / 64].load(std::memory_order_relaxed) & bit) == 0 &&
++                    (s.copied[page / 64].load(std::memory_order_relaxed) & bit) == 0) {
++                    ++s.stats.armed_unguarded_pages;
++                }
++            }
+         }
+     }
+ }
+@@ -276,6 +292,10 @@ void DisarmLocked(State& s, DeviceMemory& device_memory) {
+     if (s.copies_used != 0) {
+         // The frame is done: its copies go.
+         s.stats.most_copies = (std::max)(s.stats.most_copies, s.copies_used);
++        for (u32 slot = 0; slot < s.copies_used; ++slot) {
++            const u32 page = s.copy_page[slot];
++            s.copied[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
++        }
+         s.copies_used = 0;
+         std::fill(s.copy_index.begin(), s.copy_index.end(), 0U);
+     }
+@@ -323,9 +343,11 @@ inline void LogWindowLocked(State& s, u64 present_number) {
+         LOG_INFO(HW_GPU,
+                  "EDEN_UP_AHEAD_GUARD copies: {} pages copied before a write ({} a guard, most "
+                  "{} of {}), the pool was full {} times; {} GPU thread reads took {} KiB from "
+-                 "copies",
++                 "copies, and {} handle or pointer reads; of {} pages first read with a guard "
++                 "up, {} were not in it",
+                  st.copies, st.copies / arms, st.most_copies, CopyCapacity(), st.pool_full,
+-                 st.copy_reads, st.copy_read_bytes >> 10);
++                 st.copy_reads, st.copy_read_bytes >> 10, st.value_reads, st.armed_new_pages,
++                 st.armed_unguarded_pages);
+     }
+     st = {};
+ }
+@@ -476,6 +498,7 @@ bool CopyBeforeWrite(u64 device_addr, u64 size, DeviceMemory& device_memory) {
+             at = (at + 1) & mask;
+         }
+         s.copy_index[at] = slot + 1;
++        s.copied[page / 64].fetch_or(u64{1} << (page % 64), std::memory_order_release);
+         s.guarded[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
+         device_memory.UpdatePagesCachedCount(page << PageBits, PageSize, -1);
+         ++s.stats.copies;
+@@ -523,6 +546,42 @@ void Read(u64 device_addr, u8* out, u64 size, bool upload, Live&& live) {
+     }
+ }
+ 
++/// Copy mode: a small value the GPU thread reads from guest memory at a GPU address when it draws
++/// (a texture handle or a storage buffer's pointer in a constant buffer): from the page's copy
++/// when it has one. The page's bit is looked at without the lock; a value that crosses a page, or
++/// has no device address, is read as before.
++template <class T, class GpuMemory>
++[[nodiscard]] T ReadGpu(GpuMemory& gpu_memory, u64 gpu_addr) {
++    if (Mode() != 2 || (gpu_addr & (PageSize - 1)) > PageSize - sizeof(T)) {
++        return gpu_memory.template Read<T>(gpu_addr);
++    }
++    State& s = Get();
++    if (!s.active.load(std::memory_order_acquire)) {
++        return gpu_memory.template Read<T>(gpu_addr);
++    }
++    const auto device_addr = gpu_memory.GpuToCpuAddress(gpu_addr);
++    if (!device_addr) {
++        return gpu_memory.template Read<T>(gpu_addr);
++    }
++    const u64 page = static_cast<u64>(*device_addr) >> PageBits;
++    if (page >= PageLimit || (s.copied[page / 64].load(std::memory_order_acquire) &
++                              (u64{1} << (page % 64))) == 0) {
++        return gpu_memory.template Read<T>(gpu_addr);
++    }
++    std::scoped_lock lk{s.mutex};
++    const u32 slot = Detail::FindCopy(s, page);
++    if (slot == NoSlot) {
++        return gpu_memory.template Read<T>(gpu_addr);
++    }
++    T value{};
++    std::memcpy(&value,
++                s.copy_bytes.get() + u64{slot} * PageSize +
++                    (static_cast<u64>(*device_addr) & (PageSize - 1)),
++                sizeof(T));
++    ++s.stats.value_reads;
++    return value;
++}
++
+ /// Copy mode: the ranges uploads read from copies in guards lifted since the last call, as guest
+ /// writes (`write(device_addr, size)`) for the gather that applies them: a buffer uploaded from
+ /// a copy holds the presented frame's bytes, and memory has the newer ones. Only those ranges:
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9342c74..3500edc 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1739,7 +1739,7 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index,
+     GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
+     if (indirect_offset != ~0U) {
+         // The pointer is an entry of a table the constant buffer points to.
+-        const GPUVAddr holder = gpu_memory->Read<u64>(ssbo_addr);
++        const GPUVAddr holder = VideoCommon::AheadGuard::ReadGpu<u64>(*gpu_memory, ssbo_addr);
+         if (holder == 0) {
+             channel_state->storage_buffers[stage][ssbo_index] = NULL_BINDING;
+             return false;
+@@ -1860,7 +1860,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+     };
+     if (indirect_offset != ~0U) {
+         // The pointer is an entry of a table the constant buffer points to.
+-        const GPUVAddr holder = gpu_memory->Read<u64>(ssbo_addr);
++        const GPUVAddr holder = VideoCommon::AheadGuard::ReadGpu<u64>(*gpu_memory, ssbo_addr);
+         if (holder == 0) {
+             channel_state->compute_storage_buffers[ssbo_index] = NULL_BINDING;
+             return;
+@@ -1889,7 +1889,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
+             }
+             if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
+                 // The extent counts from the pointer, the binding from the pointer aligned down.
+-                const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
++                const GPUVAddr pointer = VideoCommon::AheadGuard::ReadGpu<u64>(*gpu_memory, ssbo_addr);
+                 const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+                 const u64 mark = (std::min<u64>)(binding.size, pad + *extent);
+                 channel_state->compute_storage_write_marks[ssbo_index] = static_cast<u32>(mark);
+@@ -5358,7 +5358,7 @@ template <class P>
+ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+                                              bool is_written, bool native_pointer,
+                                              bool table_pointer) const {
+-    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
++    const GPUVAddr gpu_addr = VideoCommon::AheadGuard::ReadGpu<u64>(*gpu_memory, ssbo_addr);
+ 
+     if (gpu_addr == 0) {
+         return NULL_BINDING;
+@@ -5366,7 +5366,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+ 
+     // The size word after a plain pointer is part of the answer; native pointers ignore it.
+     const bool reads_size_word = !native_pointer;
+-    const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
++    const u64 next_qword = reads_size_word ? VideoCommon::AheadGuard::ReadGpu<u64>(*gpu_memory, ssbo_addr + 8) : 0;
+     // Every draw rebinds each storage buffer: the layout lookup (a mutex), the range walk and
+     // two page walks cost Ocarina's GPU thread ~6%. Answers hold until the page table changes.
+     struct CachedBinding {
+@@ -5442,7 +5442,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+             // A native pointer's size word is read here only (the binding cache above keys native
+             // answers without it, so a stated size that changes under the same page table is seen
+             // at the next page table change).
+-            const u64 stated_qword = reads_size_word ? next_qword : gpu_memory->Read<u64>(ssbo_addr + 8);
++            const u64 stated_qword = reads_size_word ? next_qword : VideoCommon::AheadGuard::ReadGpu<u64>(*gpu_memory, ssbo_addr + 8);
+             const u32 stated_size = static_cast<u32>(stated_qword);
+             if (static_cast<u32>(stated_qword >> 32) == 0 && stated_size != 0 && stated_size < size) {
+                 // Runs on one thread; the log thins out as the count doubles.
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 638c92f..03035a3 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -208,12 +208,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                 const u32 secondary_offset{desc.secondary_cbuf_offset + index_offset};
+                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
+                                              secondary_offset};
+-                const u32 lhs_raw{gpu_memory.Read<u32>(addr) << desc.shift_left};
+-                const u32 rhs_raw{gpu_memory.Read<u32>(separate_addr) << desc.secondary_shift_left};
++                const u32 lhs_raw{VideoCommon::AheadGuard::ReadGpu<u32>(gpu_memory, addr) << desc.shift_left};
++                const u32 rhs_raw{VideoCommon::AheadGuard::ReadGpu<u32>(gpu_memory, separate_addr) << desc.secondary_shift_left};
+                 return TexturePair(lhs_raw | rhs_raw, via_header_index);
+             }
+         }
+-        return TexturePair(gpu_memory.Read<u32>(addr), via_header_index);
++        return TexturePair(VideoCommon::AheadGuard::ReadGpu<u32>(gpu_memory, addr), via_header_index);
+     }};
+     const auto add_image{[&](const auto& desc, bool blacklist) {
+         for (u32 index = 0; index < desc.count; ++index) {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 4ba37af..b2ed76c 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -642,7 +642,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+         // EDEN_UP_UBO_AHEAD_VERIFY: each handle word read from guest memory is compared with the
+         // front's copy of its constant buffer page (ubo_ahead.h). Nothing else unless set.
+         const auto read_word{[&](u32 cbuf_index, u32 offset, GPUVAddr addr) {
+-            const u32 word{gpu_memory->Read<u32>(addr)};
++            // EDEN_UP_AHEAD_GUARD=2 (ahead_guard.h): from the page's copy when a guest thread
++            // has written the page since the frame in flight was presented.
++            const u32 word{VideoCommon::AheadGuard::ReadGpu<u32>(*gpu_memory, addr)};
+             if (VideoCommon::UboAhead::Capturing() && VideoCommon::UboAhead::VerifyEnabled())
+                 [[unlikely]] {
+                 VideoCommon::UboAhead::BackVerifyHandle(stage, cbuf_index, offset,

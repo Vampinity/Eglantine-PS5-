@@ -1,0 +1,127 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_ASTC_BC1_ALL=1, a PICTURE TRADE: every re-compressed ASTC texture is BC1 instead of BC3 (1-bit alpha), half the memory of the alpha ones; off by default
+
+Idea from Eglantine's #ocarina-of-time Discord, 9 Nov (Diethelm: Eglantine, NX2navi and Hookshot all
+convert ASTC to BC3, BC1 cuts VRAM a lot; CandyBlue, RX 5600 XT 6 GB, got past the post-intro
+out-of-memory crash with BC1). The BC1 mode is Eden's own ASTC recompression setting
+(AstcRecompression::Bc1, yuzu 2023; CPU encoder BCN::CompressBC1 with the 0.5 alpha threshold).
+The GPU encoder (bc_encoder.comp) already writes punch-through BC1 for the opaque path. The PS5
+had no way to pick it: the setting stays at its BC3 default and the console has no config UI.
+
+What it does: TextureCacheRuntime's constructor, right after UseBc3ForSwitch2OnSmallCards and
+before anything reads the setting (passes, view formats), sets the recompression override to Bc1
+when the switch is exactly "1", the device has no native ASTC and the session is BC3. Every
+place already follows Settings::GetAstcRecompression(): host and view formats (maxwell_to_vk),
+host bytes and the TEX_TRIM decision (HostBytesFromLevel), the CPU path's buffer sizes and
+encoder (CalculateConvertedSizeBytes, ConvertedLayout, ConvertImage), the GPU transcode's encode
+mode and output buffer (bc3 = false), TranscodedAstcSize. Startup only, never flipped later.
+The switch name joins the shader-prep stamp list (generated from the backend's names), so the
+first run with it builds its own shader-prep store.
+
+PICTURE TRADE. Only the alpha ASTC changes (opaque ASTC is BC1 already, EDEN_NX2_ASTC_BC1).
+Alpha becomes 1 bit at about 0.5: soft alpha (smoke, fog cards, light shafts, glows, fades,
+anti-aliased text and HUD edges) gets hard edges, and a transparent texel decodes as black, so
+straight-alpha filtering can leave dark fringes. Blocks with any transparent texel have three
+colours instead of four, which bands more. Both encoders also drop the colour of a texel under
+0.5 alpha (CompressBCN zeroes it, bc_encoder.comp picks the transparent index), so a texture
+that keeps data in alpha instead of coverage (blend masks, terrain weights) shows black or
+wrongly blended patches wherever that alpha is under 0.5, not only hard edges: look at the
+6144 ground texture and the format-71 array first, the two biggest alpha ASTC images. Never for
+the play env until the picture is judged.
+
+Memory, Ocarina of Time (t85-f run702 village walk, control):
+- 6144x6144 13-level ground texture: 48 -> 24 MiB kept, and its GPU transcode output buffer
+  48 -> 24 MiB. The RGBA8 decode image is the same (192 MiB), so EDEN_NX2_GPU_TRANSCODE_MIB
+  routes it as before.
+- Format-71 1365x1365x90 array: 213 -> 106 MiB, after EDEN_NX2_TEX_TRIM_MIB=64 53 -> 27 MiB
+  (still over 64, still trimmed). The format-60 array is BC1 already.
+- The other alpha ASTC: about 62% of new ASTC images (584 alpha / 361 opaque per 600 frames),
+  half their bytes. The log counts images, not bytes per format: about 50 MiB is certain, 100-300
+  MiB in the village is the estimate.
+- No opaque scan runs, so the texture cache's astc_scan_buffer (grown to the largest scanned
+  ASTC image, up to 64 MiB, never shrunk) stays empty.
+- The 6144's GPU transcode output only matters with EDEN_NX2_GPU_TRANSCODE_MIB over 192; at the
+  default 128 it takes the CPU decode, whose output buffer halves the same way.
+
+Testing: the first run with the switch has no kept shader translations (its own stamp), so prime
+the store with one run before comparing memory or stutter against the control.
+
+Interplay:
+- EDEN_NX2_TC_KEEP_ASYNC: AsynchronousDecode is still set by the RGBA8 scratch size
+  (TranscodeScratchTooLarge), so the same images are kept; each kept one is half the size, and
+  the CPU decode's output buffer halves (fewer "No memory to decode" retries expected).
+- EDEN_NX2_GPU_TRANSCODE_MIB: routing unchanged (it measures the decode image); only the encode
+  output halves. The 6144's gap in KEEP_ASYNC at =256 stays: this switch does not close it.
+- Ahead guard (0491-0504): covers buffer pages and constant-buffer reads only, no texture
+  formats. No interaction.
+- EDEN_UP_SKIP_STALE_UPLOADS (0495): CopiesWriteWholeImage already refuses block-compressed
+  formats and compares astc_opaque, which is false on both sides here. No interaction.
+- EDEN_NX2_AREA_EVICT: counts images, not bytes; bursts free less per image because images are
+  smaller. No change needed.
+- EDEN_UP_ASTC_BATCH_MIB (draft): sizes its output by the same bc3 flag, so BC1 halves its
+  output batches too. Textually independent.
+- The opaque scan does not run with the switch (nothing to choose), so the TC_LOG line shows
+  "ASTC 0 opaque / 0 alpha". EDEN_NX2_ASTC_BC1=0 has no effect while it is on. Huge arrays and
+  EDEN_NX2_UNEVEN_MIPS_RGBA8 images stay RGBA8. A future alpha array of 64-128 MiB as BC3 would
+  drop under TEX_TRIM_MIB=64 as BC1 and keep its top level (none in run702: only the two 1365
+  arrays are trimmed).
+
+Unset (or anything but "1"): no override, byte for byte as before. Nothing compiled or run.
+
+---
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+index 6b75745..e91d6fb 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -126,7 +126,8 @@ constexpr const char* TranslationSwitches[] = {
+     "EDEN_PE_PIPELINE_CACHE_EXIT", "EDEN_PE_REG_BLOCKS", "EDEN_PE_STATIC_VERTEX_INPUT",
+     "EDEN_PE_TRANSCODE_BOUND", "EDEN_PE_UNIFORM_PREFETCH", "EDEN_PE_VMA_OWN_BUDGET",
+     "EDEN_PS5_LAZY_PRESENT", "EDEN_PS5_TRANSCODE_PENDING_MIB", "EDEN_STREAMLINE_DIR",
+-    "EDEN_STREAM_RING_MIB", "EDEN_TC_SCRATCH_KEEP_MIB", "EDEN_UP_BACK_DRAW_CHEAP",
++    "EDEN_STREAM_RING_MIB", "EDEN_TC_SCRATCH_KEEP_MIB", "EDEN_UP_ASTC_BC1_ALL",
++    "EDEN_UP_BACK_DRAW_CHEAP",
+     "EDEN_UP_BIND_ON_BACK", "EDEN_UP_BLIT_EDGE_CLAMP", "EDEN_UP_BUFFER_USE_MARKS",
+     "EDEN_UP_COMPUTE_INDIRECT_ORDER", "EDEN_UP_DEFERRED_CLEAR_PASS", "EDEN_UP_DJ_CHANNEL_IDS",
+     "EDEN_UP_DJ_FRAG_BARRIER", "EDEN_UP_DJ_GATHER_OWNERS", "EDEN_UP_DRAIN_SKIP_SAME",
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index f1766f2..87012cd 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1378,6 +1378,29 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
+                 memory >> 20);
+     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
+ }
++
++// EDEN_UP_ASTC_BC1_ALL=1 (Common::PeSwitch, exact "1", read once; off by default). A PICTURE
++// TRADE: every ASTC texture that would be re-compressed to BC3 goes to BC1 instead, half the
++// memory. BC1 keeps one bit of alpha: a texel under 0.5 alpha becomes transparent black, one at or
++// over it fully opaque, so soft alpha (smoke, fog cards, light shafts, glows, fades, text edges)
++// gets hard, possibly dark-fringed edges, and colour blocks with any transparent texel have three
++// colours instead of four. Opaque ASTC is BC1 already (EDEN_NX2_ASTC_BC1), so only the alpha
++// textures change. Both encoders already write punch-through BC1 (bc_encoder.comp,
++// BCN::CompressBC1), and every size and format choice follows Settings::GetAstcRecompression().
++// Set before any image exists and never changed later: a texture made as BC3 must not be
++// re-uploaded as BC1. Huge arrays and EDEN_NX2_UNEVEN_MIPS_RGBA8 images stay RGBA8, an
++// uncompressed session stays uncompressed, and EDEN_NX2_ASTC_BC1=0 no longer applies.
++void UseBc1ForAllAstc(const Device& device) {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_ASTC_BC1_ALL");
++    if (!enabled || device.IsOptimalAstcSupported() ||
++        Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc3) {
++        return;
++    }
++    LOG_WARNING(Render_Vulkan,
++                "EDEN_UP_ASTC_BC1_ALL: every re-compressed ASTC texture is BC1 for this session, "
++                "alpha ones included (picture trade: 1-bit alpha at 0.5)");
++    Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc1);
++}
+ } // Anonymous namespace
+ 
+ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
+@@ -1394,6 +1417,7 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
+       resolution{Settings::values.resolution_info} {
+     // Before anything below reads astc_recompression (passes, view formats).
+     UseBc3ForSwitch2OnSmallCards(device);
++    UseBc1ForAllAstc(device);
+     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
+     if (Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu ||
+         !device.IsOptimalAstcSupported()) {

@@ -1,0 +1,573 @@
+Subject: [PATCH] EDEN_UP_AHEAD_GUARD (+ _SETS, _MAX_MS) and EDEN_UP_AHEAD_ALWAYS: run a frame ahead (EDEN_NX2_FRAMES_AHEAD=1), a guest thread that writes a buffer page the frame in flight may still read waits for that frame's fence; off by default
+
+Run a frame ahead, Ocarina rewrites buffer memory for a later frame while the GPU thread still
+draws the presented one, and the GPU thread reads guest memory when it draws.
+EDEN_NX2_OVERWRITE_CHECK on T86 (run 736, v2.4-fast): about 9 of 10 frames had such reads (~700
+collected writes and 10-70 reads a frame); the fade to black showed every second frame drawn with
+the value of two frames later, the frames whose present returned at once.
+
+The guard notes the device pages the buffer cache reads from guest memory (uploads and streamed
+uniform blocks, at the EDEN_NX2_OVERWRITE_CHECK read sites), frame by frame; a frame ends at its
+present's fence. When a present returns before its fence, the pages read in the last finished
+frames (EDEN_UP_AHEAD_GUARD_SETS, default one and two presents back) and in this frame so far get
++1 on their cached count, so every guest write to them goes through HandleRasterizerWrite (the
+PS5 has no fastmem arena: a page table flip, no mprotect), and a guest thread on a CPU core that
+writes one waits there until the GPU thread reaches the fence. A wait ends after
+EDEN_UP_AHEAD_GUARD_MAX_MS (500), and with EDEN_UP_AHEAD_GUARD_GPU_ESCAPE=1 after 3 ms once a GPU
+channel is seen suspended; either lifts the guard for the frame. One log line per 300 presents: arms, pages, how many writes waited and how long, by core
+and by guest thread id.
+
+EDEN_UP_AHEAD_ALWAYS=1 (after GrowingBlackBeans' 0911): no second wait when the previous frame
+was still on the GPU at the present. For tests with the guard.
+
+Not covered: texture data and descriptor tables the texture cache reads.
+
+---
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index 88be8ee..1781f32 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -40,6 +40,7 @@
+ #include "video_core/renderer_base.h"
+ #include "core/frontend/framebuffer_layout.h"
+ #include "core/perf_stats.h"
++#include "video_core/ahead_guard.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/ubo_snapshot.h"
+@@ -1977,7 +1978,12 @@ private:
+             // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
+             // suspended channel brought us here: this frame can't finish before the present
+             // returns.
+-            const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
++            // EDEN_UP_AHEAD_ALWAYS=1 (after GrowingBlackBeans' 0911): never this second wait, so
++            // every present returns once the previous frame is done. For tests with
++            // EDEN_UP_AHEAD_GUARD, which holds back the writes that made it glitch more.
++            static const bool ahead_always = Common::PeSwitch("EDEN_UP_AHEAD_ALWAYS");
++            const bool gpu_behind = frames_ahead == 1 && !ahead_always &&
++                                    m_previous_fence_id < 192 &&
+                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
+                                         m_previous_fence_id, m_previous_fence_value);
+             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
+@@ -1991,6 +1997,17 @@ private:
+         } else if (frames_ahead == 0) {
+             WaitForFrame(~w[22], w[24]);
+         }
++        // EDEN_UP_AHEAD_GUARD (video_core/ahead_guard.h): when this present returns before its
++        // frame's fence, guest writes to the buffer pages that frame may still read wait for the
++        // fence. Also notes where each frame ends for the GPU thread.
++        if (VideoCommon::AheadGuard::Enabled() && ~w[22] < 192) {
++            auto& syncpoints = system.Host1x().GetSyncpointManager();
++            const bool previous_reached =
++                m_previous_fence_id < 192 &&
++                syncpoints.IsReadyGuest(m_previous_fence_id, m_previous_fence_value);
++            VideoCommon::AheadGuard::AtPresent(m_presents, ~w[22], w[24], previous_reached,
++                                               syncpoints, system.Host1x().MemoryManager());
++        }
+         m_previous_fence_id = ~w[22];
+         m_previous_fence_value = w[24];
+         const auto waited = std::chrono::steady_clock::now();
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index d958d7e..f577ee3 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -33,7 +33,9 @@
+ #include "core/hardware_properties.h"
+ #include "core/hle/kernel/k_page_table.h"
+ #include "core/hle/kernel/k_process.h"
++#include "core/hle/kernel/k_thread.h"
+ #include "core/memory.h"
++#include "video_core/ahead_guard.h"
+ #include "video_core/nx2.h"
+ #include "video_core/gpu.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+@@ -906,6 +908,42 @@ struct Memory::Impl {
+         if (!gpu_device_memory) [[unlikely]] {
+             gpu_device_memory = &system.Host1x().MemoryManager();
+         }
++        // EDEN_UP_AHEAD_GUARD (video_core/ahead_guard.h): a present returned before its frame's
++        // fence and this page holds buffer bytes that frame may still read. A guest thread on a
++        // CPU core waits here until the GPU thread reaches the fence; other host threads (the GPU
++        // threads, services off the cores) write on. Before sys_core_guard: the wait must not
++        // hold it.
++        if (VideoCommon::AheadGuard::Active()) [[unlikely]] {
++            if (const size_t host_thread = system.GetCurrentHostThreadID();
++                host_thread < Core::Hardware::NUM_CPU_CORES) {
++                bool guarded = false;
++                DAddr guarded_address = 0;
++                if (core == sys_core) {
++                    sys_core_guard.lock();
++                }
++                gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
++                    if (!guarded && VideoCommon::AheadGuard::Guarded(address, size)) {
++                        guarded = true;
++                        guarded_address = address;
++                    }
++                });
++                if (core == sys_core) {
++                    sys_core_guard.unlock();
++                }
++                if (guarded) {
++                    const Kernel::KThread* const thread =
++                        Kernel::GetCurrentThreadPointer(system.Kernel());
++                    VideoCommon::AheadGuard::HoldWriter(
++                        guarded_address, size, host_thread,
++                        thread != nullptr ? thread->GetThreadId() : 0, *gpu_device_memory, [&] {
++                            if (!system.IsPoweredOn()) {
++                                return 1;
++                            }
++                            return system.GPU().HasSuspendedChannels() ? 2 : 0;
++                        });
++                }
++            }
++        }
+         // Guard on sys_core;
+         if (core == sys_core) [[unlikely]] {
+             sys_core_guard.lock();
+diff --git a/src/video_core/ahead_guard.h b/src/video_core/ahead_guard.h
+new file mode 100644
+index 0000000..392c2fe
+--- /dev/null
++++ b/src/video_core/ahead_guard.h
+@@ -0,0 +1,417 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <utility>
++#include <vector>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++
++/// EDEN_UP_AHEAD_GUARD=1: keeps the game from rewriting buffer bytes a frame still in flight
++/// reads, when a present returns before that frame's fence (EDEN_NX2_FRAMES_AHEAD=1).
++///
++/// Run a frame ahead, Ocarina writes buffer memory (uniform blocks, vertex and storage data) for
++/// a later frame while the GPU thread still draws the presented one, and the GPU thread reads
++/// guest memory when it draws: EDEN_NX2_OVERWRITE_CHECK counted such reads in about 9 of 10
++/// frames (run 736: ~700 writes and 10-70 reads a frame), and the fade to black showed every
++/// second frame drawn with the value of two frames later.
++///
++/// The guard notes which device pages the GPU thread reads for buffers, frame by frame (a frame
++/// ends at its present's fence). When a present returns before its fence, the pages read in the
++/// last finished frames and in this one so far are marked cached for the guest (a +1 on their
++/// cached count: every guest write to them then goes through Memory's HandleRasterizerWrite),
++/// and a guest thread that writes one waits there until the frame's fence is reached. Only the
++/// threads that would rewrite in-flight bytes wait, and only from their first such write; the
++/// thread that builds the next frame's command lists runs on unless it writes such a page itself.
++/// The log line says which guest threads waited and for how long.
++///
++///   EDEN_UP_AHEAD_GUARD_SETS=<mask>   which finished frames' pages are guarded, bit d = the frame
++///                                     d presents back (default 6: one and two back; 4: only two
++///                                     back, for a game with a two-deep ring)
++///   EDEN_UP_AHEAD_GUARD_MAX_MS=<n>    longest wait of one write (default 500), after which the
++///                                     guard is lifted for that frame
++///   EDEN_UP_AHEAD_GUARD_GPU_ESCAPE=1  a wait also ends after 3 ms once a GPU channel is seen
++///                                     suspended (the write could be what it waits for). Off by
++///                                     default: Ocarina's channels are suspended on each other in
++///                                     most frames, and its frames finish with the game's present
++///                                     blocked (EDEN_UP_OOT_FRAME_WAIT), so nothing a held writer
++///                                     does is needed for the fence.
++/// Not covered: texture data and descriptor tables the texture cache reads.
++namespace VideoCommon::AheadGuard {
++
++inline bool Enabled() {
++    static const bool on = [] {
++        const bool value = Common::PeSwitch("EDEN_UP_AHEAD_GUARD");
++        if (value) {
++            LOG_INFO(HW_GPU, "EDEN_UP_AHEAD_GUARD=1: guest writes to buffer pages of a frame in "
++                             "flight wait for its fence");
++        }
++        return value;
++    }();
++    return on;
++}
++
++inline u32 SetsMask() {
++    static const u32 mask = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_SETS");
++        const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 0) : 6UL;
++        return static_cast<u32>(parsed & 0xeUL);
++    }();
++    return mask;
++}
++
++inline std::chrono::milliseconds MaxHold() {
++    static const long ms = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_MAX_MS");
++        const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 500L;
++        return (std::clamp)(parsed, 1L, 4000L);
++    }();
++    return std::chrono::milliseconds{ms};
++}
++
++inline bool GpuEscape() {
++    static const bool on = Common::PeSwitch("EDEN_UP_AHEAD_GUARD_GPU_ESCAPE");
++    return on;
++}
++
++inline constexpr u64 AddressBits = 36; // the device address space
++inline constexpr u64 PageBits = 12;
++inline constexpr u64 PageLimit = u64{1} << (AddressBits - PageBits);
++
++struct State {
++    using Clock = std::chrono::steady_clock;
++    using Run = std::pair<u64, size_t>; // device address, bytes
++
++    std::mutex mutex;
++    std::condition_variable released;
++    /// Pages of `current` (under the mutex).
++    std::unique_ptr<u64[]> seen{new u64[PageLimit / 64]()};
++    /// Pages guarded now: read by guest threads without the mutex.
++    std::unique_ptr<std::atomic<u64>[]> guarded{new std::atomic<u64>[PageLimit / 64]()};
++    /// Pages the GPU thread read since the last frame end.
++    std::vector<u32> current;
++    struct Frame {
++        u64 number{~u64{0}};
++        std::vector<u32> pages;
++    };
++    std::array<Frame, 4> frames; ///< by present number & 3
++    u64 last_ended{};            ///< newest present number whose frame end was noted
++
++    std::atomic<bool> active{};
++    std::vector<Run> armed_runs;
++    u64 armed_frame{~u64{0}};
++    u64 arm_serial{};
++    Clock::time_point armed_at{};
++
++    // Per log window (under the mutex).
++    struct Stats {
++        u32 presents{}, arms{}, overlaps{}, gave_up{}, gave_up_gpu{};
++        u64 pages{}, runs{};
++        long long arm_us{}, max_arm_us{}, armed_us{};
++        u32 holds{};
++        long long held_us{}, max_held_us{};
++        std::array<u32, 5> core_holds{};
++        struct Thread {
++            u64 id{};
++            u32 holds{};
++            long long held_us{};
++        };
++        std::array<Thread, 6> threads{}; ///< the first six guest threads that waited
++        u32 other_thread_holds{};
++    } stats{};
++    u32 hold_lines{};
++};
++
++inline State& Get() {
++    static State* const state = new State{};
++    return *state;
++}
++
++/// The GPU thread reads [device_addr, device_addr + size) of guest memory for a buffer (an
++/// upload or a streamed uniform block).
++inline void NoteRead(u64 device_addr, u64 size) {
++    constexpr u64 limit = u64{1} << AddressBits;
++    if (size == 0 || device_addr >= limit) {
++        return;
++    }
++    State& s = Get();
++    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    std::scoped_lock lk{s.mutex};
++    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++        u64& word = s.seen[page / 64];
++        const u64 bit = u64{1} << (page % 64);
++        if ((word & bit) == 0) {
++            word |= bit;
++            s.current.push_back(static_cast<u32>(page));
++        }
++    }
++}
++
++namespace Detail {
++
++inline void EndFrameLocked(State& s, u64 number) {
++    if (number <= s.last_ended) {
++        return;
++    }
++    State::Frame& frame = s.frames[number & 3];
++    frame.number = number;
++    frame.pages.swap(s.current);
++    s.current.clear();
++    for (const u32 page : frame.pages) {
++        s.seen[page / 64] &= ~(u64{1} << (page % 64));
++    }
++    s.last_ended = number;
++}
++
++template <class DeviceMemory>
++void DisarmLocked(State& s, DeviceMemory& device_memory) {
++    if (!s.active.load(std::memory_order_relaxed)) {
++        return;
++    }
++    for (const auto& [addr, size] : s.armed_runs) {
++        const u64 last = (addr + size - 1) >> PageBits;
++        for (u64 page = addr >> PageBits; page <= last; ++page) {
++            s.guarded[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
++        }
++    }
++    s.active.store(false, std::memory_order_release);
++    device_memory.UpdatePagesCachedBatch(s.armed_runs, -1);
++    s.armed_runs.clear();
++    s.stats.armed_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                            State::Clock::now() - s.armed_at)
++                            .count();
++}
++
++inline void LogWindowLocked(State& s, u64 present_number) {
++    State::Stats& st = s.stats;
++    if (++st.presents < 300) {
++        return;
++    }
++    const u32 arms = (std::max)(st.arms, 1U);
++    const u32 holds = (std::max)(st.holds, 1U);
++    LOG_INFO(HW_GPU,
++             "EDEN_UP_AHEAD_GUARD: last 300 presents (to #{}): armed {} ({} while one was still "
++             "armed), {} pages in {} runs each, arming {} us (max {}), armed {} us each; {} "
++             "writes waited, {} us each (max {}), by core {}/{}/{}/{}/other {}; lifted early {} "
++             "({} for a waiting GPU channel)",
++             present_number, st.arms, st.overlaps, st.pages / arms, st.runs / arms,
++             st.arm_us / arms, st.max_arm_us, st.armed_us / arms, st.holds, st.held_us / holds,
++             st.max_held_us, st.core_holds[0], st.core_holds[1], st.core_holds[2],
++             st.core_holds[3], st.core_holds[4], st.gave_up, st.gave_up_gpu);
++    if (st.holds != 0) {
++        LOG_INFO(HW_GPU,
++                 "EDEN_UP_AHEAD_GUARD: guest threads that waited (id: writes, ms in all): {}: {}, "
++                 "{}; {}: {}, {}; {}: {}, {}; {}: {}, {}; {}: {}, {}; {}: {}, {}; others {}",
++                 st.threads[0].id, st.threads[0].holds, st.threads[0].held_us / 1000,
++                 st.threads[1].id, st.threads[1].holds, st.threads[1].held_us / 1000,
++                 st.threads[2].id, st.threads[2].holds, st.threads[2].held_us / 1000,
++                 st.threads[3].id, st.threads[3].holds, st.threads[3].held_us / 1000,
++                 st.threads[4].id, st.threads[4].holds, st.threads[4].held_us / 1000,
++                 st.threads[5].id, st.threads[5].holds, st.threads[5].held_us / 1000,
++                 st.other_thread_holds);
++    }
++    st = {};
++}
++
++} // namespace Detail
++
++/// The frame of present `number` ended (its fence was reached): its pages become a finished
++/// frame's, and a guard armed for it is lifted. Runs on the thread that makes the fence's
++/// increment, or on the present's thread when the fence was reached already.
++template <class DeviceMemory>
++void AtFence(u64 number, DeviceMemory& device_memory) {
++    State& s = Get();
++    {
++        std::scoped_lock lk{s.mutex};
++        Detail::EndFrameLocked(s, number);
++        if (s.active.load(std::memory_order_relaxed) && s.armed_frame <= number) {
++            Detail::DisarmLocked(s, device_memory);
++        }
++    }
++    s.released.notify_all();
++}
++
++/// From nx2:vi2 PresentClientBuffer after its waits, before the reply. `previous_reached`: the
++/// previous present's fence is known to be reached.
++template <class DeviceMemory, class Syncpoints>
++void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
++               Syncpoints& syncpoints, DeviceMemory& device_memory) {
++    State& s = Get();
++    bool lifted = false;
++    {
++        std::scoped_lock lk{s.mutex};
++        if (previous_reached && number != 0) {
++            // Its fence action may still be queued behind this thread's own wake.
++            Detail::EndFrameLocked(s, number - 1);
++            if (s.active.load(std::memory_order_relaxed) && s.armed_frame < number) {
++                Detail::DisarmLocked(s, device_memory);
++                lifted = true;
++            }
++        }
++        if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
++            if (s.active.load(std::memory_order_relaxed)) {
++                ++s.stats.overlaps;
++            } else {
++                const auto start = State::Clock::now();
++                std::vector<u32> pages{s.current};
++                for (u32 back = 1; back <= 3; ++back) {
++                    const State::Frame& frame = s.frames[(number - back) & 3];
++                    if ((SetsMask() & (1U << back)) != 0 && number >= back &&
++                        frame.number == number - back) {
++                        pages.insert(pages.end(), frame.pages.begin(), frame.pages.end());
++                    }
++                }
++                std::sort(pages.begin(), pages.end());
++                pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
++                s.armed_runs.clear();
++                for (size_t i = 0; i < pages.size();) {
++                    size_t end = i + 1;
++                    while (end < pages.size() && pages[end] == pages[end - 1] + 1) {
++                        ++end;
++                    }
++                    s.armed_runs.emplace_back(u64{pages[i]} << PageBits,
++                                              static_cast<size_t>(end - i) << PageBits);
++                    i = end;
++                }
++                if (!s.armed_runs.empty()) {
++                    for (const u32 page : pages) {
++                        s.guarded[page / 64].fetch_or(u64{1} << (page % 64),
++                                                      std::memory_order_relaxed);
++                    }
++                    device_memory.UpdatePagesCachedBatch(s.armed_runs, 1);
++                    s.armed_frame = number;
++                    ++s.arm_serial;
++                    s.armed_at = State::Clock::now();
++                    s.active.store(true, std::memory_order_release);
++                    const long long arm_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                                 s.armed_at - start)
++                                                 .count();
++                    ++s.stats.arms;
++                    s.stats.pages += pages.size();
++                    s.stats.runs += s.armed_runs.size();
++                    s.stats.arm_us += arm_us;
++                    s.stats.max_arm_us = (std::max)(s.stats.max_arm_us, arm_us);
++                }
++            }
++        }
++        Detail::LogWindowLocked(s, number);
++    }
++    if (lifted) {
++        s.released.notify_all();
++    }
++    syncpoints.RegisterGuestAction(fence_id, fence_value,
++                                   [number, &device_memory] { AtFence(number, device_memory); });
++}
++
++/// Whether a guest write to [device_addr, device_addr + size) must wait: lock-free, for
++/// Memory's HandleRasterizerWrite.
++inline bool Active() {
++    return Enabled() && Get().active.load(std::memory_order_acquire);
++}
++inline bool Guarded(u64 device_addr, u64 size) {
++    constexpr u64 limit = u64{1} << AddressBits;
++    if (size == 0 || device_addr >= limit) {
++        return false;
++    }
++    State& s = Get();
++    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++        if ((s.guarded[page / 64].load(std::memory_order_relaxed) & (u64{1} << (page % 64))) != 0) {
++            return true;
++        }
++    }
++    return false;
++}
++
++/// A guest thread on a CPU core is about to write a guarded page: waits until the guard is lifted
++/// (the caller leaves other host threads alone: the GPU threads never wait here). `stop()`
++/// returns 1 when the wait must end at once (power off) and 2 while a GPU channel is suspended
++/// (with EDEN_UP_AHEAD_GUARD_GPU_ESCAPE=1 the wait then ends after 3 ms). Ending a wait early
++/// lifts the guard for the frame, so later writers don't wait in turn.
++template <class DeviceMemory, class Stop>
++void HoldWriter(u64 device_addr, u64 size, size_t core, u64 thread_id, DeviceMemory& device_memory,
++                Stop&& stop) {
++    State& s = Get();
++    const auto start = State::Clock::now();
++    bool lifted = false;
++    {
++        std::unique_lock lk{s.mutex};
++        if (!s.active.load(std::memory_order_relaxed)) {
++            return;
++        }
++        const u64 serial = s.arm_serial;
++        const u64 frame = s.armed_frame;
++        bool gpu_waited = false;
++        int gave_up = 0;
++        while (s.active.load(std::memory_order_relaxed) && s.arm_serial == serial) {
++            s.released.wait_for(lk, std::chrono::milliseconds{1});
++            if (!s.active.load(std::memory_order_relaxed) || s.arm_serial != serial) {
++                break;
++            }
++            lk.unlock();
++            const int stopped = stop();
++            lk.lock();
++            const auto waited = State::Clock::now() - start;
++            gpu_waited |= stopped == 2 && GpuEscape();
++            if (stopped == 1 || waited > MaxHold()) {
++                gave_up = 1;
++            } else if (gpu_waited && waited > std::chrono::milliseconds{3}) {
++                gave_up = 2;
++            }
++            if (gave_up != 0) {
++                break;
++            }
++        }
++        if (gave_up != 0 && s.active.load(std::memory_order_relaxed) && s.arm_serial == serial) {
++            Detail::DisarmLocked(s, device_memory);
++            lifted = true;
++            ++s.stats.gave_up;
++            s.stats.gave_up_gpu += gave_up == 2 ? 1 : 0;
++        }
++        const long long held_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                      State::Clock::now() - start)
++                                      .count();
++        State::Stats& st = s.stats;
++        ++st.holds;
++        st.held_us += held_us;
++        st.max_held_us = (std::max)(st.max_held_us, held_us);
++        ++st.core_holds[(std::min<size_t>)(core, 4)];
++        bool counted = false;
++        for (auto& thread : st.threads) {
++            if (thread.holds == 0 || thread.id == thread_id) {
++                thread.id = thread_id;
++                ++thread.holds;
++                thread.held_us += held_us;
++                counted = true;
++                break;
++            }
++        }
++        st.other_thread_holds += counted ? 0 : 1;
++        if (s.hold_lines < 48) {
++            ++s.hold_lines;
++            LOG_INFO(HW_GPU,
++                     "EDEN_UP_AHEAD_GUARD: guest thread {} on core {} waited {} us to write {} B "
++                     "at {:#x} (frame of present #{}{})",
++                     thread_id, core, held_us, size, device_addr, frame,
++                     gave_up == 2   ? ", lifted for a waiting GPU channel"
++                     : gave_up == 1 ? ", lifted at the longest wait"
++                                    : "");
++        }
++    }
++    if (lifted) {
++        s.released.notify_all();
++    }
++}
++
++} // namespace VideoCommon::AheadGuard
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 71a822b..c72a43d 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -39,6 +39,7 @@
+ #include "shader_recompiler/storage_write_extent.h"
+ #include "video_core/buffer_cache/buffer_base.h"
+ #include "video_core/buffer_cache/uniform_stream_reuse.h"
++#include "video_core/ahead_guard.h"
+ #include "video_core/ubo_ahead.h"
+ #include "video_core/buffer_cache/virtual_range_cache.h"
+ #include "video_core/control/channel_state_cache.h"
+@@ -1121,6 +1122,11 @@ private:
+     /// GPU thread reads of guest memory for buffers (uploads, streamed uniforms): counts ahead
+     /// reads for EDEN_NX2_OVERWRITE_CHECK. Off, or with nothing ahead: returns at once.
+     void OverwriteNoteRead(DAddr device_addr, u64 size) {
++        // EDEN_UP_AHEAD_GUARD (ahead_guard.h): the pages a frame reads are guarded from guest
++        // writes while the next such frame is in flight.
++        if (VideoCommon::AheadGuard::Enabled()) [[unlikely]] {
++            VideoCommon::AheadGuard::NoteRead(device_addr, size);
++        }
+         if (!overwrite_ahead_active || size == 0 ||
+             !overwrite_ahead_ranges.Intersects(device_addr, size)) {
+             return;

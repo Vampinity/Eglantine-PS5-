@@ -641,6 +641,15 @@ extern "C" void eden_heap_growth_report(void) __attribute__((weak));
 extern "C" void eden_heap_arena_report(void) __attribute__((weak));
 extern "C" void eden_heap_name_thread(const char* name) __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
+// EDEN_UP_HEAP_WAIT_MS (headless/heap_arenas.inc): pipeline builder requests waiting for memory now,
+// and how many waited so far.
+extern "C" unsigned eden_heap_wanted(void) __attribute__((weak));
+extern "C" void eden_heap_wait_stats(unsigned long long* count, unsigned long long* total_ms, unsigned* longest_ms,
+                                     unsigned long long* lost) __attribute__((weak));
+// EDEN_UP_HEAP_RESCUE: requests about to be refused that an arena served, and those none could.
+extern "C" void eden_heap_rescue_stats(unsigned long long* rescued, unsigned long long* missed) __attribute__((weak));
+// EDEN_TEST_HEAP_STARVE: test shortages begun on pipeline builder threads, and requests refused in them.
+extern "C" void eden_heap_starve_stats(unsigned long long* begun, unsigned long long* refused) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 extern "C" void eden_guest_memory_report(void) __attribute__((weak));
 extern "C" void eden_guest_memory_pool_short(int is_short) __attribute__((weak));
@@ -656,6 +665,18 @@ extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemo
 extern "C" std::int32_t sceKernelAvailableFlexibleMemorySize(std::size_t*);
 extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long* blocks,
                                     unsigned long long* hits, unsigned long long* fallbacks) __attribute__((weak));
+// EDEN_UP_SHADER_SET (video_core/shader_set.cpp, FreeMemoryBytes): the free memory its extraction
+// and preparation stop below. This kernel has no vm.stats sysctl counters; the largest free block
+// of the pool is what the caches here go by too (RefreshFreeMemory). 0: not known.
+extern "C" unsigned long long eden_free_memory_bytes(void) {
+    std::int64_t start = 0;
+    std::size_t largest = 0;
+    const std::int64_t total = sceKernelGetDirectMemorySize();
+    if (total > 0 && sceKernelAvailableDirectMemorySize(0, total, 0x4000, &start, &largest) == 0) {
+        return largest;
+    }
+    return 0;
+}
 // The allocator's blocks and what is in use of them (vulkan_memory_allocator.cpp).
 extern "C" void eden_vma_usage(unsigned long long* blocks, unsigned long long* used) __attribute__((weak));
 #ifdef EDEN_PS5_RADV
@@ -769,6 +790,28 @@ static void WriteMemorySummary(std::size_t largest, bool memory_short) {
                  largest >> 20, int(memory_short), guest_held >> 20,
                  kernel_memory ? kernel_memory() >> 20 : 0ULL);
     ReportHeap("every 20 s");
+    if (eden_heap_wait_stats) {
+        unsigned long long count = 0, total_ms = 0, lost = 0;
+        unsigned longest_ms = 0;
+        eden_heap_wait_stats(&count, &total_ms, &longest_ms, &lost);
+        if (count != 0)
+            std::fprintf(stderr, "EDEN_HEAP_WAIT pipeline builders waited for memory %llu times, %llu ms in all, "
+                         "longest %u ms, %llu got none\n", count, total_ms, longest_ms, lost);
+    }
+    if (eden_heap_rescue_stats) {
+        unsigned long long rescued = 0, missed = 0;
+        eden_heap_rescue_stats(&rescued, &missed);
+        if (rescued != 0 || missed != 0)
+            std::fprintf(stderr, "EDEN_HEAP_RESCUE requests about to be refused: %llu served by an arena, %llu by none\n",
+                         rescued, missed);
+    }
+    if (eden_heap_starve_stats) {
+        unsigned long long begun = 0, refused = 0;
+        eden_heap_starve_stats(&begun, &refused);
+        if (begun != 0)
+            std::fprintf(stderr, "EDEN_TEST_HEAP_STARVE %llu test shortages on pipeline builder threads, %llu requests "
+                         "refused in them\n", begun, refused);
+    }
     ReportLedger();
     // EDEN_NX2_POOL_WALK=1 (off unless set): the pool by block size every 20 s (EDEN_REFUSED_POOL,
     // the walk a refusal makes). available_mib is the largest block, the ledger the sum: only
@@ -855,8 +898,10 @@ static void RefreshFreeMemory() {
 // A write to the guest's memory waiting for a block (src/guest_memory_service.inc, WaitForBlock): the game's own
 // memory comes first, so while one waits the caches see memory short and none free, and the texture collector
 // evicts at its hardest until the write has its block.
+// The same for a pipeline builder's heap request that waits for memory (EDEN_UP_HEAP_WAIT_MS): the
+// driver's compiler cannot take a refusal, so the caches give way until it is served.
 static bool GuestMemoryWanted() {
-    return eden_guest_memory_wanted && eden_guest_memory_wanted() != 0;
+    return (eden_guest_memory_wanted && eden_guest_memory_wanted() != 0) || (eden_heap_wanted && eden_heap_wanted() != 0);
 }
 static bool GraphicsMemoryShort() {
     if (GuestMemoryWanted()) return true;

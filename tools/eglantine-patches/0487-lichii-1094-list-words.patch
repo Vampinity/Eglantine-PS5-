@@ -1,0 +1,576 @@
+Subject: [PATCH] Lichii #1094: command lists on GPU-written pages read the words no GPU work wrote from guest memory, DMAClear checks its whole range (EDEN_UP_L1094_LIST_WORDS, EDEN_UP_L1094_DMACLEAR, EDEN_UP_L1094_STATS; all off by default)
+
+Port of zortos293/Lichii #1094 (jpkto, open; "video_core: wait less for the writers of command
+lists", #805's lists 18 = 34656e8225 and 43 = d4e8d85d4d). On top of T85 (0001..0486).
+
+Mapped against T85 (have / partly / missing; T85 line numbers):
+- DMACopy notes its guest write to command list pages (34656e8225): have, EDEN_UP_FRITCHII_DMALIST
+  (0453), buffer_cache.h:1303-1311.
+- DMAClear checks its whole range (`amount` counts words, the check took it as bytes) and notes
+  its guest write (34656e8225): have, EDEN_UP_FRITCHII_DMALIST (0453), buffer_cache.h:1362-1378,
+  both halves behind one switch.
+- Command list pages track the words GPU work wrote; lists on none of them read guest memory, copy
+  reads take the other words from guest memory (34656e8225, Fritchii's EXP40 word reads): missing.
+  0474 left it out by name. T85's Nx2ListPage (buffer_cache_base.h:1258) counts writes per page
+  only; Nx2ReadListCopy (buffer_cache.h:3854) is Synced only when the whole page is.
+- An entry that begins between methods skips the writer wait while no copy engine work is queued
+  (d4e8d85d4d): have, EDEN_UP_FRITCHII_LISTSKIP (0474): dma_pusher.cpp:552, CopyWritersPending
+  gpu_split.h:542, NoteCopyWriter dma_pusher.cpp:1403/1475. The same rule as upstream's
+  `command_entry && !CopyWritersPending`; ours waits by the active list rule when it does wait.
+- The wait before a list on a GPU-written page goes to the writers before the last sync, new
+  site "list copy writers" (d4e8d85d4d): missing. T85 waits for every writer there
+  (dma_pusher.cpp:1922, site "list gpu-written"). Not ported, see below.
+- BufferCacheRuntime::WaitSubmittedTick publishes the front's words before it waits for a copy:
+  missing (vk_buffer_cache.cpp:566). Not ported, see below.
+
+Against LISTSYNC (0474) and the 0485 list fetch rules: those set how long an entry on a page NOT
+known GPU-written waits for queued compute and copy work (the "list writers" site). LIST_WORDS
+acts later and elsewhere: only on entries on pages already GPU-written and marked as command list
+pages, after their own writer wait ("list gpu-written", unchanged), on what they read (copy, guest
+memory, or drain and flush). Complementary, no shared state beyond the page entries; any of them
+can be on together. LIST_WORDS does not move the "list writers" wait at all.
+
+What each switch does (Common::PeSwitch, exactly "1"; read once):
+EDEN_UP_L1094_LIST_WORDS=1: each command list page keeps a bitset of its 4-byte words GPU work
+  wrote that guest memory lacks: set for the whole range each noted dispatch or copy write may
+  cover (Nx2NoteListWrite), cleared for the words a host write covers whole (Nx2NoteListHostWrite:
+  CPU, inline and, with this switch, DMACopy/DMAClear writes) and for all words when the front
+  flushed the page (Nx2NoteListSynced, which also marks the page `flushed`). In Nx2ReadListCopy a
+  list on a flushed page draws never wrote, on none of those words, returns Synced: the front reads
+  guest memory, waits for no copy and does not drain and flush. A copy read on a flushed page
+  takes only the GPU-written words from the copy and the others from guest memory (a CPU write the
+  buffer had not uploaded when the copy was made is no longer read stale from the copy). It also
+  turns on DMALIST's two DMACopy/DMAClear notes (as upstream), not DMALIST's range fix.
+EDEN_UP_L1094_DMACLEAR=1: DMAClear's buffer check covers the whole range, without DMALIST's
+  notes. A plain bug fix, but it changes behaviour: a clear whose registered buffer lies past the
+  first quarter of its range now also clears the GPU buffer (before, only guest memory got it,
+  through MaxwellDMA's unsafe write, and the buffer kept the old words). It adds a GPU clear, no
+  waits. DMALIST keeps doing both halves.
+EDEN_UP_L1094_STATS=1 (any arm, the control included; no behaviour change, the words are then
+  tracked so each list gets the verdict LIST_WORDS would give) logs every 10 s from the front:
+  "Lichii #1094 in 10 s (EDEN_UP_L1094_LIST_WORDS=, EDEN_UP_L1094_DMACLEAR=): lists on
+  GPU-written command list pages R: S on pages guest memory holds whole, C checked by word (W
+  words): K on no word GPU work wrote (read from guest memory | would read guest memory with
+  LIST_WORDS; on the copy path now: A waited for their copy (X ms), B without a current copy);
+  copy path: F copies ready, T copy waits (Y ms), U without a current copy (drain and flush) or
+  pending, M copy reads merged with guest memory; DMA clears N: Q registered past the old quarter
+  check". K = list waits skipped because no written word was touched, F+T+U = kept, W = words
+  checked. In the control, A/X/B are what LIST_WORDS would save; with LIST_WORDS on they are 0.
+  The start line "Lichii #1094: EDEN_UP_L1094_LIST_WORDS=..." shows the switches as read.
+
+Unset (all three): T85 behaviour. What still runs: a static switch test per noted list page write,
+host write and flush, three no-op counter calls and one switch test per list read, a time_point
+default in the copy wait path, a switch test per DMACopy/DMAClear; Nx2ListPage grows by a
+1,024-bit bitset and a bool per command list page.
+
+Not ported:
+- d4e8d85d4d's narrower wait before lists on GPU-written pages (ReadGpuWrittenCommands: every
+  writer -> the writers before the last sync, site "list copy writers"). In the T85 walk control
+  (t85-b run684) that whole site is "list gpu-written" 0.1-0.2 ms/s at 159-268 waits/s: nothing to
+  gain on this route, and it would read lists whose writer is still queued with no miss check.
+  Worth porting with a back-side check once a route (Death Mountain: upstream's 99.6 ms/s) shows it.
+- WaitSubmittedTick's Publish before a copy wait: the copy path is ~80 lists/s here (FETCH_COUNT
+  "GPU-written page, host copy" 8,862 in ~110 s of run684); what its waits cost is not measured
+  yet. The STATS line's copy waits (T, Y ms) measure it; port it if they are worth it.
+- The tests (buffer_cache_ports.cpp): our tests are not built.
+- Upstream's draw-written pages after a host sync (past_sync / NeedsSync): T85 has none of that
+  base; draw-written pages keep draining here, with or without the switch.
+
+Risks:
+- LIST_WORDS: a GPU write that reaches a list page without Nx2NoteListWrite (a path that marks the
+  page GPU-written some other way) would leave its words clear, and a list on them would read guest
+  memory without the write: a stale list can lose the device or hang. Every noted path is the one
+  T85's copies already rely on (MarkWrittenBuffer for dispatches, DMACopy's mirror), and the words
+  are only trusted on pages the front flushed once. A draw's first write to a page still queued
+  when a list there is read is missed exactly as T85's Synced and copy paths miss it today.
+- DMACLEAR: one more GPU clear per affected DMA clear; the STATS line counts them (Q).
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1304,9 +1304,10 @@
+     // memory gets the copy below (the unsafe scoped write at the end, which notes nothing), and it
+     // holds every byte the source has in guest memory. Command list pages in the destination read
+     // those from it, and their copies are stale. The bytes copied from GPU-written source ranges
+-    // are noted as GPU writes after this.
++    // are noted as GPU writes after this. EDEN_UP_L1094_LIST_WORDS (zortos293/Lichii #1094) takes
++    // this note too: it also gives the words back to guest memory (Nx2NoteListHostWrite).
+     static const bool fritchii_dma_list = Common::PeSwitch("EDEN_UP_FRITCHII_DMALIST");
+-    if (fritchii_dma_list) {
++    if (fritchii_dma_list || VideoCommon::GpuSplit::L1094ListWords()) {
+         Nx2NoteListHostWrite(*cpu_dest_address, amount);
+     }
+ 
+@@ -1362,16 +1363,26 @@
+     // EDEN_UP_FRITCHII_DMALIST=1 (zortos293/Lichii#805 34656e8225, Fritchii 266cb620c1):
+     // `amount` counts words, and the check looked at a quarter of the range. A buffer registered
+     // only past it was never cleared, and the caller's unsafe guest write never reaches it.
++    // EDEN_UP_L1094_DMACLEAR=1 (zortos293/Lichii #1094 by jpkto): the same range fix alone,
++    // without DMALIST's notes. EDEN_UP_L1094_STATS counts the clears the quarter check misses.
+     static const bool fritchii_dma_list = Common::PeSwitch("EDEN_UP_FRITCHII_DMALIST");
++    static const bool whole_range = fritchii_dma_list || VideoCommon::GpuSplit::L1094DmaClear();
+     const size_t size = amount * sizeof(u32);
+-    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, fritchii_dma_list ? size : amount);
++    if (VideoCommon::g_l1094_counting) [[unlikely]] {
++        VideoCommon::L1094Count(VideoCommon::g_l1094_stats.clears);
++        if (!IsRegionRegistered(*cpu_dst_address, amount) &&
++            IsRegionRegistered(*cpu_dst_address, size)) {
++            VideoCommon::L1094Count(VideoCommon::g_l1094_stats.clears_missed);
++        }
++    }
++    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, whole_range ? size : amount);
+     if (!dest_dirty) {
+         return false;
+     }
+ 
+     ClearDownload(*cpu_dst_address, size);
+     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
+-    if (fritchii_dma_list) {
++    if (fritchii_dma_list || VideoCommon::GpuSplit::L1094ListWords()) {
+         // The caller writes the cleared words to guest memory after this (WriteBlockUnsafe), as
+         // an inline write: command list pages read them from guest memory, their copies are stale.
+         Nx2NoteListHostWrite(*cpu_dst_address, size);
+@@ -3772,6 +3783,13 @@
+                     std::scoped_lock lock{nx2_list_mutex};
+                     Nx2ListPage& entry = nx2_list_pages[page_addr];
+                     ++entry.writes;
++                    if (VideoCommon::GpuSplit::L1094TrackWords()) { // zortos293/Lichii #1094
++                        Nx2MarkListWords(
++                            entry, (std::max)(device_addr, page_addr) - page_addr,
++                            (std::min)(device_addr + size, page_addr + (DAddr{1} << page_bits)) -
++                                page_addr,
++                            true);
++                    }
+                     if (!nx2_collect_list_copies && !entry.draw_written) {
+                         entry.draw_written = true;
+                         LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
+@@ -3866,6 +3884,13 @@
+             return entry.copy && !entry.draw_written && entry.copy_writes == entry.writes &&
+                    offset >= entry.copy_begin && offset + out.size() <= entry.copy_end;
+         };
++        // EDEN_UP_L1094_LIST_WORDS (zortos293/Lichii #1094 by jpkto, #805's list 18): a list on a
++        // page flushed once and on none of the words GPU work wrote since is in guest memory too:
++        // it waits for no copy and drains nothing. Off, EDEN_UP_L1094_STATS only counts that
++        // verdict (`skip`) and what the list did instead.
++        static const bool list_words = VideoCommon::GpuSplit::L1094ListWords();
++        auto& stats = VideoCommon::g_l1094_stats;
++        bool skip = false;
+         u64 tick{};
+         u64 writes{};
+         {
+@@ -3875,34 +3900,68 @@
+                 return Nx2ListRead::Unknown;
+             }
+             const Nx2ListPage& entry = it->second;
++            VideoCommon::L1094Count(stats.reads);
+             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
+             if (!entry.draw_written && entry.synced_writes == entry.writes) {
++                VideoCommon::L1094Count(stats.synced);
+                 return Nx2ListRead::Synced;
+             }
++            if (VideoCommon::GpuSplit::L1094TrackWords() && !entry.draw_written && entry.flushed) {
++                VideoCommon::L1094Count(stats.checked);
++                VideoCommon::L1094Count(stats.words, (offset + out.size() + 3) / 4 - offset / 4);
++                skip = !Nx2HasListWords(entry, offset, offset + out.size());
++                if (skip) {
++                    VideoCommon::L1094Count(stats.skipped);
++                    if (list_words) {
++                        return Nx2ListRead::Synced;
++                    }
++                }
++            }
+             if (!current(entry)) {
++                VideoCommon::L1094Count(stats.unknown);
++                if (skip) {
++                    VideoCommon::L1094Count(stats.skip_unknown);
++                }
+                 return Nx2ListRead::Unknown;
+             }
+             // The lists after the first of a batch find the copy done: read it at once.
+             if (runtime.IsFree(entry.copy_tick)) {
+-                std::memcpy(out.data(), entry.copy->mapped_span.data() + offset, out.size());
++                VideoCommon::L1094Count(stats.copied);
++                Nx2ReadListWords(entry, device_addr, offset, out, list_words);
+                 return Nx2ListRead::Copied;
+             }
+             tick = entry.copy_tick;
+             writes = entry.copy_writes;
+             if (pending_tick != nullptr) {
++                VideoCommon::L1094Count(stats.unknown);
+                 *pending_tick = tick;
+                 return Nx2ListRead::Pending;
+             }
+         }
+         // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
++        const bool timed = VideoCommon::g_l1094_counting;
++        const auto wait_start = timed ? std::chrono::steady_clock::now()
++                                      : std::chrono::steady_clock::time_point{};
+         runtime.WaitSubmittedTick(tick);
++        if (timed) [[unlikely]] {
++            const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                std::chrono::steady_clock::now() - wait_start)
++                                                .count());
++            VideoCommon::L1094Count(stats.copy_waits);
++            VideoCommon::L1094Count(stats.copy_wait_ns, ns);
++            if (skip) {
++                VideoCommon::L1094Count(stats.skip_waits);
++                VideoCommon::L1094Count(stats.skip_wait_ns, ns);
++            }
++        }
+         std::scoped_lock lock{nx2_list_mutex};
+         const auto it = nx2_list_pages.find(page);
+         if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||
+             it->second.copy_writes != writes) {
++            VideoCommon::L1094Count(stats.unknown);
+             return Nx2ListRead::Unknown;
+         }
+-        std::memcpy(out.data(), it->second.copy->mapped_span.data() + offset, out.size());
++        Nx2ReadListWords(it->second, device_addr, offset, out, list_words);
+         return Nx2ListRead::Copied;
+     }
+ }
+@@ -3913,7 +3972,66 @@
+         std::scoped_lock lock{nx2_list_mutex};
+         Nx2ListPage& entry = nx2_list_pages[page];
+         entry.synced_writes = entry.writes;
++        if (VideoCommon::GpuSplit::L1094TrackWords()) { // zortos293/Lichii #1094
++            entry.gpu_words.reset();
++            entry.flushed = true;
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::Nx2ReadListWords(const Nx2ListPage& entry, DAddr device_addr, u64 offset,
++                                      std::span<u8> out, bool merge) {
++    if constexpr (!IS_OPENGL) {
++        const u8* const copy = entry.copy->mapped_span.data();
++        const u64 end = offset + out.size();
++        // zortos293/Lichii #1094: the copy holds the words GPU work wrote. Guest memory holds the
++        // others once the page was flushed: the host wrote them, and the buffer the copy came
++        // from need not have had those writes uploaded.
++        bool all_gpu = true;
++        if (merge && entry.flushed) {
++            for (u64 word = offset / 4; word < (end + 3) / 4 && all_gpu; ++word) {
++                all_gpu = entry.gpu_words.test(static_cast<size_t>(word));
++            }
++        }
++        if (all_gpu) {
++            std::memcpy(out.data(), copy + offset, out.size());
++            return;
++        }
++        VideoCommon::L1094Count(VideoCommon::g_l1094_stats.merged);
++        device_memory.ReadBlockUnsafe(device_addr, out.data(), out.size());
++        for (u64 byte = offset; byte < end;) {
++            const u64 next = (std::min)((byte / 4 + 1) * 4, end);
++            if (entry.gpu_words.test(static_cast<size_t>(byte / 4))) {
++                std::memcpy(out.data() + (byte - offset), copy + byte, next - byte);
++            }
++            byte = next;
++        }
++    }
++}
++
++template <class P>
++void BufferCache<P>::Nx2MarkListWords(Nx2ListPage& entry, u64 begin, u64 end, bool set) {
++    if (begin >= end) {
++        return;
++    }
++    // Words GPU work may have written in part count whole; the host clears only whole words.
++    const u64 first = set ? begin / 4 : (begin + 3) / 4;
++    const u64 last = (std::min<u64>)(set ? (end + 3) / 4 : end / 4, Nx2ListPageWords);
++    for (u64 word = first; word < last; ++word) {
++        entry.gpu_words.set(static_cast<size_t>(word), set);
++    }
++}
++
++template <class P>
++bool BufferCache<P>::Nx2HasListWords(const Nx2ListPage& entry, u64 begin, u64 end) {
++    const u64 last = (std::min<u64>)((end + 3) / 4, Nx2ListPageWords);
++    for (u64 word = begin / 4; word < last; ++word) {
++        if (entry.gpu_words.test(static_cast<size_t>(word))) {
++            return true;
++        }
+     }
++    return false;
+ }
+ 
+ template <class P>
+@@ -3932,7 +4050,8 @@
+                 continue;
+             }
+             std::scoped_lock lock{nx2_list_mutex};
+-            const auto it = nx2_list_pages.find(page << page_bits);
++            const DAddr page_addr = page << page_bits;
++            const auto it = nx2_list_pages.find(page_addr);
+             if (it == nx2_list_pages.end()) {
+                 continue;
+             }
+@@ -3941,6 +4060,14 @@
+             ++entry.writes;
+             if (synced) {
+                 entry.synced_writes = entry.writes;
++            }
++            // zortos293/Lichii #1094: the words this write covers are guest memory's again.
++            if (VideoCommon::GpuSplit::L1094TrackWords()) {
++                Nx2MarkListWords(entry, (std::max)(device_addr, page_addr) - page_addr,
++                                 (std::min)(device_addr + size,
++                                            page_addr + (DAddr{1} << page_bits)) -
++                                     page_addr,
++                                 false);
+             }
+         }
+     }
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -12,6 +12,7 @@
+ #include <cstdlib>
+ #include <array>
+ #include <bit>
++#include <bitset>
+ #include <functional>
+ #include <memory>
+ #include <mutex>
+@@ -46,6 +47,7 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/nx2.h"
+ #include "video_core/nx2_async_readback.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/rasterizer_download_area.h"
+@@ -467,7 +469,9 @@
+     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
+     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
+     /// With `pending_tick` (EDEN_NX2_LIST_ASYNC), a copy the GPU has not finished returns Pending
+-    /// and sets the tick instead of waiting for it.
++    /// and sets the tick instead of waiting for it. EDEN_UP_L1094_LIST_WORDS: also Synced when
++    /// the page was flushed once and GPU work wrote none of the list's words since; a copy read
++    /// takes the words GPU work wrote from the copy and the others from guest memory.
+     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out,
+                                 u64* pending_tick = nullptr);
+     /// Front thread, the split drained: the command list page was flushed to guest memory.
+@@ -1255,6 +1259,7 @@
+ 
+     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
+     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
++    static constexpr size_t Nx2ListPageWords = (size_t{1} << Tegra::Nx2WrittenPageBits) / 4;
+     struct Nx2ListPage {
+         u64 writes{};      ///< GPU writes noted to the page
+         u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
+@@ -1267,8 +1272,25 @@
+         /// once: the front can't tell from what it sent whether such a write is still queued, so
+         /// the page's lists always drain the split instead of reading a copy.
+         bool draw_written{};
++        /// EDEN_UP_L1094_LIST_WORDS / _STATS (zortos293/Lichii #1094): the page's 4-byte words GPU
++        /// work wrote that guest memory does not hold. Set by the GPU writes noted to the page (the
++        /// whole range a dispatch or copy may write), cleared for the words a host write covers
++        /// whole and for every word once the front flushed the page (`flushed`). Before the first
++        /// flush GPU work may have written the page unnoted (before it became a list page).
++        std::bitset<Nx2ListPageWords> gpu_words;
++        bool flushed{};
+         std::optional<Nx2Staging> copy;
+     };
++    /// Sets (`set`) or clears the bits of `entry.gpu_words` within [begin, end) bytes of its
++    /// page: every word the bytes touch when setting, only the words they cover when clearing.
++    static void Nx2MarkListWords(Nx2ListPage& entry, u64 begin, u64 end, bool set);
++    /// Whether GPU work wrote a word of [begin, end) bytes of the page that guest memory lacks.
++    [[nodiscard]] static bool Nx2HasListWords(const Nx2ListPage& entry, u64 begin, u64 end);
++    /// Fills `out` with the page's bytes from `offset` (`device_addr`) on from its current copy;
++    /// with `merge` (EDEN_UP_L1094_LIST_WORDS) on a flushed page, the words GPU work did not write
++    /// from guest memory instead.
++    void Nx2ReadListWords(const Nx2ListPage& entry, DAddr device_addr, u64 offset,
++                          std::span<u8> out, bool merge);
+     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
+     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
+     /// Copies replaced while the GPU may still write them: freed once it is past their tick.
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -147,6 +147,9 @@
+     if (active && g_l1056_counting) [[unlikely]] {
+         ReportL1056();
+     }
++    if (active && g_l1094_counting) [[unlikely]] {
++        ReportL1094();
++    }
+     if (active && !allowed) {
+         Drain();
+         Stop();
+@@ -162,6 +165,14 @@
+     feed = Ship2Feed();
+     g_l949_counting = L949StatsSwitch() || L949AcquireVerify();
+     g_l1056_counting = L1056StatsSwitch(); // zortos293/Lichii #1056
++    g_l1094_counting = L1094StatsSwitch(); // zortos293/Lichii #1094
++    if (L1094ListWords() || L1094DmaClear() || L1094StatsSwitch()) {
++        LOG_INFO(HW_GPU,
++                 "Lichii #1094: EDEN_UP_L1094_LIST_WORDS={} (lists on GPU-written pages read the "
++                 "words no GPU work wrote from guest memory), EDEN_UP_L1094_DMACLEAR={} (DMA "
++                 "clears check their whole range), EDEN_UP_L1094_STATS={}",
++                 L1094ListWords() ? 1 : 0, L1094DmaClear() ? 1 : 0, L1094StatsSwitch() ? 1 : 0);
++    }
+     if (L1056BackMacros() || ListFetchRule() != 0 || L1056StatsSwitch()) {
+         LOG_INFO(HW_GPU,
+                  "Lichii #1056: EDEN_UP_L1056_BACK_MACROS={} (3D macros that read memory into "
+@@ -230,6 +241,9 @@
+     g_l1056_counting = false;
+     l1056_report_calls = 0;
+     l1056_window_start = 0;
++    g_l1094_counting = false;
++    l1094_report_calls = 0;
++    l1094_window_start = 0;
+     same_read_count = 0;
+     same_read_position = 0;
+     // zortos293/Lichii #949: set again by the next start; the positions restart at 0.
+@@ -791,6 +805,56 @@
+              register_waits, register_wait_ms, code_waits, code_wait_ms, takeovers, escapes,
+              list_entries, list_t84, list_listsync, list_1056, list_1055, list_waited,
+              list_rechecked);
++}
++
++void GpuSplit::ReportL1094() {
++    // MaybeStart runs once per GPU thread loop: read the clock every 256th call only.
++    if (++l1094_report_calls % 256 != 0) {
++        return;
++    }
++    const u64 now = WaitClockNs();
++    if (l1094_window_start == 0) {
++        l1094_window_start = now;
++        return;
++    }
++    if (now - l1094_window_start < 10'000'000'000ULL) {
++        return;
++    }
++    l1094_window_start = now;
++    auto& stats = g_l1094_stats;
++    const auto take = [](std::atomic<u64>& counter) {
++        return counter.exchange(0, std::memory_order_relaxed);
++    };
++    const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
++    const u64 reads = take(stats.reads);
++    const u64 synced = take(stats.synced);
++    const u64 checked = take(stats.checked);
++    const u64 words = take(stats.words);
++    const u64 skipped = take(stats.skipped);
++    const u64 skip_waits = take(stats.skip_waits);
++    const double skip_wait_ms = ms(take(stats.skip_wait_ns));
++    const u64 skip_unknown = take(stats.skip_unknown);
++    const u64 copied = take(stats.copied);
++    const u64 copy_waits = take(stats.copy_waits);
++    const double copy_wait_ms = ms(take(stats.copy_wait_ns));
++    const u64 unknown = take(stats.unknown);
++    const u64 merged = take(stats.merged);
++    const u64 clears = take(stats.clears);
++    const u64 clears_missed = take(stats.clears_missed);
++    LOG_INFO(HW_GPU,
++             "Lichii #1094 in 10 s (EDEN_UP_L1094_LIST_WORDS={}, EDEN_UP_L1094_DMACLEAR={}): "
++             "lists on GPU-written command list pages {}: {} on pages guest memory holds whole, "
++             "{} checked by word ({} words): {} on no word GPU work wrote ({}: {} waited for "
++             "their copy ({:.1f} ms), {} without a current copy); copy path: {} copies ready, {} "
++             "copy waits ({:.1f} ms), {} without a current copy (drain and flush) or pending, {} "
++             "copy reads merged with guest memory; DMA clears {}: {} registered past the old "
++             "quarter check",
++             L1094ListWords() ? 1 : 0, L1094DmaClear() ? 1 : 0, reads, synced, checked, words,
++             skipped,
++             L1094ListWords() ? "read from guest memory"
++                              : "would read guest memory with LIST_WORDS; on the copy path now",
++             skip_waits, skip_wait_ms, skip_unknown, copied, copy_waits, copy_wait_ms, unknown,
++             merged, clears, clears_missed);
+ }
+ 
+ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -116,6 +116,38 @@
+     }
+ }
+ 
++// zortos293/Lichii #1094 (jpkto; #805's lists 18 and 43): how the command lists on GPU-written
++// command list pages were read (BufferCache::Nx2ReadListCopy) and what the word check
++// (EDEN_UP_L1094_LIST_WORDS) took from guest memory, and the DMA clears the old quarter range check
++// missed (EDEN_UP_L1094_DMACLEAR). Counted only with EDEN_UP_L1094_STATS=1 (as of the split's last
++// start; any arm, the control included: the words are then tracked and each list gets the verdict
++// LIST_WORDS would give, with no behaviour change) and logged every 10 s (GpuSplit::ReportL1094).
++struct L1094Stats {
++    std::atomic<u64> reads{};       ///< Front: lists read through their command list page's entry
++    std::atomic<u64> synced{};      ///< ...on a page guest memory holds whole (as before)
++    std::atomic<u64> checked{};     ///< ...on a flushed page GPU work wrote since: words checked
++    std::atomic<u64> words{};       ///< ...the words those checks looked at
++    std::atomic<u64> skipped{};     ///< ...on none of the words GPU work wrote: guest memory
++    std::atomic<u64> skip_waits{};  ///< ...of those, without LIST_WORDS: waited for their copy
++    std::atomic<u64> skip_wait_ns{};
++    std::atomic<u64> skip_unknown{}; ///< ...without LIST_WORDS: no current copy (drain and flush)
++    std::atomic<u64> copied{};      ///< Copy path: the copy was done already
++    std::atomic<u64> copy_waits{};  ///< Copy path: waited for the GPU to finish the copy
++    std::atomic<u64> copy_wait_ns{};
++    std::atomic<u64> unknown{};     ///< Copy path: no current copy (drain and flush) or pending
++    std::atomic<u64> merged{};      ///< Copy reads that took the other words from guest memory
++    std::atomic<u64> clears{};      ///< Back: DMA clears that reached the buffer check
++    std::atomic<u64> clears_missed{}; ///< ...registered in their range, not in its first quarter
++};
++inline L1094Stats g_l1094_stats;
++/// Whether g_l1094_stats counts, as of the split's last start (set before its back starts).
++inline bool g_l1094_counting{};
++inline void L1094Count(std::atomic<u64>& counter, u64 amount = 1) {
++    if (g_l1094_counting) [[unlikely]] {
++        counter.fetch_add(amount, std::memory_order_relaxed);
++    }
++}
++
+ // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
+ // CPU's commands, parses command lists and runs the puller; engine method calls and everything
+ // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a
+@@ -532,6 +564,32 @@
+         static const bool enabled = Common::PeSwitch("EDEN_UP_L1056_BACK_MACROS");
+         return enabled;
+     }
++    // EDEN_UP_L1094_LIST_WORDS=1 (zortos293/Lichii #1094 by jpkto, #805's list 18 34656e8225): a
++    // command list page keeps which of its words GPU work wrote that guest memory lacks; a list on
++    // a page flushed once and on none of those words reads guest memory (no copy, no drain), and a
++    // copy read takes the other words from guest memory. DMACopy and DMAClear note their guest
++    // writes to the pages (as EDEN_UP_FRITCHII_DMALIST's notes). Off unless exactly "1"; read once.
++    [[nodiscard]] static bool L1094ListWords() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_L1094_LIST_WORDS");
++        return enabled;
++    }
++    // EDEN_UP_L1094_DMACLEAR=1 (#1094, from 34656e8225): DMAClear's buffer check covers the whole
++    // range (`amount` counts words; the check took it as bytes), as EDEN_UP_FRITCHII_DMALIST does
++    // without its notes. Off unless exactly "1"; read once.
++    [[nodiscard]] static bool L1094DmaClear() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_L1094_DMACLEAR");
++        return enabled;
++    }
++    /// EDEN_UP_L1094_STATS=1: count and log the #1094 line every 10 s (g_l1094_stats).
++    [[nodiscard]] static bool L1094StatsSwitch() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_L1094_STATS");
++        return enabled;
++    }
++    /// Whether the command list pages track their GPU-written words: for LIST_WORDS or its stats.
++    [[nodiscard]] static bool L1094TrackWords() {
++        static const bool track = L1094ListWords() || L1094StatsSwitch();
++        return track;
++    }
+     /// Front, EDEN_UP_FRITCHII_LISTSKIP: copy engine work that may write memory was just sent (after
+     /// NoteWriter). It can copy GPU-written words anywhere, so every entry waits while it is queued.
+     void NoteCopyWriter() {
+@@ -870,6 +928,8 @@
+     void ReportL949();
+     /// Front thread, while g_l1056_counting: logs g_l1056_stats every 10 s.
+     void ReportL1056();
++    /// Front thread, while g_l1094_counting: logs g_l1094_stats every 10 s.
++    void ReportL1094();
+     /// EDEN_UP_L949_ACQUIRE: NoteSemaphoreWrite with the switch on.
+     void RecordSemaphoreWrite(u64 device_address, u32 payload, bool known);
+     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+@@ -895,6 +955,9 @@
+     /// Front, while g_l1056_counting: calls of ReportL1056 and the start of its window.
+     u32 l1056_report_calls{};
+     u64 l1056_window_start{};
++    /// Front, while g_l1094_counting: calls of ReportL1094 and the start of its window.
++    u32 l1094_report_calls{};
++    u64 l1094_window_start{};
+     u64 session_generation{};
+     std::unique_ptr<u64[]> ring;
+ 

@@ -1,0 +1,1484 @@
+Subject: [PATCH] EDEN_UP_UBO_AHEAD (+ _LARGE, _STATS, _VERIFY): run a frame ahead (EDEN_NX2_FRAMES_AHEAD=1), the back's uniform binds read the split front's copies of the constant buffer pages, taken after each list batch's submit and each semaphore acquire, instead of guest memory the game already rewrites for the next frame; all off by default
+
+Follows GrowingBlackBeans' EDEN_GBB_UBO_AHEAD (issue 21, 9 Nov: 0439's present-time copy moved
+into the one-frame-ahead present hit its 4 MiB cap and missed most frames the back recorded).
+Here the front copies at the binds and draw methods it parses, so every frame the back records
+has its copies: 4 KiB pages, once per capture epoch (each DmaPusher::DispatchCalls and each
+semaphore acquire, met at once or not), a page whose bytes did not change keeps its copy, sent
+to the back in stream order (GpuSplit::DeferWords, which now takes Defer's flags: the batches
+are FastDrawNeutral). GPU writes reach the copies through the hooks 0439 placed
+(UboSnapshot::OnGpuWrite). Copies live in a pool of 1 MiB blocks that grows on demand up to
+128 MiB and is freed when the split stops. Ranges up to 4 KiB are served (of a larger binding
+the first 4 KiB are captured for them); larger ones (the 64 KiB indirectly read banks) with
+EDEN_UP_UBO_AHEAD_LARGE=1. Binds the copies can't serve read guest memory as before, counted by
+reason. EDEN_UP_UBO_AHEAD_STATS=1 logs three lines every 10 s; EDEN_UP_UBO_AHEAD_VERIFY=1
+compares each bind's copy, and each texture handle word a full resolve reads, with guest memory
+(with or without UBO_AHEAD). Off with EDEN_UP_L1056_BACK_MACROS=1. Not covered: texture and
+sampler handles (VERIFY counts changed handle words), compute constant buffers.
+
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 2b9cda5..88ad2d7 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -103,6 +103,8 @@ add_library(video_core STATIC
+     gpu_split.cpp
+     gpu_split.h
+     gpu_split_sites.h
++    ubo_ahead.cpp
++    ubo_ahead.h
+     ubo_snapshot.cpp
+     ubo_snapshot.h
+     gpu_thread.cpp
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9d25cb2..8791dc0 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -29,6 +29,7 @@
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/texture_cache/util.h"
++#include "video_core/ubo_ahead.h"
+ #include "video_core/ubo_snapshot.h"
+ 
+ namespace VideoCommon {
+@@ -2690,6 +2691,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         // How much of this slot's buffer the present's copy takes (ubo_snapshot.h).
+         UboSnapshot::NoteUsedSize(stage, index, (*channel_state->uniform_buffer_sizes)[stage][index]);
+     }
++    if (UboAhead::Capturing()) [[unlikely]] {
++        // How much of this slot's buffers the front copies (ubo_ahead.h).
++        UboAhead::NoteUsedSize(stage, index, (*channel_state->uniform_buffer_sizes)[stage][index],
++                               device_memory);
++    }
+     Buffer& buffer = slot_buffers[binding.buffer_id];
+     TouchBuffer(buffer, binding.buffer_id);
+     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
+@@ -2705,6 +2711,19 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+             return alignment > 1 && (offset % alignment) != 0;
+         }
+     }();
++    // EDEN_UP_UBO_AHEAD: the bytes as the front copied them after the list's submit, not guest
++    // memory the game may already rewrite for the next frame (ubo_ahead.h). Ranges the GPU wrote
++    // on the host stay with the host buffer; what the copies can't serve takes the paths below.
++    // EDEN_UP_UBO_AHEAD_VERIFY: compared with guest memory first (also without UBO_AHEAD).
++    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
++        if (UboAhead::Capturing() && has_host_buffer && size != 0) [[unlikely]] {
++            if (BindUboAheadUniformBuffer(stage, index, binding_index, device_addr, size)) {
++                channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
++                channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
++                return;
++            }
++        }
++    }
+     // EDEN_UP_UBO_SNAPSHOT: the bytes as they were when the game presented this frame, not guest
+     // memory it may already rewrite for the next one (ubo_snapshot.h). Ranges the GPU wrote stay
+     // with the host buffer; ranges the copy lacks take the paths below, as without it.
+@@ -2889,6 +2908,74 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+     channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
+ }
+ 
++template <class P>
++bool BufferCache<P>::BindUboAheadUniformBuffer(size_t stage, u32 index, u32 binding_index,
++                                               DAddr device_addr, u32 size) {
++    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
++        const bool gpu_modified = memory_tracker.IsRegionGpuModified(device_addr, size);
++        if (UboAhead::VerifyEnabled() && !gpu_modified) {
++            UboAhead::BackVerify(device_addr, size, device_memory);
++        }
++        if (!UboAhead::Enabled()) {
++            return false;
++        }
++        if (gpu_modified) {
++            UboAhead::NoteFallback(UboAhead::Fallback::GpuModified);
++            return false;
++        }
++        const bool large = size > UboAhead::SmallMax;
++        if (large && !UboAhead::LargeEnabled()) {
++            UboAhead::NoteFallback(UboAhead::Fallback::LargeOff);
++            return false;
++        }
++        u64 signature = 0;
++        if (!UboAhead::BackProbe(device_addr, size, signature)) {
++            return false; // Counted by BackProbe
++        }
++        if (!large) {
++            UboAhead::BackCopy(device_addr, size, ubo_ahead_scratch.data());
++            bool streamed = false;
++            if (VideoCommon::UniformStreamReuseEnabled()) {
++                streamed = VideoCommon::BindSmallUniformFromSource(
++                    runtime, stage, index, binding_index, ubo_ahead_scratch.data(), size);
++            }
++            if (!streamed) {
++                const std::span<u8> span =
++                    runtime.BindMappedUniformBuffer(stage, binding_index, size);
++                std::memcpy(span.data(), ubo_ahead_scratch.data(), size);
++            }
++            UboAhead::NoteServed(false, false);
++            return true;
++        }
++        // Over 4 KiB (the 64 KiB banks): streamed whole from the copies, and bound again while
++        // nothing changes in the same command buffer, instead of the host buffer synchronized from
++        // guest memory (the bank re-mark and SynchronizeBuffer are skipped; tracking stays).
++        if (stage >= ubo_ahead_reuse.size() || index >= ubo_ahead_reuse[stage].size()) {
++            UboAhead::NoteFallback(UboAhead::Fallback::LargeOff);
++            return false;
++        }
++        UboAheadReuse& reuse = ubo_ahead_reuse[stage][index];
++        if (reuse.size == size && reuse.device_addr == device_addr &&
++            reuse.signature == signature && reuse.tick == runtime.CurrentTick()) {
++            runtime.RebindStreamUniform(reuse.ref, size);
++            UboAhead::NoteServed(true, true);
++            return true;
++        }
++        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
++        UboAhead::BackCopy(device_addr, size, span.data());
++        reuse.ref = runtime.LastStreamUniformRef();
++        reuse.device_addr = device_addr;
++        reuse.signature = signature;
++        // After the allocation: the tick its stream region is tagged with.
++        reuse.tick = runtime.CurrentTick();
++        reuse.size = size;
++        UboAhead::NoteServed(true, false);
++        return true;
++    } else {
++        return false;
++    }
++}
++
+ template <class P>
+ bool BufferCache<P>::BindSnapshotUniformBuffer(size_t stage, u32 index, u32 binding_index,
+                                                DAddr device_addr, u32 size) {
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 05a0eea..d3162de 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -38,6 +38,7 @@
+ #include "shader_recompiler/storage_write_extent.h"
+ #include "video_core/buffer_cache/buffer_base.h"
+ #include "video_core/buffer_cache/uniform_stream_reuse.h"
++#include "video_core/ubo_ahead.h"
+ #include "video_core/buffer_cache/virtual_range_cache.h"
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/delayed_destruction_ring.h"
+@@ -534,6 +535,22 @@ public:
+     std::array<std::array<UboSnapshotReuse, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+         ubo_snapshot_reuse{};
+     std::array<u8, 4096> ubo_snapshot_scratch{};
++    /// EDEN_UP_UBO_AHEAD (ubo_ahead.h): binds (stage, cbuf `index`) from the front's copies of the
++    /// constant buffer pages; false (nothing bound, the fallback counted) when they can't serve it.
++    bool BindUboAheadUniformBuffer(size_t stage, u32 index, u32 binding_index, DAddr device_addr,
++                                   u32 size);
++    /// Per stage and slot: the stream allocation a range over 4 KiB was copied to last. Bound
++    /// again while the address, size, the copies' signature and the command buffer are the same.
++    struct UboAheadReuse {
++        typename VideoCommon::StreamUniformRefOf<Runtime>::type ref{};
++        DAddr device_addr{};
++        u64 signature{};
++        u64 tick{};
++        u32 size{}; ///< 0: nothing streamed
++    };
++    std::array<std::array<UboAheadReuse, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
++        ubo_ahead_reuse{};
++    std::array<u8, VideoCommon::UboAhead::SmallMax> ubo_ahead_scratch{};
+     /// A page of a native program's indirectly read bank when last checked: unchanged pages keep
+     /// their tracking (marking one costs two mprotect calls).
+     struct Nx2BankPage {
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 88753ca..112c923 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -34,6 +34,7 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2.h"
+ #include "video_core/rasterizer_interface.h"
++#include "video_core/ubo_ahead.h"
+ 
+ // PS5 port (EDEN_NX2_JUNK_TRACE): the guest memory service's state of the slot behind a host
+ // address, and whether that slot ever went out to the file or a packed block. Absent elsewhere.
+@@ -457,6 +458,9 @@ bool DmaPusher::CanResumeAcquire() {
+ void DmaPusher::DispatchCalls() {
+     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
+     dma_state.is_last_call = true;
++    // EDEN_UP_UBO_AHEAD / _VERIFY: the lists from here on were submitted after the front's last
++    // constant buffer copies, whose bytes the CPU may have rewritten for them (ubo_ahead.h).
++    VideoCommon::UboAhead::FrontNewEpoch();
+     while (system.IsPoweredOn()) {
+         if (!Step()) {
+             break;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 18c06f9..01ad6c7 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -36,6 +36,7 @@
+ #include "video_core/query_dma.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/textures/texture.h"
++#include "video_core/ubo_ahead.h"
+ #include "video_core/ubo_snapshot.h"
+ #ifdef ARCHITECTURE_x86_64
+ #include "video_core/macro_turing_jit.h"
+@@ -1353,6 +1354,11 @@ struct Maxwell3D::FrontState {
+     u64 back_last{};                 ///< The position after the last macro sent to the back
+     std::atomic<u32> back_escapes{}; ///< Back macros that wrote outside their write set
+     u32 back_escapes_seen{};
++
++    /// EDEN_UP_UBO_AHEAD / _VERIFY (ubo_ahead.h): the constant buffer bindings as ProcessCBBind
++    /// leaves them on the back, and the capture epoch of the last draw method sent.
++    VideoCommon::UboAhead::FrontBindings ubo_bindings{};
++    u64 ubo_epoch{};
+ };
+ 
+ namespace {
+@@ -1471,6 +1477,53 @@ void FrontNoteBind(const void* engine, MemoryManager& memory_manager, const u32*
+         valid ? memory_manager.GpuToCpuAddress(address) : std::optional<DAddr>{}, size);
+ }
+ 
++// EDEN_UP_UBO_AHEAD / _VERIFY: a bind group write (`value`, shadow RAM applied) as ProcessCBBind
++// will run it on the back, against the front's copy of the registers: the binding, and the
++// front's copy of the pages it reads (ubo_ahead.h).
++void FrontNoteUboAheadBind(VideoCommon::UboAhead::FrontBindings& bindings,
++                           MemoryManager& memory_manager, const u32* regs, u32 method, u32 value) {
++    constexpr u32 first = MAXWELL3D_REG_INDEX(bind_groups[0].raw_config);
++    constexpr u32 stride = MAXWELL3D_REG_INDEX(bind_groups[1].raw_config) - first;
++    const u32 stage = (method - first) / stride;
++    const u32 slot = (value >> 4) & 31;
++    if (stage >= VideoCommon::UboAhead::NumStages || slot >= VideoCommon::UboAhead::NumSlots) {
++        return; // ProcessCBBind ignores slots past the 18 it holds
++    }
++    VideoCommon::UboAhead::Binding& binding = bindings[stage][slot];
++    if ((value & 1) == 0) {
++        binding = {};
++        return;
++    }
++    const GPUVAddr address =
++        (GPUVAddr{regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
++        regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
++    const u32 size = regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
++    const std::optional<DAddr> device = memory_manager.GpuToCpuAddress(address);
++    binding = {device.value_or(0), size, device.has_value()};
++    if (binding.valid) {
++        VideoCommon::UboAhead::FrontCapture(binding.device, size, stage, slot);
++    }
++}
++
++// EDEN_UP_UBO_AHEAD / _VERIFY: a method the draw manager handles is about to be sent. The first in
++// a capture epoch captures every binding again: the lists of the new epoch may read bytes the CPU
++// wrote after the last copy.
++void FrontUboAheadDraw(VideoCommon::UboAhead::FrontBindings& bindings, u64& seen_epoch) {
++    const u64 epoch = VideoCommon::UboAhead::FrontEpoch();
++    if (seen_epoch == epoch) {
++        return;
++    }
++    seen_epoch = epoch;
++    for (size_t stage = 0; stage < VideoCommon::UboAhead::NumStages; ++stage) {
++        for (u32 slot = 0; slot < VideoCommon::UboAhead::NumSlots; ++slot) {
++            const VideoCommon::UboAhead::Binding& binding = bindings[stage][slot];
++            if (binding.valid) {
++                VideoCommon::UboAhead::FrontCapture(binding.device, binding.size, stage, slot);
++            }
++        }
++    }
++}
++
+ // EDEN_UP_L1056_BACK_MACROS (zortos293/Lichii #1056, BackWritable): whether a macro the split's
+ // back runs may write `method`: the front then only loses track of the register's value. Not the
+ // methods with effects the front tracks (macro code and bindings, the shadow RAM mode, draws,
+@@ -1548,6 +1601,19 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
+         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+         front->executing_macro = executing_macro;
+         front->parameters = std::move(macro_params);
++        if (VideoCommon::UboAhead::Capturing()) [[unlikely]] {
++            // EDEN_UP_UBO_AHEAD: the bindings ProcessCBBind made on the back so far.
++            for (size_t stage = 0; stage < VideoCommon::UboAhead::NumStages; ++stage) {
++                for (u32 slot = 0; slot < VideoCommon::UboAhead::NumSlots; ++slot) {
++                    const auto& buffer = state.shader_stages[stage].const_buffers[slot];
++                    const std::optional<DAddr> device =
++                        buffer.enabled ? memory_manager.GpuToCpuAddress(buffer.address)
++                                       : std::optional<DAddr>{};
++                    front->ubo_bindings[stage][slot] = {device.value_or(0), buffer.size,
++                                                        device.has_value()};
++                }
++            }
++        }
+         macro_params.clear();
+         executing_macro = 0;
+         front_macros = true;
+@@ -1638,6 +1704,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+             if (VideoCommon::UboSnapshot::Enabled()) [[unlikely]] {
+                 FrontNoteBind(this, memory_manager, fs.regs.data(), method, value);
+             }
++            if (VideoCommon::UboAhead::Capturing()) [[unlikely]] {
++                FrontNoteUboAheadBind(fs.ubo_bindings, memory_manager, fs.regs.data(), method,
++                                      value);
++            }
+             break;
+         case MAXWELL3D_REG_INDEX(sync_info):
+             // EDEN_UP_OOT_FRONT_WAIT: counted before it is sent (GpuSplit::FrontReached).
+@@ -1662,10 +1732,15 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+                 fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
+             } else if (!FrontHandledOutsideDrawManager(method)) {
+                 fs.draw_pending = true;
++                if (VideoCommon::UboAhead::Capturing()) [[unlikely]] {
++                    FrontUboAheadDraw(fs.ubo_bindings, fs.ubo_epoch);
++                }
+             }
+             break;
+         }
+     }
++    // EDEN_UP_UBO_AHEAD / _VERIFY: the copies (and a new epoch) reach the back before the method.
++    VideoCommon::UboAhead::FrontFlush();
+     constexpr u32 cb_data_first = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+     if (!execution_mask[method] && split.RegBlocks()) {
+         split.PlainWrite(this, method, argument);
+@@ -1785,6 +1860,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+             fs.regs[method] = last;
+         }
+         fs.draw_pending = true;
++        if (VideoCommon::UboAhead::Capturing()) [[unlikely]] {
++            FrontUboAheadDraw(fs.ubo_bindings, fs.ubo_epoch);
++        }
+     } else {
+         // CallMethod for each word, macro uploads among them (load_mme.instruction). A word may
+         // change the shadow RAM mode for the next (a run of SET_SHADOW_RAM_CONTROL writes).
+@@ -1835,6 +1913,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+                 if (VideoCommon::UboSnapshot::Enabled()) [[unlikely]] {
+                     FrontNoteBind(this, memory_manager, fs.regs.data(), method, value);
+                 }
++                if (VideoCommon::UboAhead::Capturing()) [[unlikely]] {
++                    FrontNoteUboAheadBind(fs.ubo_bindings, memory_manager, fs.regs.data(), method,
++                                          value);
++                }
+                 break;
+             case MAXWELL3D_REG_INDEX(sync_info):
+                 // EDEN_UP_OOT_FRONT_WAIT: counted before the words are sent, after this loop.
+@@ -1845,11 +1927,16 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+             default:
+                 if (!FrontHandledOutsideDrawManager(method)) {
+                     fs.draw_pending = true;
++                    if (VideoCommon::UboAhead::Capturing()) [[unlikely]] {
++                        FrontUboAheadDraw(fs.ubo_bindings, fs.ubo_epoch);
++                    }
+                 }
+                 break;
+             }
+         }
+     }
++    // EDEN_UP_UBO_AHEAD / _VERIFY: the copies (and a new epoch) reach the back before the words.
++    VideoCommon::UboAhead::FrontFlush();
+     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+     // Noted once sent (see FrontWrite).
+     if (FrontMemoryNotesEnabled() && amount != 0 && FrontWritesGuestMemory(method)) {
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 5852438..cb50dae 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -27,6 +27,7 @@
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/readback_wait.h"
++#include "video_core/ubo_ahead.h"
+ 
+ namespace Tegra::Engines {
+ 
+@@ -706,6 +707,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+             LOG_ERROR(HW_GPU, "Invalid semaphore operation {}", static_cast<u32>(op));
+             return;
+         }
++        // EDEN_UP_UBO_AHEAD: a new capture epoch. The CPU may write what the commands after an
++        // acquire read until it releases it, also when the acquire is met at once (ubo_ahead.h).
++        VideoCommon::UboAhead::FrontNewEpoch();
+         // EDEN_UP_FRITCHII_LISTSYNC: a semaphore acquire is a host-level wait, whichever way it is
+         // met below (drained, queued release, SEM_FAST; a suspended one again at ResumeAcquire).
+         // Nothing unless set.
+@@ -772,6 +776,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+         }
+     } else {
+         DrainBack();
++        // EDEN_UP_UBO_AHEAD: a new capture epoch. The CPU may write what the commands after an
++        // acquire read until it releases it, also when the acquire is met at once (ubo_ahead.h).
++        VideoCommon::UboAhead::FrontNewEpoch();
+         do {
+             const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
+             regs.acquire_source = true;
+@@ -816,6 +823,9 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
+ 
+ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+     DrainBack();
++    // EDEN_UP_UBO_AHEAD: a new capture epoch. The CPU may write what the commands after an
++    // acquire read until it releases it, also when the acquire is met at once (ubo_ahead.h).
++    VideoCommon::UboAhead::FrontNewEpoch();
+     // EDEN_UP_FAST_DRAW: the CPU may rewrite what the next draws read once it sees the release
+     // this waits for.
+     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+@@ -849,6 +859,9 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+         NoteSemaphoreRelease(dma_pusher, address, payload, false); // EDEN_UP_L949_ACQUIRE
+         return;
+     }
++    // EDEN_UP_UBO_AHEAD: a new capture epoch. The CPU may write what the commands after an
++    // acquire read until it releases it, also when the acquire is met at once (ubo_ahead.h).
++    VideoCommon::UboAhead::FrontNewEpoch();
+     // EDEN_UP_FRITCHII_LISTSYNC: an acquire, met or not below (nothing unless set).
+     VideoCommon::GpuSplit::Get().NoteListSync();
+     const auto met = [operation, payload](u32 word) {
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 173e593..ef62a0e 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -30,6 +30,7 @@
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/ubo_ahead.h"
+ #include "video_core/ubo_snapshot.h"
+ 
+ namespace VideoCommon {
+@@ -266,6 +267,9 @@ void GpuSplit::Stop() {
+     if (UboSnapshot::Enabled()) {
+         UboSnapshot::Reset(); // The copies, the bind log and the back's frame
+     }
++    if (UboAhead::Capturing()) {
++        UboAhead::Reset(); // EDEN_UP_UBO_AHEAD: the copies, both threads' views of them
++    }
+ }
+ 
+ u64* GpuSplit::ReserveSlow(size_t words) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index bb062fb..562374a 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -252,14 +252,14 @@ public:
+         Commit(2 + payload);
+     }
+     /// EDEN_UP_L1056_BACK_MACROS (zortos293/Lichii #1056): Defer, calling `func` with a copy of
+-    /// `words` (a std::span<const u32>) made at the send.
++    /// `words` (a std::span<const u32>) made at the send. `flags` as Defer's.
+     template <typename Func>
+-    void DeferWords(const Func& func, std::span<const u32> words) {
++    void DeferWords(const Func& func, std::span<const u32> words, u64 flags = 0) {
+         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+         constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+         const size_t payload = function_words + 1 + (words.size() + 1) / 2;
+         u64* const entry = Reserve(2 + payload);
+-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
++        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
+         entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
+         std::memcpy(entry + 2, &func, sizeof(Func));
+         entry[2 + function_words] = words.size();
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 1035067..06268dc 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -350,9 +350,9 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
+         }
+         return page_pointer;
+     });
+-    if (VideoCommon::UboSnapshot::Enabled()) [[unlikely]] {
++    if (VideoCommon::UboSnapshot::Enabled() || VideoCommon::UboAhead::Capturing()) [[unlikely]] {
+         // EDEN_UP_UBO_SNAPSHOT: the frame's constant buffer copies take GPU writes too (a
+-        // semaphore release), per device page.
++        // semaphore release), per device page. EDEN_UP_UBO_AHEAD's copies as well.
+         const u8* const bytes = reinterpret_cast<const u8*>(&data);
+         for (size_t done = 0; done < sizeof(T);) {
+             const GPUVAddr address = addr + done;
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 0d5ccfb..4ba37af 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -38,6 +38,7 @@
+ #include "common/settings.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/ubo_ahead.h"
+ 
+ #if defined(__clang__) && defined(NDEBUG)
+ #define LAMBDA_FORCEINLINE __attribute__((always_inline))
+@@ -638,6 +639,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+             }
+         }
+         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
++        // EDEN_UP_UBO_AHEAD_VERIFY: each handle word read from guest memory is compared with the
++        // front's copy of its constant buffer page (ubo_ahead.h). Nothing else unless set.
++        const auto read_word{[&](u32 cbuf_index, u32 offset, GPUVAddr addr) {
++            const u32 word{gpu_memory->Read<u32>(addr)};
++            if (VideoCommon::UboAhead::Capturing() && VideoCommon::UboAhead::VerifyEnabled())
++                [[unlikely]] {
++                VideoCommon::UboAhead::BackVerifyHandle(stage, cbuf_index, offset,
++                                                        gpu_memory->GpuToCpuAddress(addr), word);
++            }
++            return word;
++        }};
+         const auto read_handle{[&](const auto& desc, u32 index) {
+             if (desc.handle_program != ~0U) {
+                 // Read by the shader from a storage buffer: computed for this draw.
+@@ -661,14 +673,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+                     const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
+                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
+                                                  second_offset};
+-                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
+-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
++                    const u32 lhs_raw{read_word(desc.cbuf_index, offset, addr)
++                                      << desc.shift_left};
++                    const u32 rhs_raw{read_word(desc.secondary_cbuf_index, second_offset,
++                                                separate_addr)
+                                       << desc.secondary_shift_left};
+                     const u32 raw{lhs_raw | rhs_raw};
+                     return TexturePair(raw, via_header_index);
+                 }
+             }
+-            return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
++            return TexturePair(read_word(desc.cbuf_index, offset, addr), via_header_index);
+         }};
+         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
+             for (u32 index = 0; index < desc.count; ++index) {
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index 0b5ce8d..78a07d5 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -606,7 +606,9 @@ void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
+ 
+             SwizzleTexture(dst, src, bytes_per_block, num_tiles.width, num_tiles.height,
+                            num_tiles.depth, block.height, block.depth, 1, gpu_memory.UsesNativeTiling());
+-            if (VideoCommon::UboSnapshot::Enabled()) [[unlikely]] {
++            if (VideoCommon::UboSnapshot::Enabled() || VideoCommon::UboAhead::Capturing())
++                [[unlikely]] {
++                // EDEN_UP_UBO_AHEAD's copies take them too (through UboSnapshot::OnGpuWrite).
+                 NoteInPlaceWriteForUboSnapshot(gpu_memory, gpu_addr + guest_offset,
+                                                std::span<const u8>(dst.data(), dst.size()));
+             }
+diff --git a/src/video_core/ubo_ahead.cpp b/src/video_core/ubo_ahead.cpp
+new file mode 100644
+index 0000000..3aa3211
+--- /dev/null
++++ b/src/video_core/ubo_ahead.cpp
+@@ -0,0 +1,734 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <span>
++#include <unordered_map>
++#include <vector>
++
++#include "common/logging.h"
++#include "video_core/gpu_split.h"
++#include "video_core/ubo_ahead.h"
++
++namespace VideoCommon::UboAhead {
++
++namespace {
++
++constexpr u64 PageBits = 12; // Core::DEVICE_PAGEBITS
++constexpr u64 PageSize = u64{1} << PageBits;
++constexpr u64 PageMask = PageSize - 1;
++constexpr u64 AddressBits = 36; // the device address space (DevicePageFlags::AddressBits)
++constexpr u64 NumPages = u64{1} << (AddressBits - PageBits);
++constexpr u32 SlotsPerBlock = 256; // 1 MiB blocks
++constexpr u32 MaxBlocks = 128;     // 128 MiB of copies at most
++constexpr u32 NoSlot = ~0U;
++constexpr u32 DropFlag = 1U << 31;  // An update that drops the page (slot ids stay below 2^15)
++constexpr size_t MaxLive = 16;      // Copies of one page alive at once: the back's and the queued
++constexpr u64 DropAfter = 32;       // Epochs without a capture before the front drops a page
++constexpr u64 SweepEvery = 16;      // Epochs between the front's drop sweeps
++constexpr size_t MaxBatchWords = 2 + 2 * 512;
++constexpr u64 ReportNs = 10'000'000'000;
++
++/// A page's copies alive at once, oldest first: the one the back applied last (if any) and the
++/// ones the front sent after it. GPU writes go into all of them. Under State::mutex; inserted by
++/// the front, erased by the back once a drop emptied it.
++struct SharedPage {
++    std::array<u32, MaxLive> slots{};
++    u32 count{};
++    std::atomic<u64> writes{}; ///< GPU writes copied into its copies (BackProbe's signature)
++};
++/// Front only: the newest copy of a page and the epoch it was last captured (or failed) in.
++struct FrontPage {
++    u32 slot{NoSlot};
++    u64 epoch{};
++    SharedPage* shared{};
++};
++/// Back only: the copy draws read now, and the epoch it was last captured in.
++struct BackPage {
++    u32 slot{NoSlot};
++    u64 epoch{};
++    u64 seq{}; ///< Changes with the copy (BackProbe's signature)
++    SharedPage* shared{};
++};
++
++struct Stats {
++    std::atomic<u64> epochs{};
++    std::atomic<u64> captures{};       ///< Front: bindings captured (bind or a new epoch's draw)
++    std::atomic<u64> pages_checked{};  ///< Front: pages read this epoch for the first time
++    std::atomic<u64> new_copies{};     ///< ...whose bytes differed from their last copy
++    std::atomic<u64> unchanged{};      ///< ...whose last copy still held them
++    std::atomic<u64> unhinted{};       ///< Front: bindings no draw read yet (not captured)
++    std::atomic<u64> large_capped{};   ///< Front: over 4 KiB without _LARGE (first 4 KiB taken)
++    std::atomic<u64> unmapped{};       ///< Front: pages without guest memory
++    std::atomic<u64> lag{};            ///< Front: a page with MaxLive copies alive (not captured)
++    std::atomic<u64> pool_full{};      ///< Front: no room for a copy (not captured)
++    std::atomic<u64> front_ns{};
++    std::atomic<u64> batches{};
++    std::atomic<u64> drops{};
++    std::atomic<u64> applied{};        ///< Back: copies it switched to
++    std::atomic<u64> served_small{};
++    std::atomic<u64> served_large{};
++    std::atomic<u64> reused_large{};
++    std::array<std::atomic<u64>, static_cast<size_t>(Fallback::Count)> fallbacks{};
++    std::atomic<u64> write_throughs{}; ///< GPU writes that reached copies
++    std::atomic<u64> errors{};         ///< Updates naming a copy the page doesn't have (a bug)
++    std::atomic<u64> verified{};       ///< VERIFY: ranges compared
++    std::atomic<u64> verify_uncaptured{}; ///< VERIFY: ranges with no current copy (not compared)
++    std::atomic<u64> changed_small{};  ///< VERIFY: ranges up to 4 KiB whose bytes changed
++    std::atomic<u64> changed_bytes_small{};
++    std::atomic<u64> changed_first_kib{}; ///< VERIFY: larger ranges (first 4 KiB compared),
++    std::atomic<u64> changed_to_4kib{};   ///< ...first change in the 1st KiB, or in 1-4 KiB
++    std::atomic<u64> changed_bytes_large{};
++    std::atomic<u64> handles_compared{};   ///< VERIFY: texture handle words compared
++    std::atomic<u64> handles_uncaptured{}; ///< VERIFY: ...with no current copy (not compared)
++    std::atomic<u64> handles_changed{};    ///< VERIFY: ...whose guest word differs from the copy
++};
++
++struct State {
++    State() : live_bits{std::make_unique<std::atomic<u64>[]>(NumPages / 64)} {
++        pending.reserve(MaxBatchWords);
++        free_slots.reserve(size_t{SlotsPerBlock} * 4);
++    }
++
++    /// Guards the pool, the shared pages and the bytes of the copies against GPU writes.
++    std::mutex mutex;
++    std::array<std::atomic<u8*>, MaxBlocks> blocks{};
++    std::vector<std::unique_ptr<u8[]>> block_storage; ///< Under mutex
++    std::vector<u32> free_slots;                      ///< Under mutex
++    u32 used_slots{};                                 ///< Under mutex
++    u32 peak_slots{};                                 ///< Under mutex
++    std::unordered_map<u64, SharedPage> shared;       ///< Under mutex
++    /// One bit per device page: set while it has a SharedPage (any thread reads it unlocked).
++    std::unique_ptr<std::atomic<u64>[]> live_bits;
++    std::atomic<Tegra::MaxwellDeviceMemoryManager*> memory{};
++    /// Per stage and slot: the most bytes a shader read (NoteUsedSize); 0 until a draw read it.
++    std::array<std::atomic<u32>, NumStages * NumSlots> hints{};
++
++    // Front thread only.
++    u64 epoch{1};
++    bool epoch_sent{};
++    u64 last_sweep{};
++    std::unordered_map<u64, FrontPage> front;
++    std::vector<u32> pending;
++    std::chrono::steady_clock::time_point report_at{};
++
++    // Back thread only.
++    std::unordered_map<u64, BackPage> back;
++    u64 back_epoch{};
++    u64 back_seq{};
++
++    Stats stats;
++};
++
++State& Get() {
++    static State state;
++    return state;
++}
++
++void Count(std::atomic<u64>& counter, u64 amount = 1) {
++    counter.fetch_add(amount, std::memory_order_relaxed);
++}
++
++bool Live(const State& s, u64 page) {
++    return page < NumPages &&
++           (s.live_bits[page / 64].load(std::memory_order_relaxed) >> (page % 64) & 1) != 0;
++}
++void SetLive(State& s, u64 page, bool live) {
++    const u64 bit = u64{1} << (page % 64);
++    if (live) {
++        s.live_bits[page / 64].fetch_or(bit, std::memory_order_seq_cst);
++    } else {
++        s.live_bits[page / 64].fetch_and(~bit, std::memory_order_seq_cst);
++    }
++}
++
++u8* SlotPointer(const State& s, u32 slot) {
++    return s.blocks[slot / SlotsPerBlock].load(std::memory_order_acquire) +
++           size_t{slot % SlotsPerBlock} * PageSize;
++}
++
++/// Under mutex. NoSlot once MaxBlocks are in use.
++u32 AllocateSlot(State& s) {
++    if (s.free_slots.empty()) {
++        const size_t block = s.block_storage.size();
++        if (block >= MaxBlocks) {
++            return NoSlot;
++        }
++        s.block_storage.push_back(std::make_unique<u8[]>(size_t{SlotsPerBlock} * PageSize));
++        s.blocks[block].store(s.block_storage.back().get(), std::memory_order_release);
++        for (u32 i = SlotsPerBlock; i-- > 0;) {
++            s.free_slots.push_back(static_cast<u32>(block) * SlotsPerBlock + i);
++        }
++    }
++    const u32 slot = s.free_slots.back();
++    s.free_slots.pop_back();
++    s.peak_slots = (std::max)(s.peak_slots, ++s.used_slots);
++    return slot;
++}
++/// Under mutex.
++void FreeSlot(State& s, u32 slot) {
++    s.free_slots.push_back(slot);
++    --s.used_slots;
++}
++
++/// Front: an update for the back (a page's copy, or a drop), after the epoch header. Sent by
++/// FrontFlush, or by FlushIfFull once a batch is full: never under the mutex (sending may wait
++/// for the back to make room in the ring, and the back's GPU writes take the mutex).
++void Queue(State& s, u64 page, u32 value) {
++    if (s.pending.empty()) {
++        s.pending.push_back(static_cast<u32>(s.epoch));
++        s.pending.push_back(static_cast<u32>(s.epoch >> 32));
++    }
++    s.pending.push_back(static_cast<u32>(page));
++    s.pending.push_back(value);
++    g_front_pending = true;
++}
++void FlushIfFull(State& s) {
++    if (s.pending.size() + 2 > MaxBatchWords) {
++        FrontFlushImpl();
++    }
++}
++
++/// Front: captures `page` for this epoch, unless it was already.
++void CapturePage(State& s, Tegra::MaxwellDeviceMemoryManager& memory, u64 page) {
++    if (page >= NumPages) {
++        Count(s.stats.unmapped);
++        return;
++    }
++    FrontPage& fp = s.front[page];
++    if (fp.epoch == s.epoch) {
++        return; // Captured (or failed) in this epoch already
++    }
++    fp.epoch = s.epoch;
++    Count(s.stats.pages_checked);
++    const u8* const guest = memory.GetPointer<u8>(page << PageBits);
++    if (guest == nullptr) {
++        Count(s.stats.unmapped);
++        return; // No update: the back's copy stays from an older epoch (Stale)
++    }
++    // Touched before the lock: a page the guest memory service swapped out comes back here.
++    [[maybe_unused]] const volatile u8 touch = *guest;
++    std::scoped_lock lock{s.mutex};
++    // A GPU write lands in guest memory, then takes this lock to reach the copies: compared and
++    // copied under it, a copy either holds the write already or is written by it afterwards.
++    if (fp.slot != NoSlot && std::memcmp(SlotPointer(s, fp.slot), guest, PageSize) == 0) {
++        Count(s.stats.unchanged);
++        Queue(s, page, fp.slot);
++        return;
++    }
++    SharedPage& shared = fp.shared != nullptr ? *fp.shared : s.shared[page];
++    if (shared.count == MaxLive) {
++        Count(s.stats.lag);
++        return;
++    }
++    const u32 slot = AllocateSlot(s);
++    if (slot == NoSlot) {
++        Count(s.stats.pool_full);
++        return;
++    }
++    // Live before the copy: a GPU write that misses the bit landed before the copy reads it.
++    SetLive(s, page, true);
++    std::memcpy(SlotPointer(s, slot), guest, PageSize);
++    shared.slots[shared.count++] = slot;
++    fp.slot = slot;
++    fp.shared = &shared;
++    Count(s.stats.new_copies);
++    Queue(s, page, slot);
++}
++
++/// Front: drops the pages no binding captured for DropAfter epochs.
++void Sweep(State& s) {
++    for (auto it = s.front.begin(); it != s.front.end();) {
++        if (it->second.epoch + DropAfter < s.epoch) {
++            if (it->second.slot != NoSlot) {
++                Count(s.stats.drops);
++                Queue(s, it->first, it->second.slot | DropFlag);
++                FlushIfFull(s);
++            }
++            it = s.front.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
++void Report(State& s) {
++    const auto now = std::chrono::steady_clock::now();
++    if (s.report_at.time_since_epoch().count() == 0) {
++        s.report_at = now;
++        return;
++    }
++    if (now - s.report_at < std::chrono::nanoseconds{ReportNs}) {
++        return;
++    }
++    s.report_at = now;
++    Stats& t = s.stats;
++    const auto take = [](std::atomic<u64>& counter) {
++        return counter.exchange(0, std::memory_order_relaxed);
++    };
++    u32 pool_mib = 0;
++    u32 used = 0;
++    u32 peak = 0;
++    {
++        std::scoped_lock lock{s.mutex};
++        pool_mib = static_cast<u32>(s.block_storage.size() * SlotsPerBlock * PageSize >> 20);
++        used = s.used_slots;
++        peak = s.peak_slots;
++        s.peak_slots = s.used_slots;
++    }
++    auto& f = t.fallbacks;
++    const u64 new_copies = take(t.new_copies);
++    // Three lines: the log formats into a BUFSIZ buffer (1 KiB on the console).
++    LOG_INFO(HW_GPU,
++             "EDEN_UP_UBO_AHEAD={} LARGE={} VERIFY={} 10 s front: {} epochs, {} bindings captured "
++             "({} over 4 KiB: first 4 KiB only), {} pages read ({} new copies = {} KiB, {} "
++             "unchanged); not captured: {} unread slots, {} unmapped, {} lag, {} pool full; "
++             "front {:.1f} ms; pool {} MiB, {} copies alive (peak {}); {} batches, {} drops",
++             Enabled() ? 1 : 0, LargeEnabled() ? 1 : 0, VerifyEnabled() ? 1 : 0, take(t.epochs),
++             take(t.captures), take(t.large_capped), take(t.pages_checked), new_copies,
++             new_copies * PageSize >> 10, take(t.unchanged), take(t.unhinted), take(t.unmapped),
++             take(t.lag), take(t.pool_full), static_cast<double>(take(t.front_ns)) / 1e6,
++             pool_mib, used, peak, take(t.batches), take(t.drops));
++    LOG_INFO(HW_GPU,
++             "EDEN_UP_UBO_AHEAD 10 s back: {} copies applied; binds served from copies: {} small, "
++             "{} large ({} rebound); binds that read guest memory: {} not captured, {} stale, {} "
++             "GPU-modified, {} large (switch off); {} GPU writes into copies; {} errors",
++             take(t.applied), take(t.served_small), take(t.served_large), take(t.reused_large),
++             take(f[0]), take(f[1]), take(f[2]), take(f[3]),
++             take(t.write_throughs), take(t.errors));
++    if (VerifyEnabled()) {
++        LOG_INFO(HW_GPU,
++                 "EDEN_UP_UBO_AHEAD_VERIFY 10 s: {} binds compared ({} without a current copy); "
++                 "bytes changed since the front's copy: {} binds up to 4 KiB ({} bytes); larger "
++                 "binds (first 4 KiB compared): {} changed in the first KiB, {} in 1-4 KiB ({} "
++                 "bytes); texture handle words: {} compared ({} without a current copy), {} "
++                 "changed",
++                 take(t.verified), take(t.verify_uncaptured), take(t.changed_small),
++                 take(t.changed_bytes_small), take(t.changed_first_kib), take(t.changed_to_4kib),
++                 take(t.changed_bytes_large), take(t.handles_compared),
++                 take(t.handles_uncaptured), take(t.handles_changed));
++    }
++}
++
++/// Back: the copies of `page`, the back's view of it.
++void BackApply(std::span<const u32> words) {
++    State& s = Get();
++    if (words.size() < 2) {
++        return;
++    }
++    s.back_epoch = u64{words[0]} | (u64{words[1]} << 32);
++    Count(s.stats.batches);
++    for (size_t i = 2; i + 1 < words.size(); i += 2) {
++        const u64 page = words[i];
++        const u32 value = words[i + 1];
++        if ((value & DropFlag) != 0) {
++            // Copies up to the front's last one go (a later one is a capture made after the drop).
++            s.back.erase(page);
++            std::scoped_lock lock{s.mutex};
++            const auto it = s.shared.find(page);
++            if (it == s.shared.end()) {
++                Count(s.stats.errors);
++                continue;
++            }
++            SharedPage& shared = it->second;
++            const u32 last = value & ~DropFlag;
++            const u32* const begin = shared.slots.data();
++            const u32* const end = begin + shared.count;
++            const u32* const found = std::find(begin, end, last);
++            if (found == end) {
++                Count(s.stats.errors);
++                continue;
++            }
++            const u32 gone = static_cast<u32>(found - begin) + 1;
++            for (u32 k = 0; k < gone; ++k) {
++                FreeSlot(s, shared.slots[k]);
++            }
++            std::copy(shared.slots.data() + gone, shared.slots.data() + shared.count,
++                      shared.slots.data());
++            shared.count -= gone;
++            if (shared.count == 0) {
++                SetLive(s, page, false);
++                s.shared.erase(it);
++            }
++            continue;
++        }
++        BackPage& bp = s.back[page];
++        if (bp.slot != value) {
++            std::scoped_lock lock{s.mutex};
++            const auto it = s.shared.find(page);
++            SharedPage* const shared = it != s.shared.end() ? &it->second : nullptr;
++            const u32* const begin = shared != nullptr ? shared->slots.data() : nullptr;
++            const u32* const end = shared != nullptr ? begin + shared->count : nullptr;
++            const u32* const found = shared != nullptr ? std::find(begin, end, value) : nullptr;
++            if (found == end) {
++                Count(s.stats.errors);
++                bp.slot = NoSlot;
++                bp.shared = nullptr;
++                continue;
++            }
++            // The older copies: no draw after this point reads them, and the front moved on.
++            const u32 older = static_cast<u32>(found - begin);
++            for (u32 k = 0; k < older; ++k) {
++                FreeSlot(s, shared->slots[k]);
++            }
++            std::copy(shared->slots.data() + older, shared->slots.data() + shared->count,
++                      shared->slots.data());
++            shared->count -= older;
++            bp.slot = value;
++            bp.shared = shared;
++            bp.seq = ++s.back_seq;
++            Count(s.stats.applied);
++        }
++        bp.epoch = s.back_epoch;
++    }
++}
++
++/// The front captures at least `size` bytes of (stage, slot)'s bindings from now on.
++void RaiseHint(State& s, size_t stage, u32 slot, u32 size) {
++    if (stage >= NumStages || slot >= NumSlots) {
++        return;
++    }
++    std::atomic<u32>& hint = s.hints[stage * NumSlots + slot];
++    u32 known = hint.load(std::memory_order_relaxed);
++    while (size > known && !hint.compare_exchange_weak(known, size, std::memory_order_relaxed)) {
++    }
++}
++
++/// Calls `func(page_pointer_offset, dest_offset, bytes, page)` for each page piece of a range.
++template <typename Func>
++void ForEachPiece(u64 device, u64 size, Func&& func) {
++    u64 done = 0;
++    while (done < size) {
++        const u64 address = device + done;
++        const u64 bytes = (std::min)(size - done, PageSize - (address & PageMask));
++        func(address & PageMask, done, bytes, address >> PageBits);
++        done += bytes;
++    }
++}
++
++} // Anonymous namespace
++
++bool Enabled() noexcept {
++    static const bool enabled = Capturing() && Common::PeSwitch("EDEN_UP_UBO_AHEAD");
++    return enabled;
++}
++bool LargeEnabled() noexcept {
++    static const bool enabled = Enabled() && Common::PeSwitch("EDEN_UP_UBO_AHEAD_LARGE");
++    return enabled;
++}
++bool VerifyEnabled() noexcept {
++    static const bool enabled = Capturing() && Common::PeSwitch("EDEN_UP_UBO_AHEAD_VERIFY");
++    return enabled;
++}
++bool StatsEnabled() noexcept {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_UBO_AHEAD_STATS");
++    return enabled;
++}
++
++void FrontNewEpochImpl() {
++    State& s = Get();
++    if (!s.pending.empty()) {
++        FrontFlushImpl(); // Updates of the old epoch go with its header
++    }
++    [[maybe_unused]] static const bool announced = [] {
++        LOG_INFO(HW_GPU,
++                 "EDEN_UP_UBO_AHEAD={} (uniform binds read the front's copies), LARGE={}, "
++                 "VERIFY={}, STATS={}",
++                 Enabled() ? 1 : 0, LargeEnabled() ? 1 : 0, VerifyEnabled() ? 1 : 0,
++                 StatsEnabled() ? 1 : 0);
++        return true;
++    }();
++    ++s.epoch;
++    s.epoch_sent = false;
++    g_front_pending = true; // The epoch goes to the back with the next method sent
++    Count(s.stats.epochs);
++    if (s.epoch - s.last_sweep >= SweepEvery) {
++        s.last_sweep = s.epoch;
++        Sweep(s);
++    }
++    if (StatsEnabled() || VerifyEnabled()) [[unlikely]] {
++        Report(s);
++    }
++}
++
++u64 FrontEpoch() noexcept {
++    return Get().epoch;
++}
++
++void FrontCapture(u64 device, u32 size, size_t stage, u32 slot) {
++    State& s = Get();
++    if (stage >= NumStages || slot >= NumSlots || size == 0) {
++        return;
++    }
++    const u32 hint = s.hints[stage * NumSlots + slot].load(std::memory_order_relaxed);
++    if (hint == 0) {
++        Count(s.stats.unhinted);
++        return;
++    }
++    u32 bytes = (std::min)(size, hint);
++    if (bytes > SmallMax && !LargeEnabled()) {
++        // The hint is the most any shader read from this slot; a bind uses its own shader's size
++        // from the binding's address. Without _LARGE the back serves binds up to 4 KiB (and
++        // BackVerify compares the first 4 KiB of larger ones): the same with or without VERIFY.
++        Count(s.stats.large_capped);
++        bytes = SmallMax;
++    }
++    Tegra::MaxwellDeviceMemoryManager* const memory = s.memory.load(std::memory_order_acquire);
++    if (memory == nullptr) {
++        return;
++    }
++    const bool timed = StatsEnabled() || VerifyEnabled();
++    const auto start = timed ? std::chrono::steady_clock::now()
++                             : std::chrono::steady_clock::time_point{};
++    Count(s.stats.captures);
++    const u64 last = (device + bytes - 1) >> PageBits;
++    for (u64 page = device >> PageBits; page <= last; ++page) {
++        CapturePage(s, *memory, page);
++        FlushIfFull(s);
++    }
++    if (timed) {
++        const auto spent = std::chrono::steady_clock::now() - start;
++        Count(s.stats.front_ns, static_cast<u64>(
++                                    std::chrono::duration_cast<std::chrono::nanoseconds>(spent)
++                                        .count()));
++    }
++}
++
++void FrontFlushImpl() {
++    State& s = Get();
++    g_front_pending = false;
++    GpuSplit& split = GpuSplit::Get();
++    if (!split.Active()) {
++        s.pending.clear(); // No back to send to (the split stops: Reset follows)
++        return;
++    }
++    if (s.pending.empty()) {
++        if (s.epoch_sent) {
++            return;
++        }
++        s.pending.push_back(static_cast<u32>(s.epoch));
++        s.pending.push_back(static_cast<u32>(s.epoch >> 32));
++    }
++    s.epoch_sent = true;
++    split.DeferWords([](std::span<const u32> words) { BackApply(words); },
++                     std::span<const u32>{s.pending}, GpuSplit::FastDrawNeutral);
++    s.pending.clear();
++}
++
++void NoteUsedSize(size_t stage, u32 slot, u32 size, Tegra::MaxwellDeviceMemoryManager& memory) {
++    State& s = Get();
++    // The current session's device memory (Reset forgets the last one's).
++    if (s.memory.load(std::memory_order_relaxed) != &memory) [[unlikely]] {
++        s.memory.store(&memory, std::memory_order_release);
++    }
++    RaiseHint(s, stage, slot, size);
++}
++
++void NoteFallback(Fallback reason) {
++    Count(Get().stats.fallbacks[static_cast<size_t>(reason)]);
++}
++
++bool BackProbe(u64 device, u32 size, u64& signature) {
++    State& s = Get();
++    u64 hash = 0xcbf29ce484222325ULL;
++    bool ok = true;
++    Fallback reason = Fallback::NotCaptured;
++    ForEachPiece(device, size, [&](u64, u64, u64, u64 page) {
++        if (!ok) {
++            return;
++        }
++        const auto it = s.back.find(page);
++        if (it == s.back.end() || it->second.slot == NoSlot) {
++            ok = false;
++            reason = Fallback::NotCaptured;
++            return;
++        }
++        if (it->second.epoch != s.back_epoch) {
++            ok = false;
++            reason = Fallback::Stale;
++            return;
++        }
++        const u64 writes = it->second.shared->writes.load(std::memory_order_acquire);
++        for (const u64 value : {page, it->second.seq, writes}) {
++            hash = (hash ^ value) * 0x100000001b3ULL;
++        }
++    });
++    if (!ok) {
++        NoteFallback(reason);
++        return false;
++    }
++    signature = hash;
++    return true;
++}
++
++void BackCopy(u64 device, u32 size, u8* dest) {
++    State& s = Get();
++    ForEachPiece(device, size, [&](u64 offset, u64 done, u64 bytes, u64 page) {
++        std::memcpy(dest + done, SlotPointer(s, s.back.find(page)->second.slot) + offset, bytes);
++    });
++}
++
++void NoteServed(bool large, bool reused) {
++    Stats& t = Get().stats;
++    Count(large ? t.served_large : t.served_small);
++    if (reused) {
++        Count(t.reused_large);
++    }
++}
++
++void BackVerify(u64 device, u32 size, Tegra::MaxwellDeviceMemoryManager& memory) {
++    State& s = Get();
++    if (size == 0) {
++        return;
++    }
++    // A bind's own data starts at its address: of a larger range (Ocarina's 64 KiB banks hold
++    // other draws' blocks after it) the first 4 KiB are compared, at a 16th of the cost.
++    const bool large = size > SmallMax;
++    size = (std::min)(size, SmallMax);
++    // Without a current copy of every page there is nothing to compare.
++    bool captured = true;
++    ForEachPiece(device, size, [&](u64, u64, u64, u64 page) {
++        const auto it = s.back.find(page);
++        captured = captured && it != s.back.end() && it->second.slot != NoSlot &&
++                   it->second.epoch == s.back_epoch;
++    });
++    if (!captured) {
++        Count(s.stats.verify_uncaptured);
++        return;
++    }
++    Count(s.stats.verified);
++    u64 first = ~u64{0};
++    u64 changed = 0;
++    ForEachPiece(device, size, [&](u64 offset, u64 done, u64 bytes, u64 page) {
++        const u8* const guest = memory.GetPointer<u8>((page << PageBits) + offset);
++        const u8* const copy = SlotPointer(s, s.back.find(page)->second.slot) + offset;
++        if (guest == nullptr || std::memcmp(guest, copy, bytes) == 0) {
++            return;
++        }
++        for (u64 i = 0; i < bytes; ++i) {
++            if (guest[i] != copy[i]) {
++                first = (std::min)(first, done + i);
++                ++changed;
++            }
++        }
++    });
++    if (changed == 0) {
++        return;
++    }
++    Stats& t = s.stats;
++    if (!large) {
++        Count(t.changed_small);
++        Count(t.changed_bytes_small, changed);
++        return;
++    }
++    Count(first < 1024 ? t.changed_first_kib : t.changed_to_4kib);
++    Count(t.changed_bytes_large, changed);
++}
++
++void BackVerifyHandle(size_t stage, u32 slot, u32 offset, std::optional<u64> device, u32 word) {
++    State& s = Get();
++    // The front captures the binding up to this word from now on (VERIFY only: binds the back
++    // serves never reach past their own shader's size, so they don't change).
++    RaiseHint(s, stage, slot, offset + static_cast<u32>(sizeof(u32)));
++    if (!device || (*device & PageMask) > PageSize - sizeof(u32)) {
++        Count(s.stats.handles_uncaptured);
++        return;
++    }
++    const auto it = s.back.find(*device >> PageBits);
++    if (it == s.back.end() || it->second.slot == NoSlot || it->second.epoch != s.back_epoch) {
++        Count(s.stats.handles_uncaptured);
++        return;
++    }
++    u32 copy{};
++    std::memcpy(&copy, SlotPointer(s, it->second.slot) + (*device & PageMask), sizeof(copy));
++    Count(s.stats.handles_compared);
++    if (copy != word) {
++        Count(s.stats.handles_changed);
++    }
++}
++
++void OnGpuWrite(u64 device, const void* source, size_t size) {
++    State& s = Get();
++    // The bytes are in guest memory: a capture that misses the live bit below reads them.
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    const u8* const bytes = static_cast<const u8*>(source);
++    ForEachPiece(device, size, [&](u64 offset, u64 done, u64 length, u64 page) {
++        if (!Live(s, page)) {
++            return;
++        }
++        std::scoped_lock lock{s.mutex};
++        const auto it = s.shared.find(page);
++        if (it == s.shared.end()) {
++            return;
++        }
++        SharedPage& shared = it->second;
++        for (u32 k = 0; k < shared.count; ++k) {
++            std::memcpy(SlotPointer(s, shared.slots[k]) + offset, bytes + done, length);
++        }
++        shared.writes.fetch_add(1, std::memory_order_release);
++        Count(s.stats.write_throughs);
++    });
++}
++
++void OnGpuWriteInPlace(u64 device, size_t size, Tegra::MaxwellDeviceMemoryManager& memory) {
++    State& s = Get();
++    std::atomic_thread_fence(std::memory_order_seq_cst);
++    ForEachPiece(device, size, [&](u64 offset, u64, u64 length, u64 page) {
++        if (!Live(s, page)) {
++            return;
++        }
++        const u8* const guest = memory.GetPointer<u8>((page << PageBits) + offset);
++        if (guest == nullptr) {
++            return;
++        }
++        std::scoped_lock lock{s.mutex};
++        const auto it = s.shared.find(page);
++        if (it == s.shared.end()) {
++            return;
++        }
++        SharedPage& shared = it->second;
++        for (u32 k = 0; k < shared.count; ++k) {
++            std::memcpy(SlotPointer(s, shared.slots[k]) + offset, guest, length);
++        }
++        shared.writes.fetch_add(1, std::memory_order_release);
++        Count(s.stats.write_throughs);
++    });
++}
++
++void Reset() {
++    State& s = Get();
++    std::scoped_lock lock{s.mutex};
++    for (const auto& [page, shared] : s.shared) {
++        SetLive(s, page, false);
++    }
++    s.shared.clear();
++    // The pool goes back to the system: a GPU write on another thread reaches a copy only
++    // through s.shared, under this mutex, and the front and the back are stopped.
++    for (std::atomic<u8*>& block : s.blocks) {
++        block.store(nullptr, std::memory_order_relaxed);
++    }
++    s.block_storage.clear();
++    s.block_storage.shrink_to_fit();
++    s.free_slots.clear();
++    s.used_slots = 0;
++    s.peak_slots = 0;
++    // The next session's device memory and shaders: none until its back binds again.
++    s.memory.store(nullptr, std::memory_order_release);
++    for (std::atomic<u32>& hint : s.hints) {
++        hint.store(0, std::memory_order_relaxed);
++    }
++    s.front.clear();
++    s.pending.clear();
++    s.epoch_sent = false;
++    g_front_pending = false;
++    s.back.clear();
++    s.back_epoch = 0;
++}
++
++} // namespace VideoCommon::UboAhead
+diff --git a/src/video_core/ubo_ahead.h b/src/video_core/ubo_ahead.h
+new file mode 100644
+index 0000000..d1ec250
+--- /dev/null
++++ b/src/video_core/ubo_ahead.h
+@@ -0,0 +1,158 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <optional>
++
++#include "common/common_types.h"
++#include "common/pe_switch.h"
++#include "video_core/host1x/gpu_device_memory_manager.h"
++
++// EDEN_UP_UBO_AHEAD=1 (for EDEN_NX2_FRAMES_AHEAD=1; after GrowingBlackBeans' EDEN_GBB_UBO_AHEAD,
++// issue 21): run a frame ahead, the game writes the next frame's uniform data while the split GPU
++// thread's back still records this frame's draws, and a constant buffer the back reads from guest
++// memory then holds next-frame values (short dark and bright flashes). The front parses each
++// command list soon after its submit: it copies the guest pages of the constant buffers the draws
++// bind (4 KiB pages, "captures") and sends them to the back in stream order, and the back's
++// uniform binds read those copies instead of guest memory.
++//  - When: a page is captured at most once per capture epoch, at the first bind or draw method
++//    that needs it. An epoch begins at each DmaPusher::DispatchCalls (a batch of submitted lists):
++//    the game writes a list's uniform data before it submits the list, so a copy made after that
++//    holds it for every draw of the batch. Each semaphore acquire the front passes begins one too,
++//    also one met at once: the CPU may write what the commands after it read until it releases
++//    it. At the first draw method of an epoch the front captures every binding of the engine
++//    again, rebound or not.
++//  - What: the 3D bind groups as the front parses them, as many bytes of each binding as the back's
++//    shaders read from that stage and slot (learnt from the back's binds: nothing is captured for a
++//    slot no draw read yet). Ranges up to 4 KiB (the streamed uniforms); larger ones (Ocarina's
++//    64 KiB indirectly read banks) are served only with EDEN_UP_UBO_AHEAD_LARGE=1, streamed whole
++//    (a 64 KiB stream allocation and copy per bind at a new address: try it after UBO_AHEAD=1
++//    alone). Without it the first 4 KiB of a larger binding are captured, for smaller binds of
++//    the same slot.
++//  - Versions: a page whose bytes equal its last copy keeps that copy; the back frees a copy once
++//    it applied the next one, and pages no draw used for 32 epochs are dropped. Copies live in a
++//    pool of 1 MiB blocks that grows on demand, at most 128 MiB (the high-water mark stays until
++//    the split stops; STATS shows it).
++//  - GPU writes the back makes in stream order (constant buffer data, inline uploads, DMA copies,
++//    downloads, reports, semaphores) reach guest memory after the front copied: they are written
++//    into the copies too (OnGpuWrite, through the hooks EDEN_UP_UBO_SNAPSHOT placed). Ranges the
++//    GPU wrote on the host (GPU-modified in the buffer cache) keep reading the host buffer.
++//  - Not covered: texture and sampler handles (the back still reads the handle words and the
++//    texture and sampler headers from guest memory; VERIFY counts changed handle words),
++//    compute constant buffers (QMDs are scheduled and read on the back), the root table bank
++//    (method data, in the command copy), engines whose macros run on the back
++//    (EDEN_UP_L1056_BACK_MACROS turns all of this off).
++// A bind the copies can't serve reads guest memory as without the switch (counted by reason).
++// A served bind reads no guest memory, so EDEN_NX2_OVERWRITE_CHECK no longer counts it as an
++// ahead read, whether or not its copy was in time.
++// EDEN_UP_UBO_AHEAD_STATS=1: a line every 10 s. EDEN_UP_UBO_AHEAD_VERIFY=1 (with UBO_AHEAD or
++// without): at each uniform bind the back compares the front's copy with guest memory and counts
++// the ranges whose bytes changed in between (the CPU's writes: GPU writes are in the copies), and
++// at each full texture resolve the handle words read from constant buffers (it then captures
++// their words too; served binds stay the same). A low count is a lower bound: a copy the front
++// takes after the CPU already wrote the next frame matches guest memory and counts as unchanged.
++// All off unless exactly "1"; unset, nothing here runs.
++namespace VideoCommon::UboAhead {
++
++constexpr size_t NumStages = 5;
++constexpr u32 NumSlots = 18; ///< Maxwell constant buffers per stage
++constexpr u32 SmallMax = 4096; ///< Up to this the back streams a uniform buffer (skip cache size)
++
++/// EDEN_UP_UBO_AHEAD=1: the back's uniform binds read the front's copies.
++[[nodiscard]] bool Enabled() noexcept;
++/// EDEN_UP_UBO_AHEAD_LARGE=1 (with UBO_AHEAD): ranges over 4 KiB too.
++[[nodiscard]] bool LargeEnabled() noexcept;
++/// EDEN_UP_UBO_AHEAD_VERIFY=1: the back compares the copies with guest memory.
++[[nodiscard]] bool VerifyEnabled() noexcept;
++/// EDEN_UP_UBO_AHEAD_STATS=1: the 10 s line (also logged with VERIFY).
++[[nodiscard]] bool StatsEnabled() noexcept;
++
++/// UBO_AHEAD or VERIFY (and no back macros): the front captures, GPU writes reach the copies.
++[[nodiscard]] inline bool Capturing() noexcept {
++    static const bool capturing = [] {
++        const bool wanted = Common::PeSwitch("EDEN_UP_UBO_AHEAD") ||
++                            Common::PeSwitch("EDEN_UP_UBO_AHEAD_VERIFY");
++        return wanted && !Common::PeSwitch("EDEN_UP_L1056_BACK_MACROS");
++    }();
++    return capturing;
++}
++
++/// A constant buffer binding as the back will hold it: `device` is valid only when `valid`.
++struct Binding {
++    u64 device{};
++    u32 size{};
++    bool valid{};
++};
++/// The front's copy of a 3D engine's bindings, per stage and slot.
++using FrontBindings = std::array<std::array<Binding, NumSlots>, NumStages>;
++
++// Front thread (the split GPU thread's front, which parses the command lists).
++
++/// Front: true while updates for the back wait to be sent (FrontFlush).
++inline bool g_front_pending{};
++void FrontNewEpochImpl();
++/// Front, DmaPusher::DispatchCalls and semaphore acquires: a new capture epoch (see above).
++inline void FrontNewEpoch() {
++    if (Capturing()) [[unlikely]] {
++        FrontNewEpochImpl();
++    }
++}
++/// Front: the current capture epoch.
++[[nodiscard]] u64 FrontEpoch() noexcept;
++/// Front: slot `slot` of `stage` is bound to `size` bytes at `device`: captures the pages of the
++/// part the shaders read that this epoch has not captured yet.
++void FrontCapture(u64 device, u32 size, size_t stage, u32 slot);
++void FrontFlushImpl();
++/// Front, before it sends a method: sends the captures and the epoch to the back, in order.
++inline void FrontFlush() {
++    if (g_front_pending) [[unlikely]] {
++        FrontFlushImpl();
++    }
++}
++
++// Back thread (draws).
++
++/// Back: the shaders of (stage, slot) read `size` bytes of the binding; `memory` is the device
++/// memory the front copies from.
++void NoteUsedSize(size_t stage, u32 slot, u32 size, Tegra::MaxwellDeviceMemoryManager& memory);
++
++/// Why a bind read guest memory.
++enum class Fallback : u32 {
++    NotCaptured, ///< A page of the range has no copy (no draw read it before, unmapped, dropped)
++    Stale,       ///< A page's copy is from an older epoch (the front could not capture it now)
++    GpuModified, ///< The range holds GPU-written data on the host
++    LargeOff,    ///< Over 4 KiB without EDEN_UP_UBO_AHEAD_LARGE
++    Count,
++};
++void NoteFallback(Fallback reason);
++
++/// Back: whether every page of [device, device + size) has a copy of the current epoch (counts
++/// the fallback when not). `signature` changes whenever the bytes of any of those copies may have.
++[[nodiscard]] bool BackProbe(u64 device, u32 size, u64& signature);
++/// Back, right after a BackProbe that returned true: copies the bytes to `dest`.
++void BackCopy(u64 device, u32 size, u8* dest);
++/// Back: counts a bind served from the copies (`large`: over 4 KiB, `reused`: bound again).
++void NoteServed(bool large, bool reused);
++/// Back, EDEN_UP_UBO_AHEAD_VERIFY: compares the copy of [device, device + size) with guest memory
++/// (of a range over 4 KiB its first 4 KiB, all the front copies of it without _LARGE).
++void BackVerify(u64 device, u32 size, Tegra::MaxwellDeviceMemoryManager& memory);
++/// Back, EDEN_UP_UBO_AHEAD_VERIFY: a draw read texture handle word `word` from guest memory,
++/// `offset` bytes into slot `slot` of `stage`, at `device` (none: unmapped). Compares it with the
++/// front's copy of the page, and has the front capture the slot up to it from now on.
++void BackVerifyHandle(size_t stage, u32 slot, u32 offset, std::optional<u64> device, u32 word);
++
++// Any thread that writes guest memory for the GPU (through ubo_snapshot.h's OnGpuWrite).
++
++/// The GPU just wrote `size` bytes at `device` (already in guest memory).
++void OnGpuWrite(u64 device, const void* source, size_t size);
++/// The same for bytes written in place: read back from guest memory.
++void OnGpuWriteInPlace(u64 device, size_t size, Tegra::MaxwellDeviceMemoryManager& memory);
++
++/// The split stopped (the front's thread and the back joined): forgets every copy, frees the
++/// pool, and the device memory and read sizes of the session.
++void Reset();
++
++} // namespace VideoCommon::UboAhead
+diff --git a/src/video_core/ubo_snapshot.h b/src/video_core/ubo_snapshot.h
+index 11ace9d..cf39247 100644
+--- a/src/video_core/ubo_snapshot.h
++++ b/src/video_core/ubo_snapshot.h
+@@ -9,6 +9,7 @@
+ #include "common/common_types.h"
+ #include "common/pe_switch.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/ubo_ahead.h"
+ 
+ // EDEN_UP_UBO_SNAPSHOT=1 (Ocarina, with EDEN_UP_OOT_FRONT_WAIT=1): one copy per frame of the
+ // graphics constant buffers the frame binds, taken in the present once the split GPU thread's
+@@ -68,6 +69,10 @@ inline void OnGpuWrite(u64 device, const void* source, size_t size) {
+     if (Enabled()) [[unlikely]] {
+         OnGpuWriteImpl(device, source, size);
+     }
++    // EDEN_UP_UBO_AHEAD / _VERIFY: the front's constant buffer copies take them too.
++    if (UboAhead::Capturing()) [[unlikely]] {
++        UboAhead::OnGpuWrite(device, source, size);
++    }
+ }
+ 
+ void OnGpuWriteInPlaceImpl(u64 device, size_t size, Tegra::MaxwellDeviceMemoryManager& memory);
+@@ -77,6 +82,9 @@ inline void OnGpuWriteInPlace(u64 device, size_t size, Tegra::MaxwellDeviceMemor
+     if (Enabled()) [[unlikely]] {
+         OnGpuWriteInPlaceImpl(device, size, memory);
+     }
++    if (UboAhead::Capturing()) [[unlikely]] {
++        UboAhead::OnGpuWriteInPlace(device, size, memory);
++    }
+ }
+ 
+ /// The split stopped: forgets every copy, the bind log and tables, and the back's frame.

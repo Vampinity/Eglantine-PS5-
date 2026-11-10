@@ -1,0 +1,292 @@
+From 746d6ea049bc58ca785798220f86101ed8cbfcc3 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Tue, 10 Nov 2026 06:50:14 +0100
+Subject: [PATCH] EDEN_UP_ARBITER_SPIN_US=<1 to 20>: an address wait watches
+ the word for that many microseconds before it sleeps (javocsoft/Lichii
+ e0ae6b0, from Lichii #717); off by default
+
+Ported from javocsoft/Lichii e0ae6b08b9 ("kernel, memory: cheaper locks, waits and GPU memory
+traps", JavocSoft), which takes it from zortos293/Lichii PR 717 (open draft, eb3553bcb8) by
+stephenjayakar, where it is EDEN_NX2_ARB_SPIN and on at 8 us. Credit to both. Only the address
+arbiter spin is taken; the rest of that commit is not in this patch (see below).
+
+Why: a tester's PS5 profile had about 39% of Ocarina's main thread in WaitForAddress on its own
+job workers. Every such wait that sleeps costs the scheduler lock, a context switch, then the
+signaler's EndWait, an interrupt of the waiter's core, a host wake (umtx on the PS5) and the
+switch back. When the worker signals a few microseconds after the main thread started to wait,
+all of that is overhead on the main thread's critical path, and the signaler's SignalToAddress
+gets cheaper too (no waiter in the tree, so no EndWait and no interrupt).
+
+What it does, with EDEN_UP_ARBITER_SPIN_US=N (1 to 20; above 20 reads as 20):
+- WaitIfLessThan and WaitIfEqual (32 and 64 bit), with a non-zero timeout, first watch the word
+  without any lock for up to N us, with a pause between reads.
+- If the word stops satisfying the wait, the SVC returns ResultInvalidState, which is what the
+  kernel returns to a thread that entered the SVC that much later. The guest already handles it
+  (it re-checks the word itself).
+- The spin stops early when the core is interrupted (another thread must run there) and in
+  single-core mode or on a misaligned address it is not tried.
+- Per thread credit (0-16, starts at 8): +2 for a spin that paid off, -1 for one that ran out. At
+  0 the thread spins on one wait in 16 only. A thread whose waits are long stops wasting time.
+- A terminating thread takes the normal path, which reports the termination first.
+- Log (Kernel, Info): one line at the first wait with the setting, then every 16,384 spins:
+  spins, how many ended without a sleep (%), how many slept after the full spin, how many were cut
+  short by the core, how many were skipped by the credit, and the mean pauses of a paying and of a
+  full spin (their ratio times N is the mean time a paying spin took).
+Off (unset, empty, 0 or not plain digits): SpinBeforeWait returns at once and every wait runs
+exactly as before. Layout only: two u8 fields at the end of KThread.
+
+Deviations from upstream: the switch name and off by default (upstream: on at 8 us); the time and
+interrupt checks run every 16 pauses instead of 32, so a short spin ends closer to its time; the
+time comes from Common::g_wall_clock (the TSC, as the front's NowNs) instead of steady_clock,
+because clock_gettime is a system call of about 890 ns on the console and would put most of a
+2 us spin in the host kernel; the counters and log lines are ours. The value is read once with getenv and taken only as plain
+digits: a number cannot go through Common::PeSwitch, which takes exactly "1" (as for
+EDEN_UP_OOT_POLL_BACKOFF_US). EDEN_UP_ARBITER_SPIN_US=1 is a 1 us spin.
+
+What to expect on the PS5. The front's PhysicalCore::Idle (headless/CMakeLists.txt) already
+spins on the interrupt flag before it sleeps (idle_spin_us=, default 5,000 pauses, about 100 us),
+so a guest core that goes idle mostly avoids the host wake already. What this adds is skipping the
+guest kernel's own sleep and wake: two scheduler-lock passes, the arbiter tree, BeginWait/EndWait,
+the interrupt and two fiber switches, for every handoff that comes within N. So expect a smaller
+gain than upstream's desktop number (which also had the other changes listed below), and only if
+the game's handoffs are frequent and short; the log line says how many are.
+
+It can also cost. Guest cores 4 and 5 are 82-88% busy and the guest has more ready threads than
+cores. A spinning wait holds its guest core, and a lower priority thread that is ready there (one
+that would run the moment this thread slept) waits out the spin, since only a scheduling change
+interrupts it. On a core that would go idle instead, the spin burns nothing the idle spin would
+not. Worst steady case: about one wait in three pays off, so the credit stays up and two thirds of
+the waits burn the whole N, near N * 2/3 us per wait: at 2 us and, say, 5,000 waits a second on a
+thread, under 1% of a core; at 8 us, close to 3%. So start with 2, then 4; 8 (upstream) only if
+4 helps.
+
+Not taken from e0ae6b0: KSpinLock's 20 us budget (ours spins 128 pauses before it sleeps), the
+PhysicalCore spin lock and interrupt-flag idle, KThread's atomic context guard, constinit thread
+locals, GetParentReference offsets, SpinRecursiveMutex::try_lock and the GPU memory trap changes.
+---
+ src/core/hle/kernel/k_address_arbiter.cpp | 163 ++++++++++++++++++++++
+ src/core/hle/kernel/k_thread.h            |   6 +
+ 2 files changed, 169 insertions(+)
+
+diff --git a/src/core/hle/kernel/k_address_arbiter.cpp b/src/core/hle/kernel/k_address_arbiter.cpp
+index 3415016..42781ad 100644
+--- a/src/core/hle/kernel/k_address_arbiter.cpp
++++ b/src/core/hle/kernel/k_address_arbiter.cpp
+@@ -4,6 +4,17 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++
++#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
++#include <immintrin.h>
++#endif
++
++#include "common/cpu_features.h"
++#include "common/logging.h"
+ #include "core/arm/exclusive_monitor.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_address_arbiter.h"
+@@ -14,6 +25,7 @@
+ #include "core/hle/kernel/k_thread_queue.h"
+ #include "core/hle/kernel/k_typed_address.h"
+ #include "core/hle/kernel/kernel.h"
++#include "core/hle/kernel/physical_core.h"
+ #include "core/hle/kernel/svc_results.h"
+ #include "core/memory.h"
+ 
+@@ -111,6 +123,147 @@ bool UpdateIfEqual(KernelCore& kernel, s32* out, KProcessAddress address, s32 va
+     return true;
+ }
+ 
++/// EDEN_UP_ARBITER_SPIN_US=<1 to 20>: microseconds a thread about to sleep in WaitIfLessThan or
++/// WaitIfEqual first watches the word (javocsoft/Lichii e0ae6b0, from zortos293/Lichii PR 717 by
++/// stephenjayakar, where it is EDEN_NX2_ARB_SPIN and on at 8). Unset, empty, 0 or anything but
++/// plain digits: off, and every wait takes the path it always did. Above 20 is read as 20.
++constexpr u32 MaxArbiterSpinMicroseconds = 20;
++
++u32 ArbiterSpinMicroseconds() {
++    static const u32 microseconds = [] {
++        const char* const text = std::getenv("EDEN_UP_ARBITER_SPIN_US");
++        if (text == nullptr || text[0] == '\0') {
++            return 0U;
++        }
++        u32 value = 0;
++        for (const char* c = text; *c != '\0'; ++c) {
++            if (*c < '0' || *c > '9') {
++                return 0U;
++            }
++            value = (std::min)(value * 10 + static_cast<u32>(*c - '0'), 1000U);
++        }
++        const u32 result = (std::min)(value, MaxArbiterSpinMicroseconds);
++        if (result != 0) {
++            LOG_INFO(Kernel, "EDEN_UP_ARBITER_SPIN_US: address waits watch the word for {} us "
++                             "before they sleep",
++                     result);
++        }
++        return result;
++    }();
++    return microseconds;
++}
++
++/// Spin counters, logged every ArbiterSpinStatsEvery spins (Kernel, Info), totals since boot.
++struct ArbiterSpinStats {
++    std::atomic<u64> spins{};
++    std::atomic<u64> hits{};        ///< the word changed in time: no sleep, no wake
++    std::atomic<u64> cut{};         ///< stopped early: the core has something else to run
++    std::atomic<u64> skipped{};     ///< the thread's spins kept failing: not tried this time
++    std::atomic<u64> hit_pauses{};  ///< pauses spent in spins that paid off
++    std::atomic<u64> miss_pauses{}; ///< pauses spent in spins that ran out (then slept anyway)
++};
++ArbiterSpinStats g_arbiter_spin_stats;
++constexpr u64 ArbiterSpinStatsEvery = 1ULL << 14;
++
++enum class ArbiterSpinEnd : u8 { Hit, Cut, Miss };
++
++void CountArbiterSpin(u32 spin_us, ArbiterSpinEnd end, u32 pauses) {
++    ArbiterSpinStats& stats = g_arbiter_spin_stats;
++    constexpr auto relaxed = std::memory_order_relaxed;
++    switch (end) {
++    case ArbiterSpinEnd::Hit:
++        stats.hits.fetch_add(1, relaxed);
++        stats.hit_pauses.fetch_add(pauses, relaxed);
++        break;
++    case ArbiterSpinEnd::Cut:
++        stats.cut.fetch_add(1, relaxed);
++        break;
++    case ArbiterSpinEnd::Miss:
++        stats.miss_pauses.fetch_add(pauses, relaxed);
++        break;
++    }
++    const u64 spins = stats.spins.fetch_add(1, relaxed) + 1;
++    if ((spins % ArbiterSpinStatsEvery) != 0) {
++        return;
++    }
++    const u64 hits = stats.hits.load(relaxed);
++    const u64 cut = stats.cut.load(relaxed);
++    const u64 misses = spins > hits + cut ? spins - hits - cut : 0;
++    LOG_INFO(Kernel,
++             "Arbiter spin ({} us): {} spins, {} ended without a sleep ({}%), {} slept after the "
++             "full spin, {} cut short by the core, {} skipped (thread's spins kept failing); "
++             "pauses per paying spin {}, per full spin {}",
++             spin_us, spins, hits, hits * 100 / spins, misses, cut, stats.skipped.load(relaxed),
++             hits != 0 ? stats.hit_pauses.load(relaxed) / hits : 0,
++             misses != 0 ? stats.miss_pauses.load(relaxed) / misses : 0);
++}
++
++/// Guest job systems hand work between threads through these waits many times a frame, and the
++/// signal often comes a few microseconds later. Before the thread sleeps (scheduler lock, context
++/// switch, then the signaler's EndWait, interrupt, host wake and switch back), it watches the word
++/// briefly without any lock. If the word stops satisfying the wait, the wait ends with
++/// ResultInvalidState, exactly what the kernel returns to a thread that entered the SVC that much
++/// later. Threads whose spins rarely pay off stop spinning (m_nx2_arb_spin_credit) and try again
++/// on one wait in 16. Returns true when the wait should end with ResultInvalidState.
++template <typename StillWaits>
++bool SpinBeforeWait(KernelCore& kernel, KThread* cur_thread, uint64_t addr, bool is_64_bit,
++                    StillWaits&& still_waits) {
++    const u32 spin_us = ArbiterSpinMicroseconds();
++    if (spin_us == 0) {
++        return false;
++    }
++    if (!kernel.IsMulticore() || (addr & (is_64_bit ? 7 : 3)) != 0) {
++        return false;
++    }
++    u8& credit = cur_thread->m_nx2_arb_spin_credit;
++    if (credit == 0 && (++cur_thread->m_nx2_arb_spin_probe & 15) != 0) {
++        g_arbiter_spin_stats.skipped.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    const u8* const pointer = GetCurrentMemory(kernel).GetPointerSilent(addr);
++    if (pointer == nullptr) {
++        return false;
++    }
++    const auto load_word = [&]() -> s64 {
++        if (is_64_bit) {
++            return *reinterpret_cast<const volatile s64*>(pointer);
++        }
++        return *reinterpret_cast<const volatile s32*>(pointer);
++    };
++    const PhysicalCore& core = kernel.CurrentPhysicalCore();
++    // The TSC wall clock, not steady_clock: on the console clock_gettime is a system call of
++    // about 890 ns, which would put most of a short spin in the host kernel.
++    const auto deadline = Common::g_wall_clock.GetTimeNS() + std::chrono::microseconds{spin_us};
++    u32 spin = 1;
++    for (;; ++spin) {
++#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
++        _mm_pause();
++#endif
++        if (!still_waits(load_word())) {
++            credit = static_cast<u8>((std::min)(credit + 2, 16));
++            CountArbiterSpin(spin_us, ArbiterSpinEnd::Hit, spin);
++            // A terminating thread takes the normal path, which reports the termination first.
++            return !cur_thread->IsTerminationRequested();
++        }
++        // Every 16 pauses rather than upstream's 32, so a short spin ends close to its time.
++        if ((spin & 15) == 0) {
++            // Something else must run on this core: stop watching.
++            if (core.IsInterrupted()) {
++                CountArbiterSpin(spin_us, ArbiterSpinEnd::Cut, spin);
++                return false;
++            }
++            if (Common::g_wall_clock.GetTimeNS() >= deadline) {
++                break;
++            }
++        }
++    }
++    if (credit > 0) {
++        --credit;
++    }
++    CountArbiterSpin(spin_us, ArbiterSpinEnd::Miss, spin);
++    return false;
++}
++
+ class ThreadQueueImplForKAddressArbiter final : public KThreadQueue {
+ public:
+     explicit ThreadQueueImplForKAddressArbiter(KernelCore& kernel, KAddressArbiter::ThreadTree* t)
+@@ -251,6 +404,11 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32
+ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement, s64 timeout) {
+     // Prepare to wait.
+     KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
++    // EDEN_UP_ARBITER_SPIN_US: watch the word briefly first (off: returns false at once).
++    if (timeout != 0 && SpinBeforeWait(system.Kernel(), cur_thread, addr, false,
++                                       [value](s64 user_value) { return user_value < value; })) {
++        R_THROW(ResultInvalidState);
++    }
+     KHardwareTimer* timer{};
+     ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), std::addressof(m_tree));
+ 
+@@ -306,6 +464,11 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
+ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool is_64_bit) {
+     // Prepare to wait.
+     KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
++    // EDEN_UP_ARBITER_SPIN_US: watch the word briefly first (off: returns false at once).
++    if (timeout != 0 && SpinBeforeWait(system.Kernel(), cur_thread, addr, is_64_bit,
++                                       [value](s64 user_value) { return user_value == value; })) {
++        R_THROW(ResultInvalidState);
++    }
+     KHardwareTimer* timer{};
+     ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), std::addressof(m_tree));
+ 
+diff --git a/src/core/hle/kernel/k_thread.h b/src/core/hle/kernel/k_thread.h
+index d5fa660..3d49e14 100644
+--- a/src/core/hle/kernel/k_thread.h
++++ b/src/core/hle/kernel/k_thread.h
+@@ -984,6 +984,12 @@ public:
+     ConditionVariableThreadTree* GetConditionVariableTree() const {
+         return m_condvar_tree;
+     }
++
++    /// KAddressArbiter, EDEN_UP_ARBITER_SPIN_US only: how well this thread's pre-wait spins paid
++    /// off lately (0-16), and a counter that probes again on one wait in 16 while it is 0.
++    /// Touched only by the thread itself, inside its own wait SVC.
++    u8 m_nx2_arb_spin_credit{8};
++    u8 m_nx2_arb_spin_probe{};
+ };
+ 
+ class KScopedDisableDispatch {
+-- 
+2.54.0
+

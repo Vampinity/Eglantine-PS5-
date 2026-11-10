@@ -48,9 +48,59 @@ std::uint64_t EnvMib(const char* name) {
 //     instead of taking the pool's last pieces (eden_heap_split_pages): on 7 Nov (run T54, New
 //     Game) that left the pool's largest free block at 2 MiB and the pipeline builder threads
 //     starved. Smaller requests are not touched: they still go in pieces as before.
+//   EDEN_UP_HEAP_WAIT_MS=<n> (1 to 60000; unset or 0: off): a pipeline builder thread whose request
+//     the heap cannot serve waits up to n ms for memory instead of getting NULL, which the driver's
+//     shader compiler does not check (headless/heap_arenas.inc, eden_heap_wait_for).
+extern "C" void eden_heap_set_wait_ms(unsigned ms) __attribute__((weak));
+//   EDEN_UP_HEAP_RESCUE=1: a request the heap is about to refuse is asked of every arena first
+//     (headless/heap_arenas.inc, eden_heap_arena_rescue).
+extern "C" void eden_heap_set_rescue(int on) __attribute__((weak));
+//   EDEN_TEST_HEAP_STARVE=<every>[,<attempts>] (a test): every <every>-th request of 256 KiB or more
+//     on a pipeline builder thread is refused, <attempts> times in a row (default 150), with no
+//     memory taken away (headless/heap_arenas.inc, eden_heap_starve).
+extern "C" void eden_heap_set_starve(unsigned every, unsigned attempts) __attribute__((weak));
 extern "C" void eden_heap_pool_init(void) {
+    if (const char* const starve = std::getenv("EDEN_TEST_HEAP_STARVE");
+        starve != nullptr && starve[0] >= '1' && starve[0] <= '9' && eden_heap_set_starve) {
+        char* end = nullptr;
+        const unsigned long every = std::strtoul(starve, &end, 10);
+        unsigned long attempts = 0;
+        if (end != nullptr && *end == ',')
+            attempts = std::strtoul(end + 1, &end, 10);
+        if (end != nullptr && *end == '\0' && every <= 1000000 && attempts <= 100000) {
+            eden_heap_set_starve(static_cast<unsigned>(every), static_cast<unsigned>(attempts));
+            std::fprintf(stderr, "EDEN_TEST_HEAP_STARVE every %lu-th request of 256 KiB or more on a pipeline builder "
+                         "thread is refused, %lu times in a row\n", every, attempts != 0 ? attempts : 150UL);
+        }
+    }
+    if (const char* const wait = std::getenv("EDEN_UP_HEAP_WAIT_MS"); wait != nullptr && wait[0] >= '0' && wait[0] <= '9') {
+        char* end = nullptr;
+        const unsigned long ms = std::strtoul(wait, &end, 10);
+        if (end != nullptr && *end == '\0' && ms != 0 && ms <= 60000 && eden_heap_set_wait_ms) {
+            eden_heap_set_wait_ms(static_cast<unsigned>(ms));
+            std::fprintf(stderr, "EDEN_UP_HEAP_WAIT_MS pipeline builders wait up to %lu ms for memory\n", ms);
+        }
+    }
+    if (const char* const rescue = std::getenv("EDEN_UP_HEAP_RESCUE");
+        rescue != nullptr && rescue[0] == '1' && rescue[1] == '\0' && eden_heap_set_rescue) {
+        eden_heap_set_rescue(1);
+        std::fputs("EDEN_UP_HEAP_RESCUE a request about to be refused is asked of every arena first\n", stderr);
+    }
     if (const std::uint64_t mib = EnvMib("EDEN_BIG_IMAGE_RESERVE_MIB"); mib != 0)
         Common::TakeBigImageReserve(static_cast<std::size_t>(mib));
+    // EDEN_TEST_POOL_HOG_MIB=<n> (a test, off unless set): n MiB (in 32 MiB pieces) taken out of the pool
+    // now and never given back, so this console runs out where one with less free memory does (the
+    // door of Link's house on a PS5 Pro on 13.x, issue 21) and a memory fix can be tried in a 3 minute run.
+    if (const std::uint64_t hog = EnvMib("EDEN_TEST_POOL_HOG_MIB"); hog != 0) {
+        constexpr std::size_t piece = std::size_t{32} << 20;
+        std::uint64_t taken = 0;
+        for (; taken + 32 <= hog; taken += 32) {
+            void* const address = Common::ReserveAddressRange(piece);
+            if (address == nullptr || !Common::CommitMemoryRange(address, piece)) break;
+        }
+        std::fprintf(stderr, "EDEN_TEST_POOL_HOG %llu MiB of the pool taken for good (asked %llu)\n",
+                     static_cast<unsigned long long>(taken), static_cast<unsigned long long>(hog));
+    }
     const char* const no_split = std::getenv("EDEN_BIG_IMAGE_NO_SPLIT");
     big_image_no_split.store(no_split != nullptr && no_split[0] == '1', std::memory_order_relaxed);
     if (big_image_no_split.load(std::memory_order_relaxed))

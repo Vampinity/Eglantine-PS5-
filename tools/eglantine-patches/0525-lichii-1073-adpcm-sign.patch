@@ -1,0 +1,80 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_ADPCM_SIGN_FIX=1: ADPCM nibble steps get the right sign (Song of Time crackle); off by default
+
+Credits. Port of zortos293/Lichii e934b8210c by justin-wq1337 (PR #1073, fixes #837; the PR is
+still open, not merged into nx2), carried into Frizti/Fritchii as e6e0a8083c ("audio_core: fix the
+sign of the ADPCM nibble steps", 2026-11-09; first released in fritchii-v5.6). The upstream change
+swaps one sign; here it sits behind a switch. Not compiled or run here.
+
+Why. DecodeAdpcm's get_step lambda (decode.cpp:145-152 in e736dfd) returns -r for nibbles 0..7 and
++r for 8..15, the inverse of the table its comment says it emulates (0..7, -8..-1). A voice that
+starts from a zero history only comes out inverted, which nobody hears. But a wave buffer that
+carries a guest ADPCM context (DecodeFromWaveBuffers loads it at offset 0, decode.cpp:286-287)
+hands the decoder yn0/yn1 in the game's polarity, and the decoder then predicts from history of the
+opposite sign: a loud transient at the start of that buffer. A streamed sound made of several such
+buffers gives a train of bursts. In Ocarina of Time that is the ~0.8 s crackle when the "you played
+the Song of Time" banner appears (Lichii #837, reported on NVIDIA and AMD, Fritchii v4.1 too). No
+patch in the series touches this file, and our core still has the bug.
+
+EDEN_UP_ADPCM_SIGN_FIX=1 (Common::PeSwitch from 0310, exact 1; unset or anything else: the old
+steps, unchanged).
+- get_step returns +r for nibbles 0..7 and -r for 8..15, as upstream. The decode arithmetic and the
+  context loading stay as they are.
+- The switch is a function-local static read at the first ADPCM decode (long after main.cpp
+  applied env.txt), then copied into a local once per DecodeAdpcm call so the per-nibble lambda
+  does not touch the static guard.
+
+Risk. Audio only. Every ADPCM voice now comes out in the right polarity; from a zero history that
+sounds the same as before. PCM voices are untouched.
+
+diff --git a/src/audio_core/renderer/command/data_source/decode.cpp b/src/audio_core/renderer/command/data_source/decode.cpp
+index 0f6f782..e99868a 100644
+--- a/src/audio_core/renderer/command/data_source/decode.cpp
++++ b/src/audio_core/renderer/command/data_source/decode.cpp
+@@ -11,6 +11,7 @@
+ #include "audio_core/renderer/command/resample/resample.h"
+ #include "common/fixed_point.h"
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "common/scratch_buffer.h"
+ #include "core/guest_memory.h"
+ #include "core/memory.h"
+@@ -19,6 +20,18 @@ namespace AudioCore::Renderer {
+ 
+ constexpr u32 TempBufferSize = 0x3F00;
+ 
++/// EDEN_UP_ADPCM_SIGN_FIX=1 (Common::PeSwitch, exact 1; off unless set): justin-wq1337's
++/// zortos293/Lichii e934b8210c (#1073, in Fritchii as e6e0a8083c). DecodeAdpcm's step lambda gave
++/// nibbles 0..7 a negative step and 8..15 a positive one, the inverse of the table it emulates.
++/// From a zero history that only inverts the waveform, but a wave buffer that loads the guest's
++/// ADPCM context (yn0/yn1 in the right polarity, DecodeFromWaveBuffers) then predicts from history
++/// of the opposite sign: a click at each such buffer start (Ocarina of Time's Song of Time
++/// crackle). Read at the first ADPCM decode, long after main.cpp applied env.txt.
++[[nodiscard]] static bool AdpcmSignFix() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_ADPCM_SIGN_FIX");
++    return enabled;
++}
++
+ /// @brief Decode PCM data. Only s16 or f32 is supported.
+ /// @tparam T         - Type to decode. Only s16 and f32 are supported.
+ /// @param memory     - Core memory for reading samples.
+@@ -142,12 +155,18 @@ static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer,
+ 
+     auto yn0 = context->yn0;
+     auto yn1 = context->yn1;
+-    auto const get_step = [](u32 index) {
++    // EDEN_UP_ADPCM_SIGN_FIX: read once a call, outside the per-nibble lambda.
++    const bool sign_fix = AdpcmSignFix();
++    auto const get_step = [sign_fix](u32 index) {
+         // Emulates the following table
+         // 0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
++        // (bit set in steps_sign = negative half; the old return below has it backwards)
+         constexpr u64 steps_table = 0x1234567876543210ull;
+         constexpr u64 steps_sign = 0b1111111100000000ull;
+         auto const r = s32((steps_table >> (index * 4)) & 0xf);
++        if (sign_fix) {
++            return ((steps_sign >> index) & 1) == 0 ? r : -r;
++        }
+         return ((steps_sign >> index) & 1) == 0 ? -r : r;
+     };
+     auto const decode_sample = [&](const s32 code) -> s16 {

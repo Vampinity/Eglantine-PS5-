@@ -1,0 +1,524 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_HITCH_TRACE=1: name what the GPU thread spends a long frame on (buffer and image uploads, staging buffers and images made, decodes queued, collector passes, Finish waits); off by default
+
+Ocarina of Time, the village after Link's door (batch t87-a, 10 Nov, runs 739-743): every run
+has one frame of about 1.0 s on the GPU thread (heap.log EDEN_VULKAN_FRAME worst_ms 998-1029)
+with no log line inside it: in run739 nothing between 87.745 s (a guest service call) and
+88.752 s (the first 1365x1365x90 ASTC array made). It is 47% of the ~1.3 s a run loses to
+hitch windows. The 5 s and 600-present lines give totals, not frames, and the pieces that could
+take a second log nothing of their own time: in that second the buffer cache went from 24
+buffers (1 MiB) to 998 (512 MiB) and asked the staging pool for 128 MiB and then 64 MiB with
+nothing that large in it (stderr MKW_STAGING_MISS: a fresh allocation and mapping each), the
+texture cache uploaded 619 new images in 23 frames and queued the two 90-layer arrays (an
+unswizzle and a zero fill on the GPU thread each), and from 82 s (run742) the collector ran
+in pressure mode with a Finish per downloaded image.
+
+EDEN_UP_HITCH_TRACE=1 (Common::PeSwitch, exactly "1"; unset: every site is one bool check)
+times each of these on the thread that runs it, in video_core/hitch_trace.h:
+
+  image upload        TextureCache::RefreshContents, with the image's guest bytes
+  image made          TextureCache::InsertImage (vkCreateImage + memory)
+  decode queued       TextureCache::QueueAsyncDecode (unswizzle + zero fill, GPU thread part)
+  decode landing      TextureCache::TickAsyncDecode
+  collector pass      the RunGarbageCollector call in TickFrame (the function's own text is
+                      left as it is: the PS5 prepare script rewrites it from its original)
+  buffer upload       BufferCache::MappedUploadMemory (staging request, guest read, copy)
+  buffer made         BufferCache::JoinBuffer
+  staging buffer made StagingBufferPool::CreateStagingBuffer, to its mapping
+  Finish wait         Scheduler::Finish
+
+Two kinds of line, both HW.GPU Info:
+
+  Hitch trace: buffer upload: 128.0 MiB in 1 copies at 0x7fc1800000 took 412.3 ms
+      one operation of 20 ms or more (a staging buffer made: 5 ms or more).
+  Hitch trace: frame 3081 took 1004.2 ms on the GPU thread; traced 980.1 ms | buffer uploads
+  520.0 ms (3, 192.0 MiB, worst 412.3 ms: 128.0 MiB in 1 copies at 0x7fc1800000) | image
+  uploads 301.2 ms (142, 388.5 MiB, worst 61.0 ms: 1365x1365x90 (11 levels, format 71) ...) | ...
+      a frame (TextureCache::TickFrame to the next) of 100 ms or more: every kind with a
+      count, longest first, with its count, bytes and worst operation. Traced is the frame's
+      time inside the outer kinds; the rest is draws, command parsing and whatever has no Op.
+      Finish waits, staging buffers made and decodes queued nest inside other kinds and are
+      listed but not added to "traced".
+
+The same operations are also zones of EDEN_NX2_GPU_PROFILE (image made, decode work,
+collector, buffer upload, buffer made, staging made, finish wait), so with EDEN_NX2_GPU_PROFILE=1
+and EDEN_NX2_SLOW_FRAME_MS=100 the profile's "Slow frame" line shows them next to draw,
+update buffers and the rest. Zones are inert while the profile is unset.
+
+Next run: EDEN_UP_HITCH_TRACE=1 on the walk-fast control; the frame line at the village load
+names the ~1 s frame. The fix follows what it says: a buffer upload (upload the big dirty
+buffers in pieces across frames, or keep a 128 MiB upload staging buffer from boot), image
+uploads (spread the first-frame burst), or a decode queued (move the unswizzle to the worker).
+
+---
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9342c74..a118320 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -27,6 +27,7 @@
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/nx2.h"
++#include "video_core/hitch_trace.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/ubo_ahead.h"
+@@ -4545,6 +4546,8 @@ BufferId BufferCache<P>::JoinBuffer(DAddr device_addr, u32 wanted_size, bool spa
+     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size, stream_leap);
+     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+     BufferId new_buffer_id;
++    HitchTrace::Op made_trace{HitchTrace::Kind::BufferMade, size,
++                              HitchTrace::Desc{.addr = overlap.begin}};
+     if constexpr (requires { runtime.TryCreateBuffer(DAddr{}, u64{}, bool{}); }) {
+         std::optional<Buffer> made;
+         if (size < buffer_refused_size ||
+@@ -4565,6 +4568,7 @@ BufferId BufferCache<P>::JoinBuffer(DAddr device_addr, u32 wanted_size, bool spa
+     } else {
+         new_buffer_id = slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
+     }
++    made_trace.End();
+     Churn::Add(Churn::BuffersCreated);
+     auto& new_buffer = slot_buffers[new_buffer_id];
+     const size_t size_bytes = new_buffer.SizeBytes();
+@@ -4875,6 +4879,10 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
+                                         [[maybe_unused]] u64 total_size_bytes,
+                                         [[maybe_unused]] std::span<BufferCopy> copies) {
+     if constexpr (USE_MEMORY_MAPS) {
++        // EDEN_UP_HITCH_TRACE: the staging request (a new buffer when the pool has none
++        // large enough), the guest memory read and the copy, as one.
++        HitchTrace::Op trace{HitchTrace::Kind::BufferUpload, total_size_bytes,
++                             HitchTrace::Desc{.addr = buffer.CpuAddr(), .a = copies.size()}};
+         const auto staged = [&] {
+             if constexpr (requires { runtime.TryUploadStagingBuffer(size_t{}); }) {
+                 if (total_size_bytes > runtime.UploadSliceBytes()) {
+diff --git a/src/video_core/hitch_trace.h b/src/video_core/hitch_trace.h
+new file mode 100644
+index 0000000..7cce680
+--- /dev/null
++++ b/src/video_core/hitch_trace.h
+@@ -0,0 +1,261 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <optional>
++#include <string>
++
++#include <fmt/format.h>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "video_core/nx2_profile.h"
++
++// EDEN_UP_HITCH_TRACE=1: what the GPU thread spends a long frame on. Unset: every Op is a bool
++// check and nothing else.
++//
++// Ocarina of Time, the village after Link's door (batch t87-a, 10 Nov): a frame of ~1.0 s on the
++// GPU thread in every run, with no log line inside it. The texture cache's 5 s and 600-present
++// lines give totals, not frames, and the pieces that could take a second (a 128 MiB buffer
++// upload through a staging buffer made for it, 619 images uploaded in 23 frames, the 1365x1365x90
++// arrays queued for decode, a collector pass with a Finish per downloaded image) log nothing of
++// their own time. Each one is an Op here:
++//
++//   Hitch trace: <kind>: <what> took 412.3 ms
++//       one operation of 20 ms or more (a staging buffer made: 5 ms or more), with its size.
++//   Hitch trace: frame 3082 took 1004.2 ms on the GPU thread; traced 980.1 ms: buffer uploads
++//       520.0 ms (3, 192.0 MiB, worst 412.3 ms: 128.0 MiB at 0x7fc... in 1 copies) | image
++//       uploads 301.2 ms (142, 388.5 MiB, worst 61.0 ms: 1365x1365x90 ...) | ...
++//       a frame (TextureCache::TickFrame to the next) of 100 ms or more, every kind with a count,
++//       longest first. The rest of the frame is "traced" subtracted from the frame: the draws,
++//       command parsing and whatever has no Op.
++//
++// A Finish wait inside a collector pass counts under both kinds (the collector line says what
++// its Finish waits cost). With EDEN_NX2_GPU_PROFILE=1 and EDEN_NX2_SLOW_FRAME_MS=100 the same
++// operations also show as zones of the profile's "Slow frame" line, next to draw, update
++// buffers and the rest.
++namespace VideoCommon::HitchTrace {
++
++enum class Kind : u32 {
++    ImageUpload,   ///< TextureCache::RefreshContents (any upload of an image's guest data)
++    ImageMade,     ///< TextureCache::InsertImage: the host image made (vkCreateImage + memory)
++    DecodeQueue,   ///< TextureCache::QueueAsyncDecode: unswizzle + zero fill on the GPU thread
++    DecodeLanding, ///< TextureCache::TickAsyncDecode: decoded data copied and uploaded
++    Collector,     ///< TextureCache::RunGarbageCollector, one pass
++    BufferUpload,  ///< BufferCache::MappedUploadMemory: guest memory read into staging + copy
++    BufferMade,    ///< BufferCache::JoinBuffer: the host buffer made
++    StagingMade,   ///< StagingBufferPool::CreateStagingBuffer: a new staging buffer made and mapped
++    Finish,        ///< Scheduler::Finish: submit and wait for the device
++    Count,
++};
++
++inline constexpr std::array<const char*, static_cast<size_t>(Kind::Count)> names{
++    "image upload",    "image made",   "decode queued", "decode landing", "collector pass",
++    "buffer upload",   "buffer made",  "staging buffer made", "Finish wait",
++};
++inline constexpr std::array<const char*, static_cast<size_t>(Kind::Count)> plural_names{
++    "image uploads",   "images made",  "decodes queued", "decode landings", "collector passes",
++    "buffer uploads",  "buffers made", "staging buffers made", "Finish waits",
++};
++
++/// One operation of this many ns or more gets its own line.
++inline constexpr std::array<u64, static_cast<size_t>(Kind::Count)> op_log_ns{
++    20'000'000, 20'000'000, 20'000'000, 20'000'000, 20'000'000,
++    20'000'000, 20'000'000, 5'000'000,  20'000'000,
++};
++/// A frame of this many ns or more logs its kinds.
++inline constexpr u64 frame_log_ns = 100'000'000;
++
++inline bool On() {
++    static const bool on = Common::PeSwitch("EDEN_UP_HITCH_TRACE");
++    return on;
++}
++
++/// What an operation was, formatted only when it is logged.
++struct Desc {
++    u64 addr{}; ///< Guest address, 0: none
++    u64 a{};    ///< Images: width. Buffer upload: copies. Staging: usage.
++    u64 b{};    ///< Images: height
++    u64 c{};    ///< Images: layers
++    u64 d{};    ///< Images: levels
++    u64 e{};    ///< Images: format
++};
++
++inline std::string Describe(Kind kind, u64 bytes, const Desc& desc) {
++    std::string text;
++    switch (kind) {
++    case Kind::ImageUpload:
++    case Kind::ImageMade:
++    case Kind::DecodeQueue:
++        text = fmt::format("{}x{}x{} ({} levels, format {})", desc.a, desc.b, desc.c, desc.d, desc.e);
++        break;
++    case Kind::BufferUpload:
++        text = fmt::format("in {} copies", desc.a);
++        break;
++    case Kind::StagingMade:
++        text = fmt::format("usage {}", desc.a);
++        break;
++    default:
++        break;
++    }
++    if (bytes != 0) {
++        text = fmt::format("{:.1f} MiB{}{}", static_cast<double>(bytes) / (1024.0 * 1024.0),
++                           text.empty() ? "" : " ", text);
++    }
++    if (desc.addr != 0) {
++        text += fmt::format("{}at {:#x}", text.empty() ? "" : " ", desc.addr);
++    }
++    return text;
++}
++
++struct KindData {
++    u64 ns{};
++    u64 count{};
++    u64 bytes{};
++    u64 worst_ns{};
++    u64 worst_bytes{};
++    Desc worst{};
++};
++
++struct FrameData {
++    std::array<KindData, static_cast<size_t>(Kind::Count)> kinds{};
++    std::chrono::steady_clock::time_point start{};
++    bool started{};
++};
++
++inline thread_local FrameData t_frame;
++
++/// The profile zone an operation also counts under (EDEN_NX2_GPU_PROFILE); image uploads are
++/// already the "texture upload" zone.
++inline Nx2Profile::Zone ZoneOf(Kind kind) {
++    switch (kind) {
++    case Kind::ImageMade:
++        return Nx2Profile::Zone::ImageMade;
++    case Kind::DecodeQueue:
++    case Kind::DecodeLanding:
++        return Nx2Profile::Zone::DecodeWork;
++    case Kind::Collector:
++        return Nx2Profile::Zone::Collector;
++    case Kind::BufferUpload:
++        return Nx2Profile::Zone::BufferUpload;
++    case Kind::BufferMade:
++        return Nx2Profile::Zone::BufferMade;
++    case Kind::StagingMade:
++        return Nx2Profile::Zone::StagingMade;
++    case Kind::Finish:
++        return Nx2Profile::Zone::FinishWait;
++    default:
++        return Nx2Profile::Zone::TextureUpload;
++    }
++}
++
++/// Times one operation on the calling thread from its making to End() or its destruction.
++class Op {
++public:
++    Op(Kind kind_, u64 bytes_, Desc desc_) : kind{kind_}, bytes{bytes_}, desc{desc_}, on{On()} {
++        if (!on) {
++            return;
++        }
++        if (kind_ != Kind::ImageUpload) {
++            zone.emplace(ZoneOf(kind_));
++        }
++        start = std::chrono::steady_clock::now();
++    }
++
++    ~Op() {
++        End();
++    }
++
++    Op(const Op&) = delete;
++    Op& operator=(const Op&) = delete;
++
++    void End() {
++        if (!on || ended) {
++            return;
++        }
++        ended = true;
++        zone.reset();
++        const auto elapsed = static_cast<u64>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
++                .count());
++        const auto index = static_cast<size_t>(kind);
++        KindData& data = t_frame.kinds[index];
++        data.ns += elapsed;
++        ++data.count;
++        data.bytes += bytes;
++        if (elapsed > data.worst_ns) {
++            data.worst_ns = elapsed;
++            data.worst_bytes = bytes;
++            data.worst = desc;
++        }
++        if (elapsed >= op_log_ns[index]) {
++            LOG_INFO(HW_GPU, "Hitch trace: {}: {} took {:.1f} ms", names[index],
++                     Describe(kind, bytes, desc), static_cast<double>(elapsed) / 1e6);
++        }
++    }
++
++private:
++    Kind kind;
++    u64 bytes;
++    Desc desc;
++    bool on;
++    bool ended{};
++    std::optional<Nx2Profile::Scope> zone;
++    std::chrono::steady_clock::time_point start{};
++};
++
++/// Called once per frame on the GPU thread (TextureCache::TickFrame): logs the frame that just
++/// ended when it was long, and starts the next.
++inline void EndFrame(u64 frame_number) {
++    if (!On()) {
++        return;
++    }
++    FrameData& frame = t_frame;
++    const auto now = std::chrono::steady_clock::now();
++    if (frame.started) {
++        const auto wall = static_cast<u64>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(now - frame.start).count());
++        if (wall >= frame_log_ns) {
++            std::array<size_t, static_cast<size_t>(Kind::Count)> order{};
++            u64 traced{};
++            for (size_t i = 0; i < order.size(); ++i) {
++                order[i] = i;
++                // Nested kinds (a Finish inside a collector pass) would count twice: the outer
++                // ones carry the inner ones' time already.
++                if (i != static_cast<size_t>(Kind::Finish) &&
++                    i != static_cast<size_t>(Kind::StagingMade) &&
++                    i != static_cast<size_t>(Kind::DecodeQueue)) {
++                    traced += frame.kinds[i].ns;
++                }
++            }
++            std::sort(order.begin(), order.end(), [&frame](size_t a, size_t b) {
++                return frame.kinds[a].ns > frame.kinds[b].ns;
++            });
++            std::string line;
++            for (const size_t i : order) {
++                const KindData& data = frame.kinds[i];
++                if (data.count == 0) {
++                    continue;
++                }
++                line += fmt::format(" | {} {:.1f} ms ({}, {:.1f} MiB, worst {:.1f} ms: {})",
++                                    plural_names[i], static_cast<double>(data.ns) / 1e6, data.count,
++                                    static_cast<double>(data.bytes) / (1024.0 * 1024.0),
++                                    static_cast<double>(data.worst_ns) / 1e6,
++                                    Describe(static_cast<Kind>(i), data.worst_bytes, data.worst));
++            }
++            LOG_INFO(HW_GPU, "Hitch trace: frame {} took {:.1f} ms on the GPU thread; traced {:.1f} ms{}",
++                     frame_number - 1, static_cast<double>(wall) / 1e6,
++                     static_cast<double>((std::min)(traced, wall)) / 1e6,
++                     line.empty() ? std::string{" (nothing traced)"} : line);
++        }
++    }
++    frame.kinds = {};
++    frame.start = now;
++    frame.started = true;
++}
++
++} // namespace VideoCommon::HitchTrace
+diff --git a/src/video_core/nx2_profile.h b/src/video_core/nx2_profile.h
+index 37de6ba..57391b2 100644
+--- a/src/video_core/nx2_profile.h
++++ b/src/video_core/nx2_profile.h
+@@ -60,6 +60,14 @@ enum class Zone : u32 {
+     Puller,       ///< Puller methods (semaphores, syncpoints, channel commands)
+     BindChannel,  ///< Scheduler::BindChannel (takes the scheduling lock)
+     ListEnd,      ///< DispatchCalls' FlushCommands and OnCommandListEnd
++    // EDEN_UP_HITCH_TRACE (hitch_trace.h): the operations it times, as zones.
++    ImageMade,    ///< TextureCache::InsertImage: the host image made
++    DecodeWork,   ///< Async decode queued (unswizzle, zero fill) and landed on the GPU thread
++    Collector,    ///< TextureCache::RunGarbageCollector
++    BufferUpload, ///< BufferCache::MappedUploadMemory
++    BufferMade,   ///< BufferCache::JoinBuffer: the host buffer made
++    StagingMade,  ///< StagingBufferPool::CreateStagingBuffer
++    FinishWait,   ///< Scheduler::Finish
+     Count,
+ };
+ 
+@@ -71,7 +79,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
+     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
+     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
+     "fence skipped", "method", "split drain", "split wait", "command lists", "puller",
+-    "bind channel", "list end",
++    "bind channel", "list end", "image made", "decode work", "collector",
++    "buffer upload", "buffer made", "staging made", "finish wait",
+ };
+ 
+ // Read at startup and again when the GPU thread starts (ReadSwitch): a frontend may set the
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index ea11262..1cca27d 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -23,6 +23,7 @@
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
++#include "video_core/hitch_trace.h"
+ #include "video_core/zpass_cut.h"
+ #include "video_core/renderer_vulkan/vk_command_pool.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+@@ -334,6 +335,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
+     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
+     }
++    VideoCommon::HitchTrace::Op trace{VideoCommon::HitchTrace::Kind::Finish, 0, {}};
+     // When finishing, we need to wait for the submission to have executed on the device.
+     const u64 presubmit_tick = CurrentTick();
+     SubmitExecution(signal_semaphore, wait_semaphore);
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 839f51e..15626f4 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -19,6 +19,7 @@
+ #include "common/literals.h"
+ #include "common/logging.h"
+ #include "common/pe_switch.h"
++#include "video_core/hitch_trace.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+@@ -396,6 +397,10 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+     if (device.IsBufferDeviceAddressSupported()) {
+         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+     }
++    // EDEN_UP_HITCH_TRACE: a buffer the pool had no room for is a fresh allocation and
++    // mapping, timed to its mapping below.
++    VideoCommon::HitchTrace::Op trace{VideoCommon::HitchTrace::Kind::StagingMade, buffer_ci.size,
++                                      VideoCommon::HitchTrace::Desc{.a = static_cast<u64>(usage)}};
+     vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+     if (device.HasDebuggingToolAttached()) {
+         ++buffer_index;
+@@ -404,6 +409,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+     VideoCommon::Churn::Add(VideoCommon::Churn::StagingBuffers);
+     VideoCommon::Churn::Add(VideoCommon::Churn::StagingBytes, buffer_ci.size);
+     const std::span<u8> mapped_span = buffer.Mapped();
++    trace.End();
+     const VkDeviceAddress buffer_address =
+         device.IsBufferDeviceAddressSupported()
+             ? device.GetLogical().GetBufferDeviceAddress(*buffer)
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 94a8500..5c948e9 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -40,6 +40,7 @@
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/hitch_trace.h"
+ #include "video_core/churn_counters.h"
+ #include "video_core/textures/decoders.h"
+ 
+@@ -51,6 +52,19 @@ namespace VideoCommon {
+     return enabled;
+ }
+ 
++/// EDEN_UP_HITCH_TRACE: an image's geometry and format for its trace line.
++[[nodiscard]] inline HitchTrace::Desc HitchTraceDesc(const ImageInfo& info, GPUVAddr gpu_addr) {
++    return HitchTrace::Desc{
++        .addr = gpu_addr,
++        .a = info.size.width,
++        .b = info.size.height,
++        .c = info.resources.layers > 1 ? static_cast<u64>(info.resources.layers)
++                                       : static_cast<u64>(info.size.depth),
++        .d = static_cast<u64>(info.resources.levels),
++        .e = static_cast<u64>(info.format),
++    };
++}
++
+ /// EDEN_NX2_TC_KEEP_ASYNC=<frames> (unset or 0: off, as before): an image the CPU decodes
+ /// asynchronously (AsynchronousDecode: Ocarina of Time's 6144x6144 ground texture and its two
+ /// 1365x1365x90 arrays, seconds of decoding each, black meanwhile) is left alone by the collectors
+@@ -1029,6 +1043,8 @@ template <class P>
+ void TextureCache<P>::TickFrame() {
+     static const bool pe_busy = Common::PeSwitch("EDEN_PE_ASTC_BUSY_ASYNC");
+     if (pe_busy) Eden::AstcPolicy::Frame();
++    // EDEN_UP_HITCH_TRACE: the frame that just ended, when it was long.
++    HitchTrace::EndFrame(frame_tick);
+     if (CleanByTime() || RefusalEvictEnabled()) {
+         frame_clock.EndFrame(frame_tick, std::chrono::steady_clock::now());
+     }
+@@ -1269,6 +1285,7 @@ void TextureCache<P>::TickFrame() {
+     }
+     AreaEvict();
+     if (total_used_memory > minimum_memory) {
++        HitchTrace::Op collector_trace{HitchTrace::Kind::Collector, total_used_memory, {}};
+         RunGarbageCollector();
+     }
+     if (refused_views && std::chrono::steady_clock::now() >= image_refused_until) {
+@@ -3263,6 +3280,8 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         return;
+     }
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
++    HitchTrace::Op upload_trace{HitchTrace::Kind::ImageUpload, image.guest_size_bytes,
++                                HitchTraceDesc(image.info, image.gpu_addr)};
+ 
+     image.flags &= ~ImageFlagBits::CpuModified;
+ 
+@@ -4218,6 +4237,9 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+ 
+     image.flags |= ImageFlagBits::IsDecoding;
+     ++async_decodes_queued;
++    // EDEN_UP_HITCH_TRACE: the unswizzle and the zero fill below run on the GPU thread.
++    HitchTrace::Op queue_trace{HitchTrace::Kind::DecodeQueue, image.unswizzled_size_bytes,
++                               HitchTraceDesc(image.info, image.gpu_addr)};
+     auto decode = std::make_unique<AsyncDecodeContext>();
+     auto* decode_ptr = decode.get();
+     decode->image_id = image_id;
+@@ -4327,6 +4349,7 @@ void TextureCache<P>::QueueAsyncUnswizzle(Image& image, ImageId image_id) {
+ 
+ template <class P>
+ void TextureCache<P>::TickAsyncDecode() {
++    HitchTrace::Op landing_trace{HitchTrace::Kind::DecodeLanding, 0, {}};
+     bool has_uploads{};
+     size_t upload_budget = UPLOAD_FRAME_BYTES;
+     auto i = async_decodes.begin();
+@@ -4957,6 +4980,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+     }
+     ImageId new_image_id{};
+     const auto make_image = [&] {
++        HitchTrace::Op made_trace{HitchTrace::Kind::ImageMade, 0, HitchTraceDesc(new_info, gpu_addr)};
+         new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+     };
+     if constexpr (requires { runtime.SurvivesImageRefusal(make_image); }) {

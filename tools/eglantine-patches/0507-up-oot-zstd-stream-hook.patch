@@ -1,0 +1,1187 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_OOT_ZSTD_STREAM=1: the game's zstd stream decoder runs on the host's libzstd (svc 0xF4), with EDEN_UP_OOT_ZSTD_STREAM_VERIFY=<N> checking the first N steps against the game's own decoder (svc 0xF5); off by default
+
+0447 (EDEN_UP_OOT_NATIVE_ZSTD) replaces the three calls of ZSTD_decompressMultiFrame, but the
+loader (main+0xE8DA0) only calls that for a file that fits in one read. A larger file goes to the
+game's own stream decoder: the loader fills the decode job embedded at loader+0x5A0 (vtable
+main+0x4C177C0) and hands it the file one read chunk at a time, double buffered, on a job thread.
+The job's run method (main+0xF5BF0) calls Step(state, chunk, size, ddict) at main+0xF5C80, a loop
+of ZSTD_nextSrcSizeToDecompress / ZSTD_decompressContinue units on a buffer-less ZSTD_DCtx
+(ZSTD_decompressContinue main+0xF3880, partly inlined). The game uses no ZSTD_decompressStream on
+this path, so a stream-API hook would never run. The block decoder (main+0xF6490) and
+HUF_decompress4X (main+0xF0860) in the page GBB's fast-mode profile names (main+0xF0000, 31% of
+guest core 5 with native zstd on) are shared with ZSTD_decompressMultiFrame: with 0447 on, streams
+are the main guest user of that page we know of, but nothing measured ties the 31% to them.
+
+How it was identified: main of build E0F3CCFA... was taken out of the game's NUP (ExeFS "main",
+stored raw), its ZBIC segments rewritten as plain zstd (ZBIC differs only in the magic and in a
+binary-interpolative FSE count header; all three segment SHA-256s match the NSO header) and
+disassembled. 0447's sites and original bytes check out against it (0xBF72E0, 0xF50164, 0xE910C,
+0x14ABC, 0x58FC64). The only branch to Step is the `bl` at main+0xF5C2C (no other bl/b, no
+address taken); main+0xF5C6C..0xF5C7F after its caller is zero padding nothing branches to.
+
+With the switch, the built-in patch "Native zstd stream" turns that bl into svc 0xF4 and puts
+`svc 0xF5; b 0xF5C30` at main+0xF5C70 (all-or-none, original bytes checked, build id checked).
+svc 0xF4 checks the patch is in place. For a step state in phase 1 (start of a frame: nothing is
+written yet and the game's Step can still run) it starts a host stream: a static host DCtx
+(ZSTD_decompressBegin_usingDDict, the ddict through 0447's dictionary cache) and a 128 KiB
+staging buffer, about 225 KiB, reserved in EDEN_UP_OOT_ZSTD_STREAM_BUDGET_MIB (default 16) before
+anything is allocated; when the budget is full, streams idle for 10 s are evicted first. Every
+step of that stream then runs Step's own unit loop on the host and decodes straight into the
+guest destination through its host pointer: the destination has to be one contiguous host block
+(checked page by page at the start and for each block), and there is no window buffer. Same
+units and the same staging (a raw block split over two chunks waits, as in the game), so after
+each step the bytes written, +0x08, +0x10/+0x14, +0x2C, the phase (2/3/4) and the return value
+(-1, -2 for dstSize_tooSmall, -3 for input after the frame end) are the game's. Before and after
+each block the bytes it may write go through Memory::FlushDataCache: HandleRasterizerWrite for
+pages the GPU caches track, as WriteBlock calls it before it copies (the ahead guard copies such
+a page there). One difference stays: host libzstd 1.5 may put a block's literals up to one block
+ahead of +0x08, in bytes that are not decoded yet either way. The game's DCtx is never
+initialised; +0x30 (0 from the loader) stays 0 as the host's mark, so a host stream that was lost
+or evicted, or a step state changed behind the host, fails the step (phase 3, -1) instead of
+running the game's decoder on an empty DCtx. Anything the host does not reproduce (skippable,
+empty or unknown-size frame, a destination smaller than the content or not one host block, an
+unusual dictionary, budget full, a failed allocation) runs the game's Step for the whole stream.
+Live switch (0478): EDEN_UP_OOT_ZSTD_STREAM is a new armed entry, read only when a stream starts,
+so a stream never changes owner; in an off phase new streams go to the game.
+
+EDEN_UP_OOT_ZSTD_STREAM_VERIFY=<N>: a check run. The host owns no stream; the game's Step decodes
+everything. For the first N steps (each stream from its first step on) Step returns into the
+cave, whose svc 0xF5 decodes the same chunk on the host into a window of its own
+(ZSTD_decodingBufferSize_min, charged to the budget) and compares each unit's bytes with what the
+game wrote, then the return value, the phase and +0x08/+0x10/+0x14/+0x2C (the run method keeps
+the job in x19). Only streams that started take steps. Equal steps log 16 lines, mismatches up
+to 16 lines with the first differing byte, plus a verify counters line every second (streams
+whose window does not fit the budget are counted as not checked: raise the budget for the check
+run if there are many). After N steps the game goes on alone.
+Counters: "Native zstd stream: ..." once a second while streams run.
+
+Unset: no built-in patch, svc 0xF4/0xF5 return false before anything else, as before, and the
+live switch is never read. Not compiled: needs a build, then one VERIFY run (e.g. VERIFY=2000 on
+the door benchmark) with zero mismatches before any fps run.
+---
+diff --git a/src/common/live_switch.h b/src/common/live_switch.h
+index 96d2fab..2b44f62 100644
+--- a/src/common/live_switch.h
++++ b/src/common/live_switch.h
+@@ -65,7 +65,7 @@
+ /// EDEN_UP_OOT_LOAD_WAIT=1 was set at boot (the change is refused and logged). When a schedule
+ /// starts, a warning names every switch its phases turn on that cannot do anything in this run.
+ ///
+-/// Four of the switches have to be on at boot to change at all, because the work that makes
++/// Five of the switches have to be on at boot to change at all, because the work that makes
+ /// them possible is set up once (marked "armed" below): with them off at boot a phase that
+ /// turns them on does nothing, and the change line says so.
+ namespace Common::LiveSwitch {
+@@ -89,6 +89,11 @@ enum class Id : u8 {
+     /// Off while the game loads is where sessions ended (common/nx2_load_wait.h): keep
+     /// EDEN_UP_OOT_LOAD_WAIT=1 on at boot for any schedule that turns this off.
+     OotFrameWait,
++    /// EDEN_UP_OOT_ZSTD_STREAM, armed (the game patch). Read only when a zstd stream starts:
++    /// off, a stream that starts is decoded by the game's Step; a stream the host already owns
++    /// finishes on the host, since the game's DCtx cannot take it over
++    /// (core/hle/kernel/svc/svc_nx2_zstd.cpp).
++    OotZstdStream,
+     Count,
+ };
+ 
+@@ -131,6 +136,7 @@ inline constexpr std::array<Def, NumSwitches> kDefs{{
+     {"EDEN_UP_OOT_NATIVE_ZSTD", ParseExactOne, true, -1},
+     {"EDEN_NX2_TC_KEEP_ASYNC", ParseKeepFrames, false, -1},
+     {"EDEN_UP_OOT_FRAME_WAIT", ParseExactOne, false, -1},
++    {"EDEN_UP_OOT_ZSTD_STREAM", ParseExactOne, true, -1},
+ }};
+ 
+ /// EDEN_UP_LIVE_SWITCHES=1 (exact "1"), read once.
+diff --git a/src/core/file_sys/patch_manager.cpp b/src/core/file_sys/patch_manager.cpp
+index 1192fd8..18b6498 100644
+--- a/src/core/file_sys/patch_manager.cpp
++++ b/src/core/file_sys/patch_manager.cpp
+@@ -13,6 +13,7 @@
+ #include <span>
+ #include <string_view>
+ 
++#include "common/pe_switch.h"
+ #include "common/assert.h"
+ #include "common/hex_util.h"
+ #include "common/logging.h"
+@@ -163,6 +164,28 @@ constexpr std::array OOT_NATIVE_ZSTD_RECORDS{
+     BuiltinPatchRecord{0xE910C, OOT_ZSTD_SVC_F2, OOT_ZSTD_CALL_3},
+ };
+ 
++// EDEN_UP_OOT_ZSTD_STREAM=1: files larger than one read go through the game's own zstd stream
++// decoder, not ZSTD_decompressMultiFrame. Its step function (main+0xF5C80, called only from the
++// decode job's run method main+0xF5BF0, whose vtable is at main+0x4C177C0) feeds one read chunk to
++// a buffer-less ZSTD_DCtx (ZSTD_decompressContinue main+0xF3880, block decoder main+0xF6490). The
++// one `bl` to it becomes svc 0xF4; the zero padding after the caller (main+0xF5C6C..0xF5C7F) gets
++// `svc 0xF5; b main+0xF5C30`, the return point of the verify mode (svc_nx2_zstd.cpp).
++[[nodiscard]] bool NativeZstdStreamEnabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_OOT_ZSTD_STREAM");
++    return enabled;
++}
++constexpr std::array<u8, 4> OOT_ZSTD_STREAM_CALL{0x15, 0x00, 0x00, 0x94}; // bl 0xf5c80
++constexpr std::array<u8, 4> OOT_ZSTD_STREAM_SVC_F4{0x81, 0x1E, 0x00, 0xD4}; // svc #0xf4
++constexpr std::array<u8, 8> OOT_ZSTD_STREAM_CAVE_ORIGINAL{};
++constexpr std::array<u8, 8> OOT_ZSTD_STREAM_CAVE{
++    0xA1, 0x1E, 0x00, 0xD4, // svc #0xf5
++    0xEF, 0xFF, 0xFF, 0x17, // b 0xf5c30
++};
++constexpr std::array OOT_ZSTD_STREAM_RECORDS{
++    BuiltinPatchRecord{0xF5C2C, OOT_ZSTD_STREAM_SVC_F4, OOT_ZSTD_STREAM_CALL},
++    BuiltinPatchRecord{0xF5C70, OOT_ZSTD_STREAM_CAVE, OOT_ZSTD_STREAM_CAVE_ORIGINAL},
++};
++
+ // EDEN_UP_OOT_FAST_LOOKUP=1: the string-keyed sorted-index lookup at main+0x58EEA0 binary-searches
+ // with an inlined strcmp (8-way unrolled, two branches per byte). Both hot copies (lower bound
+ // main+0x58FC64, upper bound main+0x591E24) are rewritten in place as an 8-bytes-per-iteration
+@@ -272,6 +295,9 @@ constexpr std::array BUILTIN_GROUP_PATCHES{
+     BuiltinGroupPatch{"Native zstd (built-in)", 0x0400486024DEC000, "main",
+                       "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", OOT_NATIVE_ZSTD_RECORDS,
+                       NativeZstdEnabled},
++    BuiltinGroupPatch{"Native zstd stream (built-in)", 0x0400486024DEC000, "main",
++                      "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", OOT_ZSTD_STREAM_RECORDS,
++                      NativeZstdStreamEnabled},
+     BuiltinGroupPatch{"Fast lookup strcmp (built-in)", 0x0400486024DEC000, "main",
+                       "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348", OOT_FAST_LOOKUP_RECORDS,
+                       FastLookupEnabled},
+diff --git a/src/core/hle/kernel/svc/svc_nx2_zstd.cpp b/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
+index 637ec66..59f3d00 100644
+--- a/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
++++ b/src/core/hle/kernel/svc/svc_nx2_zstd.cpp
+@@ -7,16 +7,20 @@
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <memory>
+ #include <mutex>
+ #include <new>
++#include <unordered_map>
+ #include <vector>
+ 
+ #define ZSTD_STATIC_LINKING_ONLY
+ #include <zstd.h>
++#include <zstd_errors.h>
+ 
+ #include "common/live_switch.h"
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "common/scratch_buffer.h"
+ #include "core/arm/arm_interface.h"
+ #include "core/core.h"
+@@ -451,9 +455,999 @@ void MaybeLogCounters(s64 now) {
+     }
+ }
+ 
++// EDEN_UP_OOT_ZSTD_STREAM=1: the game's own zstd stream decoder, svc 0xF4 and 0xF5.
++//
++// ZSTD_decompressMultiFrame above only sees files that fit one read. For a larger file the loader
++// (main+0xE8DA0, the run method of its job class, vtable main+0x4C177E8) sets up the decode job
++// embedded at loader+0x5A0 (vtable main+0x4C177C0, 0xC8 bytes) and hands it the file one read
++// chunk at a time, double buffered, on a job thread: it clears the job's chunk event (job+0x98),
++// queues the job (main+0xE9234), reads the next chunk into the other half of its buffer and waits
++// on that event, which the job's run method (main+0xF5BF0) signals only after Step has returned.
++// The run method calls Step(state = job+0x10, chunk, chunkSize, ddict) at main+0xF5C80, and
++// nothing else calls Step. Step drives a buffer-less ZSTD_DCtx (0x271F8 bytes, its literal
++// buffer inside, as in zstd 1.4): ZSTD_decompressContinue (main+0xF3880, partly inlined into
++// Step), the block decoder ZSTD_decompressBlock_internal (main+0xF6490) and HUF_decompress4X
++// (main+0xF0860), which ZSTD_decompressMultiFrame uses too. Found in the main of build E0F3CCFA
++// (title 0400486024DEC000, v131072) taken out of the game's NUP and disassembled: the only `bl`
++// to Step is at kStreamSiteOffset.
++//
++// The step state (0x38 bytes, filled by the loader at main+0xE91B0 before the first chunk):
++//   +0x00 u8  phase: 1 = start a frame, 2 = decoding, 3 = failed, 4 = frame complete
++//   +0x08 u64 where the next decoded byte goes (the loader's destination buffer)
++//   +0x10 s32 destination bytes left        +0x14 s32 content bytes left (Step's return value)
++//   +0x18 u64 workspace of the game's static ZSTD_DCtx
++//   +0x20 u64 staging buffer (+0x18 plus an offset)
++//   +0x28 s32 its size (0x20000 from the loader)
++//   +0x2C s32 bytes staged (the start of a unit the chunk did not hold whole; 0 from the loader)
++//   +0x30 u64 the ZSTD_DCtx: 0 from the loader, the workspace once phase 1 ran
++// What Step does:
++//   phase 3: returns -1. Phase 4: returns -3.
++//   phase 1: ZSTD_getFrameHeader_advanced (zstd1) on the chunk. An error, a header the chunk does
++//     not hold whole, or an unknown content size gives phase 3 and -1 (a skippable frame counts as
++//     content size 0). +0x14 = content size, the static DCtx is initialised with
++//     ZSTD_decompressBegin (_usingDDict when ddict != 0), +0x30 = it, phase 2, then as phase 2.
++//   phase 2 (and any other value): while chunk bytes are left, n = ZSTD_nextSrcSizeToDecompress:
++//     - n is 0 (the frame ended) with input left: phase 3, -3.
++//     - bytes are staged: the staging buffer is filled up to n from the chunk; once it holds n,
++//       they go through ZSTD_decompressContinue and the staged count goes back to 0.
++//     - fewer than n chunk bytes are left: they are copied to the staging buffer (phase 3 and -1
++//       if n is over +0x28) and the step ends.
++//     - else n chunk bytes go through ZSTD_decompressContinue (inlined), dstCapacity = +0x10.
++//     After each unit the bytes it wrote are added to +0x08 and taken off +0x10 and +0x14. A zstd
++//     error gives phase 3 and -2 for dstSize_tooSmall, else -1 (the units before it stay counted).
++//     At the end: phase 4 if n is 0 (frame complete); the return value is +0x14.
++//   So a raw block, like every unit, is decoded only once it is whole: a block split over two
++//   chunks waits in the staging buffer.
++// The run method only looks at whether w0 is 0, negative or positive (main+0xF5C3C); the loader
++// reads the job's error word (main+0xE9314) and the phase (main+0xE931C) after its last chunk.
++//
++// The host runs that loop with host libzstd's buffer-less API (ZSTD_decompressBegin_usingDDict,
++// ZSTD_nextSrcSizeToDecompress, ZSTD_decompressContinue) on the same units, so after each step the
++// bytes written, +0x08, +0x10, +0x14, +0x2C, the phase and the return value are what the game's
++// Step leaves. It decodes straight into the guest's destination through its host pointer (the
++// whole destination must be one contiguous host block, checked page by page when the stream
++// starts and again for each block), so a stream costs a host DCtx and a 128 KiB staging buffer,
++// no window buffer. Before each block, and again after it, the bytes the block may write go
++// through Memory::FlushDataCache, which calls HandleRasterizerWrite for pages the GPU caches
++// track: the call WriteBlock makes before it copies (the ahead guard copies such a page there).
++// One difference stays: host libzstd 1.5 may put a block's literals in the destination up to one
++// block ahead of +0x08 (ZSTD_allocateLiteralsBuffer, streaming), where the game's decoder
++// keeps them in its DCtx. Those bytes are not decoded yet either way, and the next blocks' output
++// covers them.
++// The game's DCtx is never initialised: +0x30 stays 0 while the host owns a stream (the game's own
++// phase 1 never leaves it 0), so a host stream that was lost, or a step state changed behind the
++// host, fails the step (phase 3, -1) instead of running the game's decoder on an empty DCtx.
++// A stream starts on the host only in phase 1, where nothing is written yet and the game's Step
++// can still run instead; once the host owns a stream it finishes it (the game's DCtx could not
++// take it over). Anything the host does not reproduce (see StartStream) leaves the whole stream to
++// the game. The two zstd versions differ on corrupt input only (1.5 also checks a block's size
++// against blockSizeMax, and some error codes differ): both fail the step then.
++constexpr u32 kStreamSvc = 0xF4;       ///< Replaces `bl Step` (kStreamSiteOffset)
++constexpr u32 kStreamReturnSvc = 0xF5; ///< Verify mode: where Step returns to (kStreamCaveOffset)
++constexpr u64 kStreamSiteOffset = 0xF5C2C;
++constexpr u64 kStreamStepOffset = 0xF5C80;
++constexpr u64 kStreamCaveOffset = 0xF5C70; ///< `svc #0xf5; b 0xf5c30` in the padding after it
++constexpr u32 kStreamSvcInstruction = 0xD4001E81;       // svc #0xf4
++constexpr u32 kStreamReturnSvcInstruction = 0xD4001EA1; // svc #0xf5
++constexpr u32 kStepFirstInstruction = 0xD503237F;       // pacibsp
++// The run method keeps the job in x19 across the call; the step state is job+0x10.
++constexpr size_t kJobRegister = 19;
++constexpr u64 kJobStepState = 0x10;
++
++constexpr u64 kPhase = 0x00;
++constexpr u64 kDst = 0x08;
++constexpr u64 kDstLeft = 0x10;
++constexpr u64 kContentLeft = 0x14;
++constexpr u64 kStagingSize = 0x28;
++constexpr u64 kStaged = 0x2C;
++constexpr u64 kDctx = 0x30;
++constexpr u64 kStateBytes = 0x38;
++constexpr u8 kPhaseStart = 1;
++constexpr u8 kPhaseDecoding = 2;
++constexpr u8 kPhaseFailed = 3;
++constexpr u8 kPhaseComplete = 4;
++
++// The largest unit ZSTD_nextSrcSizeToDecompress asks for in a zstd1 frame is a block (host libzstd
++// rejects a block header over blockSizeMax, at most 128 KiB); a frame header is at most 18 bytes,
++// the checksum 4. It is also the most one block writes at the destination, its literals included.
++constexpr size_t kUnitMax = ZSTD_BLOCKSIZE_MAX;
++// A stream idle this long may be evicted when the budget is full (a load the game gave up).
++constexpr s64 kIdleNs = 10'000'000'000;
++constexpr size_t kFingerprintBytes = 64;
++
++bool StreamEnabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_OOT_ZSTD_STREAM");
++    return enabled;
++}
++
++// EDEN_UP_OOT_ZSTD_STREAM_VERIFY=<N> (with EDEN_UP_OOT_ZSTD_STREAM=1): a check run. The host owns
++// no stream: the game's Step decodes every stream, and for the first N steps (all streams
++// together, each stream from its first step on) a host decoder decodes the same chunk after the
++// game's step and compares (svc 0xF5). After N steps the game goes on alone. Unset or 0: streams
++// are decoded on the host, nothing is compared.
++u64 StreamVerifySteps() {
++    static const u64 steps = [] {
++        const char* value = std::getenv("EDEN_UP_OOT_ZSTD_STREAM_VERIFY");
++        if (value == nullptr || value[0] < '1' || value[0] > '9') {
++            return u64{0};
++        }
++        return std::min<u64>(std::strtoull(value, nullptr, 10), 100'000'000);
++    }();
++    return steps;
++}
++
++// EDEN_UP_OOT_ZSTD_STREAM_BUDGET_MIB=<MiB>: host memory of all stream decoders together (1 to
++// 1024). A host stream takes a static DCtx (ZSTD_estimateDCtxSize) and a 128 KiB staging buffer,
++// about 225 KiB; a verify stream also its own window (ZSTD_decodingBufferSize_min, at most the
++// content size). A stream that does not fit, after streams idle for 10 s were evicted, is decoded
++// by the game. Unset or anything else: 16.
++size_t StreamBudgetBytes() {
++    static const size_t bytes = [] {
++        const char* value = std::getenv("EDEN_UP_OOT_ZSTD_STREAM_BUDGET_MIB");
++        unsigned long long mib = 16;
++        if (value != nullptr && value[0] >= '0' && value[0] <= '9') {
++            const unsigned long long parsed = std::strtoull(value, nullptr, 10);
++            if (parsed >= 1 && parsed <= 1024) {
++                mib = parsed;
++            }
++        }
++        return static_cast<size_t>(mib) << 20;
++    }();
++    return bytes;
++}
++
++std::atomic<size_t> g_stream_budget_used{};
++std::atomic<u64> g_verify_taken{};
++
++bool ReserveBudget(size_t bytes) {
++    size_t used = g_stream_budget_used.load(std::memory_order_relaxed);
++    do {
++        if (bytes > StreamBudgetBytes() || used > StreamBudgetBytes() - bytes) {
++            return false;
++        }
++    } while (!g_stream_budget_used.compare_exchange_weak(used, used + bytes,
++                                                         std::memory_order_relaxed));
++    return true;
++}
++
++bool VerifySlotLeft() {
++    return g_verify_taken.load(std::memory_order_relaxed) < StreamVerifySteps();
++}
++
++// One verify slot per compared step, while there are any.
++bool TakeVerifySlot() {
++    const u64 limit = StreamVerifySteps();
++    u64 taken = g_verify_taken.load(std::memory_order_relaxed);
++    while (taken < limit) {
++        if (g_verify_taken.compare_exchange_weak(taken, taken + 1, std::memory_order_relaxed)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++struct StreamStats {
++    std::atomic<u64> steps{};
++    std::atomic<u64> host_steps{};
++    std::atomic<u64> host_streams{};
++    std::atomic<u64> game_streams{}; ///< Left to the game's Step for a reason (first ones logged)
++    std::atomic<u64> live_off{};     ///< Left to the game's Step: live switch off when it started
++    std::atomic<u64> budget_full{};  ///< Of game_streams: no room in the budget
++    std::atomic<u64> evicted{};      ///< Idle host streams dropped to make room
++    std::atomic<u64> bytes{};        ///< Written by the host
++    std::atomic<s64> host_ns{};
++    std::atomic<s64> longest_ns{};
++    std::atomic<u64> errors{};       ///< Host steps that ended in phase 3
++    std::atomic<u64> lost{};         ///< Steps failed because their host stream was gone
++    std::atomic<u64> shadow_streams{}; ///< Verify mode
++    std::atomic<u64> verify_steps{};
++    std::atomic<u64> verify_bytes{};
++    std::atomic<u64> verify_mismatches{};
++    std::atomic<u64> verify_aborted{};
++};
++StreamStats g_stream_stats;
++
++// A host decoder for one step state: a static DCtx and a staging buffer (and, verifying, a window
++// of its own), all allocated when the stream starts and charged to the budget, so a step never
++// allocates.
++struct HostStream {
++    ~HostStream() {
++        if (budget_bytes != 0) {
++            g_stream_budget_used.fetch_sub(budget_bytes, std::memory_order_relaxed);
++        }
++    }
++
++    std::mutex mutex;
++    size_t budget_bytes{};
++    std::unique_ptr<u64[]> dctx_space;
++    ZSTD_DCtx* dctx{};
++    std::unique_ptr<u8[]> staging;   ///< kUnitMax bytes: a partial unit, or a whole one being read
++    std::shared_ptr<DictEntry> dict; ///< The host DDict references it; kept while the stream runs
++    bool shadow{};                   ///< Verify mode: the game decodes, the host compares
++    bool evicted{};                  ///< Dropped from the table while idle (set under `mutex`)
++    std::atomic<s64> last_used_ns{};
++    // The step state as the game's Step leaves it after the last step.
++    u64 dst{};
++    s32 dst_left{};
++    s32 content_left{};
++    s32 staged{};
++    s32 staging_size{}; ///< The game's (+0x28): a partial unit at the end of a chunk must fit it
++    // Owned: the destination [dst_base, dst_base + dst_bytes), one contiguous host block.
++    u64 dst_base{};
++    u64 dst_bytes{};
++    u8* host_base{};
++    // Shadow: a window of its own, used as ZSTD_decompressStream uses its ring buffer.
++    std::unique_ptr<u8[]> ring;
++    size_t ring_size{};
++    size_t ring_pos{};
++    size_t block_size_max{};
++    u64 content_size{};
++    // Shadow: the step the game is running now, compared at svc 0xF5.
++    bool pending{};
++    u64 pending_src{};
++    s32 pending_size{};
++    std::array<u8, kFingerprintBytes> pending_head{}; ///< The chunk's first bytes at svc 0xF4
++    std::array<u8, kFingerprintBytes> pending_tail{}; ///< and its last bytes
++};
++
++struct StreamTable {
++    std::mutex mutex;
++    std::unordered_map<u64, std::shared_ptr<HostStream>> streams; ///< By step state address
++};
++
++StreamTable& Streams() {
++    static StreamTable table;
++    return table;
++}
++
++std::shared_ptr<HostStream> FindStream(u64 state) {
++    auto& table = Streams();
++    std::scoped_lock lock{table.mutex};
++    const auto it = table.streams.find(state);
++    return it == table.streams.end() ? nullptr : it->second;
++}
++
++// Removes `which` from the table (nothing if another stream holds the state now).
++void EraseStream(u64 state, const HostStream* which) {
++    std::shared_ptr<HostStream> old; // freed outside the lock
++    auto& table = Streams();
++    std::scoped_lock lock{table.mutex};
++    const auto it = table.streams.find(state);
++    if (it != table.streams.end() && it->second.get() == which) {
++        old = std::move(it->second);
++        table.streams.erase(it);
++    }
++}
++
++void InsertStream(u64 state, std::shared_ptr<HostStream> stream) {
++    auto& table = Streams();
++    std::scoped_lock lock{table.mutex};
++    table.streams[state] = std::move(stream);
++}
++
++// Drops streams idle for kIdleNs (a load the game gave up mid-file leaves its stream behind). A
++// stream in use is skipped (its mutex is held). An owned stream dropped here fails its next
++// step, if one ever comes (phase 3, -1). Returns how many were dropped.
++size_t EvictIdle(s64 now) {
++    std::vector<std::shared_ptr<HostStream>> dropped; // freed outside the lock
++    dropped.reserve(32);
++    auto& table = Streams();
++    {
++        std::scoped_lock lock{table.mutex};
++        for (auto it = table.streams.begin();
++             it != table.streams.end() && dropped.size() < dropped.capacity();) {
++            HostStream& stream = *it->second;
++            if (now - stream.last_used_ns.load(std::memory_order_relaxed) < kIdleNs ||
++                !stream.mutex.try_lock()) {
++                ++it;
++                continue;
++            }
++            stream.evicted = true;
++            stream.mutex.unlock();
++            dropped.push_back(std::move(it->second)); // within the reserved capacity
++            it = table.streams.erase(it);
++        }
++    }
++    g_stream_stats.evicted.fetch_add(dropped.size(), std::memory_order_relaxed);
++    return dropped.size();
++}
++
++bool InstructionAt(Core::Memory::Memory& memory, u64 address, u32 instruction) {
++    return memory.IsValidVirtualAddressRange(address, 4) && memory.Read32(address) == instruction;
++}
++
++// The host pointer of [address, address + bytes) when the whole range is one contiguous host
++// block, checked page by page (as Memory::GetContiguousSpan does); else null.
++u8* ContiguousHost(Core::Memory::Memory& memory, u64 address, u64 bytes) {
++    if (bytes == 0 || !memory.IsValidVirtualAddressRange(address, bytes)) {
++        return nullptr;
++    }
++    u8* const base = memory.GetPointerSilent(address);
++    if (base == nullptr) {
++        return nullptr;
++    }
++    const u64 end = address + bytes;
++    for (u64 page = (address & ~Core::Memory::YUZU_PAGEMASK) + Core::Memory::YUZU_PAGESIZE;
++         page < end; page += Core::Memory::YUZU_PAGESIZE) {
++        if (memory.GetPointerSilent(page) != base + (page - address)) {
++            return nullptr;
++        }
++    }
++    return base;
++}
++
++// Owned: [address, address + bytes) is inside the destination and still maps, page by page, to
++// the host memory it mapped to when the stream started.
++bool StillMapped(Core::Memory::Memory& memory, const HostStream& stream, u64 address, u64 bytes) {
++    if (address < stream.dst_base || address - stream.dst_base > stream.dst_bytes ||
++        bytes > stream.dst_bytes - (address - stream.dst_base)) {
++        return false;
++    }
++    const u64 end = address + bytes;
++    for (u64 at = address; at < end;
++         at = (at & ~Core::Memory::YUZU_PAGEMASK) + Core::Memory::YUZU_PAGESIZE) {
++        if (memory.GetPointerSilent(at) != stream.host_base + (at - stream.dst_base)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Phase 1 on the host: the checks the game's phase 1 makes, plus what the host needs. Null, with
++// the reason, when the game's Step must run this stream; nothing was written to the guest then.
++std::shared_ptr<HostStream> StartStream(Core::Memory::Memory& memory, u64 state, u64 src,
++                                        s32 size, u64 ddict_address, bool shadow, s64 now,
++                                        const char*& reason) {
++    std::array<u8, ZSTD_FRAMEHEADERSIZE_MAX> header{};
++    if (size < 1 || !memory.IsValidVirtualAddressRange(src, static_cast<u64>(size))) {
++        reason = "chunk empty or unreadable";
++        return nullptr;
++    }
++    const size_t header_size = std::min<size_t>(static_cast<size_t>(size), header.size());
++    if (!memory.ReadBlock(src, header.data(), header_size)) {
++        reason = "chunk unreadable";
++        return nullptr;
++    }
++    ZSTD_frameHeader frame{};
++    if (ZSTD_getFrameHeader(&frame, header.data(), header_size) != 0) {
++        reason = "no complete frame header in the first chunk (the game's Step fails it)";
++        return nullptr;
++    }
++    if (frame.frameType != ZSTD_frame || frame.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN ||
++        frame.frameContentSize == 0 ||
++        frame.frameContentSize > static_cast<u64>(std::numeric_limits<s32>::max())) {
++        reason = "skippable or empty frame, or content size unknown or over 2 GiB";
++        return nullptr;
++    }
++    const u64 content = frame.frameContentSize;
++    const u64 dst = memory.Read64(state + kDst);
++    const s32 dst_left = static_cast<s32>(memory.Read32(state + kDstLeft));
++    const s32 staging_size = static_cast<s32>(memory.Read32(state + kStagingSize));
++    const s32 staged = static_cast<s32>(memory.Read32(state + kStaged));
++    if (dst_left < 0 || static_cast<u64>(dst_left) < content) {
++        reason = "destination smaller than the content";
++        return nullptr;
++    }
++    if (staged != 0 || staging_size < 1) {
++        reason = "unusual staging state";
++        return nullptr;
++    }
++    u8* host_base = nullptr;
++    if (!shadow) {
++        host_base = ContiguousHost(memory, dst, content);
++        if (host_base == nullptr) {
++            reason = "destination not one contiguous host block";
++            return nullptr;
++        }
++    }
++    std::shared_ptr<DictEntry> dict;
++    if (ddict_address != 0) {
++        GuestDDict key;
++        if (!DictEnabled()) {
++            reason = "ddict (EDEN_UP_OOT_ZSTD_DICT=0)";
++            return nullptr;
++        }
++        if (!ReadGuestDDict(memory, ddict_address, key) || !(dict = GetDict(memory, key, now)) ||
++            !dict->ddict) {
++            reason = "dictionary the host does not reproduce";
++            return nullptr;
++        }
++    }
++    // As ZSTD_decompressStream sizes its buffer for this frame.
++    size_t ring_size = 0;
++    if (shadow) {
++        ring_size = ZSTD_decodingBufferSize_min(std::max<u64>(frame.windowSize, u64{1} << 10),
++                                                content);
++        if (ZSTD_isError(ring_size) || ring_size == 0) {
++            reason = "window the host cannot hold";
++            return nullptr;
++        }
++    }
++    const size_t dctx_words = (ZSTD_estimateDCtxSize() + 7) / 8;
++    const size_t need = dctx_words * 8 + kUnitMax + ring_size;
++    auto stream = std::make_shared<HostStream>();
++    if (!ReserveBudget(need) && (EvictIdle(now) == 0 || !ReserveBudget(need))) {
++        g_stream_stats.budget_full.fetch_add(1, std::memory_order_relaxed);
++        reason = "host budget full (EDEN_UP_OOT_ZSTD_STREAM_BUDGET_MIB)";
++        return nullptr;
++    }
++    stream->budget_bytes = need; // given back by ~HostStream, also when an allocation below throws
++    stream->dctx_space.reset(new u64[dctx_words]);
++    stream->staging.reset(new u8[kUnitMax]);
++    if (shadow) {
++        stream->ring.reset(new u8[ring_size]);
++    }
++    stream->dctx = ZSTD_initStaticDCtx(stream->dctx_space.get(), dctx_words * 8);
++    if (stream->dctx == nullptr ||
++        ZSTD_isError(ZSTD_decompressBegin_usingDDict(stream->dctx,
++                                                     dict ? dict->ddict.get() : nullptr))) {
++        reason = "host DCtx setup";
++        return nullptr;
++    }
++    stream->dict = std::move(dict);
++    stream->shadow = shadow;
++    stream->last_used_ns.store(now, std::memory_order_relaxed);
++    // The step state as the game's phase 1 leaves it.
++    stream->dst = dst;
++    stream->dst_left = dst_left;
++    stream->content_left = static_cast<s32>(content);
++    stream->staged = 0;
++    stream->staging_size = staging_size;
++    stream->dst_base = dst;
++    stream->dst_bytes = content;
++    stream->host_base = host_base;
++    stream->ring_size = ring_size;
++    stream->block_size_max = frame.blockSizeMax;
++    stream->content_size = content;
++    return stream;
++}
++
++struct StepResult {
++    s32 ret{-1};
++    u8 phase{kPhaseFailed};
++    const char* stop{};     ///< The host could not go on (owned: the step fails; shadow: no check)
++    bool differs{};         ///< Shadow: a unit's output is not what the game wrote
++    u64 first_difference{}; ///< Shadow: offset in this step's output of the first byte that differs
++};
++
++// Shadow: the `n` bytes the host decoded for guest address `address` against what the game's Step
++// wrote there. False at the first difference (offset in the step's output) or if unreadable.
++bool SameAsGuest(Core::Memory::Memory& memory, u64 address, const u8* host, size_t n,
++                 u64 step_dst, StepResult& result) {
++    std::array<u8, 4096> buffer;
++    for (size_t offset = 0; offset < n; offset += buffer.size()) {
++        const size_t piece = std::min(buffer.size(), n - offset);
++        if (!memory.ReadBlock(address + offset, buffer.data(), piece)) {
++            result.stop = "the game's output is unreadable";
++            return false;
++        }
++        if (std::memcmp(buffer.data(), host + offset, piece) != 0) {
++            size_t i = 0;
++            while (buffer[i] == host[offset + i]) {
++                ++i;
++            }
++            result.differs = true;
++            result.first_difference = address + offset + i - step_dst;
++            return false;
++        }
++    }
++    return true;
++}
++
++// One unit through the host DCtx. Owned: into the guest destination. Shadow: into the stream's
++// ring, then compared with what the game wrote at the same place. False when the step ends here
++// (`result` says how).
++bool DecodeUnit(Core::Memory::Memory& memory, HostStream& stream, const u8* unit, size_t n,
++                u64 step_dst, StepResult& result) {
++    size_t written;
++    if (stream.shadow) {
++        u8* const out = stream.ring.get() + stream.ring_pos;
++        written = ZSTD_decompressContinue(stream.dctx, out, stream.ring_size - stream.ring_pos,
++                                          unit, n);
++        if (!ZSTD_isError(written) && written != 0) {
++            if (!SameAsGuest(memory, stream.dst, out, written, step_dst, result)) {
++                return false;
++            }
++            stream.ring_pos += written;
++            if (stream.ring_size < stream.content_size &&
++                stream.ring_pos + stream.block_size_max > stream.ring_size) {
++                stream.ring_pos = 0; // as ZSTD_decompressStream restarts its ring buffer
++            }
++        }
++    } else {
++        // content_left <= dst_left (StartStream), and a valid frame writes no more than that.
++        const size_t capacity = static_cast<size_t>(std::max<s32>(stream.content_left, 0));
++        const ZSTD_nextInputType_e type = ZSTD_nextInputType(stream.dctx);
++        const u64 span = (type == ZSTDnit_block || type == ZSTDnit_lastBlock)
++                             ? std::min<u64>(capacity, kUnitMax)
++                             : 0;
++        if (span != 0) {
++            if (!StillMapped(memory, stream, stream.dst, span)) {
++                result = {-1, kPhaseFailed, "the destination no longer maps where it did"};
++                return false;
++            }
++            static_cast<void>(memory.FlushDataCache(stream.dst, span));
++        }
++        written = ZSTD_decompressContinue(
++            stream.dctx, stream.host_base + (stream.dst - stream.dst_base), capacity, unit, n);
++        if (span != 0) {
++            // Again after the block: a page the GPU caches took in meanwhile learns of it too.
++            static_cast<void>(memory.FlushDataCache(stream.dst, span));
++        }
++    }
++    if (ZSTD_isError(written)) {
++        result = {ZSTD_getErrorCode(written) == ZSTD_error_dstSize_tooSmall ? -2 : -1,
++                  kPhaseFailed};
++        return false;
++    }
++    stream.dst += written;
++    stream.dst_left -= static_cast<s32>(written);
++    stream.content_left -= static_cast<s32>(written);
++    return true;
++}
++
++// Step's phase-2 loop (see the top of this section), unit for unit, on the stream's copy of the
++// step state. Every unit is read from the chunk into the staging buffer first (whole, or what
++// the chunk holds of it), which leaves the staged count as the game's.
++StepResult ReplicateStep(Core::Memory::Memory& memory, HostStream& stream, u64 src, s32 size) {
++    const u64 step_dst = stream.dst;
++    u8* const staging = stream.staging.get();
++    StepResult result{};
++    s64 remaining = size > 0 ? size : 0;
++    u64 at = src;
++    while (remaining > 0) {
++        const size_t expected = ZSTD_nextSrcSizeToDecompress(stream.dctx);
++        if (ZSTD_isError(expected) || expected > kUnitMax) {
++            return {-1, kPhaseFailed};
++        }
++        if (expected == 0) {
++            return {-3, kPhaseFailed}; // input left after the frame ended
++        }
++        const s64 unit = static_cast<s64>(expected);
++        if (stream.staged >= 1) {
++            const s64 need = unit - stream.staged;
++            if (need > 0) {
++                const s64 n = std::min(need, remaining);
++                if (!memory.ReadBlock(at, staging + stream.staged, static_cast<size_t>(n))) {
++                    return {-1, kPhaseFailed, "chunk unreadable"};
++                }
++                stream.staged += static_cast<s32>(n);
++                at += static_cast<u64>(n);
++                remaining -= n;
++            }
++            if (stream.staged < unit) {
++                continue; // the chunk is used up
++            }
++            if (!DecodeUnit(memory, stream, staging, expected, step_dst, result)) {
++                return result;
++            }
++            const s32 extra = stream.staged - static_cast<s32>(unit);
++            if (extra != 0) {
++                std::memmove(staging, staging + unit, static_cast<size_t>(extra));
++            }
++            stream.staged = extra;
++            continue;
++        }
++        if (remaining < unit) {
++            if (stream.staging_size < unit) {
++                return {-1, kPhaseFailed};
++            }
++            if (!memory.ReadBlock(at, staging, static_cast<size_t>(remaining))) {
++                return {-1, kPhaseFailed, "chunk unreadable"};
++            }
++            stream.staged = static_cast<s32>(remaining);
++            break;
++        }
++        if (!memory.ReadBlock(at, staging, expected)) {
++            return {-1, kPhaseFailed, "chunk unreadable"};
++        }
++        if (!DecodeUnit(memory, stream, staging, expected, step_dst, result)) {
++            return result;
++        }
++        at += expected;
++        remaining -= unit;
++    }
++    return {stream.content_left,
++            ZSTD_nextSrcSizeToDecompress(stream.dctx) == 0 ? kPhaseComplete : kPhaseDecoding};
++}
++
++// The step state still is what the host left after its last step.
++bool StateMatches(Core::Memory::Memory& memory, u64 state, const HostStream& stream) {
++    return memory.Read8(state + kPhase) == kPhaseDecoding &&
++           memory.Read64(state + kDst) == stream.dst &&
++           static_cast<s32>(memory.Read32(state + kDstLeft)) == stream.dst_left &&
++           static_cast<s32>(memory.Read32(state + kContentLeft)) == stream.content_left &&
++           static_cast<s32>(memory.Read32(state + kStaged)) == stream.staged &&
++           (stream.shadow || memory.Read64(state + kDctx) == 0);
++}
++
++// A host-owned step: decode, then write the step state the way the game's Step leaves it.
++s32 OwnedStep(Core::Memory::Memory& memory, u64 state, HostStream& stream, u64 src, s32 size) {
++    const s64 start = NowNs();
++    const u64 dst_before = stream.dst;
++    StepResult result{-1, kPhaseFailed, "host allocation failed"};
++    try {
++        result = ReplicateStep(memory, stream, src, size);
++    } catch (const std::bad_alloc&) {
++        TrimBuffers(0); // the stream itself never allocates
++    }
++    memory.Write64(state + kDst, stream.dst);
++    memory.Write32(state + kDstLeft, static_cast<u32>(stream.dst_left));
++    memory.Write32(state + kContentLeft, static_cast<u32>(stream.content_left));
++    memory.Write32(state + kStaged, static_cast<u32>(stream.staged));
++    memory.Write8(state + kPhase, result.phase);
++    stream.last_used_ns.store(NowNs(), std::memory_order_relaxed);
++    if (result.phase == kPhaseFailed || result.phase == kPhaseComplete) {
++        EraseStream(state, &stream);
++    }
++    if (result.phase == kPhaseFailed) {
++        if (g_stream_stats.errors.fetch_add(1, std::memory_order_relaxed) < 16) {
++            try {
++                LOG_WARNING(Kernel_SVC,
++                            "Native zstd stream: step at {:#x} failed on the host (returned {}, "
++                            "{}), {} bytes written in it, {} content bytes left",
++                            state, result.ret,
++                            result.stop != nullptr ? result.stop : "zstd error or bad input",
++                            stream.dst - dst_before, stream.content_left);
++            } catch (const std::bad_alloc&) {
++            }
++        }
++    }
++    const s64 took = NowNs() - start;
++    g_stream_stats.host_steps.fetch_add(1, std::memory_order_relaxed);
++    g_stream_stats.bytes.fetch_add(stream.dst - dst_before, std::memory_order_relaxed);
++    g_stream_stats.host_ns.fetch_add(took, std::memory_order_relaxed);
++    s64 longest = g_stream_stats.longest_ns.load(std::memory_order_relaxed);
++    while (took > longest && !g_stream_stats.longest_ns.compare_exchange_weak(
++                                 longest, took, std::memory_order_relaxed)) {
++    }
++    return result.ret;
++}
++
++// A phase-2 step whose host stream is gone: the game's DCtx was never set up, so the step fails,
++// as Step fails.
++void FailLostStep(Core::Memory::Memory& memory, u64 state, const char* why, s32& ret) {
++    if (g_stream_stats.lost.fetch_add(1, std::memory_order_relaxed) < 16) {
++        try {
++            LOG_WARNING(Kernel_SVC, "Native zstd stream: state {:#x}: {}; the step fails", state,
++                        why);
++        } catch (const std::bad_alloc&) {
++        }
++    }
++    memory.Write8(state + kPhase, kPhaseFailed);
++    ret = -1;
++}
++
++// Shadow, svc 0xF4: remember the step the game is about to run, with the chunk's first and last
++// bytes (the loader refills this half only after the run method's signal, which comes after
++// svc 0xF5; the fingerprint makes sure).
++bool MarkPending(Core::Memory::Memory& memory, HostStream& stream, u64 src, s32 size) {
++    const size_t n = std::min<size_t>(size > 0 ? static_cast<size_t>(size) : 0, kFingerprintBytes);
++    stream.pending_head.fill(0);
++    stream.pending_tail.fill(0);
++    if (n != 0 && (!memory.ReadBlock(src, stream.pending_head.data(), n) ||
++                   !memory.ReadBlock(src + static_cast<u64>(size) - n,
++                                     stream.pending_tail.data(), n))) {
++        return false;
++    }
++    stream.pending = true;
++    stream.pending_src = src;
++    stream.pending_size = size;
++    return true;
++}
++
++bool ChunkUnchanged(Core::Memory::Memory& memory, const HostStream& stream) {
++    const size_t n = std::min<size_t>(
++        stream.pending_size > 0 ? static_cast<size_t>(stream.pending_size) : 0,
++        kFingerprintBytes);
++    std::array<u8, kFingerprintBytes> head{};
++    std::array<u8, kFingerprintBytes> tail{};
++    return n == 0 ||
++           (memory.ReadBlock(stream.pending_src, head.data(), n) &&
++            memory.ReadBlock(stream.pending_src + static_cast<u64>(stream.pending_size) - n,
++                             tail.data(), n) &&
++            std::memcmp(head.data(), stream.pending_head.data(), n) == 0 &&
++            std::memcmp(tail.data(), stream.pending_tail.data(), n) == 0);
++}
++
++// Verify mode, svc 0xF5 after the game's step returned: the host decodes the same chunk and
++// compares the output bytes, the return value, the phase and +0x08/+0x10/+0x14/+0x2C.
++void VerifyStep(Core::Memory::Memory& memory, u64 state, s32 game_ret) {
++    const auto stream = FindStream(state);
++    if (!stream || !stream->shadow) {
++        return;
++    }
++    std::unique_lock lock{stream->mutex};
++    if (!stream->pending || stream->evicted) {
++        return;
++    }
++    stream->pending = false;
++    stream->last_used_ns.store(NowNs(), std::memory_order_relaxed);
++    const u64 step_dst = stream->dst;
++    StepResult result{};
++    if (!ChunkUnchanged(memory, *stream)) {
++        result.stop = "the chunk changed before the compare";
++    } else {
++        try {
++            result = ReplicateStep(memory, *stream, stream->pending_src, stream->pending_size);
++        } catch (const std::bad_alloc&) {
++            result.stop = "host allocation failed";
++        }
++    }
++    if (result.stop != nullptr) {
++        if (g_stream_stats.verify_aborted.fetch_add(1, std::memory_order_relaxed) < 8) {
++            try {
++                LOG_WARNING(Kernel_SVC, "Native zstd stream verify: stopped at {:#x}: {}", state,
++                            result.stop);
++            } catch (const std::bad_alloc&) {
++            }
++        }
++        lock.unlock();
++        EraseStream(state, stream.get());
++        return;
++    }
++    const u8 game_phase = memory.Read8(state + kPhase);
++    const u64 game_dst = memory.Read64(state + kDst);
++    const s32 game_dst_left = static_cast<s32>(memory.Read32(state + kDstLeft));
++    const s32 game_left = static_cast<s32>(memory.Read32(state + kContentLeft));
++    const s32 game_staged = static_cast<s32>(memory.Read32(state + kStaged));
++    const char* what = nullptr;
++    if (result.differs) {
++        what = "output bytes";
++    } else if (game_ret != result.ret || game_phase != result.phase) {
++        what = "return value or phase";
++    } else if (game_dst != stream->dst || game_dst_left != stream->dst_left ||
++               game_left != stream->content_left || game_staged != stream->staged) {
++        what = "counters";
++    }
++    const u64 steps = g_stream_stats.verify_steps.fetch_add(1, std::memory_order_relaxed);
++    g_stream_stats.verify_bytes.fetch_add(game_dst - step_dst, std::memory_order_relaxed);
++    if (what != nullptr) {
++        if (g_stream_stats.verify_mismatches.fetch_add(1, std::memory_order_relaxed) < 16) {
++            try {
++                LOG_ERROR(Kernel_SVC,
++                          "Native zstd stream verify: MISMATCH at {:#x} ({}): game {} bytes, "
++                          "returned {}, phase {}, {} dst left, {} left, {} staged; host {} "
++                          "bytes, returned {}, phase {}, {} dst left, {} left, {} staged; first "
++                          "differing output byte {} (-1: none)",
++                          state, what, game_dst - step_dst, game_ret, game_phase, game_dst_left,
++                          game_left, game_staged, stream->dst - step_dst, result.ret,
++                          result.phase, stream->dst_left, stream->content_left, stream->staged,
++                          result.differs ? static_cast<s64>(result.first_difference) : s64{-1});
++            } catch (const std::bad_alloc&) {
++            }
++        }
++    } else if (steps < 16) {
++        try {
++            LOG_INFO(Kernel_SVC,
++                     "Native zstd stream verify: step at {:#x} equal ({} bytes, returned {}, "
++                     "phase {}, {} staged)",
++                     state, game_dst - step_dst, game_ret, game_phase, game_staged);
++        } catch (const std::bad_alloc&) {
++        }
++    }
++    if (what != nullptr || game_phase == kPhaseFailed || game_phase == kPhaseComplete) {
++        lock.unlock();
++        EraseStream(state, stream.get()); // a mismatch stops comparing this stream
++    }
++}
++
++// At most one counters line a second while streams are decoded.
++void MaybeLogStreamCounters(s64 now) {
++    static std::atomic<s64> next_log_ns{0};
++    s64 next = next_log_ns.load(std::memory_order_relaxed);
++    if (now < next ||
++        !next_log_ns.compare_exchange_strong(next, now + kLogIntervalNs,
++                                             std::memory_order_relaxed)) {
++        return;
++    }
++    auto& s = g_stream_stats;
++    if (StreamVerifySteps() != 0) {
++        LOG_INFO(Kernel_SVC,
++                 "Native zstd stream verify: {} steps, {} streams checked, {} steps compared ({} "
++                 "MiB), {} mismatches, {} stopped, {} streams not checked ({} budget full), {} "
++                 "MiB of host decoders live of {} MiB",
++                 s.steps.load(std::memory_order_relaxed),
++                 s.shadow_streams.load(std::memory_order_relaxed),
++                 s.verify_steps.load(std::memory_order_relaxed),
++                 s.verify_bytes.load(std::memory_order_relaxed) >> 20,
++                 s.verify_mismatches.load(std::memory_order_relaxed),
++                 s.verify_aborted.load(std::memory_order_relaxed),
++                 s.game_streams.load(std::memory_order_relaxed),
++                 s.budget_full.load(std::memory_order_relaxed),
++                 g_stream_budget_used.load(std::memory_order_relaxed) >> 20,
++                 StreamBudgetBytes() >> 20);
++        return;
++    }
++    LOG_INFO(Kernel_SVC,
++             "Native zstd stream: {} steps ({} on the host), {} streams on the host, {} left to "
++             "the game ({} of them budget full), {} more with the live switch off, {} MiB "
++             "written by the host in {} ms "
++             "(longest step {:.1f} ms since the last line), {} KiB of host decoders live of {} "
++             "MiB, {} evicted, {} host errors, {} lost",
++             s.steps.load(std::memory_order_relaxed), s.host_steps.load(std::memory_order_relaxed),
++             s.host_streams.load(std::memory_order_relaxed),
++             s.game_streams.load(std::memory_order_relaxed),
++             s.budget_full.load(std::memory_order_relaxed),
++             s.live_off.load(std::memory_order_relaxed),
++             s.bytes.load(std::memory_order_relaxed) >> 20,
++             s.host_ns.load(std::memory_order_relaxed) / 1'000'000,
++             static_cast<double>(s.longest_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
++             g_stream_budget_used.load(std::memory_order_relaxed) >> 10,
++             StreamBudgetBytes() >> 20, s.evicted.load(std::memory_order_relaxed),
++             s.errors.load(std::memory_order_relaxed), s.lost.load(std::memory_order_relaxed));
++}
++
++enum class StepBy { Host, Game, GameVerified };
++
++// svc 0xF4: decides who runs this step. Host: done, `ret` is Step's return value.
++StepBy DecideStep(Core::Memory::Memory& memory, u64 state, u64 src, s32 size, u64 ddict, s64 now,
++                  s32& ret) {
++    const u8 phase = memory.Read8(state + kPhase);
++    auto stream = FindStream(state);
++    if (phase == kPhaseStart) {
++        // A new frame on this step state; whatever the host held for it is over.
++        if (stream) {
++            EraseStream(state, stream.get());
++            stream.reset();
++        }
++        const bool verify = StreamVerifySteps() != 0;
++        if (verify && !VerifySlotLeft()) {
++            return StepBy::Game; // check run with its steps used up: the game alone
++        }
++        // The live switch is read only here, where a stream gets its owner for good.
++        if (!verify && Common::LiveSwitch::Value<Common::LiveSwitch::Id::OotZstdStream>() == 0) {
++            g_stream_stats.live_off.fetch_add(1, std::memory_order_relaxed);
++            return StepBy::Game;
++        }
++        const char* reason = nullptr;
++        try {
++            stream = StartStream(memory, state, src, size, ddict, verify, now, reason);
++            if (stream && verify && !TakeVerifySlot()) {
++                return StepBy::Game; // the last step went to another stream (frees this one)
++            }
++            if (stream) {
++                InsertStream(state, stream);
++            }
++        } catch (const std::bad_alloc&) {
++            stream.reset();
++            reason = "host allocation failed";
++        }
++        if (!stream) {
++            if (g_stream_stats.game_streams.fetch_add(1, std::memory_order_relaxed) < 16) {
++                try {
++                    LOG_WARNING(Kernel_SVC,
++                                "Native zstd stream: state {:#x} chunk {:#x}+{:#x} ddict {:#x}: "
++                                "{}; the game's decoder runs this stream",
++                                state, src, size, ddict, reason);
++                } catch (const std::bad_alloc&) {
++                }
++            }
++            return StepBy::Game;
++        }
++        std::unique_lock lock{stream->mutex};
++        if (verify) {
++            g_stream_stats.shadow_streams.fetch_add(1, std::memory_order_relaxed);
++            if (MarkPending(memory, *stream, src, size)) {
++                return StepBy::GameVerified;
++            }
++            lock.unlock();
++            EraseStream(state, stream.get());
++            return StepBy::Game;
++        }
++        g_stream_stats.host_streams.fetch_add(1, std::memory_order_relaxed);
++        // The game's phase 1 as the step state shows it: content bytes left and phase 2; the DCtx
++        // field stays 0, the host's mark.
++        memory.Write32(state + kContentLeft, static_cast<u32>(stream->content_left));
++        memory.Write64(state + kDctx, 0);
++        memory.Write8(state + kPhase, kPhaseDecoding);
++        ret = OwnedStep(memory, state, *stream, src, size);
++        return StepBy::Host;
++    }
++    if (phase == kPhaseFailed || phase == kPhaseComplete) {
++        if (stream) {
++            EraseStream(state, stream.get());
++        }
++        return StepBy::Game; // Step only returns a code
++    }
++    // Phase 2, or a value the game's Step treats as 2.
++    if (stream) {
++        std::unique_lock lock{stream->mutex};
++        const bool usable = !stream->evicted && StateMatches(memory, state, *stream);
++        if (!stream->shadow) {
++            if (usable) {
++                ret = OwnedStep(memory, state, *stream, src, size);
++                return StepBy::Host;
++            }
++            const char* const why = stream->evicted
++                                        ? "its host stream was evicted while idle"
++                                        : "the step state changed behind the host";
++            lock.unlock();
++            EraseStream(state, stream.get());
++            FailLostStep(memory, state, why, ret);
++            return StepBy::Host;
++        }
++        if (usable && TakeVerifySlot() && MarkPending(memory, *stream, src, size)) {
++            return StepBy::GameVerified;
++        }
++        // Verify steps used up, or the game's state moved on its own: the game goes on alone.
++        lock.unlock();
++        EraseStream(state, stream.get());
++        return StepBy::Game;
++    }
++    if (memory.Read64(state + kDctx) == 0) {
++        // Decoding with neither a DCtx of the game's nor a host stream: a host stream was lost.
++        FailLostStep(memory, state, "no host stream and no DCtx of the game's", ret);
++        return StepBy::Host;
++    }
++    return StepBy::Game; // a stream of the game's
++}
++
++bool CallStream(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
++    if (!StreamEnabled()) {
++        return false;
++    }
++    auto& process = GetCurrentProcess(system.Kernel());
++    if (!process.Is64Bit() || process.GetProgramId() != kOotProgramId) {
++        return false;
++    }
++    auto& memory = process.GetMemory();
++    auto* const arm = process.GetArmInterface(system.Kernel().CurrentPhysicalCoreIndex());
++    ThreadContext ctx{};
++    arm->GetContext(ctx);
++    const s64 now = NowNs();
++    if (imm == kStreamReturnSvc) {
++        const u64 main_base = ctx.pc - 4 - kStreamCaveOffset;
++        if (!InstructionAt(memory, main_base + kStreamCaveOffset, kStreamReturnSvcInstruction)) {
++            return false;
++        }
++        // x0 is Step's return value; the run method's x19 is the job.
++        try {
++            VerifyStep(memory, ctx.r[kJobRegister] + kJobStepState,
++                       static_cast<s32>(static_cast<u32>(args[0])));
++            MaybeLogStreamCounters(now);
++        } catch (const std::bad_alloc&) {
++        }
++        return true; // on to `b 0xf5c30`, where `bl Step` would have returned
++    }
++    const u64 main_base = ctx.pc - 4 - kStreamSiteOffset;
++    if (!InstructionAt(memory, main_base + kStreamSiteOffset, kStreamSvcInstruction) ||
++        !InstructionAt(memory, main_base + kStreamStepOffset, kStepFirstInstruction)) {
++        return false;
++    }
++    g_stream_stats.steps.fetch_add(1, std::memory_order_relaxed);
++    const u64 state = args[0];
++    const u64 src = args[1];
++    const s32 size = static_cast<s32>(static_cast<u32>(args[2]));
++    const u64 ddict = args[3];
++    s32 ret = -1;
++    StepBy by = StepBy::Game;
++    if (memory.IsValidVirtualAddressRange(state, kStateBytes)) {
++        by = DecideStep(memory, state, src, size, ddict, now, ret);
++    }
++    if (by == StepBy::Host) {
++        args[0] = static_cast<u32>(ret); // Step returns an int in w0
++    } else {
++        // The game's Step, as the replaced bl would have run it; in verify mode it returns into
++        // the cave, whose svc 0xF5 compares before going on to the bl's return address.
++        ctx.lr = by == StepBy::GameVerified ? main_base + kStreamCaveOffset : ctx.pc;
++        ctx.pc = main_base + kStreamStepOffset;
++        arm->SetContext(ctx);
++    }
++    try {
++        MaybeLogStreamCounters(now);
++    } catch (const std::bad_alloc&) {
++    }
++    return true;
++}
++
+ } // Anonymous namespace
+ 
+ bool CallNx2OotZstd(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
++    if (imm == kStreamSvc || imm == kStreamReturnSvc) {
++        // EDEN_UP_OOT_ZSTD_STREAM: the game's zstd stream decoder (see CallStream).
++        return CallStream(system, imm, args);
++    }
+     if (imm < kFirstSvc || imm >= kFirstSvc + kCallSites.size()) {
+         return false;
+     }
+diff --git a/src/core/hle/kernel/svc/svc_nx2_zstd.h b/src/core/hle/kernel/svc/svc_nx2_zstd.h
+index f1e6869..6fc62e6 100644
+--- a/src/core/hle/kernel/svc/svc_nx2_zstd.h
++++ b/src/core/hle/kernel/svc/svc_nx2_zstd.h
+@@ -16,8 +16,9 @@ namespace Kernel::Svc {
+ 
+ /// EDEN_UP_OOT_NATIVE_ZSTD=1 (from Lichii PR 717, stephenjayakar).
+ /// Ocarina of Time: svc 0xF0-0xF2 placed by the built-in patch "Native zstd" over the game's calls
+-/// to ZSTD_decompressMultiFrame (with or without a ZSTD_DDict). Returns false (and does nothing)
+-/// for any other SVC.
++/// to ZSTD_decompressMultiFrame (with or without a ZSTD_DDict). EDEN_UP_OOT_ZSTD_STREAM=1: also
++/// svc 0xF4 (over the call of the game's zstd stream step) and 0xF5 (its verify-mode return).
++/// Returns false (and does nothing) for any other SVC.
+ bool CallNx2OotZstd(Core::System& system, u32 imm, std::span<uint64_t, 8> args);
+ 
+ } // namespace Kernel::Svc

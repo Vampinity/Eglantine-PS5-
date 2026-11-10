@@ -1,0 +1,657 @@
+Subject: [PATCH] EDEN_UP_AHEAD_GUARD=2: run a frame ahead, a buffer page of the frame in flight is copied before a guest thread's first write to it, and the GPU thread's buffer reads take the copy until that frame's fence; =1 stays the waiting guard; off by default
+
+T87's guard (=1) made every writer wait for the fence. Batch t87-a: the writers are the game's
+job threads, twelve and more of them, writing these pages all through the frame; each waited
+20-40 ms a frame and the walk fell from about 18 fps to 12-16. So the wait is the full frame
+wait by another road.
+
+=2 keeps the guard's page set and trap, and changes what a trapped write does: under the guard's
+lock the page is copied as it is (4 KiB, into a pool of EDEN_UP_AHEAD_GUARD_COPY_PAGES pages,
+default 2048), the page's guard and its +1 on the cached count go, and the write goes on. The
+buffer cache's reads of guest memory for buffers (mapped uploads, uploads in pieces, the streamed
+graphics and compute uniform blocks) go through BufferCache::ReadGuestForBuffer, which takes a
+copied page's bytes from its copy, under the same lock, so a read sees a page whole as presented
+or from its copy. The small-uniform reuse compares the copy-aware bytes
+(BindSmallUniformFromSource) instead of guest memory. At the fence the copies are dropped and
+the ranges uploads read from them are handed to the next gather as guest writes
+(GPU::GatherAndApply, AheadGuard::TakeRedirty): a buffer uploaded from a copy is then uploaded
+again from memory. A page is copied under every device address its memory has. With
+the pool full a write waits as with =1. The log line per 300 presents adds pages copied, the
+most in one guard, pool-full counts and how much the GPU thread read from copies.
+
+Not covered: texture data and descriptor tables the texture cache reads.
+
+---
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index f577ee3..afd8a0b 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -921,8 +921,19 @@ struct Memory::Impl {
+                 if (core == sys_core) {
+                     sys_core_guard.lock();
+                 }
++                // =2: a guarded page is copied for the GPU thread here, under each device
++                // address the memory has, before the write goes on. With the copy pool full, or
++                // =1: the write waits below.
++                const bool copy = VideoCommon::AheadGuard::Mode() == 2;
+                 gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+-                    if (!guarded && VideoCommon::AheadGuard::Guarded(address, size)) {
++                    if (!VideoCommon::AheadGuard::Guarded(address, size)) {
++                        return;
++                    }
++                    if (copy && VideoCommon::AheadGuard::CopyBeforeWrite(address, size,
++                                                                         *gpu_device_memory)) {
++                        return;
++                    }
++                    if (!guarded) {
+                         guarded = true;
+                         guarded_address = address;
+                     }
+diff --git a/src/video_core/ahead_guard.h b/src/video_core/ahead_guard.h
+index 392c2fe..f8b71ac 100644
+--- a/src/video_core/ahead_guard.h
++++ b/src/video_core/ahead_guard.h
+@@ -9,6 +9,7 @@
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <mutex>
+ #include <utility>
+@@ -16,25 +17,32 @@
+ 
+ #include "common/common_types.h"
+ #include "common/logging.h"
+-#include "common/pe_switch.h"
+ 
+-/// EDEN_UP_AHEAD_GUARD=1: keeps the game from rewriting buffer bytes a frame still in flight
+-/// reads, when a present returns before that frame's fence (EDEN_NX2_FRAMES_AHEAD=1).
++/// EDEN_UP_AHEAD_GUARD=1 or 2: keeps a frame still in flight from being drawn with buffer bytes
++/// the game has already rewritten, when a present returns before that frame's fence
++/// (EDEN_NX2_FRAMES_AHEAD=1).
+ ///
+-/// Run a frame ahead, Ocarina writes buffer memory (uniform blocks, vertex and storage data) for
+-/// a later frame while the GPU thread still draws the presented one, and the GPU thread reads
+-/// guest memory when it draws: EDEN_NX2_OVERWRITE_CHECK counted such reads in about 9 of 10
+-/// frames (run 736: ~700 writes and 10-70 reads a frame), and the fade to black showed every
+-/// second frame drawn with the value of two frames later.
++/// Run a frame ahead, Ocarina's job threads write buffer memory (uniform blocks, vertex and
++/// storage data) for a later frame while the GPU thread still draws the presented one, and the
++/// GPU thread reads guest memory when it draws. The fade to black showed every second frame
++/// drawn with the value of two frames later: the frames whose present returned at once.
+ ///
+ /// The guard notes which device pages the GPU thread reads for buffers, frame by frame (a frame
+ /// ends at its present's fence). When a present returns before its fence, the pages read in the
+ /// last finished frames and in this one so far are marked cached for the guest (a +1 on their
+-/// cached count: every guest write to them then goes through Memory's HandleRasterizerWrite),
+-/// and a guest thread that writes one waits there until the frame's fence is reached. Only the
+-/// threads that would rewrite in-flight bytes wait, and only from their first such write; the
+-/// thread that builds the next frame's command lists runs on unless it writes such a page itself.
+-/// The log line says which guest threads waited and for how long.
++/// cached count: every guest write to them then goes through Memory's HandleRasterizerWrite; on
++/// the PS5 that is a page table flip, there is no fastmem arena to protect).
++///
++///   =1 (wait): a guest thread that writes such a page waits there until the fence is reached.
++///      T87, batch t87-a: twelve and more job threads write these pages all through the frame,
++///      each waited 20-40 ms a frame, and the walk fell from about 18 to 12-16 fps. Safe, slow.
++///   =2 (copy): the first write to such a page copies the page as it was (4 KiB, into a pool that
++///      lives until the fence), takes the page's guard off and goes on at once. The GPU thread's
++///      buffer reads take a copied page's bytes from its copy until the fence, so the frame in
++///      flight is drawn with the bytes it was presented with. At the fence the copies are dropped
++///      and the ranges uploads read from them are handed to the next gather as guest writes
++///      (TakeRedirty), so a buffer uploaded from a copy is uploaded again from memory. With the
++///      pool full a write waits as with =1.
+ ///
+ ///   EDEN_UP_AHEAD_GUARD_SETS=<mask>   which finished frames' pages are guarded, bit d = the frame
+ ///                                     d presents back (default 6: one and two back; 4: only two
+@@ -47,19 +55,32 @@
+ ///                                     most frames, and its frames finish with the game's present
+ ///                                     blocked (EDEN_UP_OOT_FRAME_WAIT), so nothing a held writer
+ ///                                     does is needed for the fence.
++///   EDEN_UP_AHEAD_GUARD_COPY_PAGES=<n> the copy pool in pages (default 2048 = 8 MiB, 64 to 16384)
+ /// Not covered: texture data and descriptor tables the texture cache reads.
+ namespace VideoCommon::AheadGuard {
+ 
+-inline bool Enabled() {
+-    static const bool on = [] {
+-        const bool value = Common::PeSwitch("EDEN_UP_AHEAD_GUARD");
+-        if (value) {
++/// 0: off, 1: writers wait, 2: writers copy the page first.
++inline int Mode() {
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD");
++        const int parsed =
++            value != nullptr && (value[0] == '1' || value[0] == '2') && value[1] == '\0'
++                ? value[0] - '0'
++                : 0;
++        if (parsed == 1) {
+             LOG_INFO(HW_GPU, "EDEN_UP_AHEAD_GUARD=1: guest writes to buffer pages of a frame in "
+                              "flight wait for its fence");
++        } else if (parsed == 2) {
++            LOG_INFO(HW_GPU, "EDEN_UP_AHEAD_GUARD=2: buffer pages of a frame in flight are copied "
++                             "before a guest write, and the GPU thread reads the copies");
+         }
+-        return value;
++        return parsed;
+     }();
+-    return on;
++    return mode;
++}
++
++inline bool Enabled() {
++    return Mode() != 0;
+ }
+ 
+ inline u32 SetsMask() {
+@@ -81,13 +102,27 @@ inline std::chrono::milliseconds MaxHold() {
+ }
+ 
+ inline bool GpuEscape() {
+-    static const bool on = Common::PeSwitch("EDEN_UP_AHEAD_GUARD_GPU_ESCAPE");
++    static const bool on = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_GPU_ESCAPE");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
+     return on;
+ }
+ 
++inline u32 CopyCapacity() {
++    static const u32 pages = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_COPY_PAGES");
++        const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 2048UL;
++        return static_cast<u32>((std::clamp)(parsed, 64UL, 16384UL));
++    }();
++    return pages;
++}
++
+ inline constexpr u64 AddressBits = 36; // the device address space
+ inline constexpr u64 PageBits = 12;
++inline constexpr u64 PageSize = u64{1} << PageBits;
+ inline constexpr u64 PageLimit = u64{1} << (AddressBits - PageBits);
++inline constexpr u32 NoSlot = ~u32{0};
+ 
+ struct State {
+     using Clock = std::chrono::steady_clock;
+@@ -109,11 +144,21 @@ struct State {
+     u64 last_ended{};            ///< newest present number whose frame end was noted
+ 
+     std::atomic<bool> active{};
+-    std::vector<Run> armed_runs;
++    std::vector<u32> armed_pages; ///< sorted; those whose `guarded` bit is still set are trapped
+     u64 armed_frame{~u64{0}};
+     u64 arm_serial{};
+     Clock::time_point armed_at{};
+ 
++    // Copy mode (all under the mutex).
++    std::unique_ptr<u8[]> copy_bytes;  ///< CopyCapacity() pages, made at the first copy
++    std::vector<u32> copy_page;        ///< [slot] the device page copied there
++    std::vector<u32> copy_index;       ///< open addressing over page: slot + 1, 0 = empty
++    u32 copies_used{};
++    /// Ranges an upload read from copies in the guard armed now, and those of guards lifted
++    /// since the last gather (device address, bytes).
++    std::vector<std::pair<u64, u32>> served, redirty;
++    std::atomic<bool> redirty_ready{}; ///< `redirty` is not empty
++
+     // Per log window (under the mutex).
+     struct Stats {
+         u32 presents{}, arms{}, overlaps{}, gave_up{}, gave_up_gpu{};
+@@ -121,7 +166,7 @@ struct State {
+         long long arm_us{}, max_arm_us{}, armed_us{};
+         u32 holds{};
+         long long held_us{}, max_held_us{};
+-        std::array<u32, 5> core_holds{};
++        std::array<u32, 7> core_holds{};
+         struct Thread {
+             u64 id{};
+             u32 holds{};
+@@ -129,6 +174,8 @@ struct State {
+         };
+         std::array<Thread, 6> threads{}; ///< the first six guest threads that waited
+         u32 other_thread_holds{};
++        u64 copies{}, copy_reads{}, copy_read_bytes{};
++        u32 most_copies{}, pool_full{};
+     } stats{};
+     u32 hold_lines{};
+ };
+@@ -174,20 +221,70 @@ inline void EndFrameLocked(State& s, u64 number) {
+     s.last_ended = number;
+ }
+ 
++inline bool GuardedBit(const State& s, u64 page) {
++    return (s.guarded[page / 64].load(std::memory_order_relaxed) & (u64{1} << (page % 64))) != 0;
++}
++
++/// Consecutive pages of a sorted list as device ranges.
++template <class Keep>
++void RunsOf(const std::vector<u32>& pages, std::vector<State::Run>& runs, Keep&& keep) {
++    runs.clear();
++    for (size_t i = 0; i < pages.size();) {
++        if (!keep(pages[i])) {
++            ++i;
++            continue;
++        }
++        size_t end = i + 1;
++        while (end < pages.size() && pages[end] == pages[end - 1] + 1 && keep(pages[end])) {
++            ++end;
++        }
++        runs.emplace_back(u64{pages[i]} << PageBits, static_cast<size_t>(end - i) << PageBits);
++        i = end;
++    }
++}
++
++inline u32 FindCopy(const State& s, u64 page) {
++    if (s.copies_used == 0 || s.copy_index.empty()) {
++        return NoSlot;
++    }
++    const size_t mask = s.copy_index.size() - 1;
++    for (size_t at = (page * 0x9E3779B97F4A7C15ULL >> 40) & mask;; at = (at + 1) & mask) {
++        const u32 entry = s.copy_index[at];
++        if (entry == 0) {
++            return NoSlot;
++        }
++        if (s.copy_page[entry - 1] == page) {
++            return entry - 1;
++        }
++    }
++}
++
+ template <class DeviceMemory>
+ void DisarmLocked(State& s, DeviceMemory& device_memory) {
+     if (!s.active.load(std::memory_order_relaxed)) {
+         return;
+     }
+-    for (const auto& [addr, size] : s.armed_runs) {
+-        const u64 last = (addr + size - 1) >> PageBits;
+-        for (u64 page = addr >> PageBits; page <= last; ++page) {
+-            s.guarded[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
+-        }
++    // The pages still trapped: a copied page gave its trap back when it was copied.
++    std::vector<State::Run> runs;
++    RunsOf(s.armed_pages, runs, [&s](u32 page) { return GuardedBit(s, page); });
++    for (const u32 page : s.armed_pages) {
++        s.guarded[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
+     }
+     s.active.store(false, std::memory_order_release);
+-    device_memory.UpdatePagesCachedBatch(s.armed_runs, -1);
+-    s.armed_runs.clear();
++    device_memory.UpdatePagesCachedBatch(runs, -1);
++    s.armed_pages.clear();
++    if (s.copies_used != 0) {
++        // The frame is done: its copies go.
++        s.stats.most_copies = (std::max)(s.stats.most_copies, s.copies_used);
++        s.copies_used = 0;
++        std::fill(s.copy_index.begin(), s.copy_index.end(), 0U);
++    }
++    if (!s.served.empty()) {
++        // What uploads took from the copies is a guest write for the next gather.
++        s.redirty.insert(s.redirty.end(), s.served.begin(), s.served.end());
++        s.served.clear();
++        s.redirty_ready.store(true, std::memory_order_release);
++    }
+     s.stats.armed_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                             State::Clock::now() - s.armed_at)
+                             .count();
+@@ -203,12 +300,13 @@ inline void LogWindowLocked(State& s, u64 present_number) {
+     LOG_INFO(HW_GPU,
+              "EDEN_UP_AHEAD_GUARD: last 300 presents (to #{}): armed {} ({} while one was still "
+              "armed), {} pages in {} runs each, arming {} us (max {}), armed {} us each; {} "
+-             "writes waited, {} us each (max {}), by core {}/{}/{}/{}/other {}; lifted early {} "
+-             "({} for a waiting GPU channel)",
++             "writes waited, {} us each (max {}), by core {}/{}/{}/{}/{}/{}/other {}; lifted "
++             "early {} ({} for a waiting GPU channel)",
+              present_number, st.arms, st.overlaps, st.pages / arms, st.runs / arms,
+              st.arm_us / arms, st.max_arm_us, st.armed_us / arms, st.holds, st.held_us / holds,
+              st.max_held_us, st.core_holds[0], st.core_holds[1], st.core_holds[2],
+-             st.core_holds[3], st.core_holds[4], st.gave_up, st.gave_up_gpu);
++             st.core_holds[3], st.core_holds[4], st.core_holds[5], st.core_holds[6], st.gave_up,
++             st.gave_up_gpu);
+     if (st.holds != 0) {
+         LOG_INFO(HW_GPU,
+                  "EDEN_UP_AHEAD_GUARD: guest threads that waited (id: writes, ms in all): {}: {}, "
+@@ -221,6 +319,14 @@ inline void LogWindowLocked(State& s, u64 present_number) {
+                  st.threads[5].id, st.threads[5].holds, st.threads[5].held_us / 1000,
+                  st.other_thread_holds);
+     }
++    if (Mode() == 2) {
++        LOG_INFO(HW_GPU,
++                 "EDEN_UP_AHEAD_GUARD copies: {} pages copied before a write ({} a guard, most "
++                 "{} of {}), the pool was full {} times; {} GPU thread reads took {} KiB from "
++                 "copies",
++                 st.copies, st.copies / arms, st.most_copies, CopyCapacity(), st.pool_full,
++                 st.copy_reads, st.copy_read_bytes >> 10);
++    }
+     st = {};
+ }
+ 
+@@ -264,7 +370,8 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+                 ++s.stats.overlaps;
+             } else {
+                 const auto start = State::Clock::now();
+-                std::vector<u32> pages{s.current};
++                std::vector<u32>& pages = s.armed_pages;
++                pages.assign(s.current.begin(), s.current.end());
+                 for (u32 back = 1; back <= 3; ++back) {
+                     const State::Frame& frame = s.frames[(number - back) & 3];
+                     if ((SetsMask() & (1U << back)) != 0 && number >= back &&
+@@ -274,22 +381,14 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+                 }
+                 std::sort(pages.begin(), pages.end());
+                 pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+-                s.armed_runs.clear();
+-                for (size_t i = 0; i < pages.size();) {
+-                    size_t end = i + 1;
+-                    while (end < pages.size() && pages[end] == pages[end - 1] + 1) {
+-                        ++end;
+-                    }
+-                    s.armed_runs.emplace_back(u64{pages[i]} << PageBits,
+-                                              static_cast<size_t>(end - i) << PageBits);
+-                    i = end;
+-                }
+-                if (!s.armed_runs.empty()) {
++                if (!pages.empty()) {
++                    std::vector<State::Run> runs;
++                    Detail::RunsOf(pages, runs, [](u32) { return true; });
+                     for (const u32 page : pages) {
+                         s.guarded[page / 64].fetch_or(u64{1} << (page % 64),
+                                                       std::memory_order_relaxed);
+                     }
+-                    device_memory.UpdatePagesCachedBatch(s.armed_runs, 1);
++                    device_memory.UpdatePagesCachedBatch(runs, 1);
+                     s.armed_frame = number;
+                     ++s.arm_serial;
+                     s.armed_at = State::Clock::now();
+@@ -299,7 +398,7 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+                                                  .count();
+                     ++s.stats.arms;
+                     s.stats.pages += pages.size();
+-                    s.stats.runs += s.armed_runs.size();
++                    s.stats.runs += runs.size();
+                     s.stats.arm_us += arm_us;
+                     s.stats.max_arm_us = (std::max)(s.stats.max_arm_us, arm_us);
+                 }
+@@ -314,7 +413,7 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+                                    [number, &device_memory] { AtFence(number, device_memory); });
+ }
+ 
+-/// Whether a guest write to [device_addr, device_addr + size) must wait: lock-free, for
++/// Whether a guest write to [device_addr, device_addr + size) meets the guard: lock-free, for
+ /// Memory's HandleRasterizerWrite.
+ inline bool Active() {
+     return Enabled() && Get().active.load(std::memory_order_acquire);
+@@ -327,13 +426,128 @@ inline bool Guarded(u64 device_addr, u64 size) {
+     State& s = Get();
+     const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
+     for (u64 page = device_addr >> PageBits; page <= last; ++page) {
+-        if ((s.guarded[page / 64].load(std::memory_order_relaxed) & (u64{1} << (page % 64))) != 0) {
++        if (Detail::GuardedBit(s, page)) {
+             return true;
+         }
+     }
+     return false;
+ }
+ 
++/// Copy mode: a guest thread is about to write guarded pages. Each is copied as it is now, loses
++/// its guard (and its trap: later writes to it are ordinary ones) and the write may go on. False:
++/// the pool is full, the writer must wait instead (HoldWriter).
++template <class DeviceMemory>
++bool CopyBeforeWrite(u64 device_addr, u64 size, DeviceMemory& device_memory) {
++    constexpr u64 limit = u64{1} << AddressBits;
++    if (size == 0 || device_addr >= limit) {
++        return true;
++    }
++    State& s = Get();
++    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    std::scoped_lock lk{s.mutex};
++    if (!s.active.load(std::memory_order_relaxed)) {
++        return true;
++    }
++    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++        if (!Detail::GuardedBit(s, page)) {
++            continue;
++        }
++        const u32 capacity = CopyCapacity();
++        if (s.copies_used == capacity) {
++            ++s.stats.pool_full;
++            return false;
++        }
++        if (!s.copy_bytes) {
++            s.copy_bytes.reset(new u8[u64{capacity} * PageSize]);
++            s.copy_page.assign(capacity, 0U);
++            size_t index_size = 256;
++            while (index_size < size_t{capacity} * 2) {
++                index_size *= 2;
++            }
++            s.copy_index.assign(index_size, 0U);
++        }
++        const u32 slot = s.copies_used++;
++        device_memory.ReadBlockUnsafe(page << PageBits, s.copy_bytes.get() + u64{slot} * PageSize,
++                                      PageSize);
++        s.copy_page[slot] = static_cast<u32>(page);
++        const size_t mask = s.copy_index.size() - 1;
++        size_t at = (page * 0x9E3779B97F4A7C15ULL >> 40) & mask;
++        while (s.copy_index[at] != 0) {
++            at = (at + 1) & mask;
++        }
++        s.copy_index[at] = slot + 1;
++        s.guarded[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
++        device_memory.UpdatePagesCachedCount(page << PageBits, PageSize, -1);
++        ++s.stats.copies;
++    }
++    return true;
++}
++
++/// Copy mode: the GPU thread's read of guest memory for a buffer. Bytes of a page copied for the
++/// frame in flight come from its copy, the rest through `live(address, out, size)`. Under the
++/// guard's lock, which a guest thread's CopyBeforeWrite takes before its write goes on: a read
++/// sees a page either whole as presented or from its copy. `upload`: the bytes go into a host
++/// buffer that the buffer cache then takes for memory's; what came from a copy is noted, and
++/// handed to a gather as a guest write once the guard is lifted (TakeRedirty).
++template <class Live>
++void Read(u64 device_addr, u8* out, u64 size, bool upload, Live&& live) {
++    State& s = Get();
++    std::scoped_lock lk{s.mutex};
++    if (s.copies_used == 0) {
++        live(device_addr, out, size);
++        return;
++    }
++    const u64 end = device_addr + size;
++    for (u64 at = device_addr; at < end;) {
++        const u64 page = at >> PageBits;
++        u64 piece_end = (std::min)(end, (page + 1) << PageBits);
++        const u32 slot = page < PageLimit ? Detail::FindCopy(s, page) : NoSlot;
++        if (slot != NoSlot) {
++            std::memcpy(out + (at - device_addr),
++                        s.copy_bytes.get() + u64{slot} * PageSize + (at & (PageSize - 1)),
++                        piece_end - at);
++            ++s.stats.copy_reads;
++            s.stats.copy_read_bytes += piece_end - at;
++            if (upload) {
++                s.served.emplace_back(at, static_cast<u32>(piece_end - at));
++            }
++        } else {
++            // On over the pages after it that have no copy either.
++            while (piece_end < end && (piece_end >> PageBits) < PageLimit &&
++                   Detail::FindCopy(s, piece_end >> PageBits) == NoSlot) {
++                piece_end = (std::min)(end, ((piece_end >> PageBits) + 1) << PageBits);
++            }
++            live(at, out + (at - device_addr), piece_end - at);
++        }
++        at = piece_end;
++    }
++}
++
++/// Copy mode: the ranges uploads read from copies in guards lifted since the last call, as guest
++/// writes (`write(device_addr, size)`) for the gather that applies them: a buffer uploaded from
++/// a copy holds the presented frame's bytes, and memory has the newer ones. Only those ranges:
++/// an upload range is the guest's (GPU-written bytes are left out of uploads), a whole page may
++/// not be.
++template <class Write>
++void TakeRedirty(Write&& write) {
++    if (!Enabled()) {
++        return;
++    }
++    State& s = Get();
++    if (!s.redirty_ready.load(std::memory_order_acquire)) {
++        return;
++    }
++    std::vector<std::pair<u64, u32>> ranges;
++    {
++        std::scoped_lock lk{s.mutex};
++        ranges.swap(s.redirty);
++        s.redirty_ready.store(false, std::memory_order_release);
++    }
++    for (const auto& [address, bytes] : ranges) {
++        write(address, static_cast<size_t>(bytes));
++    }
++}
++
+ /// A guest thread on a CPU core is about to write a guarded page: waits until the guard is lifted
+ /// (the caller leaves other host threads alone: the GPU threads never wait here). `stop()`
+ /// returns 1 when the wait must end at once (power off) and 2 while a GPU channel is suspended
+@@ -386,7 +600,7 @@ void HoldWriter(u64 device_addr, u64 size, size_t core, u64 thread_id, DeviceMem
+         ++st.holds;
+         st.held_us += held_us;
+         st.max_held_us = (std::max)(st.max_held_us, held_us);
+-        ++st.core_holds[(std::min<size_t>)(core, 4)];
++        ++st.core_holds[(std::min<size_t>)(core, st.core_holds.size() - 1)];
+         bool counted = false;
+         for (auto& thread : st.threads) {
+             if (thread.holds == 0 || thread.id == thread_id) {
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9639bbd..9342c74 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -3063,23 +3063,41 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
+         bool streamed = false;
++        // EDEN_UP_AHEAD_GUARD=2 (ahead_guard.h): the bytes as the frame in flight was presented
++        // with them (a copy where a guest thread has written the page since), then the same
++        // reuse by content as below.
++        const bool guard_copy = VideoCommon::AheadGuard::Mode() == 2 &&
++                                size <= ubo_snapshot_scratch.size();
++        if (guard_copy) {
++            ReadGuestForBuffer(device_addr, ubo_snapshot_scratch.data(), size, false);
++        }
+         if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+             // The same bytes as this slot's previous bind, in the same command buffer: bind that
+             // stream allocation again instead of allocating and copying (uniform_stream_reuse.h).
+             // EDEN_NX2_UBOREUSE=0 turns it off.
+             if (VideoCommon::UniformStreamReuseEnabled()) {
+-                streamed = VideoCommon::BindSmallUniformReusing(
+-                    runtime, device_memory, stage, index, binding_index, device_addr, size);
+-                if (streamed && Nx2FastDraw::UboKeepEnabled()) {
+-                    // EDEN_UP_L949_UBO_KEEP: the next delta draw may bind this allocation again.
+-                    uniform_keep.streamed[stage] |= 1u << index;
+-                    ++uniform_keep.streamed_binds;
++                if (guard_copy) {
++                    streamed = VideoCommon::BindSmallUniformFromSource(
++                        runtime, stage, index, binding_index, ubo_snapshot_scratch.data(), size);
++                } else {
++                    streamed = VideoCommon::BindSmallUniformReusing(
++                        runtime, device_memory, stage, index, binding_index, device_addr, size);
++                    if (streamed && Nx2FastDraw::UboKeepEnabled()) {
++                        // EDEN_UP_L949_UBO_KEEP: the next delta draw may bind this allocation
++                        // again.
++                        uniform_keep.streamed[stage] |= 1u << index;
++                        ++uniform_keep.streamed_binds;
++                    }
+                 }
+             }
+         }
+         if (!streamed) {
+             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+-            device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
++            if (guard_copy) {
++                std::memcpy(span.data(), ubo_snapshot_scratch.data(), size);
++            } else {
++                ReadGuestForBuffer(device_addr, span.data(), size, false);
++            }
+         }
+         return;
+     }
+@@ -3644,7 +3662,7 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
+                 OverwriteNoteRead(binding.device_addr, size);
+                 const std::span<u8> span =
+                     runtime.BindMappedUniformBuffer(0, binding_index, size);
+-                device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
++                ReadGuestForBuffer(binding.device_addr, span.data(), size, false);
+                 return;
+             }
+         }
+@@ -4874,7 +4892,7 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
+         for (BufferCopy& copy : copies) {
+             u8* const src_pointer = staging_pointer.data() + copy.src_offset;
+             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
+-            device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size);
++            ReadGuestForBuffer(device_addr, src_pointer, copy.size, true);
+             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
+             // marks their guest memory cold (see TextureCache::RefreshContents).
+             if (copy.size >= 256_KiB) {
+@@ -4917,8 +4935,7 @@ void BufferCache<P>::UploadInPieces([[maybe_unused]] Buffer& buffer,
+             for (u64 done = 0; done < copy.size;) {
+                 const u64 size = (std::min)(copy.size - done, piece_size);
+                 auto upload_staging = runtime.UploadStagingBuffer(size);
+-                device_memory.ReadBlockUnsafe(device_addr + done, upload_staging.mapped_span.data(),
+-                                              size);
++                ReadGuestForBuffer(device_addr + done, upload_staging.mapped_span.data(), size, true);
+                 const std::array part{BufferCopy{
+                     .src_offset = upload_staging.offset,
+                     .dst_offset = copy.dst_offset + done,
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index c72a43d..cc61d1f 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -1121,6 +1121,19 @@ private:
+ 
+     /// GPU thread reads of guest memory for buffers (uploads, streamed uniforms): counts ahead
+     /// reads for EDEN_NX2_OVERWRITE_CHECK. Off, or with nothing ahead: returns at once.
++    /// Guest bytes for a buffer: `upload` for a host buffer's upload, not for a streamed uniform
++    /// block. EDEN_UP_AHEAD_GUARD=2 (ahead_guard.h): a page a guest thread has written since the
++    /// frame in flight was presented is read from the copy taken before that write.
++    void ReadGuestForBuffer(DAddr device_addr, void* out, u64 size, bool upload) {
++        if (VideoCommon::AheadGuard::Mode() == 2) [[unlikely]] {
++            VideoCommon::AheadGuard::Read(device_addr, static_cast<u8*>(out), size, upload,
++                                          [this](u64 address, u8* bytes, u64 count) {
++                                              device_memory.ReadBlockUnsafe(address, bytes, count);
++                                          });
++            return;
++        }
++        device_memory.ReadBlockUnsafe(device_addr, out, size);
++    }
+     void OverwriteNoteRead(DAddr device_addr, u64 size) {
+         // EDEN_UP_AHEAD_GUARD (ahead_guard.h): the pages a frame reads are guarded from guest
+         // writes while the next such frame is in flight.
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index cdf8bb5..0fc3621 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -37,6 +37,7 @@
+ #include "video_core/engines/kepler_memory.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/engines/maxwell_dma.h"
++#include "video_core/ahead_guard.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/gpu_thread.h"
+@@ -194,6 +195,9 @@ struct GPU::Impl {
+                         std::function<void(PAddr, size_t)>& callback_writes) {
+         if (!VideoCore::LandingPort::Active()) {
+             system.GatherGPUDirtyMemory(callback_writes);
++            // EDEN_UP_AHEAD_GUARD=2 (ahead_guard.h): pages copied for a frame that is done now
++            // count as guest writes, so buffers uploaded from the copies are uploaded again.
++            VideoCommon::AheadGuard::TakeRedirty(callback_writes);
+             if (!writes.empty()) {
+                 renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+                 ForgetHandedOutWrites();
+@@ -203,6 +207,9 @@ struct GPU::Impl {
+         {
+             std::scoped_lock lock{applying_writes_mutex};
+             system.GatherGPUDirtyMemory(callback_writes);
++            // EDEN_UP_AHEAD_GUARD=2 (ahead_guard.h): pages copied for a frame that is done now
++            // count as guest writes, so buffers uploaded from the copies are uploaded again.
++            VideoCommon::AheadGuard::TakeRedirty(callback_writes);
+             if (writes.empty()) {
+                 return;
+             }

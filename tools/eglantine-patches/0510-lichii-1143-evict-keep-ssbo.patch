@@ -1,0 +1,452 @@
+From b6b349a1e12ead10fa2df7952fa9160540b42979 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Tue, 10 Nov 2026 06:35:00 +0100
+Subject: [PATCH] EDEN_UP_EVICT_KEEP_SSBO=1: an evicted graphics pipeline keeps
+ its storage buffer pointer slots when it is translated again
+ (zortos293/Lichii #1143); off by default
+
+Ported from zortos293/Lichii PR #1143 (merged as d2eaae4, GPL-3.0-or-later), "vulkan: keep an
+evicted graphics pipeline's storage buffer pointers when it is translated again".
+
+Ours carries the eviction it fixes: PipelineCache::EvictUnusedPipelines (every 600 frames,
+pipelines unused for 9000 frames). An evicted pipeline is translated again on its next use
+(CreateGraphicsPipeline() from fresh GraphicsEnvironments), and GenericEnvironment::
+IsCbufStorageBufferPointer classifies each constant buffer pointer slot by what it holds at that
+moment. A slot that is null, unmapped or outside the GPU range then (around an area load) is
+not a pointer in the new translation, so that pipeline reads zeros through it for the rest of
+the session. Upstream: Ocarina of Time corruption that builds up over a long session and clears
+on restart. Our compute rebuilds already seed their earlier slots (SeedStoragePointers); graphics
+pipelines had nothing like it.
+
+EDEN_UP_EVICT_KEEP_SSBO=1 (Common::PeSwitch, exactly "1"):
+- every graphics pipeline records, per program, the slots its translation took as pointers
+  (pointer-table entries included): from the FileEnvironments for pipelines built at boot, from
+  the live environments for run-time ones (translated or made from a kept translation);
+- EvictUnusedPipelines keeps those slots by key hash (VideoCommon::EvictedPointerSlots, at most
+  8192 entries, an entry is dropped once taken);
+- the next CreateGraphicsPipeline() of that key seeds them into the environments before the
+  EDEN_UP_SHADER_PREP check and the translation, so a re-translation never binds fewer pointers
+  than the pipeline it replaces;
+- a kept slot that would otherwise have been no pointer logs a Warning (first 32, then every
+  1000th): "Graphics pipeline <hash> translated again after eviction: s<N>:c<I>[<off>] holds
+  <value> (<reason>), kept as the storage buffer pointer it was (<n> so far)". That line is the
+  field evidence: it shows the bug was hit in a run.
+Off (unset): nothing is recorded, kept or seeded; translation and eviction as before. Layout
+only: one pointer per GraphicsPipeline and an empty map in PipelineCache.
+
+Out of memory: recording, keeping and seeding the slots are wrapped like the tree's other
+bad_alloc survival code (SurviveBadAlloc; EDEN_NX2_BAD_ALLOC_ENDS=1 still ends the session). A
+pipeline then goes without its slots, as with the switch off, and is never dropped for it.
+
+Differences from upstream: our SeedStoragePointers stands in for upstream's KeepStoragePointers
+(emplace vs insert_or_assign: the environments are fresh, nothing was asked yet); slots are
+stored behind a pointer and only when a pipeline has any. Upstream's unit test is left out
+(needs its test fixture). Not covered, as upstream: disk records captured with a slot null.
+
+Shader prep: the switch is in the TranslationSwitches list only because the check script wants
+every switch name the backend reads. It changes no kept translation (those are made at boot from
+disk records, which are never seeded), but set, it changes the stamp like any listed switch: the
+first run with it prepares a store of its own and stutters more. For an A/B test, give that arm
+one warm-up run first (the stores of both arms are kept after that), or start the control arm
+from a fresh store too.
+
+Field test: only sessions long enough to evict (10 minutes or more, leaving an area and coming
+back); the scripted test queue logs no evictions.
+
+Checks: git apply --check and git apply on copies of the T88 core files, and on T88 with build
+series 0493 to 0503 applied in order before it (0494, 0499 and 0501 touch the same files). Not
+compiled, not run.
+---
+ src/video_core/CMakeLists.txt                 |   1 +
+ src/video_core/evicted_pointer_slots.h        |  67 ++++++++++++
+ .../renderer_vulkan/vk_graphics_pipeline.h    |  16 +++
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 114 ++++++++++++++++++
+ .../renderer_vulkan/vk_pipeline_cache.h       |   6 +
+ .../renderer_vulkan/vk_pipeline_prep.cpp      |   1 +
+ src/video_core/shader_environment.cpp         |  21 ++++
+ src/video_core/shader_environment.h           |   7 +
+ 8 files changed, 233 insertions(+)
+ create mode 100644 src/video_core/evicted_pointer_slots.h
+
+Rebased onto T98 (0505-0507 and, for the later two, the drafts before it) with patch -F3; no hunk rejected.
+
+---
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 911d4f1..b226dd5 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -264,6 +264,7 @@ add_library(video_core STATIC
+     shader_cache.h
+     shader_environment.cpp
+     shader_environment.h
++    evicted_pointer_slots.h
+     shader_handle_program.h
+     shader_notify.cpp
+     shader_notify.h
+diff --git a/src/video_core/evicted_pointer_slots.h b/src/video_core/evicted_pointer_slots.h
+new file mode 100644
+index 0000000..4b12bb9
+--- /dev/null
++++ b/src/video_core/evicted_pointer_slots.h
+@@ -0,0 +1,67 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <optional>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#include "common/common_types.h"
++
++namespace VideoCommon {
++
++/// EDEN_UP_EVICT_KEEP_SSBO=1 (zortos293/Lichii #1143): the constant buffer slots each program of
++/// an evicted graphics pipeline bound as storage buffer pointers, by pipeline key hash.
++/// Translating the pipeline again classifies a slot by what it holds at that moment, and a slot
++/// that is null or unmapped then (around an area load) loses its buffer: the new translation
++/// reads zeros through it for the rest of the session. Kept for the next translation, the
++/// pipeline can't bind fewer pointers than the one it replaces.
++class EvictedPointerSlots {
++public:
++    static constexpr size_t NumPrograms = 6;
++    using Slots = std::array<std::vector<u64>, NumPrograms>;
++
++    [[nodiscard]] static bool Any(const Slots& slots) noexcept {
++        for (const auto& keys : slots) {
++            if (!keys.empty()) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /// Keeps the slots of a pipeline that bound any. When full, an arbitrary older entry goes.
++    void Remember(u64 key_hash, const Slots& slots) {
++        if (!Any(slots)) {
++            return;
++        }
++        if (!entries.contains(key_hash) && entries.size() >= MaxEntries) {
++            entries.erase(entries.begin());
++        }
++        entries.insert_or_assign(key_hash, slots);
++    }
++
++    /// The slots kept for this pipeline, forgotten once taken
++    [[nodiscard]] std::optional<Slots> Take(u64 key_hash) {
++        auto node = entries.extract(key_hash);
++        if (node.empty()) {
++            return std::nullopt;
++        }
++        return std::move(node.mapped());
++    }
++
++    [[nodiscard]] size_t Size() const noexcept {
++        return entries.size();
++    }
++
++    static constexpr size_t MaxEntries = 8192;
++
++private:
++    std::unordered_map<u64, Slots> entries;
++};
++
++} // namespace VideoCommon
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 21a2c77..04e4162 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -19,6 +19,7 @@
+ #include "common/thread_worker.h"
+ #include "shader_recompiler/shader_info.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/evicted_pointer_slots.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+ #include "video_core/renderer_vulkan/pipeline_helper.h"
+@@ -181,6 +182,19 @@ public:
+         return last_use_frame;
+     }
+ 
++    /// EDEN_UP_EVICT_KEEP_SSBO: the constant buffer slots each program binds as storage buffer
++    /// pointers (null: none, or the switch is off).
++    [[nodiscard]] const VideoCommon::EvictedPointerSlots::Slots* MappedPointers() const noexcept {
++        return mapped_pointers.get();
++    }
++
++    void SetMappedPointers(VideoCommon::EvictedPointerSlots::Slots slots) {
++        if (VideoCommon::EvictedPointerSlots::Any(slots)) {
++            mapped_pointers = std::make_unique<const VideoCommon::EvictedPointerSlots::Slots>(
++                std::move(slots));
++        }
++    }
++
+     /// Forgets the transitions, which may point to pipelines the cache evicted.
+     void ClearTransitions() noexcept {
+         transition_keys.clear();
+@@ -292,6 +306,8 @@ private:
+     std::vector<GraphicsPipelineCacheKey> transition_keys;
+     std::vector<GraphicsPipeline*> transitions;
+     u64 last_use_frame{};
++    /// EDEN_UP_EVICT_KEEP_SSBO only; a pointer, so it costs 8 bytes a pipeline when off.
++    std::unique_ptr<const VideoCommon::EvictedPointerSlots::Slots> mapped_pointers;
+ 
+     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 415be99..7f2c807 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1064,6 +1064,20 @@ bool PipelineColdBoot() {
+     return cold;
+ }
+ 
++// EDEN_UP_EVICT_KEEP_SSBO=1 (exact "1"; zortos293/Lichii #1143): a graphics pipeline evicted
++// after 9000 unused frames is translated again on its next use, and that translation classifies
++// each constant buffer pointer slot by what it holds right then. A slot that is null or unmapped
++// at that moment (around an area load) loses its storage buffer, and the new pipeline reads
++// zeros through it until a restart: corruption that builds up over a long session. With the
++// switch every graphics pipeline records the slots it bound as pointers, eviction keeps them by
++// key hash, and the next translation of that key takes them as pointers whatever they hold.
++// Off: nothing recorded, nothing kept, translation as before.
++bool EvictKeepSsbo() {
++    static const bool on = Common::PeSwitch("EDEN_UP_EVICT_KEEP_SSBO");
++    return on;
++}
++static_assert(VideoCommon::EvictedPointerSlots::NumPrograms == Maxwell::MaxShaderProgram);
++
+ // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
+ bool PreloadAllPipelines() {
+     static const bool all = [] {
+@@ -2032,6 +2046,22 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+             if (prep && pipeline) {
+                 NotePrepared(key, prep_stages, envs_, prep_compared, prep_differed);
+             }
++            if (pipeline && EvictKeepSsbo()) {
++                // envs_ holds the programs present, in program order. Out of memory: the
++                // pipeline is kept without its slots, as with the switch off.
++                try {
++                    VideoCommon::EvictedPointerSlots::Slots slots;
++                    for (size_t index = 0, env_index = 0;
++                         index < Maxwell::MaxShaderProgram && env_index < envs_.size(); ++index) {
++                        if (key.unique_hashes[index] != 0) {
++                            slots[index] = envs_[env_index++].MappedStoragePointerKeys();
++                        }
++                    }
++                    pipeline->SetMappedPointers(std::move(slots));
++                } catch (const std::bad_alloc&) {
++                    SurviveBadAlloc("a graphics pipeline's storage buffer pointer slots");
++                }
++            }
+ 
+             std::scoped_lock lock{state.mutex};
+             if (pipeline) {
+@@ -2301,6 +2331,16 @@ void PipelineCache::EvictUnusedPipelines() {
+         if (used_this_session.erase(pipeline) != 0) {
+             used_and_evicted.insert(it->first.Hash());
+         }
++        if (EvictKeepSsbo()) {
++            if (const auto* const slots = pipeline->MappedPointers()) {
++                try {
++                    evicted_pointer_slots.Remember(it->first.Hash(), *slots);
++                } catch (const std::bad_alloc&) {
++                    // Not kept: its next translation classifies the slots afresh, as before.
++                    SurviveBadAlloc("an evicted graphics pipeline's storage buffer pointer slots");
++                }
++            }
++        }
+         evicted_pipelines.emplace_back(tick, std::move(it->second));
+         it = graphics_cache.erase(it);
+         ++evicted;
+@@ -2816,6 +2856,46 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
+ }
+ } // Anonymous namespace
+ 
++void PipelineCache::WarnKeptPointer(size_t program, u64 slot) const {
++    if ((slot >> 63) != 0) {
++        return; // pointer-table entry: kept, not logged
++    }
++    const u32 index = static_cast<u32>(slot >> 32);
++    const u32 offset = static_cast<u32>(slot);
++    const size_t stage = program == 0 ? 0 : program - 1;
++    if (stage >= maxwell3d->state.shader_stages.size()) {
++        return;
++    }
++    const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
++    GPUVAddr value = 0;
++    const char* reason = nullptr;
++    if (index >= cbufs.size() || !cbufs[index].enabled ||
++        u64{offset} + sizeof(u64) > cbufs[index].size ||
++        !gpu_memory->IsFullyMappedRange(cbufs[index].address + offset, sizeof(u64))) {
++        reason = "constant buffer not bound";
++    } else {
++        value = gpu_memory->Read<u64>(cbufs[index].address + offset);
++        if (value == 0) {
++            reason = "null";
++        } else if (!gpu_memory->IsWithinGPUAddressRange(value)) {
++            reason = "outside the GPU address range";
++        } else if (!gpu_memory->IsFullyMappedRange(value, 1)) {
++            reason = "unmapped";
++        }
++    }
++    if (reason == nullptr) {
++        return;
++    }
++    static std::atomic<u64> kept{};
++    const u64 count = kept.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (count <= 32 || count % 1000 == 0) {
++        LOG_WARNING(Render_Vulkan,
++                    "Graphics pipeline {:016x} translated again after eviction: s{}:c{}[{:#x}] "
++                    "holds {:#x} ({}), kept as the storage buffer pointer it was ({} so far)",
++                    graphics_key.Hash(), program, index, offset, value, reason, count);
++    }
++}
++
+ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     Common::HangSite site{"building a graphics pipeline"};
+     const auto begin = std::chrono::steady_clock::now();
+@@ -2828,6 +2908,26 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     };
+     GraphicsEnvironments environments;
+     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
++    if (EvictKeepSsbo()) {
++        // An evicted pipeline of this key: the slots it bound stay pointers whatever they hold
++        // now. Before the kept-translation check too, which asks these slots of the same envs.
++        if (const auto keep = evicted_pointer_slots.Take(key_hash)) {
++            try {
++                for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
++                    if (graphics_key.unique_hashes[index] == 0) {
++                        continue;
++                    }
++                    environments.envs[index].SeedStoragePointers((*keep)[index]);
++                    for (const u64 slot : (*keep)[index]) {
++                        WarnKeptPointer(index, slot);
++                    }
++                }
++            } catch (const std::bad_alloc&) {
++                // Seeded in part: still no fewer pointers than without the switch.
++                SurviveBadAlloc("an evicted graphics pipeline's storage buffer pointers");
++            }
++        }
++    }
+ 
+     // EDEN_UP_SHADER_PREP: a pipeline whose translation was kept is made from that, without
+     // translating on this thread (null: translated as before). What follows is the same for
+@@ -2860,6 +2960,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     auto pipeline{kept ? std::move(kept)
+                        : CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(),
+                                                 nullptr, true)};
++    if (pipeline && EvictKeepSsbo()) {
++        // Out of memory: the pipeline is kept without its slots, as with the switch off.
++        try {
++            VideoCommon::EvictedPointerSlots::Slots slots;
++            for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
++                if (graphics_key.unique_hashes[index] != 0) {
++                    slots[index] = environments.envs[index].MappedStoragePointerKeys();
++                }
++            }
++            pipeline->SetMappedPointers(std::move(slots));
++        } catch (const std::bad_alloc&) {
++            SurviveBadAlloc("a graphics pipeline's storage buffer pointer slots");
++        }
++    }
+     if (!pipeline || pipeline_cache_filename.empty()) {
+         return pipeline;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 65c946f..97b3fee 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -201,6 +201,10 @@ private:
+ 
+     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+ 
++    /// EDEN_UP_EVICT_KEEP_SSBO: logs a kept pointer slot (program index, slot key) that this
++    /// translation would otherwise have classified as no pointer: null, unmapped or out of range.
++    void WarnKeptPointer(size_t program, u64 slot) const;
++
+     /// kept_out (EDEN_UP_SHADER_PREP): takes the SPIR-V and shader infos of the translation.
+     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
+         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+@@ -270,6 +274,8 @@ private:
+     u64 frame_count{};
+     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
+     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
++    /// EDEN_UP_EVICT_KEEP_SSBO: storage buffer pointer slots of evicted pipelines, by key hash
++    VideoCommon::EvictedPointerSlots evicted_pointer_slots;
+ 
+     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
+     u64 last_compute_hash{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+index c13f5d1..6b75745 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -130,6 +130,7 @@ constexpr const char* TranslationSwitches[] = {
+     "EDEN_UP_BIND_ON_BACK", "EDEN_UP_BLIT_EDGE_CLAMP", "EDEN_UP_BUFFER_USE_MARKS",
+     "EDEN_UP_COMPUTE_INDIRECT_ORDER", "EDEN_UP_DEFERRED_CLEAR_PASS", "EDEN_UP_DJ_CHANNEL_IDS",
+     "EDEN_UP_DJ_FRAG_BARRIER", "EDEN_UP_DJ_GATHER_OWNERS", "EDEN_UP_DRAIN_SKIP_SAME",
++    "EDEN_UP_EVICT_KEEP_SSBO",
+     "EDEN_UP_FAST_DRAW", "EDEN_UP_FAST_DRAW_OOT_EXEMPT", "EDEN_UP_FAST_DRAW_VERIFY",
+     "EDEN_UP_FAST_POLL", "EDEN_UP_FRITCHII_BLITSTATE", "EDEN_UP_FRITCHII_CHURN",
+     "EDEN_UP_FRITCHII_CLOCK", "EDEN_UP_FRITCHII_CLOCK_SYNCPT", "EDEN_UP_FRITCHII_COLD",
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index a27efbe..35d9f6e 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -269,6 +269,27 @@ void FileEnvironment::StoragePointerSlots(std::vector<u64>& pointers,
+     CollectStoragePointerSlots(storage_pointer_types, cbuf_values, pointers, null_slots);
+ }
+ 
++// EDEN_UP_EVICT_KEEP_SSBO (zortos293/Lichii #1143): plain slots and pointer-table entries alike.
++static std::vector<u64> CollectMappedStoragePointerKeys(
++    const ::Common::unordered_map<u64, u8>& types) {
++    std::vector<u64> keys;
++    for (const auto& [key, type] : types) {
++        if (type != 0) {
++            keys.push_back(key);
++        }
++    }
++    std::ranges::sort(keys);
++    return keys;
++}
++
++std::vector<u64> GenericEnvironment::MappedStoragePointerKeys() const {
++    return CollectMappedStoragePointerKeys(storage_pointer_types);
++}
++
++std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {
++    return CollectMappedStoragePointerKeys(storage_pointer_types);
++}
++
+ 
+ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+     const u64 key = MakeIndirectCbufKey(index, offset, indirect);
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+index 5334542..fc33774 100644
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -111,6 +111,10 @@ public:
+     /// Takes these slots as pointers without reading them: a rebuild keeps its earlier buffers.
+     void SeedStoragePointers(std::span<const u64> slots);
+ 
++    /// EDEN_UP_EVICT_KEEP_SSBO: every key storage tracking took as a pointer, pointer-table
++    /// entries included, sorted (what SeedStoragePointers takes back).
++    [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const;
++
+     bool HasHLEMacroState() const override {
+         return has_hle_engine_state;
+     }
+@@ -271,6 +275,9 @@ public:
+     /// See GenericEnvironment::StoragePointerSlots.
+     void StoragePointerSlots(std::vector<u64>& pointers, std::vector<u64>& null_slots) const;
+ 
++    /// See GenericEnvironment::MappedStoragePointerKeys.
++    [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const;
++
+     [[nodiscard]] u64 ReadInstruction(u32 address) override;
+ 
+     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;

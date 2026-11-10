@@ -1,0 +1,279 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_JIT_COLD_CHUNKS=1: JIT slow paths go into 256 KiB cold chunks so hot code stays dense (PS5_Lichii 0202); off by default
+
+Port of PS5_Lichii patch 0202 "JIT cold chunks" by Mihawk (mihawk-99/PS5_Lichii, commit 7aa138d9b,
+patches/fritchii/fritchii-4012e52-ps5.d/0202-jit-cold-chunks.diff), GPL-3.0-or-later.
+
+Upstream's finding: dynarmic writes a block's slow paths (deferred emits: memory-access
+fallbacks, FP NaN and saturation paths) right after the block's hot code, so hot code is spread
+over more cache lines and pages than it needs. On their PS5 lab, OOT's busiest guest cores ran JIT
+code at an IPC of 0.64 with 44% of cycles waiting for instructions. With slow paths moved out,
+upstream measured OOT at 33.1/33.2 -> 35.1/35.6 fps (ABBA, +6.7%), and on a Pro capped at 30 fps
+cores 0-2 went from 67.0/65.1% to 61.1/61.4% busy.
+
+With the switch on, the first block that has slow paths reserves a 256 KiB chunk at the hot
+frontier; its slow paths and those of the blocks after it go into that chunk, and hot code
+continues after it. When fewer than 8 KiB are left, the next chunk is reserved at the frontier. A
+chunk is committed when it is reserved, so committed memory still grows in order. Hot code jumps to
+its slow paths with rel32 (the emitters already use T_NEAR for those labels); slow paths jump back
+to labels that are already placed. A block's registered size is its hot part only. With less than
+2.25 MiB left in a cache, the rest of the block's slow paths stay inline, as without the switch.
+
+Differences from upstream:
+- EDEN_UP_JIT_COLD_CHUNKS, exact "1" (Common::PeSwitch), off by default; upstream is on by default
+  with EDEN_JIT_COLD=0 to turn it off. Unset: the emitted code is the same byte for byte.
+- Core only. Upstream forgets the chunk in headless/jit-permissions.inc's ClearCache; here
+  EmitX64::ClearCache does it (every cache clear, ours in headless/dynarmic/jit_impl.inc and
+  upstream's in a32/a64_interface.cpp, clears the emitter with the code), and BeginColdCode also
+  drops a chunk that lies ahead of the frontier. BlockOfCode::ClearCache forgets it too, for builds
+  without the port's replacement.
+- Cold code is written behind the frontier, so it needs the separate writable view
+  (headless/jit-alias.cmake). The call is compiled only with EDEN_JIT_ALIAS_LAYOUT, so host builds
+  without that layout build and keep the old layout.
+- No live override: our front has no EDEN_JIT_CLEAR_FILE, and a switch flipped mid-session would
+  only change blocks compiled after it, so A/B it by boot.
+- Log: "EDEN_UP_JIT_COLD_CHUNKS on=1 chunk_kib=256" once at the first block (on=0: no writable view,
+  nothing changes), and "EDEN_UP_JIT_COLD_CHUNKS chunks=N" every 64 chunks over all caches.
+- Fix (not in upstream): when a block's slow paths move to a new chunk, or back inline near the end
+  of the cache, a jmp to the new place ends the old run. EmitDetectMisalignedVAddr's page-boundary
+  check (on for every page-table access: detect_misaligned_access_via_page_table with
+  only_detect_misalignment_via_page_table_on_page_boundary) falls through into the next deferred
+  emit, the access's abort path; upstream's split leaves it running into unwritten chunk bytes on a
+  misaligned access that crosses a page. 5 bytes per chunk.
+
+With our JIT switches: the out-of-line lookups of EDEN_JIT_TABLE=1 and EDEN_JIT_PAGE_REUSE=1 are
+deferred emits, so they move too (the play env has both on). EDEN_JIT_CACHE_MIB: chunks count
+against the cache, and each full chunk leaves under 8 KiB unused (at most ~3% of the slow-path
+bytes), so a cache fills that much sooner. Extra commit is that, one partly used chunk and 0.25 MiB
+of lookahead per cache. EDEN_JIT_R13 and EDEN_JIT_DISPATCH_BITS are not
+touched. Development PC sampling (eden_jit_block) maps a block's hot part only, so samples in slow
+paths are not attributed to a block.
+
+Checked on this Mac: applies on Eglantine 0ca2032 plus tools/eglantine-patches 0001-0510 (the
+dynarmic and common parts), and every literal anchor in the front's CMake edits of block_of_code,
+emit_x64 and a32/a64_emit_x64 matches as often as before. Not compiled, not run.
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index e0e3c46..f65d21f 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -177,12 +177,18 @@ finish_this_inst:
+     code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+     code.int3();
+-
+-    for (auto& deferred_emit : ctx.deferred_emits)
++    // EDEN_UP_JIT_COLD_CHUNKS=1: the slow paths go into a cold chunk (BlockOfCode::BeginColdCode).
++    const bool has_slow_paths = !ctx.deferred_emits.empty();
++    const CodePtr hot_end = has_slow_paths ? code.BeginColdCode() : CodePtr(code.getCurr());
++    for (auto& deferred_emit : ctx.deferred_emits) {
++        code.ColdCodeStep();
+         deferred_emit();
++    }
+     code.int3();
+ 
+-    const size_t size = size_t(code.getCurr() - entrypoint);
++    // With cold code the block's registered size is its hot part only.
++    const bool cold = has_slow_paths && code.EndColdCode();
++    const size_t size = size_t((cold ? static_cast<const u8*>(hot_end) : code.getCurr<const u8*>()) - static_cast<const u8*>(entrypoint));
+ 
+     const A32::LocationDescriptor descriptor{block.Location()};
+     const A32::LocationDescriptor end_location{block.EndLocation()};
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 699b333..f7340ce 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -168,11 +168,18 @@ finish_this_inst:
+     code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+     code.int3();
+-    for (auto& deferred_emit : ctx.deferred_emits)
++    // EDEN_UP_JIT_COLD_CHUNKS=1: the slow paths go into a cold chunk (BlockOfCode::BeginColdCode).
++    const bool has_slow_paths = !ctx.deferred_emits.empty();
++    const CodePtr hot_end = has_slow_paths ? code.BeginColdCode() : CodePtr(code.getCurr());
++    for (auto& deferred_emit : ctx.deferred_emits) {
++        code.ColdCodeStep();
+         deferred_emit();
++    }
+     code.int3();
+ 
+-    const size_t size = size_t(code.getCurr() - entrypoint);
++    // With cold code the block's registered size is its hot part only.
++    const bool cold = has_slow_paths && code.EndColdCode();
++    const size_t size = size_t((cold ? static_cast<const u8*>(hot_end) : code.getCurr<const u8*>()) - static_cast<const u8*>(entrypoint));
+ 
+     const A64::LocationDescriptor descriptor{block.Location()};
+     const A64::LocationDescriptor end_location{block.EndLocation()};
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
+index 57001d4..9a4cc43 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
+@@ -22,9 +22,12 @@
+ #endif
+ 
+ #include <array>
++#include <atomic>
++#include <cstdio>
+ #include <cstring>
+ 
+ #include "common/assert.h"
++#include "common/pe_switch.h"
+ #include "dynarmic/mcl/bit.hpp"
+ #include "dynarmic/backend/x64/xbyak.h"
+ 
+@@ -221,6 +224,7 @@ void BlockOfCode::DisableWriting() {
+ void BlockOfCode::ClearCache() {
+     ASSERT(prelude_complete);
+     SetCodePtr(code_begin);
++    ResetColdCode();
+ }
+ 
+ size_t BlockOfCode::SpaceRemaining() const {
+@@ -500,4 +504,97 @@ void BlockOfCode::EnsurePatchLocationSize(CodePtr begin, size_t size) {
+     nop(size - current_size);
+ }
+ 
++namespace {
++// EDEN_UP_JIT_COLD_CHUNKS=1 (exact "1"), read at the first block that has slow paths, after env.txt
++// is in the environment. Unset or anything else: slow paths stay right after their block.
++bool ColdCodeSwitch() {
++    static const bool on = ::Common::PeSwitch("EDEN_UP_JIT_COLD_CHUNKS");
++    return on;
++}
++constexpr size_t COLD_CHUNK = 256 * 1024;        // one reservation in the code stream
++constexpr size_t COLD_SLACK = 8 * 1024;          // more than any single deferred emit
++constexpr size_t COLD_KEEP = 2 * 1024 * 1024;    // below this room after a chunk, stay inline
++std::atomic<unsigned> cold_chunks_total{0};
++std::atomic<bool> cold_logged{false};
++}  // namespace
++
++CodePtr BlockOfCode::BeginColdCode() {
++    const u8* const hot_end = getCurr<const u8*>();
++    cold_active = writing_cold = false;
++    if (!ColdCodeSwitch() || !prelude_complete)
++        return hot_end;
++    // Cold code is written behind the hot frontier, which the port's page-local W^X allows only
++    // through the separate writable view (headless/jit-alias.cmake).
++#ifdef EDEN_JIT_ALIAS_LAYOUT
++    const bool alias = hasWritableAlias();
++#else
++    const bool alias = false;
++#endif
++    if (!cold_logged.load(std::memory_order_relaxed) && !cold_logged.exchange(true, std::memory_order_relaxed))
++        std::printf("EDEN_UP_JIT_COLD_CHUNKS on=%d chunk_kib=%zu\n", alias ? 1 : 0, COLD_CHUNK / 1024);
++    if (!alias)
++        return hot_end;
++    // After a full clear the frontier is behind the old chunk: that chunk is free space now.
++    if (cold_end > hot_end)
++        cold_ptr = cold_end = nullptr;
++    hot_resume = hot_end;
++    cold_active = true;
++    ColdCodeStep();
++    return hot_end;
++}
++
++void BlockOfCode::ColdCodeStep() {
++    if (!cold_active)
++        return;
++    if (writing_cold) {
++        cold_ptr = getCurr<const u8*>();
++        ASSERT(cold_ptr <= cold_end);
++    }
++    if (cold_ptr && size_t(cold_end - cold_ptr) >= COLD_SLACK) {
++        if (!writing_cold)
++            SetCodePtr(cold_ptr);
++        writing_cold = true;
++        return;
++    }
++    // A new chunk at the hot frontier; hot code continues after it. Near the end of the cache the
++    // rest of this block's slow paths stay inline, as without the switch.
++    if (writing_cold) {
++        // A slow path may fall through into the next one (EmitDetectMisalignedVAddr's page-boundary
++        // check falls into the access's abort path): carry it on to where the next one goes.
++        jmp(static_cast<const void*>(hot_resume), T_NEAR);
++        cold_ptr = getCurr<const u8*>();
++        ASSERT(cold_ptr <= cold_end);
++    }
++    SetCodePtr(hot_resume);
++    writing_cold = false;
++    if (size_t(&top_[maxSize_] - hot_resume) < COLD_CHUNK + COLD_KEEP) {
++        cold_active = false;
++        return;
++    }
++    EnsureMemoryCommitted(COLD_CHUNK + 1024 * 1024);
++    cold_ptr = hot_resume;
++    cold_end = hot_resume + COLD_CHUNK;
++    hot_resume = cold_end;
++    writing_cold = true;
++    const unsigned chunks = cold_chunks_total.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (chunks % 64 == 0)
++        std::printf("EDEN_UP_JIT_COLD_CHUNKS chunks=%u (all caches, since start)\n", chunks);
++}
++
++bool BlockOfCode::EndColdCode() {
++    if (!cold_active)
++        return false;
++    if (writing_cold)
++        cold_ptr = getCurr<const u8*>();
++    ASSERT(cold_ptr <= cold_end);
++    SetCodePtr(hot_resume);
++    cold_active = writing_cold = false;
++    return true;
++}
++
++void BlockOfCode::ResetColdCode() {
++    cold_ptr = cold_end = hot_resume = nullptr;
++    cold_active = writing_cold = false;
++}
++
+ }  // namespace Dynarmic::Backend::X64
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.h b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.h
+index 20012a0..5ceb211 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.h
+@@ -143,6 +143,17 @@ public:
+     void SetCodePtr(CodePtr code_ptr);
+     void EnsurePatchLocationSize(CodePtr begin, size_t size);
+ 
++    /// EDEN_UP_JIT_COLD_CHUNKS=1: a block's slow paths (deferred emits) go into cold chunks reserved
++    /// in the code stream instead of right after its hot code, so hot code stays dense in the
++    /// instruction caches. BeginColdCode returns where the block's hot code ends; ColdCodeStep goes
++    /// before each deferred emit; EndColdCode returns to the hot frontier (true if cold code was
++    /// used). ResetColdCode forgets the chunk (the cache was cleared). Off: all four leave the
++    /// emitted code as it was.
++    CodePtr BeginColdCode();
++    void ColdCodeStep();
++    bool EndColdCode();
++    void ResetColdCode();
++
+     static const Xbyak::Reg64 ABI_JIT_PTR;
+     // ABI registers
+ #ifdef _WIN32
+@@ -180,6 +191,13 @@ private:
+     RunCodeFuncType step_code = nullptr;
+     RunCodeCallbacks cb;
+     CodePtr code_begin = nullptr;
++    // Cold code (EDEN_UP_JIT_COLD_CHUNKS): the current chunk's next free byte and end, and where hot
++    // code resumes after a block's slow paths. Forgotten by ResetColdCode (EmitX64::ClearCache).
++    const u8* cold_ptr = nullptr;
++    const u8* cold_end = nullptr;
++    const u8* hot_resume = nullptr;
++    bool cold_active = false;
++    bool writing_cold = false;
+ #ifdef _WIN32
+     size_t committed_size = 0;
+ #endif
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+index 84b9888..aea2c66 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -417,6 +417,9 @@ void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
+ void EmitX64::ClearCache() {
+     block_descriptors.clear();
+     patch_information.clear();
++    // The cache was cleared with this emitter (the port replaces BlockOfCode::ClearCache, see
++    // headless/jit-permissions.inc): a cold chunk is now inside free space (EDEN_UP_JIT_COLD_CHUNKS).
++    code.ResetColdCode();
+ 
+     PerfMapClear();
+ }

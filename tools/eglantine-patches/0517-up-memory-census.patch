@@ -1,0 +1,949 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_MEM_CENSUS=1: who holds the memory, every 2 s while the pool's largest free block is under EDEN_UP_MEM_CENSUS_MIB (768) and at each area change, with the one change that frees the most; off by default
+
+Not a port. The memory lines we have answer this only in pieces: EDEN_MEMORY, EDEN_POOL_LEDGER,
+EDEN_VMA_USAGE and RADV_PS5_MEMORY come every 20 s, the guest memory report every 5 s under
+256 MiB, and nothing splits the graphics caches by kind. In the t87-a door runs (run739) the
+pool's largest block went from 5126 MiB (t=81 s) to 612 MiB (t=89 s) and 212 MiB (t=101 s); the
+20 s summaries caught only the 612. This census reads the same counters at the moments that
+matter and puts them in three lines (stderr.log), so the census just before a refusal or crash
+says who held what.
+
+When: a thread of its own ("MemCensus", placed by name like every other worker) asks the front for
+the pool's largest free block every 250 ms (the call RefreshFreeMemory makes at 10 Hz). Under the
+mark: a census every 2 s. An area load (AreaEvict's burst rule: EDEN_NX2_AREA_EVICT_BURST, 100,
+new images within 30 frames, counted here on its own so EDEN_NX2_AREA_EVICT is not needed): a
+census at once and one 3 s later. The first only marks the start; the second shows what the load
+added.
+
+  EDEN_MEM_CENSUS_AREA n frame new_images
+  EDEN_MEM_CENSUS n why=low|area|area+3s t_s largest low (lowest since the last census) mark
+      gpu=fresh|stale/<age>ms images=<MiB>/<count> sparse target astc other scaled stale_clean
+      stale_written retiring decode_in_flight decode_kept copy_buffers msaa staging device upload
+      download idle stream buffers async_ready/<waiting> cpu_scratch
+  EDEN_MEM_CENSUS_POOL n out guest reserve jit tables heap (pieces live free_pages idle_arenas
+      fragmented large in_use) vma_blocks vma_used vma_slack rest
+  EDEN_MEM_CENSUS_TOP n short_by: 1 <name>=<MiB> 2 ... (up to 6); grew_most=<owner>+<MiB> since n-1
+
+All in MiB. The first line splits what the allocator's blocks hold (images by the collector's own
+measure: sparse = unbacked, target = GPU-written, astc, other; stale = in the LRU unused for 120
+frames, clean or needing a copy back; retiring = deleted, memory not yet free; decode = the ASTC
+decode images, in flight or kept; the staging pool's kept buffers, idle = the GPU is done and
+nothing pins them; the buffer cache's buffers). async_ready and cpu_scratch are heap memory. The
+POOL line splits everything out of the pool: guest memory, its reserve, JIT, tables, heap
+(pieces = committed, live = blocks in use in them, free_pages = whole 2 MiB pages holding no block,
+fragmented = the rest of the pieces, large = blocks of their own), the allocator's blocks, and
+rest = out minus all of those: RADV's own buffers (RADV_PS5_MEMORY driver_mib less app), packed
+guest slots (EDEN_SWAP_PACK held), Fine slots' blocks and whatever nobody counts. The two lines
+overlap (the first is inside vma_used and heap): do not add them up.
+
+Which single change frees the most: the first entry of EDEN_MEM_CENSUS_TOP, read at the last
+census before the refusal or crash (or at area+3s of the failing transition). Each entry is what
+one change could give back now:
+  vma_slack        blocks less use: deleted images leave holes in shared blocks. Only whole blocks
+                   go back: smaller blocks or dedicated memory for large images, or defragmenting
+  stale_clean      EDEN_NX2_AREA_EVICT (a shorter age), or the collector
+  stale_written    the same after a copy back (EDEN_NX2_AREA_EVICT_DIRTY drops them uncopied)
+  heap_free_pages  a heap that gives whole free 2 MiB pages back (the trim returns idle arenas)
+  heap_fragmented  only compaction or fewer long-lived blocks
+  decode_kept      EDEN_NX2_TRANSCODE_KEEP_MIB=0
+  decode_in_flight EDEN_PE_TRANSCODE_BOUND=1 with EDEN_PS5_TRANSCODE_PENDING_MIB
+  staging_idle     EDEN_UP_STAGING_STEPS=1 (0506)
+  copy_buffers     EDEN_NX2_TC_TEMP_BUFFER_FRAMES
+  cpu_scratch      EDEN_TC_SCRATCH_KEEP_MIB
+  async_ready      a lower EDEN_NX2_TC_KEEP_ASYNC
+  retiring         nothing: it frees itself within 8 frames (what a GPU wait would release)
+  guest_reserve    the guest's reserve (a refused graphics allocation already borrows it,
+                   eden_guest_reserve_lend); a smaller EDEN_GUEST_RESERVE_FLOOR
+grew_most names the owner that grew most since the previous census (images, decode, staging,
+buffers, vma_slack, guest, heap, jit, rest, cpu_side). If it is not one of the entries above (guest,
+jit, images in use), the fix is a budget for that owner, not a release. A freed byte helps the next
+graphics allocation only if it comes back where that allocation fits: largest is one block, heap
+pages come back 2 MiB at a time, and slack inside a VMA block only when the whole block empties.
+From run739's own lines at t=89 s (largest 612 MiB): VMA blocks 2931 MiB with 2247 in use, so
+vma_slack 684; heap free pages 94, fragmented ~249; between t=69 and t=89 the VMA blocks grew by
+2476 MiB and guest memory by 1244 MiB.
+
+Detail: the census 3 s after an area change and the first one under the mark in 10 s also call the
+existing reports: RADV_PS5_MEMORY (prints with RADV_PS5_MEMORY_REPORT=1) and the guest memory
+service's EDEN_CRAM / EDEN_SWAP / EDEN_SWAP_PACK lines, which carry the swapped-out and packed
+split (the front has no cheap getter for those; the 2 s line leaves them in rest).
+
+Cost, with the switch: per frame, four atomic loads (two in each cache) and the burst count (a few
+integer operations), at the end of TextureCache::TickFrame and BufferCache::TickFrame. Per census, on the
+GPU thread at its next frame end: one walk of the images and of the stale end of the LRU (as
+EDEN_NX2_TC_LOG's 600-frame walk does), the decode images, copy buffers and kept staging buffers,
+and the front's EDEN_VMA_USAGE function (the GPU thread owns the allocator). The census thread
+waits at most 300 ms for these; a frame can take a second at a door, and then it prints gpu=stale
+with the age of the last answer. The front's numbers are atomic reads (EDEN_POOL_LEDGER's
+eden_direct_ledger, eden_heap_*, eden_guest_memory_reserve, Common::GuestMemoryUsage /
+SparseUsage / CodeRangeUsage, eden_free_memory_bytes), declared weak and used only on ELF targets:
+elsewhere the POOL line reads 0 and low censuses do not run (area censuses still do).
+eden_free_memory_bytes is the front's function from 0503 (mig020 front); a front without it
+(the T88 front) gets area censuses only, and the start line says "free memory not known here".
+The first census only sets the baseline for grew_most once the GPU thread has answered once.
+
+Not counted on their own: pipeline objects (host objects and RADV's compiler memory are heap
+blocks, in live; compiled code is RADV's shader arenas, RADV_PS5_MEMORY shader=), JIT used against
+held (EDEN_JIT_MEMORY per cache).
+
+EDEN_UP_MEM_CENSUS (Common::PeSwitch, exactly "1"). EDEN_UP_MEM_CENSUS_MIB=<MiB> is a size, read
+only with the switch on (unset, 0 or over 2^20: 768); on its own it does nothing. Unset: the
+census thread, CensusTick and the buffer cache's answer never run; the texture cache carries four
+more counters that stay 0; StagingBufferPool::CensusBytes and
+TextureCacheRuntime::PublishMemoryCensus are only called by the census. Behaviour is as before.
+
+Compared with PS5_Lichii's compactor (its src/guest_memory_service.inc and README, read 10 Nov),
+what it gives back that ours does not:
+- Packed slots share 2 MiB slabs, compacted in the background: when the slabs hold over 1.25x
+  their copies plus 32 MiB, the copies in the emptiest slabs move to the open one and whole 2 MiB
+  blocks go back. Ours (EDEN_GUEST_SWAP=3) gives each packed slot a block of 16 KiB pages of its
+  own and never moves it, so packing turns the pool into small blocks (run739 at t=129 s: 496 MiB
+  in 696 blocks under 2 MiB), a slot unpacked leaves a hole only another small block fits, and
+  packing under pressure needs a new block before it frees one (reclaim stops at the first
+  "no block for the packed bytes"). On the census this is in rest and in EDEN_SWAP_PACK held.
+- Packing paced by pressure: under 2.5 GiB free it scans every 250 ms and packs what one pass
+  left cold, up to 256 MiB a pass, before the area change asks. Ours packs slots untouched for
+  EDEN_GUEST_SWAP_COLD_S (30 s) on a 2 s tick: at the door nothing cold is left (run739 t=129 s:
+  untouched 30s=0MiB), so eden_guest_memory_reclaim (slots untouched for one tick) has little.
+- A refused allocation of 64 MiB or more packs all it asked for there and then, taking any written
+  slot when too few are cold; ours takes only slots armed and untouched for 2 s.
+Already the same here: the heap in 32 MiB pieces, slots nobody wrote holding no memory. Its ASTC
+conversion in 64 MiB layer batches is not part of the compactor; here it would show as
+decode_in_flight.
+
+PS5 port: every literal anchor tools/prepare-vulkan-port.py looks for in the touched files
+(texture_cache.h, buffer_cache.h, vk_texture_cache.cpp, vk_staging_buffer_pool.h/.cpp; 31) still
+matches as often as before, and no scheduler.Wait/Finish line is added (the port counts them).
+Applies to T88 alone and after 0493-0510 (those that apply to T88).
+
+---
+  src/video_core/buffer_cache/buffer_cache.h         |   9 +
+  src/video_core/memory_census.h                     | 493 +++++++++++++++++++++
+  .../renderer_vulkan/vk_staging_buffer_pool.cpp     |  22 +
+  .../renderer_vulkan/vk_staging_buffer_pool.h       |   5 +
+  .../renderer_vulkan/vk_texture_cache.cpp           |  54 +++
+  src/video_core/renderer_vulkan/vk_texture_cache.h  |   4 +
+  src/video_core/texture_cache/texture_cache.h       | 105 +++++
+  src/video_core/texture_cache/texture_cache_base.h  |  11 +
+  8 files changed, 703 insertions(+)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9342c74..41392ff 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -23,6 +23,7 @@
+ #include "video_core/buffer_cache/buffer_cache_base.h"
+ #include "video_core/buffer_cache/uniform_stream_reuse.h"
+ #include "video_core/churn_counters.h"
++#include "video_core/memory_census.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+@@ -240,6 +241,14 @@ void BufferCache<P>::TickFrame() {
+     } else if (total_used_memory >= minimum_memory) {
+         RunGarbageCollector(total_used_memory >= critical_memory);
+     }
++    if (MemoryCensus::Enabled()) {
++        // EDEN_UP_MEM_CENSUS=1 (video_core/memory_census.h): the buffers' own size after the
++        // collector, when a census asks.
++        if (const u32 request = MemoryCensus::BuffersWanted(); request != 0) {
++            MemoryCensus::Set(MemoryCensus::Buffers, buffer_bytes);
++            MemoryCensus::BuffersPublished(request);
++        }
++    }
+     ++frame_tick;
+     delayed_destruction_ring.Tick();
+ 
+diff --git a/src/video_core/memory_census.h b/src/video_core/memory_census.h
+new file mode 100644
+index 0000000..a6e903e
+--- /dev/null
++++ b/src/video_core/memory_census.h
+@@ -0,0 +1,493 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++
++#include "common/common_types.h"
++#include "common/pe_switch.h"
++#include "common/thread.h"
++
++/// EDEN_UP_MEM_CENSUS=1 (off unless set): who holds the memory when it runs out at an area change.
++///
++/// A thread of its own ("MemCensus") looks at the pool's largest free block every 250 ms. While it
++/// is under EDEN_UP_MEM_CENSUS_MIB (unset: 768) it writes a census every 2 s, and it writes one when
++/// an area load begins and one 3 s later. A census is three lines in stderr:
++///
++///   EDEN_MEM_CENSUS       the graphics caches, a split of what the allocator's blocks hold in use:
++///                         images by kind, ASTC decode images, staging, buffers, the CPU scratch
++///   EDEN_MEM_CENSUS_POOL  everything taken out of the pool by owner: guest memory, its reserve,
++///                         JIT, tables, heap (pieces live / whole free pages / fragmented, large
++///                         blocks), the allocator's blocks, and the rest (the driver's own buffers,
++///                         packed guest slots, anything nobody counts)
++///   EDEN_MEM_CENSUS_TOP   what could be given back now, largest first, and the owner that grew most
++///                         since the last census. Its first entry is the single change that frees
++///                         the most.
++///
++/// The first census under the mark and the one 3 s after an area change also write the existing
++/// detail lines: RADV_PS5_MEMORY (with RADV_PS5_MEMORY_REPORT=1) and EDEN_CRAM / EDEN_SWAP /
++/// EDEN_SWAP_PACK (the guest memory service's own report).
++///
++/// Every number is a counter something already keeps, read at census time. The GPU thread walks
++/// the images only when a census asks for them (TextureCache::CensusTick), at most every 2 s and
++/// twice per area change; between censuses it reads two atomics a frame. Without the switch none of
++/// this runs: one cached flag is checked at the end of each frame.
++///
++/// The front's numbers (pool, heap, guest memory, JIT, the allocator's blocks) come from the PS5
++/// front's functions, declared weak: where there are none, those fields read 0 and only the
++/// graphics caches and area changes are counted.
++
++// ELF only (the console is FreeBSD): a weak reference nobody defines reads as null there.
++#if (defined(__GNUC__) || defined(__clang__)) && (defined(__FreeBSD__) || defined(__linux__))
++#define VIDEO_CORE_CENSUS_FRONT 1
++// headless/performance.cpp: the pool's largest free block (0: not known).
++extern "C" unsigned long long eden_free_memory_bytes(void) __attribute__((weak));
++// src/direct_memory.c: what is out of the pool, by block size (EDEN_POOL_LEDGER).
++extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long* blocks,
++                                   unsigned long long* hits, unsigned long long* fallbacks)
++    __attribute__((weak));
++// headless/heap_arenas.inc (EDEN_HEAP_PAGES, [EglantinePS5] heap).
++extern "C" std::size_t eden_heap_committed(void) __attribute__((weak));
++extern "C" std::size_t eden_heap_large_held(unsigned* blocks) __attribute__((weak));
++extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned)
++    __attribute__((weak));
++extern "C" void eden_heap_page_usage(std::size_t* free_pages, std::size_t* idle_arenas,
++                                     std::size_t* live) __attribute__((weak));
++// src/guest_memory_service.inc: the guest's reserve, and its full report (EDEN_CRAM, EDEN_SWAP).
++extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target)
++    __attribute__((weak));
++extern "C" void eden_guest_memory_report(void) __attribute__((weak));
++// vulkan_memory_allocator.cpp as the port adapts it (EDEN_VMA_USAGE): blocks and use, all heaps.
++extern "C" void eden_vma_usage(unsigned long long* blocks, unsigned long long* used)
++    __attribute__((weak));
++// The console's RADV (tools/patch-radv-memory-report.py, as isolate-radv.py names it).
++extern "C" void eden_radv_private_radv_ps5_memory_report_now(void) __attribute__((weak));
++namespace Common {
++// src/memory_pages.cpp: guest memory, sparse tables and the JIT's code ranges (EDEN_POOL_LEDGER).
++void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept __attribute__((weak));
++void SparseUsage(std::size_t* reserved, std::size_t* committed) noexcept __attribute__((weak));
++void CodeRangeUsage(std::size_t* reserved, std::size_t* committed) noexcept __attribute__((weak));
++} // namespace Common
++#else
++#define VIDEO_CORE_CENSUS_FRONT 0
++#endif
++
++namespace VideoCommon::MemoryCensus {
++
++[[nodiscard]] inline bool Enabled() {
++    static const bool enabled = ::Common::PeSwitch("EDEN_UP_MEM_CENSUS");
++    return enabled;
++}
++
++/// An image unused for this many frames counts as stale (AreaEvict's window is 120 frames too).
++inline constexpr u64 StaleFrames = 120;
++
++enum Value : size_t {
++    // TextureCache::CensusTick
++    Images,       ///< ImageMemoryBytes of every image (the collector's own measure)
++    ImageCount,
++    ImagesSparse, ///< Unbacked: what BindLayers/BindTiles gave them
++    ImagesTarget, ///< GpuModified: render targets and other images the GPU wrote
++    ImagesAstc,   ///< ASTC textures, as stored on the host (transcoded)
++    ImagesOther,
++    ImagesScaled, ///< The scaled copies (on top of Images)
++    StaleClean,   ///< Unused for StaleFrames, nothing to copy back: deletable now
++    StaleWritten, ///< Unused for StaleFrames, GPU-written: deletable after a copy back
++    Retiring,     ///< Deleted, memory not yet free (waiting for the GPU or TICKS_TO_DESTROY)
++    AsyncReady,   ///< CPU-decoded results waiting for their upload (heap)
++    AsyncWaiting, ///< Decodes not finished (a count)
++    CpuScratch,   ///< The upload swizzle/unswizzle scratch buffers (heap)
++    // TextureCacheRuntime::PublishMemoryCensus (Vulkan)
++    DecodeInFlight, ///< ASTC decode images (RGBA8, every level) the GPU may still use
++    DecodeKept,     ///< Finished decode images kept for the next texture of their shape
++    CopyBuffers,    ///< Image copy buffers (GetTemporaryBuffer)
++    MsaaScratch,    ///< MSAA scratch images (a count)
++    StagingDevice,
++    StagingUpload,
++    StagingDownload,
++    StagingIdle, ///< Of the three, kept buffers the GPU is done with and nothing pins
++    StagingStream,
++    VmaBlocks,
++    VmaUsed,
++    // BufferCache::TickFrame
++    Buffers,
++    Count,
++};
++
++struct State {
++    std::array<std::atomic<u64>, Count> values{};
++    std::atomic<u32> wanted{0};       ///< The census asking for the GPU thread's numbers
++    std::atomic<u32> images_done{0};  ///< The last request the texture cache answered
++    std::atomic<u32> buffers_done{0}; ///< The last request the buffer cache answered
++    std::atomic<long long> published_ns{0};
++    std::atomic<u32> area_notes{0};
++    std::atomic<u64> area_frame{0};
++    std::atomic<u64> area_images{0};
++    std::atomic<bool> started{false};
++    std::mutex mutex;
++    std::condition_variable changed;
++};
++
++[[nodiscard]] inline State& Get() {
++    static State* const state = new State; // outlives every static destructor
++    return *state;
++}
++
++[[nodiscard]] inline long long NowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++inline void Set(Value value, u64 amount) {
++    Get().values[value].store(amount, std::memory_order_relaxed);
++}
++
++/// GPU thread, end of frame: the request to answer, or 0. Two atomic loads.
++[[nodiscard]] inline u32 ImagesWanted() {
++    State& state = Get();
++    const u32 wanted = state.wanted.load(std::memory_order_acquire);
++    return wanted != state.images_done.load(std::memory_order_relaxed) ? wanted : 0;
++}
++[[nodiscard]] inline u32 BuffersWanted() {
++    State& state = Get();
++    const u32 wanted = state.wanted.load(std::memory_order_acquire);
++    return wanted != state.buffers_done.load(std::memory_order_relaxed) ? wanted : 0;
++}
++inline void ImagesPublished(u32 request) {
++    State& state = Get();
++    state.published_ns.store(NowNs(), std::memory_order_relaxed);
++    state.images_done.store(request, std::memory_order_release);
++}
++inline void BuffersPublished(u32 request) {
++    Get().buffers_done.store(request, std::memory_order_release);
++}
++
++/// GPU thread: an area load began (a burst of new images). No lock on this side: the census
++/// thread wakes within 250 ms if it misses the notification.
++inline void NoteArea(u64 frame, u64 images) {
++    State& state = Get();
++    state.area_frame.store(frame, std::memory_order_relaxed);
++    state.area_images.store(images, std::memory_order_relaxed);
++    state.area_notes.fetch_add(1, std::memory_order_release);
++    state.changed.notify_one();
++}
++
++[[nodiscard]] inline u64 ThresholdBytes() {
++    static const u64 bytes = [] {
++        const char* const value = std::getenv("EDEN_UP_MEM_CENSUS_MIB");
++        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
++        return (mib != 0 && mib < (u64{1} << 20) ? mib : u64{768}) << 20;
++    }();
++    return bytes;
++}
++
++[[nodiscard]] inline u64 FreeLargest() {
++#if VIDEO_CORE_CENSUS_FRONT
++    if (eden_free_memory_bytes != nullptr) {
++        return eden_free_memory_bytes();
++    }
++#endif
++    return 0;
++}
++
++inline constexpr unsigned long long Mib(u64 bytes) {
++    return static_cast<unsigned long long>(bytes >> 20);
++}
++
++/// The census thread's own snapshot of the owners, for "grew_most".
++struct Owners {
++    static constexpr size_t Count = 10;
++    std::array<u64, Count> bytes{};
++    static constexpr std::array<const char*, Count> names{
++        "images", "decode", "staging", "buffers", "vma_slack",
++        "guest",  "heap",   "jit",     "rest",    "cpu_side"};
++};
++
++/// One census. `detail`: also the existing RADV and guest memory report lines.
++inline void Write(unsigned number, const char* why, u64 largest, u64 low, double seconds,
++                  bool detail, Owners& previous, bool& have_previous) {
++    State& state = Get();
++    // The GPU thread's numbers: asked for, answered at its next frame end. A frame can take a
++    // second at a door; after 300 ms the last answer is used and its age printed.
++    const u32 request = state.wanted.fetch_add(1, std::memory_order_acq_rel) + 1;
++    bool fresh = false;
++    for (int waited = 0; waited < 75; ++waited) {
++        if (state.images_done.load(std::memory_order_acquire) == request &&
++            state.buffers_done.load(std::memory_order_acquire) == request) {
++            fresh = true;
++            break;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(4));
++    }
++    const long long published = state.published_ns.load(std::memory_order_relaxed);
++    const long long gpu_age_ms = published != 0 ? (NowNs() - published) / 1000000 : -1;
++    std::array<u64, Count> v{};
++    for (size_t i = 0; i < Count; ++i) {
++        v[i] = state.values[i].load(std::memory_order_relaxed);
++    }
++    const u64 staging = v[StagingDevice] + v[StagingUpload] + v[StagingDownload];
++    const u64 decode = v[DecodeInFlight] + v[DecodeKept];
++    const u64 vma_slack = v[VmaBlocks] > v[VmaUsed] ? v[VmaBlocks] - v[VmaUsed] : 0;
++
++    // The front: every owner of the pool, as EDEN_POOL_LEDGER and the heap lines count them.
++    u64 out = 0, guest = 0, reserve = 0, jit = 0, tables = 0;
++    u64 pieces = 0, large = 0, in_use = 0, free_pages = 0, idle_arenas = 0, live = 0;
++#if VIDEO_CORE_CENSUS_FRONT
++    if (eden_direct_ledger != nullptr) {
++        unsigned long long bytes[4]{}, blocks[4]{}, hits = 0, fallbacks = 0;
++        eden_direct_ledger(bytes, blocks, &hits, &fallbacks);
++        out = bytes[0] + bytes[1] + bytes[2] + bytes[3];
++    }
++    std::size_t span = 0, held = 0;
++    if (::Common::GuestMemoryUsage != nullptr) {
++        ::Common::GuestMemoryUsage(&span, &held);
++        guest = held;
++    }
++    if (::Common::CodeRangeUsage != nullptr) {
++        ::Common::CodeRangeUsage(&span, &held);
++        jit = held;
++    }
++    if (::Common::SparseUsage != nullptr) {
++        ::Common::SparseUsage(&span, &held);
++        tables = held;
++    }
++    if (eden_guest_memory_reserve != nullptr) {
++        std::size_t target = 0;
++        eden_guest_memory_reserve(&held, &target);
++        reserve = held;
++    }
++    if (eden_heap_committed != nullptr) {
++        pieces = eden_heap_committed();
++    }
++    if (eden_heap_large_held != nullptr) {
++        unsigned large_blocks = 0;
++        large = eden_heap_large_held(&large_blocks);
++    }
++    if (eden_heap_usage != nullptr) {
++        std::size_t heap_held = 0, heap_in_use = 0, returned = 0;
++        eden_heap_usage(&heap_held, &heap_in_use, &returned);
++        in_use = heap_in_use;
++    }
++    if (eden_heap_page_usage != nullptr) {
++        std::size_t page_free = 0, page_idle = 0, page_live = 0;
++        eden_heap_page_usage(&page_free, &page_idle, &page_live);
++        free_pages = page_free;
++        idle_arenas = page_idle;
++        live = page_live;
++    }
++#endif
++    const u64 heap = pieces + large;
++    const u64 fragmented = pieces > free_pages + live ? pieces - free_pages - live : 0;
++    const u64 named = guest + reserve + jit + tables + heap + v[VmaBlocks];
++    const long long rest = out != 0 ? static_cast<long long>(out) - static_cast<long long>(named) : 0;
++    const u64 cpu_side = v[AsyncReady] + v[CpuScratch];
++
++    char line[1024];
++    int length = std::snprintf(
++        line, sizeof(line),
++        "EDEN_MEM_CENSUS n=%u why=%s t_s=%.1f largest=%llu low=%llu mark=%llu gpu=%s/%lldms "
++        "images=%llu/%llu sparse=%llu target=%llu astc=%llu other=%llu scaled=%llu stale_clean=%llu "
++        "stale_written=%llu retiring=%llu decode_in_flight=%llu decode_kept=%llu copy_buffers=%llu "
++        "msaa=%llu staging=%llu device=%llu upload=%llu download=%llu idle=%llu stream=%llu "
++        "buffers=%llu async_ready=%llu/%llu cpu_scratch=%llu (MiB)\n",
++        number, why, seconds, Mib(largest), Mib(low), Mib(ThresholdBytes()),
++        fresh ? "fresh" : "stale", gpu_age_ms, Mib(v[Images]),
++        static_cast<unsigned long long>(v[ImageCount]), Mib(v[ImagesSparse]),
++        Mib(v[ImagesTarget]), Mib(v[ImagesAstc]), Mib(v[ImagesOther]), Mib(v[ImagesScaled]),
++        Mib(v[StaleClean]), Mib(v[StaleWritten]), Mib(v[Retiring]), Mib(v[DecodeInFlight]),
++        Mib(v[DecodeKept]), Mib(v[CopyBuffers]), static_cast<unsigned long long>(v[MsaaScratch]),
++        Mib(staging), Mib(v[StagingDevice]), Mib(v[StagingUpload]), Mib(v[StagingDownload]),
++        Mib(v[StagingIdle]), Mib(v[StagingStream]), Mib(v[Buffers]), Mib(v[AsyncReady]),
++        static_cast<unsigned long long>(v[AsyncWaiting]), Mib(v[CpuScratch]));
++    if (length > 0) {
++        std::fputs(line, stderr);
++    }
++    length = std::snprintf(
++        line, sizeof(line),
++        "EDEN_MEM_CENSUS_POOL n=%u out=%llu guest=%llu reserve=%llu jit=%llu tables=%llu heap=%llu "
++        "(pieces=%llu live=%llu free_pages=%llu idle_arenas=%llu fragmented=%llu large=%llu "
++        "in_use=%llu) vma_blocks=%llu vma_used=%llu vma_slack=%llu rest=%lld (MiB)\n",
++        number, Mib(out), Mib(guest), Mib(reserve), Mib(jit), Mib(tables), Mib(heap), Mib(pieces),
++        Mib(live), Mib(free_pages), Mib(idle_arenas), Mib(fragmented), Mib(large), Mib(in_use),
++        Mib(v[VmaBlocks]), Mib(v[VmaUsed]), Mib(vma_slack), rest / (1LL << 20));
++    if (length > 0) {
++        std::fputs(line, stderr);
++    }
++
++    // What could be given back now, each by one change (see the patch notes for which).
++    struct Candidate {
++        const char* name;
++        u64 bytes;
++    };
++    std::array<Candidate, 13> candidates{{
++        {"vma_slack", vma_slack},
++        {"stale_clean", v[StaleClean]},
++        {"stale_written", v[StaleWritten]},
++        {"heap_free_pages", free_pages},
++        {"heap_fragmented", fragmented},
++        {"decode_kept", v[DecodeKept]},
++        {"decode_in_flight", v[DecodeInFlight]},
++        {"staging_idle", v[StagingIdle]},
++        {"copy_buffers", v[CopyBuffers]},
++        {"cpu_scratch", v[CpuScratch]},
++        {"async_ready", v[AsyncReady]},
++        {"retiring", v[Retiring]},
++        {"guest_reserve", reserve},
++    }};
++    std::sort(candidates.begin(), candidates.end(),
++              [](const Candidate& a, const Candidate& b) { return a.bytes > b.bytes; });
++    Owners now;
++    now.bytes = {v[Images], decode, staging, v[Buffers], vma_slack,
++                 guest,     heap,   jit,     rest > 0 ? static_cast<u64>(rest) : 0, cpu_side};
++    const char* grew = "none";
++    long long grew_by = 0;
++    const bool compared = have_previous;
++    if (compared) {
++        for (size_t i = 0; i < Owners::Count; ++i) {
++            const long long delta =
++                static_cast<long long>(now.bytes[i]) - static_cast<long long>(previous.bytes[i]);
++            if (delta > grew_by) {
++                grew_by = delta;
++                grew = Owners::names[i];
++            }
++        }
++    }
++    previous = now;
++    have_previous = have_previous || published != 0; // no GPU answer yet: no baseline
++    const long long short_by = largest != 0 ? static_cast<long long>(ThresholdBytes()) -
++                                                  static_cast<long long>(largest)
++                                            : 0;
++    length = std::snprintf(line, sizeof(line), "EDEN_MEM_CENSUS_TOP n=%u short_by=%lld:", number,
++                           short_by / (1LL << 20));
++    for (size_t i = 0, shown = 0; i < candidates.size() && shown < 6 && length > 0 &&
++                                  static_cast<size_t>(length) < sizeof(line) - 96;
++         ++i) {
++        if (candidates[i].bytes < (u64{1} << 20)) {
++            break;
++        }
++        ++shown;
++        length += std::snprintf(line + length, sizeof(line) - length, " %zu %s=%llu", shown,
++                                candidates[i].name, Mib(candidates[i].bytes));
++    }
++    if (length > 0 && static_cast<size_t>(length) < sizeof(line) - 96) {
++        if (compared) {
++            std::snprintf(line + length, sizeof(line) - length,
++                          "; grew_most=%s+%lld since n=%u (MiB)\n", grew, grew_by / (1LL << 20),
++                          number - 1);
++        } else {
++            std::snprintf(line + length, sizeof(line) - length, "; grew_most=- (first census)\n");
++        }
++        std::fputs(line, stderr);
++    }
++#if VIDEO_CORE_CENSUS_FRONT
++    if (detail) {
++        if (eden_radv_private_radv_ps5_memory_report_now != nullptr) {
++            eden_radv_private_radv_ps5_memory_report_now();
++        }
++        if (eden_guest_memory_report != nullptr) {
++            eden_guest_memory_report();
++        }
++    }
++#else
++    (void)detail;
++#endif
++}
++
++inline void Run() {
++    ::Common::SetCurrentThreadName("MemCensus");
++    State& state = Get();
++    using Clock = std::chrono::steady_clock;
++    const auto start = Clock::now();
++    const u64 mark = ThresholdBytes();
++    std::fprintf(stderr,
++                 "EDEN_MEM_CENSUS on: every 2 s while the largest free block is under %llu MiB, "
++                 "and at each area change%s\n",
++                 Mib(mark), FreeLargest() != 0 ? "" : " (free memory not known here: area changes only)");
++    Owners previous;
++    bool have_previous = false;
++    unsigned number = 0;
++    u32 area_seen = state.area_notes.load(std::memory_order_acquire);
++    bool after_area = false;
++    Clock::time_point after_area_at{};
++    Clock::time_point last_census{};
++    Clock::time_point last_low{};
++    bool any_census = false, any_low = false;
++    u64 low = ~u64{0};
++    for (;;) {
++        {
++            std::unique_lock lock{state.mutex};
++            state.changed.wait_for(lock, std::chrono::milliseconds(250), [&] {
++                return state.area_notes.load(std::memory_order_acquire) != area_seen;
++            });
++        }
++        const auto now = Clock::now();
++        const u64 largest = FreeLargest();
++        if (largest != 0) {
++            low = (std::min)(low, largest);
++        }
++        const char* why = nullptr;
++        bool detail = false;
++        bool area_start = false;
++        if (const u32 area = state.area_notes.load(std::memory_order_acquire); area != area_seen) {
++            area_seen = area;
++            why = "area";
++            area_start = true;
++            after_area = true;
++            after_area_at = now + std::chrono::seconds(3);
++        } else if (after_area && now >= after_area_at) {
++            after_area = false;
++            why = "area+3s";
++            detail = true;
++        } else if (largest != 0 && largest < mark &&
++                   (!any_census || now - last_census >= std::chrono::seconds(2))) {
++            why = "low";
++            // Entering a low stretch (none for 10 s): the detail lines too.
++            detail = !any_low || now - last_low >= std::chrono::seconds(10);
++            any_low = true;
++            last_low = now;
++        }
++        if (why == nullptr) {
++            continue;
++        }
++        any_census = true;
++        last_census = now;
++        if (area_start) {
++            std::fprintf(stderr, "EDEN_MEM_CENSUS_AREA n=%u frame=%llu new_images=%llu\n", number,
++                         static_cast<unsigned long long>(state.area_frame.load(std::memory_order_relaxed)),
++                         static_cast<unsigned long long>(state.area_images.load(std::memory_order_relaxed)));
++        }
++        const double seconds = std::chrono::duration<double>(now - start).count();
++        Write(number, why, largest, low != ~u64{0} ? low : 0, seconds, detail, previous,
++              have_previous);
++        ++number;
++        low = ~u64{0};
++    }
++}
++
++/// GPU thread, end of frame: starts the census thread once. Never joined: the process ends with
++/// _exit on the console, and the thread only sleeps and reads counters.
++inline void Start() {
++    State& state = Get();
++    if (state.started.load(std::memory_order_relaxed)) {
++        return;
++    }
++    state.started.store(true, std::memory_order_relaxed);
++    try {
++        std::thread(Run).detach();
++    } catch (...) {
++        std::fputs("EDEN_MEM_CENSUS could not start its thread: no census\n", stderr);
++    }
++}
++
++} // namespace VideoCommon::MemoryCensus
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 839f51e..d3f376f 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -485,4 +485,26 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+     }
+ }
+ 
++// What a kept buffer holds is measured as the console's port measures it (staging_buffers.h
++// Holds): its mapping's size, or 2^log2_level for a buffer that is not mapped.
++void StagingBufferPool::CensusBytes(u64 (&held)[3], u64 (&idle)[3], u64* stream) const {
++    const StagingBuffersCache* const caches[3] = {&device_local_cache, &upload_cache,
++                                                  &download_cache};
++    for (size_t kind = 0; kind < 3; ++kind) {
++        held[kind] = 0;
++        idle[kind] = 0;
++        for (const StagingBuffers& level : *caches[kind]) {
++            for (const StagingBuffer& entry : level.entries) {
++                const u64 bytes = !entry.mapped_span.empty() ? entry.mapped_span.size()
++                                                             : u64{1} << entry.log2_level;
++                held[kind] += bytes;
++                if (!entry.deferred && scheduler.IsFree(entry.tick)) {
++                    idle[kind] += bytes;
++                }
++            }
++        }
++    }
++    *stream = stream_buffer_size;
++}
++
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 3331ec7..58d8c7b 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -74,6 +74,11 @@ public:
+     /// handed out in old_tick. Everything stamped old_tick stays busy until new_tick is done.
+     void CarryTick(u64 old_tick, u64 new_tick);
+ 
++    /// EDEN_UP_MEM_CENSUS=1 (video_core/memory_census.h): what the kept buffers hold, device-local,
++    /// upload and download: held[k] in all, idle[k] of it the GPU is done with and nothing pins;
++    /// *stream the stream ring. Walks the kept buffers: only for a census.
++    void CensusBytes(u64 (&held)[3], u64 (&idle)[3], u64* stream) const;
++
+ private:
+     struct StreamBufferCommit {
+         size_t upper_bound;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index f1766f2..0a79fea 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -42,6 +42,7 @@
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/churn_counters.h"
++#include "video_core/memory_census.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #ifdef EGLANTINE_STREAMLINE
+ #include "video_core/vulkan_common/streamline.h"
+@@ -2936,6 +2937,59 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
+     return device.GetDeviceMemorySlack();
+ }
+ 
++// EDEN_UP_MEM_CENSUS=1: only when a census asks (TextureCache::CensusTick), on the GPU thread,
++// which owns the allocator. The decode images are sized as TickFrame sizes them for
++// EDEN_NX2_TRANSCODE_KEEP_MIB (four bytes a texel, every level and layer). A copy buffer of level
++// n is 2^n bytes (GetTemporaryBuffer). The allocator's blocks and use come from the front's
++// EDEN_VMA_USAGE function (all heaps) where there is one, else from the main heap's figures.
++void TextureCacheRuntime::PublishMemoryCensus() {
++    namespace Census = VideoCommon::MemoryCensus;
++    const auto decode_bytes = [](const PendingTranscode& t) {
++        u64 bytes{};
++        for (u32 level = 0; level < t.levels; ++level) {
++            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
++        }
++        return bytes * t.layers;
++    };
++    u64 in_flight = 0, kept = 0, copy = 0;
++    for (const PendingTranscode& t : pending_transcodes) {
++        in_flight += decode_bytes(t);
++    }
++    for (const PendingTranscode& t : free_transcodes) {
++        kept += decode_bytes(t);
++    }
++    for (size_t level = 0; level < indexing_slots; ++level) {
++        if (buffers[level]) {
++            copy += u64{1} << level;
++        }
++    }
++    u64 held[3]{}, idle[3]{}, stream = 0;
++    staging_buffer_pool.CensusBytes(held, idle, &stream);
++    unsigned long long blocks = 0, used = 0;
++    bool from_front = false;
++#if VIDEO_CORE_CENSUS_FRONT
++    if (eden_vma_usage != nullptr) {
++        eden_vma_usage(&blocks, &used);
++        from_front = true;
++    }
++#endif
++    if (!from_front) {
++        used = device.GetDeviceMemoryUsage();
++        blocks = used + device.GetDeviceMemorySlack();
++    }
++    Census::Set(Census::DecodeInFlight, in_flight);
++    Census::Set(Census::DecodeKept, kept);
++    Census::Set(Census::CopyBuffers, copy);
++    Census::Set(Census::MsaaScratch, msaa_scratch_images.size());
++    Census::Set(Census::StagingDevice, held[0]);
++    Census::Set(Census::StagingUpload, held[1]);
++    Census::Set(Census::StagingDownload, held[2]);
++    Census::Set(Census::StagingIdle, idle[0] + idle[1] + idle[2]);
++    Census::Set(Census::StagingStream, stream);
++    Census::Set(Census::VmaBlocks, blocks);
++    Census::Set(Census::VmaUsed, used);
++}
++
+ bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
+     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
+     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 86b5c8d..e906ca7 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -121,6 +121,10 @@ public:
+ 
+     u64 GetDeviceMemorySlack() const;
+ 
++    /// EDEN_UP_MEM_CENSUS=1 (video_core/memory_census.h): the decode images, copy buffers, MSAA
++    /// scratch, staging pool and the allocator's blocks, for a census that asks. GPU thread.
++    void PublishMemoryCensus();
++
+     bool CanReportMemoryUsage() const;
+ 
+     /// Images that did not fit the device memory budget so far (see MemoryAllocator).
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 94a8500..90d0982 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -31,6 +31,7 @@
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/guest_memory.h"
++#include "video_core/memory_census.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/texture_cache/formatter.h"
+ #include "video_core/texture_cache/image_view_base.h"
+@@ -608,6 +609,107 @@ void TextureCache<P>::CollectForBuffer(u64 wanted) {
+     }
+ }
+ 
++// EDEN_UP_MEM_CENSUS=1 (video_core/memory_census.h). Every frame: starts the census thread once,
++// and counts AreaEvict's burst on its own (at least EDEN_NX2_AREA_EVICT_BURST, 100, new images in
++// 30 frames; one note per load, none again until 120 frames without a burst), so the census needs
++// no EDEN_NX2_AREA_EVICT. Only when the census asks (every 2 s at most while memory is low, and
++// twice per area change): one walk of the images, the collector's own measure (ImageMemoryBytes)
++// split by kind, and of the LRU's images unused for 120 frames, split by what deleting them needs.
++template <class P>
++void TextureCache<P>::CensusTick() {
++    MemoryCensus::Start();
++    static const u64 burst = [] {
++        const char* const value = std::getenv("EDEN_NX2_AREA_EVICT_BURST");
++        const u64 images = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
++        return images != 0 ? images : 100ULL;
++    }();
++    constexpr u64 WindowFrames = 30;
++    constexpr u64 QuietFrames = 120;
++    const u64 created = area_images_created - census_created_seen;
++    census_created_seen = area_images_created;
++    if (frame_tick - census_window_frame >= WindowFrames) {
++        census_window_frame = frame_tick;
++        census_window_created = 0;
++    }
++    census_window_created += created;
++    if (census_window_created >= burst) {
++        if (frame_tick >= census_quiet_until) {
++            MemoryCensus::NoteArea(frame_tick, census_window_created);
++        }
++        census_quiet_until = frame_tick + QuietFrames;
++        census_window_frame = frame_tick;
++        census_window_created = 0;
++    }
++    const u32 request = MemoryCensus::ImagesWanted();
++    if (request == 0) {
++        return;
++    }
++    u64 images = 0, count = 0, sparse = 0, target = 0, astc = 0, other = 0, scaled = 0;
++    for (const auto [image_id, image] : slot_images) {
++        const u64 bytes = ImageMemoryBytes(*image);
++        images += bytes;
++        ++count;
++        if (image->HasScaled()) {
++            scaled += GetScaledImageSizeBytes(*image);
++        }
++        if (True(image->flags & ImageFlagBits::Unbacked)) {
++            sparse += bytes;
++        } else if (True(image->flags & ImageFlagBits::GpuModified)) {
++            target += bytes;
++        } else if (IsPixelFormatASTC(image->info.format)) {
++            astc += bytes;
++        } else {
++            other += bytes;
++        }
++    }
++    u64 stale_clean = 0, stale_written = 0;
++    if (frame_tick > MemoryCensus::StaleFrames) {
++        lru_cache.ForEachItemBelow(frame_tick - MemoryCensus::StaleFrames, [&](ImageId image_id) {
++            const Image& image = slot_images[image_id];
++            if (True(image.flags & ImageFlagBits::IsDecoding)) {
++                return false;
++            }
++            const u64 bytes = ImageMemoryBytes(image) +
++                              (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
++            const bool written =
++                IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
++            (written ? stale_written : stale_clean) += bytes;
++            return false;
++        });
++    }
++    u64 retiring = gpu_sentenced_bytes;
++    for (const u64 bytes : sentenced_image_bytes) {
++        retiring += bytes;
++    }
++    u64 async_ready = 0, async_waiting = 0;
++    for (const auto& decode : async_decodes) {
++        if (decode->complete.load(std::memory_order_acquire)) {
++            async_ready += decode->decoded_data.capacity();
++        } else {
++            ++async_waiting;
++        }
++    }
++    using MemoryCensus::Set;
++    Set(MemoryCensus::Images, images);
++    Set(MemoryCensus::ImageCount, count);
++    Set(MemoryCensus::ImagesSparse, sparse);
++    Set(MemoryCensus::ImagesTarget, target);
++    Set(MemoryCensus::ImagesAstc, astc);
++    Set(MemoryCensus::ImagesOther, other);
++    Set(MemoryCensus::ImagesScaled, scaled);
++    Set(MemoryCensus::StaleClean, stale_clean);
++    Set(MemoryCensus::StaleWritten, stale_written);
++    Set(MemoryCensus::Retiring, retiring);
++    Set(MemoryCensus::AsyncReady, async_ready);
++    Set(MemoryCensus::AsyncWaiting, async_waiting);
++    Set(MemoryCensus::CpuScratch,
++        swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity());
++    if constexpr (requires { runtime.PublishMemoryCensus(); }) {
++        runtime.PublishMemoryCensus();
++    }
++    MemoryCensus::ImagesPublished(request);
++}
++
+ // EDEN_NX2_AREA_EVICT=<frames> (unset or 0: off, as before): when the game changes area, the
+ // images of the area it left go before the pool runs dry. The collector keys on its marks and
+ // on the pool's largest free block, and on the PS5 both can sit quiet until the pool is gone:
+@@ -1263,6 +1365,9 @@ void TextureCache<P>::TickFrame() {
+         }
+         refusal_evicts_this_frame = 0;
+     }
++    if (MemoryCensus::Enabled()) {
++        CensusTick();
++    }
+     if (FritchiiRelocationGuards()) {
+         // EDEN_UP_FRITCHII_RELOCATE / EDEN_UP_FRITCHII_COLD: the cold sweep and the 600-frame line.
+         TickRelocation();
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 757e149..18d0a20 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -204,6 +204,12 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     u64 area_evict_min_until{}; ///< ...but not before this frame (very low frame rates)
+     bool area_window_open{};    ///< The window was open last frame (the done line, time mode)
+     size_t area_kept_last{};    ///< GPU-written images kept in the last pass (the done line)
++    /// EDEN_UP_MEM_CENSUS (CensusTick): its own count of AreaEvict's burst, so the census needs no
++    /// EDEN_NX2_AREA_EVICT.
++    u64 census_created_seen{};
++    u64 census_window_frame{};
++    u64 census_window_created{};
++    u64 census_quiet_until{}; ///< One area note per load: none again before this frame
+     /// EDEN_NX2_CLEAN_BY_TIME / EDEN_NX2_REFUSAL_EVICT: when each frame ended (TickFrame).
+     FrameClock frame_clock;
+     /// EDEN_NX2_REFUSAL_EVICT: allocator refusals already answered at a frame's end.
+@@ -348,6 +354,11 @@ public:
+     /// of a frame, with mutex held, before the collector.
+     void AreaEvict();
+ 
++    /// EDEN_UP_MEM_CENSUS=1 (video_core/memory_census.h): starts the census thread, tells it when an
++    /// area load begins, and when a census asks, hands it what the images hold by kind. At the end
++    /// of a frame, with mutex held, before the relocation sweep and AreaEvict.
++    void CensusTick();
++
+     /// Destroys the deleted images the GPU is done with, as TickFrame does. Mutex held.
+     void ReleaseFinished();
+ 

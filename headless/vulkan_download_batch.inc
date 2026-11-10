@@ -14,6 +14,9 @@
                 const auto copies = FullDownloadCopies(image.info);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
                              swizzle_data_buffer);
+                if (SkipStaleUploads()) {
+                    ClearStaleImage(image); // UB-128: the write-back has reached guest memory.
+                }
             }
             pending.clear();
             batch_bytes = 0;
