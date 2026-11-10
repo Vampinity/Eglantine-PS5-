@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] vulkan: make Ocarina occlusion report fixes unconditional
+
+Ocarina of Time (0400486024DEC000) only; other titles retain their existing switches.
+
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -709,7 +709,12 @@
+     // not been tried on AMD yet.
+     static const bool pause_zpass = [] {
+         const char* value = std::getenv("EDEN_NX2_ZPASS_PAUSE");
+-        return value != nullptr && value[0] == '1';
++        if (value != nullptr) {
++            return value[0] == '1';
++        }
++        // Ocarina's Low-accuracy report window may cross a submission. Resetting
++        // here feeds a one-frame false occlusion result to foliage and ground.
++        return Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+     }();
+     const bool pause_now = VideoCommon::ZpassCut::PauseNow(pause_zpass);
+     if (VideoCommon::ZpassCut::Enabled()) [[unlikely]] {
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -295,7 +295,13 @@
+     // registered until its fence runs, as at High accuracy, without making other fences wait.
+     static const bool keep_pending = [] {
+         const char* const value = std::getenv("EDEN_NX2_QUERY_KEEP_PENDING");
+-        return value != nullptr && value[0] != '0';
++        if (value != nullptr) {
++            return value[0] != '0';
++        }
++        // Low-accuracy Ocarina reports can be released before the fence that
++        // produces them runs; keep the report registered so the consumer cannot
++        // sample the previous frame's visibility result.
++        return Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+     }();
+     bool is_synced = !keep_pending && (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+-- 
+2.54.0

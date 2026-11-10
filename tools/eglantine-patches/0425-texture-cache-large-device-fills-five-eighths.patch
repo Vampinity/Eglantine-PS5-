@@ -1,0 +1,64 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] texture_cache: a large device may fill 5/8 of its budget before collecting
+
+Ported from Frizti/Fritchii 78f38e077 (zortos293/Lichii #268), which Fritchii carries in v5.
+
+The collector's thresholds are sized for a device with far less memory than this one presents. The PS5
+reports a ~6 GiB Vulkan budget, and our own logs show the heap driven to 6274 of 6422 MiB - 98% -
+while the collector keeps evicting: 2633 images created and 3615 deleted in a single 600-frame window,
+with the present frame time doubling from 32 ms to 61 ms. Collecting that hard, that early, is what
+makes the churn, because the cache throws away images it is about to need again.
+
+Fritchii lets a large card fill 5/8 of its budget before it collects at all, so the working set a big
+scene needs can stay resident.
+
+What this can break: a device filling 5/8 of its budget keeps less headroom for one large allocation,
+so a big texture arriving into a full cache has a narrower window between "fits" and "fails". That is
+why it belongs with 0427, which makes a texture that does not fit fail cleanly instead of being left
+unbacked - the two are a pair.
+
+Measured or a guess: the churn counts and heap percentages are from our own log, and the threshold
+change is measured on upstream's hardware. The effect on the PS5 is not console-tested.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index adda3a859..315177c31 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -408,10 +408,18 @@ bool TextureCache<P>::IsAllStale(DAddr addr, size_t size) const {
+ 
+ template <class P>
+ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+-    // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
+-    // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
+-    // MaxCriticalMemory on rather than near the card's budget.
+-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
++    // Past what a frame needs, more device memory only keeps the textures of earlier scenes
++    // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
++    // MaxCriticalMemory on rather than near the card's budget. Larger cards get 5/8 of the
++    // driver's budget (GetDeviceLocalMemory is capped near 7 GiB): at 5 GiB title 1's races
++    // recreate and upload ~8 MiB of render targets a frame (16 GB card: 53 -> 59 fps at 10 GiB).
++    // 5/8 of the budget only passes 5 GiB above an 8 GiB budget, so cards up to 8 GB (and
++    // integrated GPUs, whose budget is capped at 4-6 GiB) keep the 5 GiB cap.
++    u64 max_critical = MaxCriticalMemory;
++    if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
++        max_critical = (std::max)(max_critical, runtime.GetDeviceMemoryBudget() / 8 * 5);
++    }
++    critical_memory = (std::min)(critical_memory, max_critical);
+     expected_memory =
+         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+     minimum_memory =
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 29c42fcf4..1faf9e21f 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -152,8 +152,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+ 
+     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
+     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
+-    /// The most device memory the collector lets the cache fill before it collects in earnest,
+-    /// on every GPU (ApplyThresholdOverrides).
++    /// The most device memory the collector lets the cache fill before it collects in earnest on
++    /// cards up to 8 GiB; larger ones 5/8 of the driver's budget (ApplyThresholdOverrides).
+     static constexpr u64 MaxCriticalMemory = 5_GiB;
+     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
+ 

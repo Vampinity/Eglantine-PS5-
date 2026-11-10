@@ -1,0 +1,40 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] shader: EDEN_NX2_TENSOR_ONLY must not veto Ocarina's title default
+
+EDEN_NX2_TENSOR_ONLY lists the HMMA programs the lowering admits. Patch 0205 moved the list check
+after upstream's title_tensor default, so a list left in a console's env.txt vetoes the default it
+was meant to narrow. The release ships no env.txt, but the console's copy cannot be edited, and its
+list (ad0) is exactly the ten NDVE movie-filter offsets 43c0, 1eb0, 790, 3440, 9f0, 2c40, ef0, 9a0,
+1bb0 and b30 that Ocarina lowers by default: a console log shows all ten rejected with "native
+matrix multiply (not in EDEN_NX2_TENSOR_ONLY)", each followed by "Upscale fallback target ...
+0/3597 non-zero, 0 changes" - the plain upscale stand-in, rendering them black.
+
+Skip the list for title_tensor. An explicit EDEN_NX2_TENSOR still narrows to the list for other
+titles, and EDEN_NX2_TENSOR_BACKGROUND (shipped default) builds the programs off the frame path, so
+the ~12 s Configure hold the list was avoiding does not come back.
+
+Checked: reverse-applies on the core plus the 0205/0203/0187/0204/0178/0051 stack; the stack plus
+this patch applies to 0ca2032bff with none failing. Not run on a console.
+
+---
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -1623,11 +1623,16 @@
+             // The others stay rejected, so they keep the stand-in. Ocarina of Time: ad0 is the one
+             // program outside its movie library; the movie filter NDVE is 43c0, 1eb0, 790, 3440,
+             // 9f0, 2c40, ef0, 9a0, 1bb0 and b30, close to a plain copy on nxnative (#1375).
++            // The list must not veto title_tensor, the title's own default: the console's env.txt
++            // cannot be edited, so a stale EDEN_NX2_TENSOR_ONLY there rejects exactly the ten NDVE
++            // programs this title lowers, and the plain upscale stand-in renders them black
++            // ("Upscale fallback target ... 0/3597 non-zero"). An explicit EDEN_NX2_TENSOR still
++            // narrows to the list for other titles.
+             static const std::string tensor_only = [] {
+                 const char* const text = std::getenv("EDEN_NX2_TENSOR_ONLY");
+                 return text ? "," + std::string{text} + "," : std::string{};
+             }();
+-            if (!tensor_only.empty() && !hmma_program_listed) {
++            if (!tensor_only.empty() && !hmma_program_listed && !title_tensor) {
+                 const std::string offset = fmt::format(",{:x},", index * sizeof(Instruction));
+                 if (tensor_only.find(offset) == std::string::npos) {
+                     return fail(index, "native matrix multiply (not in EDEN_NX2_TENSOR_ONLY)");

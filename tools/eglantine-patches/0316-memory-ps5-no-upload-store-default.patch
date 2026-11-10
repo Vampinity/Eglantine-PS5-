@@ -1,0 +1,34 @@
+From a794545ded000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 00:00:00 +0000
+Subject: [PATCH] kepler_compute: stop the native upload bookkeeping leak on PS5
+
+Every native exec_upload currently appends a 24-byte UploadInfo to `uploads`,
+but only the legacy launch path consumes and clears that vector. On the PS5
+console this was about 2,900 entries per second: a 96 MiB heap block at
+13 minutes and 192 MiB at 24 minutes. It is a long-lived reservation and its
+vector growth also creates allocator churn at the area-change boundary.
+
+The native path never needs the legacy upload list, so disable that store by
+default for PS5_NATIVE. EDEN_NX2_NO_UPLOAD_STORE=0 remains an explicit rollback;
+other targets retain the old opt-in behavior.
+
+---
+ src/video_core/engines/kepler_compute.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -42,7 +42,11 @@ namespace {
+ bool NoUploadStore() {
+     static const bool no_store = [] {
+         const char* const value = std::getenv("EDEN_NX2_NO_UPLOAD_STORE");
++#ifdef PS5_NATIVE
++        return value == nullptr || value[0] == '1';
++#else
+         return value != nullptr && value[0] == '1';
++#endif
+     }();
+     return no_store;
+ }

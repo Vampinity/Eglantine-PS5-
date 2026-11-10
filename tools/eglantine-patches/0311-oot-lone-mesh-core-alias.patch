@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] vulkan: connect the PS5 lone-mesh switch to the core fallback
+
+Ocarina of Time (0400486024DEC000) only; other titles retain their existing switches.
+
+--- a/src/video_core/renderer_vulkan/vk_mesh_compute.cpp
++++ b/src/video_core/renderer_vulkan/vk_mesh_compute.cpp
+@@ -4,6 +4,7 @@
+ #include <cstdlib>
+ 
+ #include "common/logging.h"
++#include "common/settings.h"
+ #include "video_core/renderer_vulkan/vk_mesh_compute.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+--- a/src/video_core/renderer_vulkan/vk_mesh_compute.cpp
++++ b/src/video_core/renderer_vulkan/vk_mesh_compute.cpp
+@@ -14,7 +14,16 @@
+ bool MeshComputeScratch::Requested() noexcept {
+     static const bool requested = [] {
+         const char* value = std::getenv("EDEN_NX2_MESH_AS_COMPUTE");
+-        return value != nullptr && value[0] == '1';
++        if (value != nullptr) {
++            return value[0] == '1';
++        }
++        if (Settings::GetCurrentProgramID() != 0x0400486024DEC000ULL) {
++            return false;
++        }
++        // Ocarina's safe lone-mesh fallback is on by default. The PS5 RADV switch
++        // remains an explicit opt-in for other titles.
++        const char* const radv_lone = std::getenv("EDEN_NX2_RADV_MESH_COMPUTE_LONE");
++        return radv_lone == nullptr || radv_lone[0] == '1';
+     }();
+     return requested;
+ }
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -24,6 +24,7 @@
+ #include <numeric>
+ #include "common/cityhash.h"
+ #include "common/scope_exit.h"
++#include "common/settings.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
+ #include "common/thread_worker.h"
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -731,7 +731,16 @@
+ bool MeshComputeLoneOnly() {
+     static const bool lone = [] {
+         const char* value = std::getenv("EDEN_NX2_MESH_COMPUTE_LONE");
+-        return value != nullptr && value[0] == '1';
++        if (value != nullptr) {
++            return value[0] == '1';
++        }
++        if (Settings::GetCurrentProgramID() != 0x0400486024DEC000ULL) {
++            return false;
++        }
++        // Ocarina's safe lone-mesh fallback is on by default. The PS5 RADV switch
++        // remains an explicit opt-in for other titles.
++        const char* const radv_lone = std::getenv("EDEN_NX2_RADV_MESH_COMPUTE_LONE");
++        return radv_lone == nullptr || radv_lone[0] == '1';
+     }();
+     return lone;
+ }
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -758,10 +758,17 @@
+     // feature stays on for it. Run156 logged "the device has no buffer device addresses" and the
+     // draws went down the native mesh path instead.
+     const char* const mesh_as_compute = std::getenv("EDEN_NX2_MESH_AS_COMPUTE");
+-    const bool mesh_wants_device_address = mesh_as_compute != nullptr &&
+-                                           mesh_as_compute[0] == '1' &&
+-                                           features.buffer_device_address.bufferDeviceAddress;
+-    if (!extensions.descriptor_buffer && !mesh_wants_device_address) {
++    const char* const core_lone = std::getenv("EDEN_NX2_MESH_COMPUTE_LONE");
++    const char* const radv_lone = std::getenv("EDEN_NX2_RADV_MESH_COMPUTE_LONE");
++    const bool mesh_lone_as_compute =
++        Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL &&
++        ((core_lone == nullptr && (radv_lone == nullptr || radv_lone[0] == '1')) ||
++         (core_lone != nullptr && core_lone[0] == '1'));
++    const bool mesh_wants_device_address =
++        (mesh_as_compute != nullptr && mesh_as_compute[0] == '1') || mesh_lone_as_compute;
++    const bool mesh_device_address_available =
++        mesh_wants_device_address && features.buffer_device_address.bufferDeviceAddress;
++    if (!extensions.descriptor_buffer && !mesh_device_address_available) {
+         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
+                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+     }
+-- 
+2.54.0

@@ -1,0 +1,99 @@
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index d0eb29c925..82b97a656a 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -605,8 +605,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+             .samples = image_ci.samples,
+             .tiling = image_ci.tiling,
+             .usage = image_ci.usage,
+-            .view_formats = view_formats.data(),
+-            .view_format_count = view_formats.size(),
++            .view_formats = std::vector<VkFormat>(view_formats.begin(), view_formats.end()),
+         };
+         if (pool != nullptr) {
+             if (vk::Image image = pool->TakePooledImage(*pool_key)) {
+@@ -3071,7 +3070,8 @@ void Image::ReleaseToPool() {
+             return;
+         }
+         const vk::Image::MemoryBlock block = image.GetMemoryBlock();
+-        if (block.block == 0 || block.size < MinPooledBytes || !image.IsDeviceLocal()) {
++        if ((block.block == 0 && !block.dedicated) || block.size < MinPooledBytes ||
++            !image.IsDeviceLocal()) {
+             return;
+         }
+         if (ENABLE_MSAA_RESOLVE_CONSUME) {
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 2025f8b042..8ca1b369d3 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -12,6 +12,7 @@
+ #include <optional>
+ #include <span>
+ #include <utility>
++#include <vector>
+ 
+ #include "video_core/texture_cache/texture_cache_base.h"
+ 
+@@ -64,8 +65,7 @@ struct ImagePoolKey {
+     VkSampleCountFlagBits samples{};
+     VkImageTiling tiling{};
+     VkImageUsageFlags usage{};
+-    const VkFormat* view_formats{};
+-    size_t view_format_count{};
++    std::vector<VkFormat> view_formats;
+ 
+     bool operator==(const ImagePoolKey&) const noexcept = default;
+ };
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index eecc937f21..4b5dea0b1f 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -557,6 +557,9 @@ void TextureCache<P>::ReleaseFinished() {
+         while (!gpu_sentenced_images.empty() &&
+                runtime.IsFree(gpu_sentenced_images.front().tick)) {
+             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
++            if constexpr (requires(Image& image) { image.ReleaseToPool(); }) {
++                gpu_sentenced_images.front().image.ReleaseToPool();
++            }
+             gpu_sentenced_images.pop_front();
+         }
+     }
+@@ -686,6 +689,9 @@ void TextureCache<P>::TickFrame() {
+         while (!gpu_sentenced_images.empty() &&
+                runtime.IsFree(gpu_sentenced_images.front().tick)) {
+             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
++            if constexpr (requires(Image& image) { image.ReleaseToPool(); }) {
++                gpu_sentenced_images.front().image.ReleaseToPool();
++            }
+             gpu_sentenced_images.pop_front();
+         }
+     }
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.cpp b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+index 17da5273f9..e47d2dd3a4 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.cpp
++++ b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+@@ -558,10 +558,10 @@ Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
+     VmaAllocationInfo2 info{};
+     vmaGetAllocationInfo2(allocator, allocation, &info);
+     if (info.dedicatedMemory) {
+-        return {0, info.blockSize, info.allocationInfo.size};
++        return {0, info.blockSize, info.allocationInfo.size, true};
+     }
+     return {reinterpret_cast<u64>(info.allocationInfo.deviceMemory), info.blockSize,
+-            info.allocationInfo.size};
++            info.allocationInfo.size, false};
+ }
+ 
+ bool Image::IsDeviceLocal() const noexcept {
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.h b/src/video_core/vulkan_common/vulkan_wrapper.h
+index 29f16326d8..f0f83c1aff 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.h
++++ b/src/video_core/vulkan_common/vulkan_wrapper.h
+@@ -750,6 +750,7 @@ public:
+         u64 block;
+         u64 block_size;
+         u64 size;
++        bool dedicated;
+     };
+     [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
+ 

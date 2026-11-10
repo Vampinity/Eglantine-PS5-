@@ -1,0 +1,126 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] renderer: the AMD/RADV correctness fixes are on by default
+
+Three corrections this tree already carries behind opt-in switches are wrong to leave off on the
+device it runs on. Fritchii's fork carries all three as ordinary renderer behaviour, and the PS5 is
+RADV on RDNA2, so each switch's own stated precondition is met.
+
+1. EDEN_NX2_AMD_SHADER_FIXES, now on. Two SPIR-V lowering corrections:
+   - A 64/128-bit storage access whose offset is not known to be a multiple of the access size is
+     split into 32-bit words instead of taking a vector view. The binding base is aligned only to
+     the device's storage-buffer alignment - 4 bytes on RADV - so the vector view reads the vector
+     before it. The file's own words are "it reads the vector before (Ocarina's lighting)".
+   - FP min/max/clamp/saturate emit the NaN-defining OpNMin/OpNMax, because Maxwell's FMNMX and .SAT
+     return the non-NaN operand while Vulkan's FMin/FMax/FClamp leave NaN undefined and AMD's
+     compiler passes it through. A NaN arriving in a fog or light chain then spreads to the target.
+
+2. EDEN_NX2_BLEND_ALWAYS, now on. Native Switch 2 paths write blend registers without raising
+   Dirty::Blending, which leaves a stale blend state in the pipeline key on a device without dynamic
+   blend. The code already sits inside `if (!extended_dynamic_state_3_blend)`, and this device reports
+   dynamic state level 2, so it is always in that branch. The fix is Fritchii's, and its comment
+   names Ocarina's forest fog rendering black there.
+
+3. EDEN_NX2_PLAIN_SAMPLER, now on. A compare-enabled TSC read by a plain, non-Dref sample: Maxwell
+   ignores the comparison, Vulkan leaves it undefined, and AMD returns the 0/1 compare result, which
+   is Ocarina's forest-fog composite reading alpha 0. The sampler variant now drops the comparison.
+
+Each keeps its variable as a live escape: setting it to 0 turns that fix off, so a regression can be
+bisected on the console without a new build.
+
+What this can break. (1) re-emits SPIR-V for every affected program, and the split into 32-bit words
+costs instructions on paths that used a vector view - the price Fritchii pays too. It also applies to
+every title, not only Ocarina, which is intended: the alignment and NaN semantics are wrong for all
+of them on this device. (2) and (3) change pipeline and sampler variant keys, so they add variants
+rather than remove them: (3) can add a sampler variant per compare-enabled image, and (2) refreshes
+blend state on every pipeline update in that branch instead of only when the dirty flag is set.
+
+The disk cache is versioned for exactly this, so CACHE_VERSION goes from 23 to 24. A cache written by
+an earlier build holds the old SPIR-V for these programs and would otherwise be loaded as it is,
+hiding the whole change. The first boot after this build will re-translate and re-cache what it needs.
+
+Measured or a guess: the preconditions are measured - RADV aligns storage bindings to 4 bytes, this
+device reports dynamic state level 2, and Fritchii ships all three unconditionally with its release
+notes attributing the black forest fog to the blend case. The effect on this round's two screenshots
+is not measured. It is the strongest remaining hypothesis for the character lighting collapsing to
+black with only the emissive eyes lit, and for the blown-out haze, and it is being tested as such.
+
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 7b984343d6..d13d5d1acb 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -36,9 +36,14 @@ bool AmdPr273Fixes() {
+ }
+ 
+ bool AmdShaderFixes() {
++    // On by default. The device this port runs on is RADV on RDNA2, where a storage-buffer binding
++    // base is aligned only to 4 bytes so a 64/128-bit access can land on any word (Ocarina's
++    // lighting), and where Maxwell's NaN-defining FMNMX/.SAT has no equivalent in Vulkan's
++    // FMin/FMax/FClamp. Fritchii's fork carries both as ordinary renderer behaviour rather than an
++    // option. EDEN_NX2_AMD_SHADER_FIXES=0 turns them off for a bisect.
+     static const bool enabled = [] {
+         const char* const value = std::getenv("EDEN_NX2_AMD_SHADER_FIXES");
+-        return value != nullptr && value[0] != '0';
++        return value == nullptr || value[0] != '0';
+     }();
+     return enabled;
+ }
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index bd978f370e..1f3160319f 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -254,12 +254,13 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
+     }
+     if (!extended_dynamic_state_3_blend) {
+-        // EDEN_NX2_BLEND_ALWAYS=1 (mja00/Lichii f00aa63884, from sharkiix): native Switch 2 paths
+-        // write blend registers without raising Dirty::Blending, which leaves a stale blend state
+-        // in the key on a device without dynamic blend. The PS5 runs at dynamic state level 2.
++        // On by default (mja00/Lichii f00aa63884, from sharkiix): native Switch 2 paths write blend
++        // registers without raising Dirty::Blending, which leaves a stale blend state in the key on
++        // a device without dynamic blend. The PS5 reports dynamic state level 2, so it is always in
++        // this branch, and Fritchii's fork refreshes unconditionally. =0 turns it off for a bisect.
+         static const bool blend_always = [] {
+             const char* const value = std::getenv("EDEN_NX2_BLEND_ALWAYS");
+-            return value != nullptr && value[0] != '0';
++            return value == nullptr || value[0] != '0';
+         }();
+         if (blend_always || maxwell3d.dirty.flags[Dirty::Blending]) {
+             maxwell3d.dirty.flags[Dirty::Blending] = false;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 71cd6499c5..191cfe6276 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -81,7 +81,10 @@ using VideoCommon::FileEnvironment;
+ using VideoCommon::GenericEnvironment;
+ using VideoCommon::GraphicsEnvironment;
+ 
+-constexpr u32 CACHE_VERSION = 23;
++// 24: AmdShaderFixes() is on by default now, which changes the emitted SPIR-V for the misaligned
++// 64/128-bit storage accesses and the NaN-safe min/max/clamp. A cache written by version 23 holds
++// the old programs for those shaders and would be loaded exactly as they are, hiding the change.
++constexpr u32 CACHE_VERSION = 24;
+ constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
+ constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
+ constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 55ec1a18b0..454f950d93 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -4566,12 +4571,12 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
+     key.drop_reduction = has_minmax_reduction && !image_view.SupportsMinmaxFilter();
+     key.drop_custom_border = has_custom_border_colors && image_view.RequiresBorderColorFormat();
+     key.srgb_border = has_srgb_border_color && IsPixelFormatSRGB(image_view.format);
+-    // EDEN_NX2_PLAIN_SAMPLER=1 (mja00/Lichii 05a9fb2dca, from sharkiix): a compare-enabled TSC read
+-    // by a plain sample. Maxwell ignores the comparison, Vulkan leaves it undefined and AMD returns
+-    // the 0/1 compare result (Ocarina's forest fog composite read alpha 0).
++    // On by default (mja00/Lichii 05a9fb2dca, from sharkiix): a compare-enabled TSC read by a plain
++    // sample. Maxwell ignores the comparison, Vulkan leaves it undefined and AMD returns the 0/1
++    // compare result (Ocarina's forest fog composite read alpha 0). =0 turns it off for a bisect.
+     static const bool plain_sampler = [] {
+         const char* const value = std::getenv("EDEN_NX2_PLAIN_SAMPLER");
+-        return value != nullptr && value[0] != '0';
++        return value == nullptr || value[0] != '0';
+     }();
+     key.drop_compare = plain_sampler && has_depth_comparison && !is_depth;
+     if (needs_swizzle_mapping && !key.drop_custom_border && !image_view.HasIdentitySwizzle()) {
+

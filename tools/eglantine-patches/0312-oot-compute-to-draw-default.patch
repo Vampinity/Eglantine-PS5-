@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] vulkan: order Ocarina compute tables before the following draw
+
+Ocarina of Time (0400486024DEC000) only; other titles retain their existing switches.
+
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1534,7 +1534,13 @@
+     // invalidates no cache unless EDEN_NX2_WFI_BARRIER=1.
+     static const bool compute_to_draw = [] {
+         const char* const value = std::getenv("EDEN_NX2_COMPUTE_TO_DRAW");
+-        return value != nullptr && value[0] != '0';
++        if (value != nullptr) {
++            return value[0] != '0';
++        }
++        // Ocarina's foliage/water tables are produced by native compute and consumed
++        // by the following graphics pass. Preserve the compute->draw dependency by
++        // default; without it a stale table can darken the ground and flip reflection.
++        return Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+     }();
+     const auto record_read_barrier = [this] {
+         static constexpr VkMemoryBarrier READ_BARRIER{
+-- 
+2.54.0

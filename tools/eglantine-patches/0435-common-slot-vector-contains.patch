@@ -1,0 +1,19 @@
+diff --git a/src/common/slot_vector.h b/src/common/slot_vector.h
+index 8e1c06e35a..60780ff6b8 100644
+--- a/src/common/slot_vector.h
++++ b/src/common/slot_vector.h
+@@ -156,6 +156,14 @@ public:
+         return values_capacity - free_list.size();
+     }
+ 
++    /// Whether the slot still holds an object. A freed slot reuses its index, so an id is only
++    /// meaningful while this holds; a default-constructed id is always absent.
++    [[nodiscard]] bool contains(SlotId id) const noexcept {
++        const size_t index = id.Value();
++        return index / 64 < stored_bitset.size() &&
++               ((stored_bitset[index / 64] >> (index % 64)) & 1) != 0;
++    }
++
+ private:
+     struct NonTrivialDummy {
+         NonTrivialDummy() noexcept {}

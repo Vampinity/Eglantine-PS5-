@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 00:00:00 +0000
+Subject: [PATCH] vulkan: keep mesh runtime-cache diagnostics honest
+
+---
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index d62341bc9f..8d208cb053 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1926,7 +1926,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     // Task and mesh programs are translated with the mesh registers, which vulkan.bin doesn't
+     // carry: they go to their own file (builds without it never read those records).
+     const bool is_mesh = pipeline->IsMeshPipeline();
+-    if (is_mesh) {
++    if (is_mesh && reason == RuntimeBuild::New) {
+         reason = RuntimeBuild::Mesh;
+     }
+     if (disk_pipelines.contains(graphics_key.Hash())) {
+

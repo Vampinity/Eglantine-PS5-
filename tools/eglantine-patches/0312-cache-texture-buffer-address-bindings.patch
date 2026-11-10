@@ -1,0 +1,46 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -3558,6 +3558,33 @@
+ template <class P>
+ TextureBufferBinding BufferCache<P>::GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
+                                                              PixelFormat format) {
++    // Texture-buffer bindings are rebuilt during every graphics Configure, even when the
++    // descriptor handle still names the same mapped range. Mapping changes invalidate these
++    // answers; ordinary draws do not. Keep a small per-GPU-thread cache, matching the storage
++    // binding cache above, so repeated Ocarina draws avoid the range-map lookup and allocation.
++    struct CachedBinding {
++        size_t owner{};
++        GPUVAddr gpu_addr{};
++        u32 size{};
++        PixelFormat format{};
++        u64 serial{};
++        TextureBufferBinding binding{};
++    };
++    constexpr size_t Ways = 4;
++    thread_local std::array<std::array<CachedBinding, Ways>, 256> binding_cache{};
++    const size_t owner = gpu_memory->GetID() + 1;
++    const u64 serial = gpu_memory->MapSerial();
++    const u64 key = gpu_addr ^ (u64{size} << 32) ^ static_cast<u64>(format);
++    auto& set = binding_cache[(key * 0x9E3779B97F4A7C15ULL) >> 56];
++    for (size_t way = 0; way < Ways; ++way) {
++        const CachedBinding& cached = set[way];
++        if (cached.owner == owner && cached.gpu_addr == gpu_addr && cached.size == size &&
++            cached.format == format && cached.serial == serial) {
++            const TextureBufferBinding hit = cached.binding;
++            std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
++            return hit;
++        }
++    }
+     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+     TextureBufferBinding binding;
+     if (!device_addr || size == 0) {
+@@ -3571,5 +3598,7 @@
+         binding.buffer_id = BufferId{};
+         binding.format = format;
+     }
++    std::rotate(set.begin(), set.end() - 1, set.end());
++    set[0] = {owner, gpu_addr, size, format, serial, binding};
+     return binding;
+ }
+ 

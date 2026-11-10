@@ -1,0 +1,38 @@
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index 1f3160319f..0c2ebdd62e 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -279,6 +279,18 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
+         }
+     }
+     dynamic_state.Refresh3(regs, features);
++    // The logic operation counts only while logic op is on. Without a dynamic logic-op enable the key
++    // holds the register even with logic op off, so two draws differing only in that unread value key
++    // two pipelines (Fritchii 9ea66c827). EDEN_NX2_LOGIC_OP_KEY=0 restores the old key.
++    if (!features.has_dynamic_state3_logic_op_enable && !dynamic_state.logic_op_enable) {
++        static const bool canonicalize = [] {
++            const char* const value = std::getenv("EDEN_NX2_LOGIC_OP_KEY");
++            return value == nullptr || value[0] != '0';
++        }();
++        if (canonicalize) {
++            dynamic_state.logic_op.Assign(0);
++        }
++    }
+     if (xfb_enabled) {
+         RefreshXfbState(xfb_state, regs);
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 4ecf1d8f6a..6ec7a6fe44 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -656,6 +656,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+         device.IsExtExtendedDynamicState2Supported();
+     dynamic_features.has_extended_dynamic_state_2_logic_op =
+         device.IsExtExtendedDynamicState2ExtrasSupported();
++    LOG_INFO(Render_Vulkan, "DynamicState resolved: EDS {}, EDS2 {}, EDS2 logic op {}",
++             dynamic_features.has_extended_dynamic_state,
++             dynamic_features.has_extended_dynamic_state_2,
++             dynamic_features.has_extended_dynamic_state_2_logic_op);
+     dynamic_features.has_extended_dynamic_state_2_patch_control_points = false;
+ 
+     dynamic_features.has_extended_dynamic_state_3_blend =

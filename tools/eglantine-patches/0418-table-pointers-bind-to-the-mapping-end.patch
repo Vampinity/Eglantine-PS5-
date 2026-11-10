@@ -1,0 +1,114 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -3467,14 +3467,20 @@
+         u32 size = [&]() {
+             const u32 memory_layout_size =
+                 static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+-            // A pointer read from a table in memory is the base of an object pool, read anywhere
+-            // in it (Ocarina of Time's grass instances lie 12-18 MiB past theirs). With
+-            // EDEN_NX2_TABLE_POOL_MIB=64 a read-only one is bound to the end of its mapping, up
+-            // to that size; written pools keep the cap, a write marks the whole binding
+-            // GPU-modified.
+-            if (const u32 pool_size = TablePoolSize();
+-                pool_size != 0 && table_pointer && !is_written) {
+-                return (std::min)(memory_layout_size, pool_size);
++            // A pointer read from a table in memory is the base of an object pool, read anywhere in
++            // it: bound to the end of its mapping, as far as a storage buffer binding may reach (at
++            // most 1 GiB) - Lichii #351. Ocarina of Time's grass instances lie 12-18 MiB past
++            // theirs (an 8 MiB cap culled every blade) and its light probe records reach about
++            // 130 MiB past theirs: a 64 MiB cap left the far probes outside the binding and the fog
++            // took one overbright constant from every one of them, so the exposure jumped.
++            // EDEN_NX2_TABLE_POOL_MIB still tightens this when it is set.
++            if (table_pointer && !is_written) {
++                const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
++                u64 limit = reach - (std::min)(reach, u64{64_KiB});
++                if (const u32 pool_size = TablePoolSize(); pool_size != 0) {
++                    limit = (std::min)(limit, u64{pool_size});
++                }
++                return (std::min)(memory_layout_size, static_cast<u32>(limit));
+             }
+             // A native (Switch 2) compute program's pointer is bare: the word after it is another
+             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -165,6 +165,9 @@
+ 
+     u32 GetStorageBufferAlignment() const;
+ 
++    /// Largest range a storage buffer binding may have
++    u64 GetMaxStorageBufferRange() const;
++
+     [[nodiscard]] StagingBufferRef UploadStagingBuffer(size_t size);
+ 
+     [[nodiscard]] std::optional<StagingBufferRef> TryUploadStagingBuffer(size_t size);
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -467,6 +467,10 @@
+     return static_cast<u32>(device.GetStorageBufferAlignment());
+ }
+ 
++u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
++    return device.GetMaxStorageBufferRange();
++}
++
+ std::optional<Buffer> BufferCacheRuntime::TryCreateBuffer(DAddr cpu_addr, u64 size,
+                                                           bool sparse_compatible) {
+     try {
+diff --git a/src/video_core/renderer_opengl/gl_buffer_cache.h b/src/video_core/renderer_opengl/gl_buffer_cache.h
+--- a/src/video_core/renderer_opengl/gl_buffer_cache.h
++++ b/src/video_core/renderer_opengl/gl_buffer_cache.h
+@@ -207,6 +207,13 @@
+         return static_cast<u32>(device.GetShaderStorageBufferAlignment());
+     }
+ 
++    /// Largest range a storage buffer binding may have: the driver's storage block size. It
++    /// doesn't depend on the binding mode, since bindings are cached across pipelines; a bindless
++    /// (GLASM) binding's GLsizei length holds it, as the buffer cache stops at 1 GiB.
++    u64 GetMaxStorageBufferRange() const {
++        return device.GetMaxShaderStorageBlockSize();
++    }
++
+ private:
+     static constexpr std::array PABO_LUT{
+         GL_VERTEX_PROGRAM_PARAMETER_BUFFER_NV,          GL_TESS_CONTROL_PROGRAM_PARAMETER_BUFFER_NV,
+diff --git a/src/video_core/renderer_opengl/gl_device.h b/src/video_core/renderer_opengl/gl_device.h
+--- a/src/video_core/renderer_opengl/gl_device.h
++++ b/src/video_core/renderer_opengl/gl_device.h
+@@ -35,6 +35,11 @@
+         return shader_storage_alignment;
+     }
+ 
++    /// GL_MAX_SHADER_STORAGE_BLOCK_SIZE: the largest range of a storage buffer binding
++    u64 GetMaxShaderStorageBlockSize() const {
++        return max_shader_storage_block_size;
++    }
++
+     u32 GetMaxVertexAttributes() const {
+         return max_vertex_attributes;
+     }
+@@ -202,6 +207,7 @@
+     std::array<u32, Shader::MaxStageTypes> max_uniform_buffers{};
+     size_t uniform_buffer_alignment{};
+     size_t shader_storage_alignment{};
++    u64 max_shader_storage_block_size{};
+     u32 max_vertex_attributes{};
+     u32 max_varyings{};
+     u32 max_compute_shared_memory_size{};
+diff --git a/src/video_core/renderer_opengl/gl_device.cpp b/src/video_core/renderer_opengl/gl_device.cpp
+--- a/src/video_core/renderer_opengl/gl_device.cpp
++++ b/src/video_core/renderer_opengl/gl_device.cpp
+@@ -199,6 +199,11 @@
+     max_uniform_buffers = BuildMaxUniformBuffers();
+     uniform_buffer_alignment = GetInteger<size_t>(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT);
+     shader_storage_alignment = GetInteger<size_t>(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT);
++    // A 64-bit query: drivers report sizes past 2 GiB. GL guarantees at least 2^27.
++    GLint64 max_storage_block_size{};
++    glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_storage_block_size);
++    max_shader_storage_block_size =
++        static_cast<u64>((std::max)(max_storage_block_size, GLint64{1} << 27));
+     max_vertex_attributes = GetInteger<u32>(GL_MAX_VERTEX_ATTRIBS);
+     max_varyings = GetInteger<u32>(GL_MAX_VARYING_VECTORS);
+     max_compute_shared_memory_size = GetInteger<u32>(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE);

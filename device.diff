@@ -1,0 +1,27 @@
+diff --git a/C:/Users/horac/lichii-ally/eglantine-ps5/coretest2/src/video_core/vulkan_common/vulkan_device.h b/C:/Users/horac/lichii-ally/eglantine-ps5/coretest/src/video_core/vulkan_common/vulkan_device.h
+index e4fe69aba3..b7243b9be9 100644
+--- a/C:/Users/horac/lichii-ally/eglantine-ps5/coretest2/src/video_core/vulkan_common/vulkan_device.h
++++ b/C:/Users/horac/lichii-ally/eglantine-ps5/coretest/src/video_core/vulkan_common/vulkan_device.h
+@@ -1029,6 +1029,22 @@ FN_MAX_LIMIT_LIST
+                id == VK_DRIVER_ID_MESA_RADV;
+     }
+ 
++    /// Mesh graphics pipelines can spend a long time in translation and driver compilation on
++    /// AMD/RADV. Build them on the deferred worker and skip draws until they are ready.
++    /// EDEN_NX2_DEFER_MESH_PIPELINES=1/0 forces the A/B choice.
++    bool DefersMeshGraphicsPipelines() const {
++        static const char forced = [] {
++            const char* const value = std::getenv("EDEN_NX2_DEFER_MESH_PIPELINES");
++            return value == nullptr ? '\0' : value[0];
++        }();
++        if (forced == '0' || forced == '1') {
++            return forced == '1';
++        }
++        const VkDriverIdKHR id = GetDriverID();
++        return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
++               id == VK_DRIVER_ID_MESA_RADV;
++    }
++
+     /// Returns true when the device does not properly support cube compatibility.
+     bool HasBrokenCubeImageCompatibility() const {
+         return has_broken_cube_compatibility;

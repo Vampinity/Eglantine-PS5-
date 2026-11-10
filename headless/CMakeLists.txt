@@ -869,6 +869,29 @@ foreach(bits 32 64)
             string(REPLACE "bool DynarmicCallbacks32::MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) {"
                 "bool DynarmicCallbacks32::MemoryWriteExclusive64(u32 vaddr, u64 value, u64 expected) {\n    ::Eden::Performance::CountJit(::Eden::Performance::jit_callbacks[m_parent.m_core_index].exclusive_writes);"
                 wrapper "${wrapper}")
+        else()
+            # A64 is the hot path for Switch 2 titles. Count callback exits too, so the profile
+            # can quantify how often a direct-table page still takes the slow path.
+            foreach(counted IN ITEMS "u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {|reads"
+                    "Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {|reads"
+                    "void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {|writes"
+                    "void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) {|writes"
+                    "bool DynarmicCallbacks64::MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) {|exclusive_writes"
+                    "bool DynarmicCallbacks64::MemoryWriteExclusive16(u64 vaddr, std::uint16_t value, std::uint16_t expected) {|exclusive_writes"
+                    "bool DynarmicCallbacks64::MemoryWriteExclusive32(u64 vaddr, std::uint32_t value, std::uint32_t expected) {|exclusive_writes"
+                    "bool DynarmicCallbacks64::MemoryWriteExclusive64(u64 vaddr, std::uint64_t value, std::uint64_t expected) {|exclusive_writes"
+                    "bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vector value, Dynarmic::A64::Vector expected) {|exclusive_writes")
+                string(REPLACE "|" ";" counted_parts "${counted}")
+                list(GET counted_parts 0 counted_head)
+                list(GET counted_parts 1 counted_name)
+                string(FIND "${wrapper}" "${counted_head}" counted_at)
+                if(counted_at LESS 0)
+                    message(FATAL_ERROR "Pinned A64 callback changed: ${counted_head}")
+                endif()
+                string(REPLACE "${counted_head}"
+                    "${counted_head}\n    ::Eden::Performance::CountJit(::Eden::Performance::jit_callbacks[m_parent.m_core_index].${counted_name});"
+                    wrapper "${wrapper}")
+            endforeach()
         endif()
         string(REPLACE "    m_jit.emplace(config);"
             "    std::printf(\"EDEN_DEV_JIT bits=${bits} core=%zu cache=%u\\n\", m_core_index, config.code_cache_size);\n    m_jit.emplace(config);"

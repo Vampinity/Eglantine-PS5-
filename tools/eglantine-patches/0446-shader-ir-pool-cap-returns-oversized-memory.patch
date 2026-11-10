@@ -1,0 +1,62 @@
+From c99790b8786cb6a5abc6a564a7115e2b8d15d937 Mon Sep 17 00:00:00 2001
+From: Frizti <FriztiMouche@gmail.com>
+Date: Mon, 9 Nov 2026 22:31:00 +0100
+Subject: [PATCH] shader: EDEN_NX2_IR_POOL_CAP_MIB returns oversized IR pool
+ memory after each job
+
+ReleaseContents squashes a pool into one chunk the size of its high-water mark and keeps
+it, in every main, spare, worker, audit and verify pool; Fable 5.2 (answer 2 Q1) ranks this
+first for the ~1.2 GB of process heap above the game's needs. Off unless set, for a RAM A/B.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/shader_recompiler/object_pool.h | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/shader_recompiler/object_pool.h b/src/shader_recompiler/object_pool.h
+index 4d3d337d..dd9ffb9a 100644
+--- a/src/shader_recompiler/object_pool.h
++++ b/src/shader_recompiler/object_pool.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <cstdlib>
+ #include <memory>
+ #include <type_traits>
+ #include <utility>
+@@ -38,6 +39,15 @@ public:
+         if (root.used_objects == root.num_objects) {
+             // Root chunk has been filled, squash allocations into it
+             const size_t total_objects{root.num_objects + new_chunk_size * (chunks.size() - 1)};
++            // EDEN_NX2_IR_POOL_CAP_MIB=<n> (0 or unset = keep everything, as before): a pool
++            // whose squashed chunk would pass n MiB returns its memory instead. Every pool kept
++            // its largest shader's worth for good, per worker, and the process heap stayed
++            // ~1.2 GB above the game's needs (fable52_answer_2 Q1).
++            if (const size_t cap = CapBytes();
++                cap != 0 && total_objects * sizeof(Storage) > cap) {
++                Free();
++                return;
++            }
+             chunks.clear();
+             chunks.emplace_back(total_objects);
+         } else {
+@@ -49,6 +59,15 @@ public:
+     }
+ 
+ private:
++    static size_t CapBytes() {
++        static const size_t cap = [] {
++            const char* const text = std::getenv("EDEN_NX2_IR_POOL_CAP_MIB");
++            return text != nullptr ? static_cast<size_t>(std::strtoull(text, nullptr, 10)) << 20
++                                   : size_t{0};
++        }();
++        return cap;
++    }
++
+     struct NonTrivialDummy {
+         NonTrivialDummy() noexcept {}
+     };
+-- 
+2.53.0.windows.3
+

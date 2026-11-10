@@ -1,0 +1,58 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] texture_cache: a GPU-modified join-ignore overlap is replaced, not fatal
+
+JoinImages collects into join_ignore_textures the overlaps it will not join with - a remapped image,
+or one the guest maps at the same address and size as the new image - and then deletes them so the
+new image owns the address. If such an overlap was written by the GPU since it was made, the loop
+calls UNIMPLEMENTED(), which is ASSERT(false && "Unimplemented!") (src/common/assert.h:55): a debug
+build aborts the process, taking the session with it.
+
+The port reaches this whenever device memory runs short. CreateImage then falls back to "using an
+unbacked sparse image", the next GPU write into that image is "GPU write into unwritten sparse
+image ...; replacing it", and that replacement joins over the image it is replacing - which the GPU
+had already rendered into. A console log shows 36 aborts in the last six seconds of a run, each
+preceded by "Render target in unbacked image" and "PrepareImage: GPU write into unwritten sparse
+image ...; replacing it", the first 0.9 s after the driver reported "does not fit; using an unbacked
+sparse image" and 1.2 s after the first "is over the memory budget; allocating it anyway". The run
+ends on the assertion, not on the missing memory.
+
+Deleting the overlap is what this loop does for every other flag combination, and what this situation
+calls for: the new image is at the same address and stands in for it. So log it and fall through to
+the same UntrackImage/UnregisterImage/DeleteImage the loop already runs. That matches the choice the
+port already made for unbacked images - EDEN_NX2_UNBACKED_LIMIT=0 keeps the session alive with them
+instead of ending it - which the abort contradicted.
+
+What this can break: the overlap's contents are dropped without a download, so a surface the game
+rendered and then re-created at the same address can show stale or uninitialised texels for a frame
+where it was already unbacked. It removes a hard abort; it does not remove the memory exhaustion that
+reaches the path, so image degradation under a full device-memory budget is unchanged.
+
+Checked: the patched file differs from the tree the stack produces only in this hunk; applies on the
+core plus the 0410 stack. Not run on a console.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3394,7 +3394,21 @@
+     for (const ImageId overlap_id : join_ignore_textures) {
+         Image& overlap = slot_images[overlap_id];
+         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
+-            UNIMPLEMENTED();
++            // A GPU-modified image the join will not join with is the one the new image replaces: the
++            // same address and size, or a remap, with the GPU having written it since it was made.
++            // Deleting it is what this loop does for every other flag combination, so do it here too
++            // rather than abort - UNIMPLEMENTED() is ASSERT(false && "Unimplemented!")
++            // (common/assert.h), which ends the session in a debug build. Device memory running out
++            // is what reaches this: an image that "does not fit" becomes an unbacked sparse image,
++            // and the next GPU write into it replaces it (a console log shows 36 aborts in the last
++            // six seconds of a run, the first 0.9 s after the driver gave up on the allocation). The
++            // port already keeps the session alive on those images (EDEN_NX2_UNBACKED_LIMIT=0):
++            // losing one frame of an unbacked surface's contents is part of that choice, an abort is
++            // not.
++            static size_t modified_ignored{};
++            LOG_WARNING(HW_GPU,
++                        "Join ignored a GPU-modified image at {:#x}: replacing it ({} so far)",
++                        overlap.gpu_addr, ++modified_ignored);
+         }
+         if (True(overlap.flags & ImageFlagBits::Tracked)) {
+             UntrackImage(overlap, overlap_id);

@@ -1,0 +1,215 @@
+diff --git a/src/common/lru_cache.h b/src/common/lru_cache.h
+index 952ba0eb8b..15760f5964 100644
+--- a/src/common/lru_cache.h
++++ b/src/common/lru_cache.h
+@@ -52,6 +52,11 @@ public:
+         Attach(item);
+     }
+ 
++    /// The tick the item was inserted or last touched at.
++    [[nodiscard]] TickType Tick(size_t id) const {
++        return item_pool[id].tick;
++    }
++
+     void Free(size_t id) {
+         auto& item = item_pool[id];
+         Detach(item);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index b166d464d2..8109c6ce78 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -804,6 +804,7 @@ void TextureCache<P>::TickFrame() {
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    SweepColdImages();
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
+@@ -855,6 +856,140 @@ void TextureCache<P>::TickFrame() {
+     }
+ }
+ 
++/// EDEN_NX2_TC_COLD_FRAMES (the cold sweep's K, 0 = off).
++inline u64 TcColdFrames() {
++    static const u64 frames = [] {
++        // 4 by default; set EDEN_NX2_TC_COLD_FRAMES=0 to disable the sweep.
++        const char* value = std::getenv("EDEN_NX2_TC_COLD_FRAMES");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) : 4ULL;
++    }();
++    return frames;
++}
++
++template <class P>
++void TextureCache<P>::WatchColdImage(ImageId image_id) {
++    if (TcColdFrames() == 0 || !RelocationShaped(slot_images[image_id].info)) {
++        return;
++    }
++    if (cold_watch_set.insert(image_id).second) {
++        cold_watch.emplace_back(image_id, frame_tick);
++    }
++}
++
++template <class P>
++void TextureCache<P>::SweepColdImages() {
++    const u64 cold_frames = TcColdFrames();
++    if (cold_frames == 0) {
++        return;
++    }
++    static const bool sweep_guarded = [] {
++        const char* value = std::getenv("EDEN_NX2_TC_COLD_GUARDED");
++        return value != nullptr && value[0] == '1';
++    }();
++    constexpr u32 MaxPerFrame = 16;
++    constexpr u64 MaxWatchFrames = 600; // then a watched image that never got BadOverlap leaves
++    constexpr ImageFlagBits excluded =
++        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
++        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
++        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
++        ImageFlagBits::CostlyLoad;
++    const auto queued = [](ImageId image_id, const auto& downloads) {
++        return std::ranges::any_of(downloads, [image_id](const auto& download) {
++            return download.is_swizzle && download.object_id == image_id;
++        });
++    };
++    const auto bound = [this](const ImageBase& image) {
++        return std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
++            return render_targets.depth_buffer_id == view ||
++                   std::ranges::find(render_targets.color_buffer_ids, view) !=
++                       render_targets.color_buffer_ids.end();
++        });
++    };
++    u32 deleted = 0;
++    size_t index = 0;
++    while (index < cold_watch.size()) {
++        const ImageId image_id = cold_watch[index].first;
++        const u64 watched_at = cold_watch[index].second;
++        const auto drop = [&] {
++            cold_watch_set.erase(image_id);
++            cold_watch[index] = cold_watch.back();
++            cold_watch.pop_back();
++        };
++        if (!slot_images.contains(image_id)) {
++            drop();
++            continue;
++        }
++        Image& image = slot_images[image_id];
++        if (!RelocationShaped(image.info) || False(image.flags & ImageFlagBits::Registered) ||
++            True(image.flags & excluded)) {
++            drop();
++            continue;
++        }
++        if (False(image.flags & ImageFlagBits::BadOverlap)) {
++            // The newest image of a chain has one overlap; the next drift makes it bad.
++            if (frame_tick - watched_at > MaxWatchFrames) {
++                drop();
++            } else {
++                ++index;
++            }
++            continue;
++        }
++        // Touched (prepared, bound, sampled) in the last K host frames.
++        if (frame_tick - lru_cache.Tick(image.lru_index) < cold_frames) {
++            ++index;
++            continue;
++        }
++        if (True(image.flags & ImageFlagBits::GpuModified)) {
++            // Its contents exist only on the GPU and the collector would not download them
++            // either (BadOverlap): only where nothing says they may be read again.
++            if (image.relocation_guard_noted != 0 || image.info.forced_flushed ||
++                image.info.dma_downloaded) {
++                ++cold_kept_read;
++                drop();
++                continue;
++            }
++            const auto shape = relocation_shapes.find(RelocationShapeKey(image.info));
++            const u8 guard = shape != relocation_shapes.end() ? shape->second.guard : 0;
++            if ((guard & GuardCpuRead) != 0 ||
++                (!sweep_guarded && (guard & (GuardSampled | GuardLoaded)) != 0)) {
++                ++cold_kept_guarded;
++                drop();
++                continue;
++            }
++        }
++        if (queued(image_id, uncommitted_downloads) ||
++            std::ranges::any_of(committed_downloads,
++                                [&](const auto& downloads) { return queued(image_id, downloads); }) ||
++            bound(image)) {
++            ++index;
++            continue;
++        }
++        if (deleted >= MaxPerFrame) {
++            break;
++        }
++        // DeleteImage defers destruction until GPU completion. It does not directly destroy a live
++        // VkImage, so this sweep remains safe even when the image pool is disabled.
++        MarkStale(image);
++        if (True(image.flags & ImageFlagBits::Tracked)) {
++            UntrackImage(image, image_id);
++        }
++        UnregisterImage(image_id);
++        DeleteImage(image_id);
++        ++deleted;
++        drop();
++    }
++    cold_deleted += deleted;
++    if (frame_tick % 600 == 0) {
++        LOG_INFO(HW_GPU,
++                 "Cold sweep (EDEN_NX2_TC_COLD_FRAMES={}) last 600 frames: {} chain images "
++                 "deleted, {} kept as GPU-written and guarded, {} kept as read later; {} watched; "
++                 "{} images, device memory {} MiB (expected {} MiB)",
++                 cold_frames, cold_deleted, cold_kept_guarded, cold_kept_read, cold_watch.size(),
++                 slot_images.size(), total_used_memory >> 20, expected_memory >> 20);
++        cold_deleted = cold_kept_guarded = cold_kept_read = 0;
++    }
++}
++
+ template <class P>
+ const typename P::ImageView& TextureCache<P>::GetImageView(ImageViewId id) const noexcept {
+     return slot_image_views[id];
+@@ -3728,7 +3863,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+                             moved.overlapping_images.size() > 1) {
+                             moved.flags |= ImageFlagBits::BadOverlap;
+                         }
++                        WatchColdImage(other_id);
+                     }
++                    WatchColdImage(old_id);
+                     return old_id;
+                 }
+                 if (mode == 1) {
+@@ -3874,6 +4011,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             new_image.overlapping_images.size() > 1) {
+             new_image.flags |= ImageFlagBits::BadOverlap;
+         }
++        WatchColdImage(aliased_id);
++    }
++    if (!join_bad_overlap_ids.empty()) {
++        WatchColdImage(new_image_id);
+     }
+ 
+     // The copy from an alias into the new image, or null when the loop below skips it.
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 9fe4cd1e3f..8b30eb4bea 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -545,6 +545,20 @@ private:
+     u64 relocation_crowded{};
+     bool relocation_seen{};
+ 
++    /// Cold sweep (EDEN_NX2_TC_COLD_FRAMES=K, 0 = off): a relocation-shaped image with
++    /// BadOverlap (a member of a drifted chain) untouched for K host frames, with no download
++    /// queued and not bound, is deleted in TickFrame (at most 16 a frame). This is deliberately
++    /// an early DeleteImage, not a direct VkImage destruction: the normal deferred-destruction
++    /// path remains responsible for GPU safety. JoinImages puts chain members it sees on the watch
++    /// list; GPU-written images that may be read again are excluded by the guards.
++    void WatchColdImage(ImageId image_id);
++    void SweepColdImages();
++    std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
++    ::Common::unordered_set<ImageId> cold_watch_set;
++    u64 cold_deleted{};       ///< Since the last report
++    u64 cold_kept_guarded{};  ///< Dropped from the watch: GPU-written and guarded
++    u64 cold_kept_read{};     ///< Dropped from the watch: GPU-written and read later or by the CPU
++
+     [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {
+         return info.type == ImageType::e2D && info.resources.levels == 1 &&
+                info.resources.layers == 1 && info.num_samples == 1;

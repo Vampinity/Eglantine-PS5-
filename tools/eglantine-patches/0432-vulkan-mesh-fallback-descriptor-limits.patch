@@ -1,0 +1,56 @@
+diff --git a/src/video_core/renderer_vulkan/mesh_fallback_limits.h b/src/video_core/renderer_vulkan/mesh_fallback_limits.h
+new file mode 100644
+index 0000000000..ee333be7e8
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/mesh_fallback_limits.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <cstddef>
++
++namespace Vulkan {
++
++// A zero limit means the driver did not expose a usable bound.
++[[nodiscard]] constexpr bool FitsStorageBufferSetLimit(std::size_t guest_buffers,
++                                                       std::size_t auxiliary_buffers,
++                                                       std::size_t set_limit) noexcept {
++    return set_limit == 0 ||
++           (guest_buffers <= set_limit && auxiliary_buffers <= set_limit - guest_buffers);
++}
++
++} // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index aabbaf1300..617518550c 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -33,6 +33,7 @@
+ #include "shader_recompiler/backend/spirv/mesh_compute_interface.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv_mesh_readback.h"
++#include "video_core/renderer_vulkan/mesh_fallback_limits.h"
+ #include "shader_recompiler/environment.h"
+ #include "shader_recompiler/frontend/maxwell/control_flow.h"
+ #include "shader_recompiler/frontend/maxwell/translate_program.h"
+@@ -1838,9 +1839,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+                     add(info.texture_descriptors, &compute_sampled_images);
+                     add(info.image_descriptors, nullptr);
+                 }
+-                if (compute_storage_buffers <= device.GetMaxPerStageDescriptorStorageBuffers() &&
++                const u32 guest_storage_buffers{compute_storage_buffers - (has_task ? 4U : 1U)};
++                const bool fits_stage_limits{
++                    compute_storage_buffers <= device.GetMaxPerStageDescriptorStorageBuffers() &&
+                     compute_sampled_images <= device.GetMaxPerStageDescriptorSampledImages() &&
+-                    compute_resources <= device.GetMaxPerStageResources()) {
++                    compute_resources <= device.GetMaxPerStageResources()};
++                const bool fits_set_limit{FitsStorageBufferSetLimit(
++                    guest_storage_buffers, has_task ? 4U : 1U,
++                    host_info.max_descriptor_set_storage_buffers)};
++                if (!fits_stage_limits || !fits_set_limit) {
++                    LOG_WARNING(Render_Vulkan,
++                                "Mesh emulation skipped: descriptor limits are too small");
++                } else {
+                     mesh_emulation.emplace();
+                     mesh_emulation->output_binding = output_binding;
+                     mesh_emulation->block_words =

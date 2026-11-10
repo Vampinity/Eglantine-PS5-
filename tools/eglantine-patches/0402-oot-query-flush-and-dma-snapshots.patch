@@ -1,0 +1,144 @@
+Subject: [PATCH] oot query flush and dma snapshots
+
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -13,6 +13,7 @@
+ #include <limits>
+ #include <optional>
+ #include <string_view>
++#include <unordered_map>
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+ #include "common/scope_exit.h"
+@@ -988,6 +989,9 @@
+     u32 executing_macro{};
+     std::vector<u32> parameters;
+     u64 calls{};
++    /// First-page snapshots for macro occlusion reads. A snapshot is valid only until a later
++    /// compute/copy writer is sent and while no query result remains pending.
++    std::unordered_map<u64, u64> dma_snapshots;
+     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
+     /// then can it have a deferred instanced draw to issue at the end of a macro.
+     bool draw_pending{true};
+@@ -1327,16 +1331,43 @@
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+     }
+-    split.Defer([this, memory = &memory_manager, macro, method, source, read_bytes] {
+-        // EDEN_NX2_QUERY_DMA_TRACE / EDEN_NX2_QUERY_DMA_SYNC: below High accuracy, counter reports
+-        // reach guest memory when a later fence pops, and nothing here waits for them.
+-        VideoCommon::QueryDma::BeforeRead(*memory, *rasterizer, macro, method, source, read_bytes);
+-        if (memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+-            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+-        }
+-        VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+-    });
+-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++    const auto snapshot_pages = [&] {
++        const u64 first = source >> 12;
++        const u64 last = (source + read_bytes - 1) >> 12;
++        bool hit = method == 0x158 && words != 0;
++        for (u64 page = first; page <= last && hit; ++page) {
++            const auto it = fs.dma_snapshots.find(page);
++            hit = it != fs.dma_snapshots.end() && it->second == split.LastWriterPosition();
++        }
++        return hit && !VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer,
++                                                                  source, read_bytes);
++    }();
++    if (!snapshot_pages) {
++        split.Defer([this, memory = &memory_manager, macro, method, source, read_bytes] {
++            // EDEN_NX2_QUERY_DMA_TRACE / EDEN_NX2_QUERY_DMA_SYNC: below High accuracy, counter reports
++            // reach guest memory when a later fence pops, and nothing here waits for them.
++            VideoCommon::QueryDma::BeforeRead(*memory, *rasterizer, macro, method, source, read_bytes);
++            // Occlusion reports and semaphore writes can still be pending in the query cache when the
++            // game reads them. Flush them before the DMA read; otherwise stale zeroes cull visible
++            // objects and can produce the measured one-frame white flash.
++            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
++            if (memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
++                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
++            }
++            VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
++        });
++        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++        if (method == 0x158 && words != 0) {
++            const u64 first = source >> 12;
++            const u64 last = (source + read_bytes - 1) >> 12;
++            if (fs.dma_snapshots.size() > 8192) {
++                fs.dma_snapshots.clear();
++            }
++            for (u64 page = first; page <= last; ++page) {
++                fs.dma_snapshots[page] = split.LastWriterPosition();
++            }
++        }
++    }
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+         if (method == 0x158) {
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -176,6 +176,10 @@
+     /// Compute or copy work was just sent: what can write GPU-written command lists.
+     void NoteWriter() {
+         last_writer_position = write_position;
++    }
++    /// Position of the newest compute/copy writer sent by the front.
++    [[nodiscard]] u64 LastWriterPosition() const {
++        return last_writer_position;
+     }
+     /// Waits until the back executed the compute and copy work sent so far (not what came after).
+     /// Returns whether any of it was still queued.
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -1530,23 +1530,13 @@
+                             }
+                         }
+                     }
+-                    // Accurate GPU mode holds report and semaphore writes in the query cache until a
+-                    // fence: write them out, or occlusion predicates read stale values. The split only
+-                    // runs with immediate payload writes, and the query cache belongs to its back.
+-                    // EDEN_NX2_MACRO_QUERY_FLUSH=1 turns this on.
+-                    static const bool flush_queries = [] {
+-                        const char* const flush = std::getenv("EDEN_NX2_MACRO_QUERY_FLUSH");
+-                        return flush != nullptr && flush[0] != '0';
+-                    }();
+-                    // EDEN_NX2_QUERY_DMA_TRACE / EDEN_NX2_QUERY_DMA_SYNC, here for macros run where
+-                    // the rasterizer's caches are owned (EDEN_NX2_SPLIT below 2, or no split yet).
+                     const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
+                                              VideoCommon::GpuSplit::OnBackThread();
+                     if (owns_caches) {
+                         VideoCommon::QueryDma::BeforeRead(memory, maxwell3d.Rasterizer(), method,
+                                                           address, source, read_bytes);
+-                    }
+-                    if (flush_queries && !VideoCommon::GpuSplit::Get().Active()) {
++                        // Flush the report before the game consumes it. A short fence-flush delay
++                        // otherwise leaves a stale occlusion value for one frame and flashes white.
+                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+                     }
+                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -274,7 +274,10 @@
+     // for about 5%.
+     static const s64 interval_us = [] {
+         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
+-        return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
++        // Ocarina's occlusion reads must see the fence's query writes immediately: the 500 us
++        // batch caused 31 whole-screen flashes in 30 s and 0 when disabled. Restore batching only
++        // with EDEN_NX2_FENCE_FLUSH_US=500 (or another positive value).
++        return value == nullptr ? s64{0} : static_cast<s64>(std::atoll(value));
+     }();
+     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
+         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -146,8 +146,8 @@
+     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {});
+ 
+     /// On the split GPU thread, a fence or a command list copy submits only if the last
+-    /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at
+-    /// once); otherwise it goes with the next one. The back submits deferred work before it
++    /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 0; positive values
++    /// defer); otherwise it goes with the next one. The back submits deferred work before it
+     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
+     bool DeferFlush();
+     /// Submits deferred work (the split's back, from its idle hook).

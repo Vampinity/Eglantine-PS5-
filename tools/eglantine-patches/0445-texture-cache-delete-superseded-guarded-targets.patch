@@ -1,0 +1,132 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -866,6 +866,21 @@
+     return frames;
+ }
+ 
++/// EDEN_NX2_TC_SUPERSEDED (default on; =0 restores the old behaviour): a GPU-written render
++/// target whose relocation shape is guarded still dies once it has been untouched for
++/// SupersededFrames and a render target of a different shape, touched since, covers its memory --
++/// the game reused that memory for another layout, so the old contents have no reader left.
++/// Ported from Fritchii v5.6 (EXP58, f549632a), measured at Castle Town over 150 s: device memory
++/// 7.8-10.5 -> 5.2-5.7 GB, collector evictions 83-1915 a window -> 0, worst frames 140-180 ->
++/// 30-48 ms. Never applied to a shape the CPU read.
++inline bool SupersededSweepEnabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_TC_SUPERSEDED");
++        return value == nullptr || value[0] != '0';
++    }();
++    return enabled;
++}
++
+ template <class P>
+ void TextureCache<P>::WatchColdImage(ImageId image_id) {
+     if (TcColdFrames() == 0 || !RelocationShaped(slot_images[image_id].info)) {
+@@ -877,6 +892,25 @@
+ }
+ 
+ template <class P>
++bool TextureCache<P>::ColdSuperseded(ImageId image_id, const ImageBase& image) {
++    const u64 shape = RelocationShapeKey(image.info);
++    const u64 touched = lru_cache.Tick(image.lru_index);
++    bool superseded = false;
++    ForEachImageInRegion(image.cpu_addr, image.guest_size_bytes,
++                         [&](ImageId other_id, Image& other) {
++                             if (other_id == image_id ||
++                                 False(other.flags & ImageFlagBits::Registered) ||
++                                 RelocationShapeKey(other.info) == shape ||
++                                 lru_cache.Tick(other.lru_index) <= touched) {
++                                 return false;
++                             }
++                             superseded = true;
++                             return true;
++                         });
++    return superseded;
++}
++
++template <class P>
+ void TextureCache<P>::SweepColdImages() {
+     const u64 cold_frames = TcColdFrames();
+     if (cold_frames == 0) {
+@@ -939,6 +973,7 @@
+             ++index;
+             continue;
+         }
++        bool superseded = false; // EDEN_NX2_TC_SUPERSEDED chose it
+         if (True(image.flags & ImageFlagBits::GpuModified)) {
+             // Its contents exist only on the GPU and the collector would not download them
+             // either (BadOverlap): only where nothing says they may be read again.
+@@ -952,9 +987,27 @@
+             const u8 guard = shape != relocation_shapes.end() ? shape->second.guard : 0;
+             if ((guard & GuardCpuRead) != 0 ||
+                 (!sweep_guarded && (guard & (GuardSampled | GuardLoaded)) != 0)) {
+-                ++cold_kept_guarded;
+-                drop();
+-                continue;
++                // EDEN_NX2_TC_SUPERSEDED: a guarded image still dies once it has been untouched
++                // for SupersededFrames and a render target of another shape, touched since, covers
++                // its memory. Dead guarded targets piled up here (350k "kept" in 600 frames
++                // upstream) until the collector's bursts evicted live textures -- the unbacked
++                // images that draw as black water. Never for a shape the CPU read.
++                constexpr u64 SupersededFrames = 60;
++                const bool superseded_sweep =
++                    SupersededSweepEnabled() && (guard & GuardCpuRead) == 0;
++                const u64 age = frame_tick - lru_cache.Tick(image.lru_index);
++                if (superseded_sweep && age < SupersededFrames &&
++                    frame_tick - watched_at <= MaxWatchFrames) {
++                    ++index; // looked at again when old enough
++                    continue;
++                }
++                if (!superseded_sweep || age < SupersededFrames ||
++                    !ColdSuperseded(image_id, image)) {
++                    ++cold_kept_guarded;
++                    drop();
++                    continue;
++                }
++                superseded = true;
+             }
+         }
+         if (queued(image_id, uncommitted_downloads) ||
+@@ -976,17 +1029,20 @@
+         UnregisterImage(image_id);
+         DeleteImage(image_id);
+         ++deleted;
++        cold_superseded += superseded ? 1 : 0;
+         drop();
+     }
+     cold_deleted += deleted;
+     if (frame_tick % 600 == 0) {
+         LOG_INFO(HW_GPU,
+                  "Cold sweep (EDEN_NX2_TC_COLD_FRAMES={}) last 600 frames: {} chain images "
+-                 "deleted, {} kept as GPU-written and guarded, {} kept as read later; {} watched; "
++                 "deleted ({} of them guarded but superseded), {} kept as GPU-written and "
++                 "guarded, {} kept as read later; {} watched; "
+                  "{} images, device memory {} MiB (expected {} MiB)",
+-                 cold_frames, cold_deleted, cold_kept_guarded, cold_kept_read, cold_watch.size(),
+-                 slot_images.size(), total_used_memory >> 20, expected_memory >> 20);
+-        cold_deleted = cold_kept_guarded = cold_kept_read = 0;
++                 cold_frames, cold_deleted, cold_superseded, cold_kept_guarded, cold_kept_read,
++                 cold_watch.size(), slot_images.size(), total_used_memory >> 20,
++                 expected_memory >> 20);
++        cold_deleted = cold_kept_guarded = cold_kept_read = cold_superseded = 0;
+     }
+ }
+ 
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -553,11 +553,13 @@
+     /// list; GPU-written images that may be read again are excluded by the guards.
+     void WatchColdImage(ImageId image_id);
+     void SweepColdImages();
++    bool ColdSuperseded(ImageId image_id, const ImageBase& image);
+     std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
+     ::Common::unordered_set<ImageId> cold_watch_set;
+     u64 cold_deleted{};       ///< Since the last report
+     u64 cold_kept_guarded{};  ///< Dropped from the watch: GPU-written and guarded
+     u64 cold_kept_read{};     ///< Dropped from the watch: GPU-written and read later or by the CPU
++    u64 cold_superseded{};    ///< Deleted by EDEN_NX2_TC_SUPERSEDED (guarded, but superseded)
+ 
+     [[nodiscard]] static bool RelocationShaped(const ImageInfo& info) noexcept {
+         return info.type == ImageType::e2D && info.resources.levels == 1 &&

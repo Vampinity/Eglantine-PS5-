@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 00:00:00 +0000
+Subject: [PATCH] loader: port Lichii #584 OoT Dynamic FPS 100 ms cap
+
+Port the measured CNTFRQ / 10 instruction change from Lichii #584 into the
+PS5 loader's equivalent bundled routine.
+
+diff --git a/src/core/loader/nso.cpp b/src/core/loader/nso.cpp
+index 922be51a53..c43cd1d3ef 100644
+--- a/src/core/loader/nso.cpp
++++ b/src/core/loader/nso.cpp
+@@ -54,7 +54,7 @@ constexpr u32 PageAlignSize(u32 size) {
+ // 765659af4c (Frizti, bundled there with his permission). The game steps its world by a fixed
+ // 1/30 s per frame, so at 42 ms a frame it runs at about 80% speed. One instruction at main+0x6e6cc4
+ // becomes a call to a routine in the padding after the code: it repeats that instruction, reads the
+-// system counter, caps the time since the last frame at 50 ms, smooths it by 1/8 and uses it as the
++// system counter, caps the time since the last frame at 100 ms (CNTFRQ / 10), smooths it by 1/8 and uses it as the
+ // step when that is more than 3% over the game's own. Its two words of state sit at main+0x4e9fe00,
+ // zero at load and past the BSS by the look of it (the log line says where the BSS ends). Written
+ // without the patch table Frizti extends, so this needs neither the mods folder nor
+@@ -70,7 +70,7 @@ constexpr std::array<u8, 120> OcarinaDynamicFpsCode{
+     0x28, 0x18, 0x20, 0x1E, 0xCA, 0x92, 0x00, 0xB0, 0x4A, 0x01, 0x38, 0x91,
+     0x2B, 0xE0, 0x3B, 0xD5, 0x4C, 0x01, 0x40, 0xF9, 0x4B, 0x01, 0x00, 0xF9,
+     0xCC, 0x02, 0x00, 0xB4, 0x6B, 0x01, 0x0C, 0xCB, 0x0D, 0xE0, 0x3B, 0xD5,
+-    0x8E, 0x02, 0x80, 0xD2, 0xAE, 0x09, 0xCE, 0x9A, 0x7F, 0x01, 0x0E, 0xEB,
++    0x4E, 0x01, 0x80, 0xD2, 0xAE, 0x09, 0xCE, 0x9A, 0x7F, 0x01, 0x0E, 0xEB,
+     0xCB, 0x81, 0x8B, 0x9A, 0x4C, 0x05, 0x40, 0xF9, 0x4C, 0x00, 0x00, 0xB5,
+     0xEC, 0x03, 0x0B, 0xAA, 0x6E, 0x01, 0x0C, 0xCB, 0x8C, 0x0D, 0x8E, 0x8B,
+     0x4C, 0x05, 0x00, 0xF9, 0x82, 0x01, 0x23, 0x9E, 0xA3, 0x01, 0x23, 0x9E,
+-- 
+2.39.0

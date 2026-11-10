@@ -1,0 +1,12 @@
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index e4fe69aba3..c8f00968ea 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -412,6 +412,7 @@ public:
+ #define FN_MAX_LIMIT_LIST \
+     FN_MAX_LIMIT_ELEM(ComputeSharedMemorySize) \
+     FN_MAX_LIMIT_ELEM(PerStageDescriptorSampledImages) \
++    FN_MAX_LIMIT_ELEM(PerStageDescriptorStorageBuffers) \
+     FN_MAX_LIMIT_ELEM(PerStageResources) \
+     FN_MAX_LIMIT_ELEM(DescriptorSetSamplers) \
+     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffers) \

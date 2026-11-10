@@ -1,0 +1,269 @@
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 2ef1982cbc..dc69e6e78c 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -10,6 +10,8 @@
+ #include "common/container/unordered_map.h"
+ #include <boost/icl/separate_interval_set.hpp>
+ #include <windows.h>
++#include <psapi.h>
++#include <vector>
+ #include "common/dynamic_library.h"
+ 
+ #else // ^^^ Windows ^^^ vvv POSIX vvv
+@@ -233,6 +235,20 @@ public:
+         }
+     }
+ 
++    /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
++    std::optional<size_t> BackingOffset(size_t virtual_offset) {
++        std::scoped_lock lock{placeholder_mutex};
++        const auto it = placeholders.find(virtual_offset);
++        if (it == placeholders.end()) {
++            return std::nullopt;
++        }
++        const auto host_pointer_it = placeholder_host_pointers.find(it->lower());
++        if (host_pointer_it == placeholder_host_pointers.end()) {
++            return std::nullopt;
++        }
++        return host_pointer_it->second + virtual_offset - it->lower();
++    }
++
+     void EnableDirectMappedAddress() {
+         // TODO
+         UNREACHABLE();
+@@ -823,6 +839,106 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
+     }
+ }
+ 
++namespace {
++std::atomic<u64> g_zero_filled_bytes{};
++
++[[maybe_unused]] bool IsZeroPage(const u8* page) {
++    const auto* words = reinterpret_cast<const u64*>(page);
++    u64 bits = 0;
++    for (size_t i = 0; i < PageAlignment / sizeof(u64); ++i) {
++        bits |= words[i];
++    }
++    return bits == 0;
++}
++} // namespace
++
++u64 HostMemory::ZeroFilledBytes() noexcept {
++    return g_zero_filled_bytes.load(std::memory_order_relaxed);
++}
++
++std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
++#ifdef _WIN32
++    if (backing_base == nullptr) {
++        return {0, 0};
++    }
++    std::vector<ULONG_PTR> entries(size_t{1} << 22);
++    for (int attempt = 0;; ++attempt) {
++        if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
++                               static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
++            break;
++        }
++        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
++            return {0, 0};
++        }
++        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
++    }
++    const size_t count = (std::min)(size_t{entries[0]}, entries.size() - 1);
++    const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
++    const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
++    const size_t view_size = impl ? impl->virtual_size : 0;
++    std::vector<uintptr_t> backing_pages;
++    std::vector<uintptr_t> view_pages;
++    for (size_t i = 1; i <= count; ++i) {
++        const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
++        if (page - backing_begin < backing_size) {
++            backing_pages.push_back(page);
++        } else if (view_begin != 0 && page - view_begin < view_size) {
++            view_pages.push_back(page);
++        }
++    }
++    std::sort(backing_pages.begin(), backing_pages.end());
++    // Pages are only ever read through the backing, which stays mapped and writable: a view page
++    // can be unmapped or protected by a guest thread meanwhile. Trimming keeps the contents, so a
++    // write that lands after the check costs a soft fault and nothing else.
++    std::vector<uintptr_t> trim;
++    size_t zero_bytes = 0;
++    for (const uintptr_t page : backing_pages) {
++        if (IsZeroPage(reinterpret_cast<const u8*>(page))) {
++            trim.push_back(page);
++            zero_bytes += PageAlignment;
++        }
++    }
++    for (const uintptr_t page : view_pages) {
++        const auto offset = impl->BackingOffset(page - view_begin);
++        if (!offset || *offset >= backing_size) {
++            continue;
++        }
++        const uintptr_t backing_page = backing_begin + *offset;
++        if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
++            trim.push_back(page);
++            zero_bytes += PageAlignment;
++        }
++        // Reading it put the backing page in the working set: take it out again.
++        if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
++            trim.push_back(backing_page);
++        }
++    }
++    std::sort(trim.begin(), trim.end());
++    trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
++    // A run can span two views, which VirtualUnlock refuses as a whole: then page by page.
++    const auto unlock = [](uintptr_t begin, uintptr_t end) {
++        if (VirtualUnlock(reinterpret_cast<void*>(begin), end - begin) ||
++            GetLastError() == ERROR_NOT_LOCKED) {
++            return;
++        }
++        for (uintptr_t page = begin; page < end; page += PageAlignment) {
++            VirtualUnlock(reinterpret_cast<void*>(page), PageAlignment);
++        }
++    };
++    for (size_t i = 0; i < trim.size();) {
++        size_t j = i + 1;
++        while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
++            ++j;
++        }
++        unlock(trim[i], trim[j - 1] + PageAlignment);
++        i = j;
++    }
++    return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
++#else
++    return {0, 0};
++#endif
++}
++
+ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+     if (length == 0) {
+         return;
+@@ -857,6 +973,7 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
+ #endif
+             if (!cleared) {
+                 std::memset(backing_base + offset, 0, clear_end - offset);
++                g_zero_filled_bytes.fetch_add(clear_end - offset, std::memory_order_relaxed);
+             }
+             if (whole) {
+                 granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
+diff --git a/src/common/host_memory.h b/src/common/host_memory.h
+index 84315091c5..0f10269757 100644
+--- a/src/common/host_memory.h
++++ b/src/common/host_memory.h
+@@ -62,6 +62,13 @@ public:
+     /// it needs RAM. The contents stay; using the pages brings them back.
+     void HintCold(size_t physical_offset, size_t length,
+                   std::optional<size_t> virtual_offset) const;
++    /// Windows: resident pages of guest memory (backing and its views) that hold only zeros leave
++    /// the working set, like HintCold. Returns {resident bytes looked at, bytes trimmed}.
++    std::pair<size_t, size_t> TrimZeroPages() const;
++
++    /// Bytes ClearBackingRegion has filled with zeros (memset) since start.
++    static u64 ZeroFilledBytes() noexcept;
++
+     /// Pages the kernel hands out (cleared or not).
+     void MarkUsed(size_t physical_offset, size_t length);
+ 
+diff --git a/src/core/device_memory.cpp b/src/core/device_memory.cpp
+index 1aea56a991..e82da5e674 100644
+--- a/src/core/device_memory.cpp
++++ b/src/core/device_memory.cpp
+@@ -1,6 +1,16 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifdef _WIN32
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++
++#include "common/logging.h"
++#include "common/thread.h"
++#endif
++
+ #include "core/device_memory.h"
+ #include "hle/kernel/board/nintendo/nx/k_system_control.h"
+ 
+@@ -14,8 +24,50 @@ constexpr size_t VirtualReserveSize = 1ULL << 39;
+ 
+ DeviceMemory::DeviceMemory()
+     : buffer{Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize(),
+-             VirtualReserveSize} {}
++             VirtualReserveSize} {
++#ifdef _WIN32
++    zero_trim_thread = std::jthread{[this](std::stop_token stop) { TrimZeroPages(stop); }};
++#endif
++}
+ 
+ DeviceMemory::~DeviceMemory() = default;
+ 
++#ifdef _WIN32
++// Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
++// their heaps while booting: Ocarina leaves ~7 GB) stay resident until they leave the working set.
++// A pass comes every 5 s while they keep turning up, backing off to once a minute.
++void DeviceMemory::TrimZeroPages(std::stop_token stop) {
++    using namespace std::chrono_literals;
++    Common::SetCurrentThreadName("ZeroTrim");
++    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++    constexpr size_t Busy = size_t{64} << 20;
++    std::mutex mutex;
++    std::condition_variable_any wake;
++    std::chrono::seconds interval = 5s;
++    while (true) {
++        {
++            std::unique_lock lock{mutex};
++            wake.wait_for(lock, stop, interval, [] { return false; });
++        }
++        if (stop.stop_requested()) {
++            return;
++        }
++        const auto start = std::chrono::steady_clock::now();
++        const auto [resident, trimmed] = buffer.TrimZeroPages();
++        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                            std::chrono::steady_clock::now() - start)
++                            .count();
++        if (trimmed < Busy) {
++            interval = (std::min)(interval * 2, std::chrono::seconds{60});
++            continue;
++        }
++        interval = 5s;
++        LOG_INFO(HW_Memory,
++                 "Trimmed {} MiB of all-zero guest pages out of {} MiB resident in {} ms; the kernel "
++                 "zero-filled {} MiB so far",
++                 trimmed >> 20, resident >> 20, ms, Common::HostMemory::ZeroFilledBytes() >> 20);
++    }
++}
++#endif
++
+ } // namespace Core
+diff --git a/src/core/device_memory.h b/src/core/device_memory.h
+index b5103e23bc..41d39c2753 100644
+--- a/src/core/device_memory.h
++++ b/src/core/device_memory.h
+@@ -6,6 +6,10 @@
+ 
+ #pragma once
+ 
++#ifdef _WIN32
++#include <thread>
++#endif
++
+ #include "common/host_memory.h"
+ #include "common/typed_address.h"
+ 
+@@ -66,6 +70,13 @@ public:
+     }
+ 
+     Common::HostMemory buffer;
++
++#ifdef _WIN32
++private:
++    void TrimZeroPages(std::stop_token stop);
++
++    std::jthread zero_trim_thread;
++#endif
+ };
+ 
+ } // namespace Core

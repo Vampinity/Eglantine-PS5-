@@ -1,0 +1,67 @@
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -38,6 +38,30 @@
+ 
+ namespace Vulkan {
+ 
++namespace {
++
++/// EDEN_NX2_RP_BARRIER=1: serialize writes around each render pass. The AMD OoT fork measured
++/// 0/40 HUD/minimap/dialog frames lost with this barrier, at about 0.05 ms per frame.
++bool FullRenderPassBarriers() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_RP_BARRIER");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++void RecordFullBarrier(vk::CommandBuffer cmdbuf) {
++    static constexpr VkMemoryBarrier FULL_BARRIER{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++    };
++    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, FULL_BARRIER);
++}
++
++} // Anonymous namespace
+ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
+                                          vk::CommandBuffer upload_cmdbuf) {
+     Common::HangSite site{"worker: recording commands"};
+@@ -401,8 +425,11 @@
+         values[i] = clear_values[i];
+     }
+     const bool after_compute = std::exchange(compute_writes_pending, false);
+-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
+-            after_compute](vk::CommandBuffer cmdbuf) {
++    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count, after_compute,
++            full_barrier = FullRenderPassBarriers()](vk::CommandBuffer cmdbuf) {
++        if (full_barrier) {
++            RecordFullBarrier(cmdbuf);
++        }
+         const VkRenderPassBeginInfo renderpass_bi{
+             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+             .pNext = nullptr,
+@@ -774,7 +801,8 @@
+         Record([num_images = num_renderpass_images,
+                        images = renderpass_images,
+                        ranges = renderpass_image_ranges,
+-                       has_transform_feedback = device.IsExtTransformFeedbackSupported()](
++                       has_transform_feedback = device.IsExtTransformFeedbackSupported(),
++                       full_barrier = FullRenderPassBarriers()](
+                           vk::CommandBuffer cmdbuf) {
+             std::array<VkImageMemoryBarrier, 9> barriers;
+             for (size_t i = 0; i < num_images; ++i) {
+@@ -826,6 +854,9 @@
+                                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        0, XFB_OUTPUT_BARRIER);
+             }
++            if (full_barrier) {
++                RecordFullBarrier(cmdbuf);
++            }
+         });
+ 
+         state.renderpass = VkRenderPass{};

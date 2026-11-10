@@ -1,0 +1,91 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] shader_recompiler: give every shader its own clip distances
+
+`spirv_emit_context.h` declared `static std::bitset<8> clip_distance_written;` at namespace scope in
+a header. That is one object for the whole process, shared by every shader translation and never
+reset. EmitSetAttribute set a bit when a shader wrote a clip distance, and EmitPrologue skipped
+initialising exactly the distances whose bit was set.
+
+So the prologue's behaviour depended on which shaders had been translated before it. Once any shader
+in the session wrote clip distance 0, every later shader that declares clip distances left distance 0
+uninitialised, and an uninitialised clip distance can clip whole primitives away - objects that
+vanish and stay vanished for the rest of the session, which is how Fritchii lists this fix ("objects
+that could vanish for a whole session"). It is also a data race: the bitset is written from whatever
+threads translate shaders, with no synchronisation, so concurrent translations could see and act on
+each other's bits.
+
+The fix is to stop tracking it. The prologue initialises every user clip distance unconditionally,
+which is what it did before the bitset existed, and the two writes to the bitset go with it.
+
+What this can break: a shader that writes a clip distance now has that distance initialised to zero
+and then overwritten, instead of being left alone. That is one extra store per clip distance per
+prologue, and it is what SPIR-V requires anyway - a variable read before it is written is undefined.
+The only cost is a handful of instructions in vertex and geometry prologues.
+
+Ported from Frizti/Fritchii ff0f6aa30, which is zortos293/Lichii #902.
+
+Measured or a guess: the mechanism is certain - a process-wide, never-reset static in a header, read
+by the prologue of every shader that declares clip distances - and upstream connects it to objects
+vanishing for a session. Whether any object in our own screenshots vanished this way is not
+established; nothing in our log names it. It is included because it is a real correctness and
+thread-safety defect with a trivial fix.
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+index 01c22741d3..f151b94cc6 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+@@ -441,13 +441,6 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, [[maybe_un
+         value = ctx.OpBitcast(output->type, value);
+     }
+ 
+-    static constexpr IR::Attribute cd0 = IR::Attribute::ClipDistance0;
+-    static constexpr IR::Attribute cd7 = IR::Attribute::ClipDistance7;
+-
+-    if (attr >= cd0 && attr <= cd7) {
+-        const u32 idx = (u32) attr - (u32) cd0;
+-        clip_distance_written.set(idx);
+-    }
+     ctx.OpStore(output->pointer, value);
+ }
+ 
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+index d621cdc116..cb77b524aa 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
+@@ -124,13 +124,18 @@ void EmitPrologue(EmitContext& ctx) {
+             }
+         }
+ 
++        // Every clip distance is initialised, unconditionally. This used to skip any distance that a
++        // previous translation had written, through a `static std::bitset<8>` in the header that no
++        // shader ever reset: once one shader wrote clip distance 0, every later shader left its
++        // distance 0 uninitialised, and an uninitialised distance can clip whole objects away for
++        // the rest of the session (zortos293/Lichii #902; Fritchii lists it as "objects that could
++        // vanish for a whole session"). That bitset was also a single shared object, written
++        // without synchronisation, across the threads that translate shaders.
+         if (Sirit::ValidId(ctx.clip_distances)) {
+             for (u32 i = 0; i < ctx.profile.max_user_clip_distances; ++i) {
+-                if (!clip_distance_written.test(i)) {
+-                    const Id idx = ctx.Const(i);
+-                    const Id element = ctx.OpAccessChain(ctx.output_f32, ctx.clip_distances, idx);
+-                    ctx.OpStore(element, ctx.Const(0.0f));
+-                }
++                const Id idx = ctx.Const(i);
++                const Id element = ctx.OpAccessChain(ctx.output_f32, ctx.clip_distances, idx);
++                ctx.OpStore(element, ctx.Const(0.0f));
+             }
+         }
+     }
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index 5c4595ceab..0c76ebc9fc 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -31,8 +31,6 @@ namespace Shader::Backend::SPIRV {
+ /// depth-compare typing was already here; the AMD-Windows compiler stall list is not for RADV.
+ [[nodiscard]] bool AmdPr273Fixes();
+ 
+-static std::bitset<8> clip_distance_written;
+-
+ using Sirit::Id;
+ 
+ class VectorTypes {

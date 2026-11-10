@@ -1,0 +1,58 @@
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 5d4f5eaaba..293f53d0f4 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -62,11 +62,13 @@ add_library(
+     fs/fs_util.h
+     fs/path_util.cpp
+     fs/path_util.h
++    hang_site.h
+     hash.h
+     heap_tracker.cpp
+     heap_tracker.h
+     hex_util.cpp
+     hex_util.h
++    host_command_queue.h
+     host_memory.cpp
+     host_memory.h
+     input.h
+diff --git a/src/shader_recompiler/CMakeLists.txt b/src/shader_recompiler/CMakeLists.txt
+index 13c0c06d8f..a8c4575d5f 100644
+--- a/src/shader_recompiler/CMakeLists.txt
++++ b/src/shader_recompiler/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_library(shader_recompiler STATIC
+     backend/spirv/emit_spirv_mesh.cpp
+     backend/spirv/emit_spirv_mesh_readback.cpp
+     backend/spirv/emit_spirv_mesh_readback.h
++    backend/spirv/mesh_compute_interface.h
+     backend/spirv/mesh_compute_layout.h
+     backend/spirv/mesh_compute_scan_spv.h
+     backend/spirv/emit_spirv_special.cpp
+@@ -180,6 +181,7 @@ add_library(shader_recompiler STATIC
+     frontend/maxwell/translate_program.h
+     host_translate_info.h
+     ir_opt/collect_shader_info_pass.cpp
++    ir_opt/compose_guard.h
+     ir_opt/conditional_barrier_pass.cpp
+     ir_opt/constant_propagation_pass.cpp
+     ir_opt/dead_code_elimination_pass.cpp
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index b2403e75e8..902ca7db68 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -22,6 +22,7 @@ add_library(video_core STATIC
+     buffer_cache/usage_tracker.h
+     buffer_cache/virtual_range_cache.h
+     buffer_cache/word_manager.h
++    bananza_terrain_compat.h
+     cache_types.h
+     capture.h
+     cdma_pusher.cpp
+@@ -112,6 +113,7 @@ add_library(video_core STATIC
+     native_qmd.h
+     native_query_trace.h
+     nx2.h
++    nx2_debug_control.h
+     nx2_profile.h
+     present.h
+     pte_kind.h

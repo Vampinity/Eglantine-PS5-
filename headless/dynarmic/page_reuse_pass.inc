@@ -14,7 +14,12 @@ unsigned long long eden_page_reuse_accesses = 0;
 
 namespace {
 
-constexpr s64 eden_reuse_span = 256;
+// A direct-table lookup already rejects a group that crosses a page. Keep the
+// group window at one page so larger structs can share the lookup too; the
+// old 256-byte limit left otherwise-valid accesses in the same 4 KiB page on
+// the individual lookup path. The emitter span check remains the final
+// guard for the configured page size.
+constexpr s64 eden_reuse_span = 4096;
 
 struct EdenAddress {
     IR::Inst* root;

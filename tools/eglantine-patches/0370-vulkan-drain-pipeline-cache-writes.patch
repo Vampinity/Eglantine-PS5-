@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 00:00:00 +0000
+Subject: [PATCH] vulkan: drain pipeline cache writes before shutdown
+
+Runtime pipeline entries are appended by VkPipelineSerialization. ThreadWorker
+stops its jthreads during member destruction and does not promise to execute
+queued work after stop is requested. Drain that queue while PipelineCache is
+still alive so vulkan.bin and vulkan_mesh.bin contain the pipelines built in
+the session that is closing.
+
+Break risk: shutdown now waits for pending cache serialization. If a cache
+write or its filesystem operation stalls, closing the game can take longer;
+it must not be enabled if shutdown latency is more important than retaining
+that session's cache. This does not change pipeline construction or draw
+state, so a bad write is visible as a longer close or as the next launch
+rebuilding a pipeline, not as a different rendered frame. The win is a
+source-level correctness fix; no PS5 timing measurement is available here.
+
+---
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -827,4 +827,6 @@
+ PipelineCache::~PipelineCache() {
++    // Drain queued environment-cache writes before ThreadWorker destruction stops the serializer.
++    serialization_thread.WaitForRequests();
+     SaveUsedPipelines();
+     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,

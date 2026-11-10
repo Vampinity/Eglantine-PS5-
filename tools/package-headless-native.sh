@@ -66,6 +66,15 @@ cp -a "$root/headless/eglantineps5/ui" "$app/ui"
 if [[ ${EDEN_DEV_PROFILE:-} == ON && -f "$root/headless/dev-settings.txt" ]]; then
     cp "$root/headless/dev-settings.txt" "$app/dev-settings.txt"
 fi
+# The switch lists the app reads from its own folder (headless/main.cpp reads env.txt at launch and
+# applies each line over the built-in defaults). Every fix measured on Ocarina is off without its
+# line, and a release used to ship neither file although the README told people to copy them, so a
+# package with no env.txt ran with none of the tuned settings.
+for profile in env.txt env-prettier.txt; do
+    if [[ -f "$root/$profile" ]]; then
+        cp "$root/$profile" "$app/$profile"
+    fi
+done
 # The exact-title upstream Lapy helper is verified before it reaches this package.
 python3 - "$root" "$scratch" "$app" "${1:-}" <<'PY'
 import json, pathlib, re, runpy, shutil, sys

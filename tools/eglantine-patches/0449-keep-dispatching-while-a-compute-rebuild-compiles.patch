@@ -1,0 +1,86 @@
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index 420714af0b..a00c4c17f0 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -67,6 +67,11 @@ public:
+         return is_built.load(std::memory_order::acquire) && IsBound();
+     }
+ 
++    /// Whether the build ended, with a pipeline or not (zortos293/Lichii#969).
++    [[nodiscard]] bool IsBuilt() const noexcept {
++        return is_built.load(std::memory_order::acquire);
++    }
++
+ private:
+     const Device& device;
+     vk::PipelineCache& pipeline_cache;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 3f9e3b00d5..170572052e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1201,7 +1201,31 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
+     const auto [pair, is_new]{compute_cache.try_emplace(key)};
+     auto& pipeline{pair->second};
+     if (!is_new && NullSlotsMode() != 0 && pipeline) {
+-        RecheckNullPointerSlots(key, shader, pipeline);
++        // A rebuild that was compiling: switch to it now that its build ended.
++        std::unique_ptr<ComputePipeline> ready;
++        {
++            std::scoped_lock lock{compute_null_slots_mutex};
++            const auto it = compute_null_slots.find(key);
++            if (it != compute_null_slots.end() && it->second.pending &&
++                it->second.pending->IsBuilt()) {
++                ready = std::move(it->second.pending);
++                if (!ready->IsRunnable()) {
++                    it->second.rebuilds = 4; // MaxRebuilds, as in RecheckNullPointerSlots
++                    LOG_WARNING(Render_Vulkan,
++                                "Keeping compute shader {:016x}: rebuild failed",
++                                key.unique_hash);
++                    retired_compute_pipelines.push_back(std::move(ready));
++                    ready.reset();
++                } else {
++                    retired_compute_pipelines.push_back(std::move(pipeline));
++                }
++            }
++        }
++        if (ready) {
++            pipeline = std::move(ready);
++        } else {
++            RecheckNullPointerSlots(key, shader, pipeline);
++        }
+     }
+     if (!is_new) {
+         return pipeline.get();
+@@ -1270,7 +1294,16 @@ void PipelineCache::RecheckNullPointerSlots(const ComputePipelineCacheKey& key,
+     }
+     LOG_INFO(Render_Vulkan, "Compute program {:016x} rebuilt from the live constant buffers",
+              key.unique_hash);
+-    retired_compute_pipelines.push_back(std::move(pipeline));
++    if (pipeline && pipeline->IsRunnable()) {
++        // The current translation keeps dispatching while this one compiles: for a few frames
++        // it misses the accesses through the newly filled pointer, instead of a freeze.
++        std::scoped_lock lock{compute_null_slots_mutex};
++        compute_null_slots[key].pending = std::move(rebuilt);
++        return;
++    }
++    if (pipeline) {
++        retired_compute_pipelines.push_back(std::move(pipeline));
++    }
+     pipeline = std::move(rebuilt);
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 165b3d073a..f060095afe 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -233,6 +233,10 @@ private:
+         std::vector<std::pair<u32, u32>> slots;
+         std::set<std::pair<u32, u32>> told;
+         u32 rebuilds{};
++        /// A rebuild still compiling: dispatches keep the current pipeline until it is ready
++        /// (zortos293/Lichii#969 -- the next dispatch used to wait for it, up to 2.8 s in
++        /// Ocarina of Time).
++        std::unique_ptr<ComputePipeline> pending;
+     };
+     void RecheckNullPointerSlots(const ComputePipelineCacheKey& key, const ShaderInfo* shader,
+                                  std::unique_ptr<ComputePipeline>& pipeline);

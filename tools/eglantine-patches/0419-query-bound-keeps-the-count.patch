@@ -1,0 +1,185 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] query_cache: hold the occlusion query at its bound instead of resetting it
+
+When a query's slot count passes the bound in CloseCounter, ResetCounter releases the query and,
+through a SyncOperation, sets amend_value and accumulation_value to zero. The guest then reads the
+occlusion report as 0 and takes that as "everything is occluded": it skips the whole 3D scene and
+presents the clear colour, which is the white screen with the HUD still drawn and the audio still
+playing.
+
+The bound was one bank, 256 slots, and patch 0413 raised it to 32 banks. A PS5 console log has a
+145 s session crossing that once:
+
+    86.445846 CloseCounter: Query slot count past 32 banks (8201 slots): dropping it as a reset
+             would (1th drop)
+
+8,201 slots is past 8,192, so that bound reset a live count. Ocarina's own title screen and file
+select reach 16,384 slots over 64 banks, so 64 banks is a window this game is known to fit in, and
+8,201 clears it with 2x to spare. This raises the bound to 64 banks, which is 128 KiB of query
+results.
+
+Upstream's history for this number, from the PR patches themselves: zortos293/Lichii #558 raised it
+to BANK_SIZE * 64, #564 argued it back down to * 16 and #566 to * 32, and #570 (closed, not merged)
+proposed * 32. This takes #558's 64, for the headroom the PS5 measurement needs. It is not a claim
+that upstream settled there.
+
+At the bound the query is now held rather than reset. Three things are true at once, and the hold is
+what satisfies all three:
+
+- A reset lies. It abandons the query and zeroes the carried count, which is the symptom.
+- Pausing alone is not a bound. PauseCounter only records EndQuery; the next StartCounter still calls
+  ReserveHostQuery on the same query, so a window that never closes keeps allocating. That growth is
+  what Lichii #121 records hanging an AMD host at a game's save select with the split on, and the PS5
+  runs that split. Raising the bound without holding it would move that hang, not remove it.
+- Releasing the query's banks while preserving the accumulated result needs the segmented accumulator
+  that ReplicateCurrentQueryIfNeeded does only for a pending sync - a change to the query's lifetime
+  that has not been exercised here.
+
+So StartCounter returns early while the hold is set, CloseCounter logs the moment it is taken, and the
+guest's own ResetCounter clears it. The count the guest reads stays, and no further host query slots
+are allocated.
+
+The submission boundary keeps its behaviour and only loses a misleading comment. EndPendingOperations
+already pauses rather than resets for Ocarina, through ZpassCut::PauseNow, which is Lichii #121 by
+Kajcsi - Fritchii lists it for Ocarina of Time as "the occlusion counter is paused, not reset, at
+each submission". The comment above it claimed the opposite - "Off by default: with the split on,
+pausing hung an AMD host at a game's save select" - and read as the reason the pause was not in, when
+it is. That hang is why the pause stays per-title rather than becoming unconditional.
+
+What this can break. Samples taken after the hold are not counted, so the window undercounts until the
+guest's counter reset: that is the deliberate trade against a reset, which lies about the whole window
+instead. If a guest never resets its counter the hold stays for the session and Ocarina's visibility
+stops updating, which is what the log line is for. Taking the hold inside a guest's open window also
+changes ZpassCut's cut-window bookkeeping the way a reset would have, only without the report going to
+0; EDEN_NX2_ZPASS_CUT_LOG=1 shows it.
+
+Measured, not a guess: the drop is in the console log quoted above, and the 16,384 slots the title
+screen reaches is from the port's own record of it. The effect of the change is not yet
+console-tested. The confirming run is one PS5 session with EDEN_NX2_SPLIT=2, EDEN_NX2_ZPASS_PAUSE=1,
+EDEN_NX2_QUERY_KEEP_PENDING=1 and EDEN_NX2_ZPASS_CUT_LOG=1, expecting no query above 64 banks and no
+report of 0 after a cut.
+
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index 01ade09b4c..d9d4a0874a 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -169,6 +169,11 @@ public:
+ 
+     void StartCounter() override {
+         samples_at_stake = true;
++        // The bound in CloseCounter latched this streamer: the retained query is not started again
++        // until the guest resets its counter, so no further host query slots are allocated.
++        if (paused_at_bound) {
++            return;
++        }
+         if (has_started) {
+             return;
+         }
+@@ -198,6 +203,9 @@ public:
+     }
+ 
+     void ResetCounter() override {
++        // The guest reset its counter: the window it was counting is over, so the hold the bound in
++        // CloseCounter put on this streamer is released and a new window starts.
++        paused_at_bound = false;
+         if (reset_by_submission) {
+             reset_by_submission = false;
+         } else {
+@@ -230,32 +238,41 @@ public:
+         samples_at_stake = false;
+     }
+ 
+-    // Called at each submission with EDEN_NX2_ZPASS_PAUSE=1. The running query carries the count
+-    // across it: a guest's reset-to-report window can span one.
++    // Called at each submission. The running query carries the count across it: a guest's
++    // reset-to-report window can span one.
+     void CloseCounter() override {
+         PauseCounter();
+         // A title that counts without resetting or reporting grows the query by a slot at every
+-        // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
+-        // Time's title screen and file select reached 16,384 slots over 64 banks.
++        // submission and render pass, and it keeps every bank it touches alive until the query is
++        // released (BankPool reuses a bank only once it is closed and unreferenced).
+         //
+-        // One bank is too low for gameplay. Lichii raised this same bound four times for this same
+-        // symptom - zortos293/Lichii #558 to BANK_SIZE * 64, and #564/#566/#570 for the reason in
+-        // their comment: "Gameplay near water and windows can exceed a single 256-slot bank, so the
+-        // limit must not trigger there." A reset here abandons the running query (ResetCounter ->
+-        // AbandonCurrentQuery), so the count it held is lost and the report the water surface
+-        // switches on flips - the black, flickering water. 32 banks (8,192 slots) is far past any
+-        // gameplay window and well under the 16,384 the title screen already reaches, so growth
+-        // stays bounded: 32 banks is 64 KiB of query results, against 128 KiB for the title screen.
+-        // Logged at the 1st, 2nd, 4th, 8th... drop, so a long window during play cannot go unnoticed.
+-        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE * 32) {
+-            static u64 bank_bound_resets{};
+-            if ((++bank_bound_resets & (bank_bound_resets - 1)) == 0) {
+-                LOG_INFO(Render_Vulkan,
+-                         "Query slot count past 32 banks ({} slots): dropping it as a reset would "
+-                         "({}th drop)",
+-                         current_query->size_slots, bank_bound_resets);
+-            }
+-            ResetCounter();
++        // One bank (256 slots) is far too low. A PS5 console log has one 145 s session crossing it
++        // once - "Query slot count past 32 banks (8201 slots): dropping it as a reset would (1th
++        // drop)" at 86.4 s - and that reset threw away a live count, which is the white screen with
++        // the HUD still drawn. Ocarina's own title screen and file select reach 16,384 slots over 64
++        // banks, so 64 banks is a window this game is known to fit in, and 8,201 clears it with 2x
++        // to spare. 64 banks is 128 KiB of query results.
++        //
++        // Upstream's history for this bound: zortos293/Lichii #558 raised it to BANK_SIZE * 64,
++        // #564 argued it back down to * 16 and #566 to * 32, and #570 (closed, unmerged) proposed
++        // * 32. This takes #558's 64, for the headroom the PS5 log needs.
++        //
++        // Hold the query here; do not reset it. ResetCounter calls AbandonCurrentQuery and, through
++        // a SyncOperation, zeroes amend_value and accumulation_value, so the guest reads the report
++        // as 0 and culls the whole scene. Pausing without holding is not a bound either: the next
++        // StartCounter still calls ReserveHostQuery and grows this same query, so a window that
++        // never closes would allocate without limit - which is the query growth Lichii #121 records
++        // hanging an AMD host at a game's save select. Holding does both: the count the guest reads
++        // stays, and no further host query slots are allocated until the guest's own counter reset
++        // releases the hold. The cost is that samples after the hold are not counted, so the window
++        // undercounts until that reset, where a reset would lie about all of it.
++        if (!paused_at_bound && current_query &&
++            current_query->size_slots >= SamplesQueryBank::BANK_SIZE * 64) {
++            paused_at_bound = true;
++            LOG_INFO(Render_Vulkan,
++                     "Query slot count reached 64 banks ({} slots): holding the count until the "
++                     "guest resets its counter, not a reset",
++                     current_query->size_slots);
+         }
+     }
+ 
+@@ -700,6 +717,9 @@ private:
+     bool window_open{};
+     u32 cut_note{};
+     bool reset_by_submission{};
++    /// Set when the slot bound in CloseCounter is reached: the retained query is held, and no further
++    /// host query slots are allocated, until the guest's own counter reset clears it.
++    bool paused_at_bound{};
+ };
+ 
+ // Transform feedback queries
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index b2c12d7863..19c2f8c8de 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -756,11 +756,14 @@ void Scheduler::InvalidateState() {
+ }
+ 
+ void Scheduler::EndPendingOperations() {
+-    // EDEN_NX2_ZPASS_PAUSE=1: pause, don't reset. A submission can land between a guest's counter
+-    // reset and its report, and resetting here drops the samples counted so far (the report then
+-    // reads too low). Off by default: with the split on, pausing hung an AMD host at a game's save
+-    // select (Lichii #121), and the bound in SamplesStreamer::CloseCounter meant to stop that has
+-    // not been tried on AMD yet.
++    // Pause the occlusion counter, don't reset it. A submission can land between a guest's counter
++    // reset and its report; a reset drops the samples counted so far, the report reads too low or 0,
++    // and the guest culls the whole 3D scene for that frame - the white clear colour with the HUD
++    // still drawn. Ocarina of Time does exactly that, so it pauses by default (Lichii #121 by
++    // Kajcsi: pause this counter, never reset it). EDEN_NX2_ZPASS_PAUSE=1 or =0 forces either way
++    // for any title. The pause was once seen to hang an AMD host at a game's save select with the
++    // split on, which is why it is per-title rather than unconditional;
++    // SamplesStreamer::CloseCounter carries its own bound for a window that never closes.
+     static const bool pause_zpass = [] {
+         const char* value = std::getenv("EDEN_NX2_ZPASS_PAUSE");
+         if (value != nullptr) {

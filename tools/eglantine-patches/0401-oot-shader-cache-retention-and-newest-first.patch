@@ -1,0 +1,93 @@
+Subject: [PATCH] oot shader cache retention and newest first
+
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1327,6 +1327,33 @@
+         });
+         ++state.total;
+     }};
++    std::vector<std::pair<GraphicsPipelineCacheKey, std::vector<FileEnvironment>>> deferred_graphics;
++    const auto queue_deferred_graphics = [&] {
++        // Cache records append over time; build the newest records first after a restart.
++        for (auto it = deferred_graphics.rbegin(); it != deferred_graphics.rend(); ++it) {
++            auto key = it->first;
++            auto envs = std::move(it->second);
++            workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
++                ShaderPools pools;
++                boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
++                for (auto& env : envs_) {
++                    env_ptrs.push_back(&env);
++                }
++                auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
++                                                     state.statistics.get(), false)};
++
++                std::scoped_lock lock{state.mutex};
++                if (pipeline) {
++                    graphics_cache.emplace(key, std::move(pipeline));
++                }
++                ++state.built;
++                if (state.has_loaded) {
++                    callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
++                }
++            });
++        }
++        deferred_graphics.clear();
++    };
+     bool loading_mesh_file = false;
+     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
+         GraphicsPipelineCacheKey key;
+@@ -1379,28 +1406,12 @@
+         }
+         ++queued_graphics;
+ 
+-        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
+-            ShaderPools pools;
+-            boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+-            for (auto& env : envs_) {
+-                env_ptrs.push_back(&env);
+-            }
+-            auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
+-                                                 state.statistics.get(), false)};
+-
+-            std::scoped_lock lock{state.mutex};
+-            if (pipeline) {
+-                graphics_cache.emplace(key, std::move(pipeline));
+-            }
+-            ++state.built;
+-            if (state.has_loaded) {
+-                callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
+-            }
+-        });
++        deferred_graphics.emplace_back(key, std::move(envs));
+         ++state.total;
+     }};
+     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
+                                load_graphics);
++    queue_deferred_graphics();
+     // Mesh pipelines are stored separately because their translation needs mesh state. The
+     // PS5 RADV path runs them as compute when VK_EXT_mesh_shader is absent, so it must load the
+     // same file even without the native mesh extension.
+@@ -1408,6 +1419,7 @@
+         loading_mesh_file = true;
+         VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
+                                    load_compute, load_graphics, true);
++        queue_deferred_graphics();
+     }
+ 
+     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+@@ -1570,6 +1582,15 @@
+     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
+     constexpr u64 EvictAfterFrames = 9000;
+     if (frame_count <= EvictAfterFrames) {
++        return;
++    }
++    // Do not throw away a compiled pipeline merely because it was quiet for 2.5 minutes while the
++    // cache is still bounded. OoT revisits places and otherwise pays the translation cost again.
++    static const size_t evict_above = [] {
++        const char* const value = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE");
++        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : size_t{8000};
++    }();
++    if (graphics_cache.size() <= evict_above) {
+         return;
+     }
+     const u64 cutoff = frame_count - EvictAfterFrames;

@@ -1,0 +1,86 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 4b5dea0b1f..4cf2dcde8e 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -194,6 +194,10 @@ void TextureCache<P>::RunGarbageCollector() {
+     bool evict_old_costly = false;
+     u64 ticks_to_destroy = 0;
+     size_t num_iterations = 0;
++    // Deleted images remain live until the GPU passes their last use. Do not let the collector
++    // queue unbounded deferred images while it is trying to make room: their VMA allocations are
++    // absent from the live texture-cache total but still count against the driver's heap.
++    constexpr u64 MAX_GPU_SENTENCED_BYTES = 1_GiB;
+     const auto Configure = [&](bool allow_aggressive) {
+         high_priority_mode = total_used_memory >= expected_memory;
+         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
+@@ -212,6 +216,17 @@ void TextureCache<P>::RunGarbageCollector() {
+             return true;
+         }
+         --num_iterations;
++        if (gpu_sentenced_bytes >= MAX_GPU_SENTENCED_BYTES) {
++            static u64 last_logged_frame = ~u64{0};
++            if (last_logged_frame != frame_tick) {
++                last_logged_frame = frame_tick;
++                LOG_WARNING(HW_GPU,
++                            "Texture cache collector paused: {} MiB of deleted images await GPU "
++                            "release (cap {} MiB)",
++                            gpu_sentenced_bytes >> 20, MAX_GPU_SENTENCED_BYTES >> 20);
++            }
++            return true;
++        }
+         auto& image = slot_images[image_id];
+         if (True(image.flags & ImageFlagBits::IsDecoding)) {
+             return false;
+@@ -638,9 +653,14 @@ void TextureCache<P>::TickFrame() {
+                             const u64 free = budget > usage ? budget - usage : 0;
+                             if (free >= pressure_margin + 1_GiB) {
+                                 if (++pressure_quiet_frames >= 120) {
++                                    const u64 old_margin = pressure_margin;
+                                     pressure_margin -= (std::min)(pressure_margin, 512_MiB);
+                                     pressure_quiet_frames = 0;
+                                     budget_check_frames = 0;
++                                    LOG_INFO(HW_GPU,
++                                             "Memory pressure margin recovered: {} -> {} MiB "
++                                             "(free {} MiB)",
++                                             old_margin >> 20, pressure_margin >> 20, free >> 20);
+                                 }
+                             } else {
+                                 pressure_quiet_frames = 0;
+@@ -732,6 +752,8 @@ void TextureCache<P>::TickFrame() {
+         LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
+                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
+                  image_bytes >> 20);
++        LOG_INFO(HW_GPU, "Texture cache deferred image memory: {} MiB in {} images",
++                 gpu_sentenced_bytes >> 20, gpu_sentenced_images.size());
+         std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
+                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
+@@ -4614,6 +4636,17 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(slot_images[image_id]));
+     const u64 freed_bytes = (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0) +
+                             ImageMemoryBytes(slot_images[image_id]);
++    // Count the VMA allocation, not only the texture cache's host-size estimate. The latter can be
++    // much smaller for converted/trimmed images, so a deferred-destruction queue could look cheap
++    // while retaining its real device-local allocations.
++    const u64 gpu_freed_bytes = [&] {
++        if constexpr (requires(const Image& candidate) { candidate.MemoryBlock(); }) {
++            const auto block = slot_images[image_id].MemoryBlock();
++            return block.size != 0 ? block.size : freed_bytes;
++        } else {
++            return freed_bytes;
++        }
++    }();
+     const GPUVAddr gpu_addr = image.gpu_addr;
+     const auto alloc_it = image_allocs_table.find(gpu_addr);
+     if (alloc_it == image_allocs_table.end()) {
+@@ -4672,8 +4705,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     } else if (!immediate_delete) {
+         if constexpr (requires { runtime.CurrentTick(); }) {
+             gpu_sentenced_images.push_back(
+-                {runtime.CurrentTick(), freed_bytes, std::move(slot_images[image_id])});
+-            gpu_sentenced_bytes += freed_bytes;
++                {runtime.CurrentTick(), gpu_freed_bytes, std::move(slot_images[image_id])});
++            gpu_sentenced_bytes += gpu_freed_bytes;
+         } else {
+             sentenced_images.Push(std::move(slot_images[image_id]));
+             sentenced_image_bytes[sentenced_image_index] += freed_bytes;

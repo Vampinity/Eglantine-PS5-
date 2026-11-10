@@ -1,0 +1,123 @@
+Subject: [PATCH] oot dedicated gpu thread cores
+
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -6,9 +6,11 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <chrono>
++#include <cstdlib>
+ #include <limits>
+ #include <string>
+ #include <thread>
++#include <vector>
+ 
+ #include "common/adpf.h"
+ #include "common/error.h"
+@@ -539,6 +541,62 @@
+ #endif
+ }
+ 
++void PinCurrentThread(PinnedRole role) {
++#ifdef _WIN32
++    // Ocarina uses six guest workers on the PS5's eight physical Zen 2 cores. Reserve the last
++    // two physical cores for the split GPU front and back; the guest mask never contains them.
++    static const std::vector<KAFFINITY> cores = [] {
++        DWORD length = 0;
++        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
++        std::vector<u8> buffer(length);
++        std::vector<KAFFINITY> result;
++        if (length == 0 ||
++            !GetLogicalProcessorInformationEx(
++                RelationProcessorCore,
++                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()), &length)) {
++            return result;
++        }
++        for (DWORD offset = 0; offset + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) <= length;) {
++            const auto* const entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
++                buffer.data() + offset);
++            if (entry->Size == 0) {
++                break;
++            }
++            if (entry->Relationship == RelationProcessorCore && entry->Processor.GroupCount != 0 &&
++                entry->Processor.GroupMask[0].Group == 0) {
++                result.push_back(entry->Processor.GroupMask[0].Mask);
++            }
++            offset += entry->Size;
++        }
++        return result;
++    }();
++    const char* const setting = std::getenv("EDEN_NX2_PIN_THREADS");
++    if ((setting != nullptr && setting[0] == '0') || cores.size() < 8) {
++        return;
++    }
++    const size_t split_core = cores.size() - 2;
++    KAFFINITY mask{};
++    switch (role) {
++    case PinnedRole::GpuFront:
++        mask = cores[split_core];
++        break;
++    case PinnedRole::GpuBack:
++        mask = cores[split_core + 1];
++        break;
++    case PinnedRole::GuestCore:
++        for (size_t i = 0; i < split_core; ++i) {
++            mask |= cores[i];
++        }
++        break;
++    }
++    if (mask != 0) {
++        SetThreadAffinityMask(GetCurrentThread(), mask);
++    }
++#else
++    (void)role;
++#endif
++}
++
+ void SetCurrentThreadToPerformanceCores() {
+ #if defined(__ANDROID__)
+     if (ADPF::AddCurrentThread(ADPF::Session::Render)) {
+--- a/src/common/thread.h
++++ b/src/common/thread.h
+@@ -108,6 +108,11 @@
+ void SetCurrentThreadPriority(ThreadPriority new_priority);
+ void SetCurrentThreadName(const char* name);
+ void SetCurrentThreadToPerformanceCores();
++
++/// Windows: reserve two physical cores for the split GPU front and back threads. Guest core
++/// threads are kept on the remaining cores, so they cannot preempt either GPU thread.
++enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore };
++void PinCurrentThread(PinnedRole role);
+ void SetCurrentThreadToEfficiencyCores();
+ void SetCurrentThreadToBackgroundWork();
+ void SetCurrentThreadToAllCores();
+--- a/src/core/cpu_manager.cpp
++++ b/src/core/cpu_manager.cpp
+@@ -174,6 +174,7 @@
+     std::string name = is_multicore ? ("CPUCore_" + std::to_string(core)) : std::string{"CPUThread"};
+     Common::SetCurrentThreadName(name.c_str());
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
++    Common::PinCurrentThread(Common::PinnedRole::GuestCore);
+     Common::SetCurrentThreadToPerformanceCores();
+     auto& data = core_data[core];
+     data.host_context = Common::Fiber::ThreadToFiber();
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -52,6 +52,7 @@
+         Common::SetCurrentThreadName("GPU");
+         VideoCommon::GpuSplit::MarkGpuThread();
+         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
++        Common::PinCurrentThread(Common::PinnedRole::GpuFront);
+         Common::SetCurrentThreadToPerformanceCores();
+         system.RegisterHostThread();
+         // Before any zone: the switch may have been set after startup (nx2_profile.h).
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -565,6 +565,7 @@
+     on_back_thread = true;
+     back_running.store(true, std::memory_order_release);
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
++    Common::PinCurrentThread(Common::PinnedRole::GpuBack);
+     Common::SetCurrentThreadToPerformanceCores();
+     system->RegisterHostThread();
+ #ifdef _WIN32

@@ -1,0 +1,99 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] oot: Max Resolution on by default, and the copy buffers that paid for it
+
+Ocarina of Time's built-in Max Resolution patch takes the game's "dynamic resolution disabled" path
+so the 3D renders at full scale instead of following the GPU-time controller. Lichii has it on; this
+port had it opt-in for one stated reason - "the bigger render targets come out of the same memory
+pool that ends a session".
+
+That reason was measured against this build and does not hold up as the cause. The newest 145 s PS5
+run has the patch OFF and still finishes with VMA heap 1 at 6274 MiB of 6422, 148 MiB free, deleting
+3615 images and downloading 669 in its last 600-frame window, with the present frame time gone from
+32 ms to 61 ms. The tightness is there without the patch. What causes it is the fixed pair
+EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB: they overwrite the collector's thresholds after
+it has computed them from the live budget, margin and block slack, which is the one calculation that
+knows how much room the session actually has. Unset, that calculation runs, and the pressure margin
+comes off its result.
+
+Against that, this patch's own cost is small and now known: one 32-bit render target at 1920x1080 is
+7.9 MiB against 1.6 MiB at the 854x480 floor, so about +6.3 MiB, and a colour/depth pair about
++12.7 MiB - roughly one texture, against the ~1 GiB the adaptive thresholds keep back.
+
+So the table is on unless EDEN_NX2_OOT_MAX_RESOLUTION=0, and the copy-buffer retention goes from 60
+frames to 600. A copy buffer is one per power of two, sized to the largest copy of that class, so at
+60 frames a 2560x1440 one (16 MiB) and a 4096x4096 one (64 MiB) were destroyed and made again
+repeatedly. 600 is the value the upstream build was tested at, and it bounds them, where unset used
+to mean "kept until the process ends".
+
+What this can break. If the heap is still tight after the overrides are unset, this adds pressure on
+top of it rather than being neutral, and the failure looks like the older log - "Out of device
+memory: keeping N MiB more free" repeating and the thresholds walking down. The escape is
+EDEN_NX2_OOT_MAX_RESOLUTION=0, one line in env.txt, no new build.
+
+What it deliberately does not do. The analysis proposes a further step: protecting the active
+full-scale colour/depth images from the collector and allocating them dedicated. It is not here
+because its evidence is inference - the churn counters count all texture-cache images, and the report
+could not show the full-scale targets are the churned ones - and because exempting images the wrong
+way "would convert a cache pressure problem into an immediate heap failure". If the console session
+shows pressure, that is the next change, not this one.
+
+Measured, not a guess: the heap figures, the churn counts and the frame times are from that log; the
+per-target MiB are computed from the formats' 32 bits per pixel at 854x480 and 1920x1080. The effect
+of turning the patch on is not yet console-tested. The proof lines are "Applying built-in patch "Max
+Resolution (built-in)" at main+0x805bd0" from patch_manager.cpp, the "Memory margins: base ...,
+out of memory ..., block slack ..." line, and the absence of "Out of device memory: keeping N MiB
+more free".
+
+diff --git a/src/core/file_sys/patch_manager.cpp b/src/core/file_sys/patch_manager.cpp
+index 1245039624..caa2f06a1d 100644
+--- a/src/core/file_sys/patch_manager.cpp
++++ b/src/core/file_sys/patch_manager.cpp
+@@ -73,12 +73,17 @@ constexpr std::array BUILTIN_PATCHES{
+     },
+ };
+ 
+-// EDEN_NX2_OOT_MAX_RESOLUTION=1 applies the table. Lichii has it on by default; here it is opt-in,
+-// because the bigger render targets come out of the same memory pool that ends a session.
++// On by default, as Lichii has it. The bigger render targets do come out of the same memory pool that
++// ends a session, so this went in opt-in; what changed is that the pool's tightness was measured to
++// be there with the patch off - VMA heap 6274 MiB of 6422 in a 145 s run, 148 MiB free - and to be
++// the fixed EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB overrides defeating the collector's
++// own budget calculation, not this patch. One 32-bit render target costs about 6.3 MiB more than the
++// 854x480 floor and a colour/depth pair about 12.7 MiB, against the ~1 GiB the adaptive thresholds
++// keep back. EDEN_NX2_OOT_MAX_RESOLUTION=0 turns the table off.
+ [[nodiscard]] bool BuiltinPatchesEnabled() {
+     static const bool enabled = [] {
+         const char* const value = std::getenv("EDEN_NX2_OOT_MAX_RESOLUTION");
+-        return value != nullptr && value[0] == '1';
++        return value == nullptr || value[0] != '0';
+     }();
+     return enabled;
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 55ec1a18b0..454f950d93 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -2797,13 +2797,18 @@ void TextureCacheRuntime::TickFrame() {
+     // buffer from GetTemporaryBuffer (one per power of two, the size of the largest copy of that
+     // class so far) that no copy has used for this many frames, and that the GPU is past, is
+     // destroyed; the next copy of that size makes it again.
++    // 600 by default: at 60 a copy buffer was destroyed and made again repeatedly, and 600 is the
++    // value the upstream build was tested at. Unset no longer means "kept for the session", which is
++    // what made a 2560x1440 copy 16 MiB and a 4096x4096 one 64 MiB until the process ended; =0 still
++    // asks for that.
+     static const u32 temp_buffer_frames = [] {
+         const char* const value = std::getenv("EDEN_NX2_TC_TEMP_BUFFER_FRAMES");
+-        const u32 frames = value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+-        if (frames != 0) {
+-            LOG_INFO(Render_Vulkan, "EDEN_NX2_TC_TEMP_BUFFER_FRAMES={}: copy buffers unused for {} frames are destroyed",
+-                     value, frames);
+-        }
++        const u32 frames =
++            value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 600U;
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_NX2_TC_TEMP_BUFFER_FRAMES={}: copy buffers unused for {} frames are "
++                 "destroyed",
++                 value != nullptr ? value : "600 (default)", frames);
+         return frames;
+     }();
+     if (temp_buffer_frames != 0) {

@@ -1,0 +1,57 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] texture_cache: give the pressure margin back on real headroom
+
+pressure_margin is what "Out of device memory: keeping N MiB more free" raises, 512 MiB at a
+time, under the budget. Recovery is one 128 MiB step per 600 frames with no new pressure event.
+Pressure that arrives in bursts resets that counter every time, so the margin never comes back.
+A 445-second run walked it 2560/3328 -> 2048/2816 -> 1536/2304 -> 1024/1792 -> 1024/1280 ->
+1024/1024 and stayed at the floor for the last 253 reports.
+
+At the floor the collector runs every frame (total_used_memory > minimum_memory) and in
+aggressive mode evicts anything not touched for ten frames, so intermittently used images are
+deleted and re-created every frame: created 6616, deleted 6490, downloaded 2043 images in 600
+frames. That churn is the flicker.
+
+Recover from the driver's own free figure instead: half the margin back once it reports the
+margin plus a gigabyte free, and only after 120 frames of that headroom. A run that still needs
+the room keeps it - any new pressure event resets the counter and raises the margin again.
+
+What this can break: if the driver reports free memory that a fragmented heap cannot actually
+hand out, the collector gives room back too early, allocations fail again, and images go
+unbacked (black or flickering textures) or the session dies. The extra gigabyte over the
+margin, and the 120-frame stretch, make that unlikely; they are not a guarantee. The step is
+512 MiB, the same size the pressure path takes, so a wrong guess is undone by the next event.
+
+Checked: applies to the tree the 0410-0413 stack produces. Not run on a console.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -616,9 +616,24 @@
+                         budget_check_frames = 0; // thresholds are recomputed below
+                         LOG_WARNING(HW_GPU, "Out of device memory: keeping {} MiB more free",
+                                     pressure_margin >> 20);
+-                    } else if (pressure_margin != 0 && ++pressure_quiet_frames % 600 == 0) {
+-                        pressure_margin -= (std::min)(pressure_margin, 128_MiB);
+-                        budget_check_frames = 0;
++                    } else if (pressure_margin != 0) {
++                        // Give the room back on the driver's own free figure, not on an event-free
++                        // interval: bursty pressure reset that counter every time, so the margin
++                        // never came back and the collector evicted live images every frame.
++                        if constexpr (requires { runtime.GetDeviceMemoryUsage(); }) {
++                            const u64 budget = runtime.GetDeviceMemoryBudget();
++                            const u64 usage = runtime.GetDeviceMemoryUsage();
++                            const u64 free = budget > usage ? budget - usage : 0;
++                            if (free >= pressure_margin + 1_GiB) {
++                                if (++pressure_quiet_frames >= 120) {
++                                    pressure_margin -= (std::min)(pressure_margin, 512_MiB);
++                                    pressure_quiet_frames = 0;
++                                    budget_check_frames = 0;
++                                }
++                            } else {
++                                pressure_quiet_frames = 0;
++                            }
++                        }
+                     }
+                 }
+             }

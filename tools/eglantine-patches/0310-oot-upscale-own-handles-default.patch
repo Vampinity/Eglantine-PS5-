@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] kepler_compute: use the native program handles for Ocarina upscale fallback by default
+
+Ocarina of Time (0400486024DEC000) only; other titles retain their existing switches.
+
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -975,7 +975,17 @@
+     // then a 64x36 with a 128x72 one, and blitted those while the real output stayed black. A
+     // dispatch where such a program's own handles form no pair is skipped. Programs whose own
+     // pair upscales (the movies' last pass) keep the old path. Same-size own pairs are allowed.
+-    static const bool handles_only = std::getenv("EDEN_NX2_UPSCALE_HANDLES_ONLY") != nullptr;
++    // Ocarina's network is a 1:1 native program. PR #614's contract is that a rejected
++    // dispatch may copy only its own TEX/TLD/TLD4 and SUST.P images; the cbuf0 guess can
++    // blit a lookup texture over the frame. Keep the explicit switch for other titles, but
++    // make the safe own-handles rule the Ocarina default (0 remains an escape hatch).
++    static const bool handles_only = [] {
++        const char* const value = std::getenv("EDEN_NX2_UPSCALE_HANDLES_ONLY");
++        if (Settings::GetCurrentProgramID() != 0x0400486024DEC000ULL) {
++            return value != nullptr;
++        }
++        return value == nullptr || value[0] != '0';
++    }();
+     static std::unordered_set<GPUVAddr> own_pair_programs; // 1:1 networks seen so far
+     // EDEN_NX2_UPSCALE_SOURCE_SIZE=<width>x<height>, or "half" (the output's size over 2): for a
+     // 1:1 network, the copy's source is an image of that size in the output's format, looked for
+-- 
+2.54.0

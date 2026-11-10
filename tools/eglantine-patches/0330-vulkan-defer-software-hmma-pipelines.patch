@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 00:00:00 +0000
+Subject: [PATCH] vulkan: defer software HMMA compute pipelines off wait paths
+
+Software HMMA compute pipelines on AMD/RADV can spend minutes in the driver
+and fail with VK_ERROR_OUT_OF_HOST_MEMORY. Build them on a single worker not
+waited on by disk-cache loading or the GPU thread, and skip their dispatches
+until the pipeline is ready. EDEN_NX2_DEFER_MATRIX_PIPELINES=1/0 forces the
+A/B choice.
+
+Port of zortos293/Lichii b856439571e2c7103de35653cae6f9e3838ea30d, adapted to
+Eglantine's ComputePipeline and PipelineCache APIs.
+
+---
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 9cbe7e0339..e4fe69aba3 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -1012,6 +1012,23 @@ FN_MAX_LIMIT_LIST
+         return has_broken_compute;
+     }
+ 
++    /// AMD's drivers can spend minutes on Ocarina's software HMMA compute pipelines and then fail
++    /// them with VK_ERROR_OUT_OF_HOST_MEMORY. Build those pipelines on a worker whose queue is not
++    /// waited on by disk-cache loading or the GPU thread; dispatches are skipped until ready.
++    /// EDEN_NX2_DEFER_MATRIX_PIPELINES=1/0 forces this on/off for driver A/B tests.
++    bool DefersSoftwareMatrixPipelines() const {
++        static const char forced = [] {
++            const char* const value = std::getenv("EDEN_NX2_DEFER_MATRIX_PIPELINES");
++            return value == nullptr ? '\0' : value[0];
++        }();
++        if (forced == '0' || forced == '1') {
++            return forced == '1';
++        }
++        const VkDriverIdKHR id = GetDriverID();
++        return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
++               id == VK_DRIVER_ID_MESA_RADV;
++    }
++
+     /// Returns true when the device does not properly support cube compatibility.
+     bool HasBrokenCubeImageCompatibility() const {
+         return has_broken_cube_compatibility;
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index 82b39107fb..420714af0b 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -40,7 +40,8 @@ public:
+                              Common::ThreadWorker* thread_worker,
+                              PipelineStatistics* pipeline_statistics,
+                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
+-                             vk::ShaderModule spv_module, u64 shader_hash);
++                             vk::ShaderModule spv_module, u64 shader_hash,
++                             bool skip_until_built = false);
+ 
+     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
+     ComputePipeline(ComputePipeline&&) noexcept = delete;
+@@ -73,6 +74,8 @@ private:
+     DescriptorBufferRing& descriptor_buffer_ring;
+     Shader::Info info;
+     u64 shader_hash{};
++    /// Built on a worker that disk-cache loading and dispatches do not wait for.
++    bool skip_until_built{};
+     u32 num_descriptor_entries{};
+ 
+     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index a82fc8cefa..7de3d51942 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <vector>
+ 
+ #include <boost/container/small_vector.hpp>
+@@ -39,11 +40,13 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+                                  Common::ThreadWorker* thread_worker,
+                                  PipelineStatistics* pipeline_statistics,
+                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
+-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
++                                 vk::ShaderModule spv_module_, u64 shader_hash_,
++                                 bool skip_until_built_)
+     : device{device_},
+       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
+       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
+-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
++      shader_hash{shader_hash_}, skip_until_built{skip_until_built_},
++      spv_module(std::move(spv_module_)) {
+     if (shader_notify) {
+         shader_notify->MarkShaderBuilding();
+     }
+@@ -118,11 +121,17 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+             .basePipelineHandle = 0,
+             .basePipelineIndex = 0,
+         };
++        const auto build_start = std::chrono::steady_clock::now();
++        const auto build_seconds = [&] {
++            return std::chrono::duration<double>(std::chrono::steady_clock::now() - build_start)
++                .count();
++        };
+         try {
+             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+         } catch (const vk::Exception& exception) {
+-            LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
+-                         exception.what());
++            LOG_CRITICAL(Render_Vulkan,
++                         "Driver rejected compute shader {:016X} after {:.1f} s: {}", shader_hash,
++                         build_seconds(), exception.what());
+             std::scoped_lock lock{build_mutex};
+             is_built = true;
+             build_condvar.notify_one();
+@@ -132,6 +141,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+             return;
+         }
+ 
++        if (skip_until_built) {
++            LOG_INFO(Render_Vulkan, "Deferred compute shader {:016X} built in {:.1f} s", shader_hash,
++                     build_seconds());
++        }
++
+         // Log compute pipeline creation
+         if (GPU::Logging::IsActive()) {
+             GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(
+@@ -162,6 +176,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
+                                 BufferCache& buffer_cache, TextureCache& texture_cache) {
++    if (skip_until_built && (!is_built.load(std::memory_order::acquire) || !pipeline)) {
++        // The deferred worker may still be in a multi-minute driver compile. Never let the GPU
++        // thread wait for it; the dispatch is retried by the guest on a later submission.
++        return false;
++    }
+     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+ 
+     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index a2978b2226..165b3d073a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -269,6 +269,9 @@ private:
+     std::atomic_bool flush_in_flight{};
+ 
+     Common::ThreadWorker workers;
++    /// Software HMMA compute pipelines on drivers that take minutes; disk loading and dispatches
++    /// do not wait for this single-worker queue.
++    Common::ThreadWorker deferred_workers;
+     Common::ThreadWorker serialization_thread;
+     DynamicFeatures dynamic_features;
+ };
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 19d4f28692..3c33caf619 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -466,6 +466,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+       }()},
+       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
++      deferred_workers(1, "VkDeferredPipelines", {}, Common::ThreadPlacement::Background),
+       serialization_thread(1, "VkPipelineSerialization", {},
+                            Common::ThreadPlacement::Background) {
+     const auto& float_control{device.FloatControlProperties()};
+@@ -2079,12 +2080,16 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+         std::scoped_lock lock{compute_null_slots_mutex};
+         compute_null_slots[key].slots = env.NullStoragePointerSlots();
+     }
+-    Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
++    const bool deferred = program.info.uses_software_matrix &&
++                          device.DefersSoftwareMatrixPipelines();
++    Common::ThreadWorker* const thread_worker{deferred            ? &deferred_workers
++                                              : build_in_parallel ? &workers
++                                                                  : nullptr};
+     return std::make_unique<ComputePipeline>(device, scheduler, vulkan_pipeline_cache, descriptor_pool,
+                                              guest_descriptor_queue, descriptor_buffer_ring,
+                                              thread_worker, statistics,
+                                              &shader_notify, program.info, std::move(spv_module),
+-                                             key.unique_hash);
++                                             key.unique_hash, deferred);
+ 
+ } catch (const Shader::Exception& exception) {
+     LOG_ERROR(Render_Vulkan, "{}", exception.what());

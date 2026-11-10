@@ -1,0 +1,69 @@
+Subject: [PATCH] video_core: poll current semaphores without draining GPU threads
+
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <atomic>
+ #include <cstdlib>
++#include <optional>
+ 
+ #include "common/assert.h"
+ #include "common/logging.h"
+@@ -73,6 +74,22 @@
+     return dma_pusher.memory_manager.Read<u32>(address);
+ }
+ 
++// A CPU-written semaphore is current when the buffer cache has no GPU copy to download. Reading it
++// directly avoids stopping the GPU back thread on every poll; GPU-written or queued values retain
++// the draining path below.
++std::optional<u32> SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    if (!split.Active()) {
++        return std::nullopt;
++    }
++    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
++    if (!device || dma_pusher.rasterizer->MustFlushRegion(*device, sizeof(u32),
++                                                          VideoCommon::CacheType::BufferCache)) {
++        return std::nullopt;
++    }
++    return dma_pusher.memory_manager.Read<u32>(address);
++}
++
+ } // Anonymous namespace
+ 
+ bool Puller::PendingAcquire::Matches(u32 current) const {
+@@ -91,6 +108,23 @@
+ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+     if (!pending_acquire) {
+         return true;
++    }
++    // CPU-written semaphore values are safe to poll without draining the back. Keep the old
++    // fence-release path for GPU-written or queued values, and retry it at most every millisecond.
++    if (const auto current = SemaphoreReadableNow(dma_pusher, pending_acquire->address)) {
++        if (pending_acquire->Matches(*current)) {
++            return true;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        const bool delayed = Settings::IsGPUFenceBehaviorDefault()
++                                 ? Settings::IsGPULevelHigh()
++                                 : Settings::IsGPUFenceBehaviorBalanced() ||
++                                       Settings::IsGPUFenceBehaviorAccurate();
++        if (!delayed || now - pending_acquire->last_fences < std::chrono::milliseconds{1}) {
++            return false;
++        }
++        pending_acquire->last_fences = now;
++        ReleaseFencesOnBack(dma_pusher.rasterizer);
+     }
+     // The release may still be queued for the split GPU thread's back half: ReadSemaphoreWord
+     // waits for it (and flushes the caches there).
+@@ -280,7 +314,8 @@
+             return;
+         }
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
++        if (const auto current = SemaphoreReadableNow(dma_pusher, acquire.address);
++            current && acquire.Matches(*current)) {
+             return;
+         }
+         // Registered before the fences run, so a release among them that meets the value counts

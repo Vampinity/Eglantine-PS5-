@@ -1,0 +1,36 @@
+From 8b4cdfb897000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 00:00:00 +0000
+Subject: [PATCH] vulkan: cap PS5 cold pipeline builders at four by default
+
+The cold Ocarina launch built pipelines on all 15 workers. The measured heap
+peaks were 3,552 MiB and 3,104 MiB, while warm launches were 1,600--1,900 MiB.
+Each builder retains compiler working memory and an arena, so the burst
+fragments the shared direct-memory pool before gameplay starts.
+
+Use four builders on PS5 unless EDEN_NX2_PIPELINE_WORKERS explicitly selects a
+different count. The existing switch remains the A/B escape hatch, and desktop
+builds keep their existing worker count.
+
+---
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -395,7 +395,14 @@ size_t GetTotalPipelineWorkers() {
+     }
+     return std::min(max_core_threads, desired);
+ #else
++#ifdef PS5_NATIVE
++    constexpr size_t DefaultPipelineWorkers = 4;
++    const size_t builders = (std::min)(max_core_threads, DefaultPipelineWorkers);
++    LOG_INFO(Render_Vulkan, "Pipeline builders: {} of {} (PS5 default)", builders, max_core_threads);
++    return builders;
++#else
+     return max_core_threads;
++#endif
+ #endif
+ }
+ 

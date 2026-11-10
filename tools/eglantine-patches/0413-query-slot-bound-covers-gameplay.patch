@@ -1,0 +1,59 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] query_cache: one bank is too low a limit for gameplay near water
+
+CloseCounter drops the running occlusion count when a query's slot count passes one bank
+(SamplesQueryBank::BANK_SIZE, 256 slots). ResetCounter is what "drop" means here: it calls
+AbandonCurrentQuery, so every sample the query had accumulated is gone. An occlusion report Ocarina's
+water surface switches on then reads the abandoned query, and the surface flips - the black,
+flickering water.
+
+Lichii raised this same bound four times for this same symptom: #558 to BANK_SIZE * 64 and
+#564/#566/#570 to keep water and windows under it, with the reason in their comment - "Gameplay near
+water and windows can exceed a single 256-slot bank, so the limit must not trigger there: reset only
+when the count grows far beyond anything gameplay reaches." This tree has the pre-fix bound and no
+logging at all, so a drop during play is silent.
+
+Take 32 banks (8,192 slots): far past any gameplay window, and well under the 16,384 slots over 64
+banks the title screen reaches on its own, so growth stays bounded. 32 banks is 64 KiB of query
+results against 128 KiB for the title screen. The drop is logged on the 1st, 2nd, 4th, 8th...
+
+What this can break: a query may now hold up to 32 banks alive instead of one. At 256 slots of u64 a
+bank that is 64 KiB per query rather than 2 KiB, and the title screen's own 64 banks already exceeded
+it - so the ceiling this changes is small. If a title counted without ever resetting, the bound is
+what stops the growth; it is now 32x further away, and the log line is there to show it being reached.
+
+Checked: the file differs from the tree the 0410/0411/0412 stack produces only in this hunk. Not run
+on a console.
+
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -236,9 +236,25 @@
+         PauseCounter();
+         // A title that counts without resetting or reporting grows the query by a slot at every
+         // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
+-        // Time's title screen and file select reached 16,384 slots over 64 banks (its gameplay
+-        // windows span at most 36 slots). Past a bank, drop the count as a reset would.
+-        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE) {
++        // Time's title screen and file select reached 16,384 slots over 64 banks.
++        //
++        // One bank is too low for gameplay. Lichii raised this same bound four times for this same
++        // symptom - zortos293/Lichii #558 to BANK_SIZE * 64, and #564/#566/#570 for the reason in
++        // their comment: "Gameplay near water and windows can exceed a single 256-slot bank, so the
++        // limit must not trigger there." A reset here abandons the running query (ResetCounter ->
++        // AbandonCurrentQuery), so the count it held is lost and the report the water surface
++        // switches on flips - the black, flickering water. 32 banks (8,192 slots) is far past any
++        // gameplay window and well under the 16,384 the title screen already reaches, so growth
++        // stays bounded: 32 banks is 64 KiB of query results, against 128 KiB for the title screen.
++        // Logged at the 1st, 2nd, 4th, 8th... drop, so a long window during play cannot go unnoticed.
++        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE * 32) {
++            static u64 bank_bound_resets{};
++            if ((++bank_bound_resets & (bank_bound_resets - 1)) == 0) {
++                LOG_INFO(Render_Vulkan,
++                         "Query slot count past 32 banks ({} slots): dropping it as a reset would "
++                         "({}th drop)",
++                         current_query->size_slots, bank_bound_resets);
++            }
+             ResetCounter();
+         }
+     }

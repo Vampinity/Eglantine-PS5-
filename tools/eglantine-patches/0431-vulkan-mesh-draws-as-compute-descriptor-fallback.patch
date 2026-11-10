@@ -1,0 +1,2064 @@
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index 8f3ecafb8d..b3deb0e0b4 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -286,13 +286,14 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
+         break;
+     case Stage::Task:
+         // Run as compute (mesh_compute_layout.h): a plain compute workgroup of the same size.
+-        execution_model =
+-            ctx.mesh_compute ? spv::ExecutionModel::GLCompute : spv::ExecutionModel::TaskEXT;
++        execution_model = (ctx.mesh_compute || ctx.runtime_info.mesh_as_compute)
++                               ? spv::ExecutionModel::GLCompute
++                               : spv::ExecutionModel::TaskEXT;
+         ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0], 1U,
+                              1U);
+         break;
+     case Stage::Mesh:
+-        if (ctx.mesh_compute) {
++        if (ctx.mesh_compute || ctx.runtime_info.mesh_as_compute) {
+             execution_model = spv::ExecutionModel::GLCompute;
+             ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0],
+                                  1U, 1U);
+@@ -501,7 +502,7 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
+     }
+     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+          info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&
+-        profile.support_vote && profile.SupportsSubgroupStage(ctx.stage)) {
++        profile.support_vote && ctx.SupportsSubgroups()) {
+         ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
+         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+         if (info.uses_subgroup_shuffles && profile.support_shuffle_relative) {
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.h b/src/shader_recompiler/backend/spirv/emit_spirv.h
+index c88f07c9ce..dc31af1f57 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.h
+@@ -39,4 +39,37 @@ constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area)
+     return EmitSPIRV(profile, {}, program, binding);
+ }
+ 
++/// Mesh emulation without VK_EXT_mesh_shader. The mesh program runs as a compute shader
++/// (RuntimeInfo::mesh_as_compute) that writes one block per workgroup to a u32 storage buffer:
++/// max_vertices * vertex_lines words (vertex v, line l at v * vertex_lines + l), then
++/// max_primitives * 3 vertex indices (0 0 0 past the primitive count, a degenerate triangle).
++[[nodiscard]] inline u32 MeshEmulationBlockWords(const MeshInfo& mesh) {
++    return mesh.max_vertices * static_cast<u32>(mesh.vertex_lines.size()) +
++           mesh.max_primitives * 3;
++}
++
++/// Vertex shader drawing the emulation's output as a triangle list of
++/// groups * max_primitives * 3 vertices, with the mesh program's vertex outputs. With a task
++/// program (args_binding != ~0) the blocks start at the arguments' MESH_EMULATION_ARGS_BASE.
++[[nodiscard]] std::vector<u32> EmitMeshEmulationVertex(const Profile& profile,
++                                                       const MeshInfo& mesh, u32 binding,
++                                                       u32 args_binding, bool convert_depth);
++
++/// Mesh emulation with a task program: push constants of the distribution pass.
++struct MeshEmulationDistributionConstants {
++    u32 tasks;
++    u32 payload_words;
++    u32 capacity_words;
++    u32 block_words;
++    u32 vertices_per_group;
++    u32 max_groups;
++};
++constexpr u32 MESH_EMULATION_ARGS_REQUESTED = 3;
++constexpr u32 MESH_EMULATION_DRAW_ARGS_OFFSET = 16;
++constexpr u32 MESH_EMULATION_ARGS_BASE = 8;
++constexpr u32 MESH_EMULATION_ARGS_TASKS = 9;
++constexpr u32 MESH_EMULATION_ARGS_WORDS = 10;
++
++[[nodiscard]] std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile);
++
+ } // namespace Shader::Backend::SPIRV
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+index f151b94cc6..c4f0ccabde 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+@@ -566,6 +566,13 @@ void EmitSetOFlag(EmitContext&) {
+ }
+ 
+ Id EmitWorkgroupId(EmitContext& ctx) {
++    if (Sirit::ValidId(ctx.mesh_group_index)) {
++        // Mesh emulation with a task: a mesh workgroup's index is within its task's, as in a
++        // mesh shader launched by a task shader.
++        const Id zero{ctx.u32_zero_value};
++        return ctx.OpCompositeConstruct(ctx.U32[3], ctx.OpLoad(ctx.U32[1], ctx.mesh_group_index),
++                                        zero, zero);
++    }
+     return ctx.OpLoad(ctx.U32[3], ctx.workgroup_id);
+ }
+ 
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+index de8148d7d5..a10896e9f5 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
+@@ -358,7 +358,43 @@ void MeshComputeEpilogue(EmitContext& ctx) {
+     }
+ }
+ 
++Id BufferWord(EmitContext& ctx, Id buffer, Id index) {
++    return ctx.OpAccessChain(ctx.mesh_output_u32, buffer, ctx.u32_zero_value, index);
++}
++
++Id WorkgroupX(EmitContext& ctx) {
++    return ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), 0U);
++}
++
++// Descriptor fallback: copy the task payload into the ordinary storage buffer consumed by the
++// distribution pass and by mesh workgroups.
++void ComputeTaskEpilogue(EmitContext& ctx) {
++    Barrier(ctx);
++    const u32 stride{ctx.runtime_info.mesh_task_payload_stride};
++    const u32 words{(std::min)(ctx.mesh_info.payload_words, stride)};
++    const Id block{ctx.OpIMul(ctx.U32[1], WorkgroupX(ctx), ctx.Const(stride))};
++    const Id invocation{LocalInvocation(ctx)};
++    const u32 threads{(std::max)(ctx.mesh_threads, 1U)};
++    for (u32 first = 0; first < words; first += threads) {
++        const Id word{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
++        const auto copy = [&] {
++            ctx.OpStore(BufferWord(ctx, ctx.mesh_task_payload_buffer,
++                                   ctx.OpIAdd(ctx.U32[1], block, word)),
++                        ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, word)));
++        };
++        if (first + threads > words) {
++            If(ctx, ctx.OpULessThan(ctx.U1, word, ctx.Const(words)), copy);
++        } else {
++            copy();
++        }
++    }
++}
++
+ void TaskEpilogue(EmitContext& ctx) {
++    if (ctx.runtime_info.mesh_as_compute) {
++        ComputeTaskEpilogue(ctx);
++        return;
++    }
+     Barrier(ctx);
+     const Id written{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(1U)))};
+     const Id count{MeshBounds() ? ctx.OpUMin(ctx.U32[1], written, ctx.Const(MaxMeshWorkgroupsPerTask))
+@@ -370,8 +406,91 @@ void TaskEpilogue(EmitContext& ctx) {
+     ctx.mesh_tasks_marker = {count, one, one, ctx.mesh_payload};
+ }
+ 
++Id OutputWord(EmitContext& ctx, Id index) {
++    return ctx.OpAccessChain(ctx.mesh_output_u32, ctx.mesh_output_buffer, ctx.u32_zero_value,
++                             index);
++}
++
++// Mesh emulation (RuntimeInfo::mesh_as_compute): writes this workgroup's block of the output
++// buffer, laid out as MeshEmulationBlockWords describes, instead of the mesh outputs.
++void ComputeMeshEpilogue(EmitContext& ctx) {
++    const MeshInfo& mesh{ctx.mesh_info};
++    Barrier(ctx);
++    const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
++    const u32 vertex_words{mesh.max_vertices * vertex_lines};
++    const Id workgroup{
++        ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), 0U)};
++    Id block{ctx.OpIMul(ctx.U32[1], workgroup, ctx.Const(MeshEmulationBlockWords(mesh)))};
++    if (Sirit::ValidId(ctx.mesh_task_args_buffer)) {
++        // With a task program the draw's blocks start where the distribution pass put them.
++        block = ctx.OpIAdd(ctx.U32[1], block,
++                           ctx.OpLoad(ctx.U32[1], BufferWord(ctx, ctx.mesh_task_args_buffer,
++                                                             ctx.Const(MESH_EMULATION_ARGS_BASE))));
++    }
++    const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
++                              ctx.Const(mesh.max_primitives))};
++    const Id invocation{LocalInvocation(ctx)};
++    const u32 threads{ctx.mesh_threads};
++
++    // Vertex v, line l: output word v * vertex_lines + l, from the stage buffer's line groups.
++    for (u32 first = 0; first < mesh.max_vertices; first += threads) {
++        const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
++        const auto copy = [&] {
++            const Id group{ctx.OpShiftRightLogical(ctx.U32[1], vertex, ctx.Const(5U))};
++            const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], vertex, ctx.Const(31U))};
++            const Id source{ctx.OpIAdd(
++                ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(vertex_lines * 32)), slot)};
++            const Id destination{ctx.OpIAdd(
++                ctx.U32[1], block, ctx.OpIMul(ctx.U32[1], vertex, ctx.Const(vertex_lines)))};
++            for (u32 line = 0; line < vertex_lines; ++line) {
++                const Id word{ctx.OpLoad(
++                    ctx.U32[1],
++                    SharedWord(ctx, ctx.mesh_attributes,
++                               ctx.OpIAdd(ctx.U32[1], source, ctx.Const(line * 32))))};
++                ctx.OpStore(OutputWord(ctx, ctx.OpIAdd(ctx.U32[1], destination, ctx.Const(line))),
++                            word);
++            }
++        };
++        if (first + threads > mesh.max_vertices) {
++            If(ctx, ctx.OpULessThan(ctx.U1, vertex, ctx.Const(mesh.max_vertices)), copy);
++        } else {
++            copy();
++        }
++    }
++    // Primitive p: its three vertex indices, or 0 0 0 (a degenerate triangle) past the count.
++    const Id index_base{ctx.OpIAdd(ctx.U32[1], block, ctx.Const(vertex_words))};
++    for (u32 first = 0; first < mesh.max_primitives; first += threads) {
++        const Id primitive{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
++        const auto write = [&] {
++            const Id used{ctx.OpULessThan(ctx.U1, primitive, count)};
++            const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)),
++                                     ctx.Const(4U))};
++            const Id destination{ctx.OpIAdd(
++                ctx.U32[1], index_base, ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)))};
++            for (u32 element = 0; element < 3; ++element) {
++                const Id map_index{
++                    Clamped(ctx, ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element)),
++                            ctx.mesh_map_bytes)};
++                const Id value{ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, map_index))};
++                ctx.OpStore(
++                    OutputWord(ctx, ctx.OpIAdd(ctx.U32[1], destination, ctx.Const(element))),
++                    ctx.OpSelect(ctx.U32[1], used, value, ctx.u32_zero_value));
++            }
++        };
++        if (first + threads > mesh.max_primitives) {
++            If(ctx, ctx.OpULessThan(ctx.U1, primitive, ctx.Const(mesh.max_primitives)), write);
++        } else {
++            write();
++        }
++    }
++}
++
+ void MeshEpilogue(EmitContext& ctx) {
+     const MeshInfo& mesh{ctx.mesh_info};
++    if (ctx.runtime_info.mesh_as_compute) {
++        ComputeMeshEpilogue(ctx);
++        return;
++    }
+     Barrier(ctx);
+     const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
+                               ctx.Const(mesh.max_primitives))};
+@@ -466,10 +585,16 @@ Id EmitIsbeRead(EmitContext& ctx, Id address) {
+     }
+     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
+     const Id word{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index))};
++    if (ctx.runtime_info.mesh_as_compute) {
++        const Id own_index{Sirit::ValidId(ctx.mesh_group_index)
++                               ? ctx.OpLoad(ctx.U32[1], ctx.mesh_group_index)
++                               : workgroup};
++        return ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, address, ctx.u32_zero_value),
++                            own_index, word);
++    }
+     return ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, address, ctx.u32_zero_value), workgroup,
+                         word);
+ }
+-
+ void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value) {
+     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
+     if (ctx.stage == Stage::Task) {
+@@ -497,9 +622,89 @@ void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value) {
+ }
+ 
+ void EmitMeshPrologue(EmitContext& ctx) {
++    const bool as_compute{ctx.runtime_info.mesh_as_compute};
++    if (as_compute) {
++        // Descriptor fallback keeps task payload in ordinary workgroup memory until the task
++        // epilogue copies it to the per-draw payload buffer.
++        if (ctx.stage == Stage::Task) {
++            ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
++            Barrier(ctx);
++            return;
++        }
++        if (ctx.stage != Stage::Mesh) {
++            return;
++        }
++        ctx.OpStore(ctx.mesh_primitive_count, ctx.u32_zero_value);
++        Barrier(ctx);
++        const Id invocation{LocalInvocation(ctx)};
++        const u32 step{(std::max)(ctx.mesh_threads, 1U)};
++        const u32 words{(std::max)(ctx.mesh_info.payload_words, 1U)};
++        if (Sirit::ValidId(ctx.mesh_group_index)) {
++            // Find the task owning this mesh workgroup in the distribution offsets table.
++            const Id global{WorkgroupX(ctx)};
++            const Id tasks{ctx.OpLoad(ctx.U32[1], BufferWord(
++                ctx, ctx.mesh_task_args_buffer, ctx.Const(MESH_EMULATION_ARGS_TASKS)))};
++            const Id last{ctx.OpISub(ctx.U32[1],
++                                     ctx.OpUMax(ctx.U32[1], tasks, ctx.Const(1U)), ctx.Const(1U))};
++            Id task{ctx.u32_zero_value};
++            Id remaining{tasks};
++            for (u32 i = 0; i < 17; ++i) {
++                const Id half{ctx.OpShiftRightLogical(ctx.U32[1], remaining, ctx.Const(1U))};
++                const Id middle{ctx.OpUMin(ctx.U32[1],
++                                           ctx.OpIAdd(ctx.U32[1], task, half), last)};
++                const Id first{ctx.OpLoad(ctx.U32[1],
++                                          BufferWord(ctx, ctx.mesh_task_offsets_buffer, middle))};
++                task = ctx.OpSelect(ctx.U32[1], ctx.OpULessThanEqual(ctx.U1, first, global), middle,
++                                    task);
++                remaining = ctx.OpISub(ctx.U32[1], remaining, half);
++            }
++            const Id first_group{ctx.OpLoad(
++                ctx.U32[1], BufferWord(ctx, ctx.mesh_task_offsets_buffer, task))};
++            ctx.OpStore(ctx.mesh_group_index, ctx.OpISub(ctx.U32[1], global, first_group));
++            const u32 stride{(std::max)(ctx.runtime_info.mesh_task_payload_stride, 1U)};
++            const Id block{ctx.OpIMul(ctx.U32[1], task, ctx.Const(stride))};
++            for (u32 first = 0; first < words; first += step) {
++                const Id word{ctx.OpUMin(ctx.U32[1],
++                                         ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)),
++                                         ctx.Const(words - 1))};
++                const Id source{ctx.OpUMin(ctx.U32[1], word, ctx.Const(stride - 1))};
++                const Id value{ctx.OpLoad(
++                    ctx.U32[1], BufferWord(ctx, ctx.mesh_task_payload_buffer,
++                                           ctx.OpIAdd(ctx.U32[1], block, source)))};
++                ctx.OpStore(PayloadWord(ctx, word),
++                            ctx.OpSelect(ctx.U32[1], ctx.OpULessThan(ctx.U1, word, ctx.Const(stride)),
++                                         value, ctx.u32_zero_value));
++            }
++        } else {
++            for (u32 first = 0; first < words; first += step) {
++                const Id word{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
++                ctx.OpStore(PayloadWord(ctx, ctx.OpUMin(ctx.U32[1], word, ctx.Const(words - 1))),
++                            ctx.u32_zero_value);
++            }
++        }
++        // Initialize unwritten positions to NaN so degenerate/unwritten vertices are discarded.
++        const auto& lines{ctx.mesh_info.vertex_lines};
++        const u32 num_lines{static_cast<u32>(lines.size())};
++        for (u32 line = 0; line < num_lines; ++line) {
++            const auto attribute{static_cast<IR::Attribute>(lines[line])};
++            if (attribute < IR::Attribute::PositionX || attribute > IR::Attribute::PositionW) {
++                continue;
++            }
++            for (u32 first = 0; first < ctx.mesh_info.max_vertices; first += step) {
++                const Id vertex{ctx.OpUMin(ctx.U32[1],
++                                           ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)),
++                                           ctx.Const(ctx.mesh_info.max_vertices - 1))};
++                const Id group{ctx.OpShiftRightLogical(ctx.U32[1], vertex, ctx.Const(5U))};
++                const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], vertex, ctx.Const(31U))};
++                const Id index{ctx.OpIAdd(
++                    ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(num_lines * 32)),
++                    ctx.OpIAdd(ctx.U32[1], slot, ctx.Const(line * 32)))};
++                ctx.OpStore(SharedWord(ctx, ctx.mesh_attributes, index), ctx.Const(0x7fc00000U));
++            }
++        }
++        return;
++    }
+     if (ctx.stage == Stage::Task && MeshBounds()) {
+-        // The mesh workgroup count starts at zero: the payload is workgroup memory, undefined until
+-        // written, and a program that launches no mesh workgroups on some path may not write it.
+         ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
+         Barrier(ctx);
+         return;
+@@ -510,8 +715,6 @@ void EmitMeshPrologue(EmitContext& ctx) {
+     if (ctx.mesh_compute) {
+         MeshComputePrologue(ctx);
+     }
+-    // Every invocation stores the zero: no branch here, the entry block's label is a phi
+-    // predecessor for later blocks.
+     ctx.OpStore(ctx.mesh_primitive_count, ctx.u32_zero_value);
+     Barrier(ctx);
+ }
+@@ -532,4 +735,276 @@ void EmitMeshEpilogue(EmitContext& ctx) {
+     }
+ }
+ 
++std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo& mesh, u32 binding,
++                                         u32 args_binding, bool convert_depth) {
++    Sirit::Module module{profile.supported_spirv};
++    module.AddCapability(spv::Capability::Shader);
++    module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
++    module.AddExtension("SPV_KHR_storage_buffer_storage_class");
++
++    const Id void_type{module.TypeVoid()};
++    const Id u32_type{module.TypeInt(32, false)};
++    const Id s32_type{module.TypeInt(32, true)};
++    const Id f32_type{module.TypeFloat(32)};
++    const Id vec4_type{module.TypeVector(f32_type, 4)};
++    const auto constant = [&](u32 value) { return module.Constant(u32_type, value); };
++    const Id zero_f{module.Constant(f32_type, 0.0f)};
++    const Id one_f{module.Constant(f32_type, 1.0f)};
++    const std::array<Id, 4> default_components{zero_f, zero_f, zero_f, one_f};
++    const Id default_vec4{module.ConstantComposite(vec4_type, default_components)};
++
++    // The compute pass's output buffer.
++    const Id array_type{module.TypeRuntimeArray(u32_type)};
++    module.Decorate(array_type, spv::Decoration::ArrayStride, 4U);
++    const Id struct_type{module.TypeStruct(array_type)};
++    module.Decorate(struct_type, spv::Decoration::Block);
++    module.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
++    module.MemberDecorate(struct_type, 0, spv::Decoration::NonWritable);
++    const Id buffer{module.AddGlobalVariable(
++        module.TypePointer(spv::StorageClass::StorageBuffer, struct_type),
++        spv::StorageClass::StorageBuffer)};
++    module.Decorate(buffer, spv::Decoration::Binding, binding);
++    module.Decorate(buffer, spv::Decoration::DescriptorSet, 0U);
++    module.Name(buffer, "mesh_emulation_output");
++    const Id buffer_u32{module.TypePointer(spv::StorageClass::StorageBuffer, u32_type)};
++    Id args{};
++    if (args_binding != ~0U) {
++        args = module.AddGlobalVariable(
++            module.TypePointer(spv::StorageClass::StorageBuffer, struct_type),
++            spv::StorageClass::StorageBuffer);
++        module.Decorate(args, spv::Decoration::Binding, args_binding);
++        module.Decorate(args, spv::Decoration::DescriptorSet, 0U);
++        module.Name(args, "mesh_emulation_task_args");
++    }
++
++    std::vector<Id> interfaces;
++    const Id vertex_index{module.AddGlobalVariable(
++        module.TypePointer(spv::StorageClass::Input, s32_type), spv::StorageClass::Input)};
++    module.Decorate(vertex_index, spv::Decoration::BuiltIn, spv::BuiltIn::VertexIndex);
++    interfaces.push_back(vertex_index);
++    const Id output_vec4{module.TypePointer(spv::StorageClass::Output, vec4_type)};
++    const Id output_f32{module.TypePointer(spv::StorageClass::Output, f32_type)};
++    const Id position{module.AddGlobalVariable(output_vec4, spv::StorageClass::Output)};
++    module.Decorate(position, spv::Decoration::BuiltIn, spv::BuiltIn::Position);
++    interfaces.push_back(position);
++    std::array<Id, IR::NUM_GENERICS> generics{};
++    for (const u32 line : mesh.vertex_lines) {
++        const IR::Attribute attribute{line};
++        if (!IR::IsGeneric(attribute)) {
++            continue;
++        }
++        const u32 index{IR::GenericAttributeIndex(attribute)};
++        if (!Sirit::ValidId(generics[index])) {
++            generics[index] = module.AddGlobalVariable(output_vec4, spv::StorageClass::Output);
++            module.Decorate(generics[index], spv::Decoration::Location, index);
++            interfaces.push_back(generics[index]);
++        }
++    }
++    if (profile.supported_spirv >= 0x00010400) {
++        interfaces.push_back(buffer);
++        if (Sirit::ValidId(args)) {
++            interfaces.push_back(args);
++        }
++    }
++
++    const Id main{module.OpFunction(void_type, spv::FunctionControlMask::MaskNone,
++                                    module.TypeFunction(void_type))};
++    module.AddLabel();
++    const auto load = [&](Id word_index) {
++        return module.OpLoad(u32_type, module.OpAccessChain(buffer_u32, buffer, constant(0),
++                                                             word_index));
++    };
++    const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
++    const u32 max_primitives{(std::max)(mesh.max_primitives, 1U)};
++    // Vertex i of the draw: corner i % 3 of primitive slot i / 3, which belongs to workgroup
++    // slot / max_primitives.
++    const Id draw_vertex{module.OpBitcast(u32_type, module.OpLoad(s32_type, vertex_index))};
++    const Id slot{module.OpUDiv(u32_type, draw_vertex, constant(3))};
++    const Id corner{module.OpUMod(u32_type, draw_vertex, constant(3))};
++    const Id workgroup{module.OpUDiv(u32_type, slot, constant(max_primitives))};
++    const Id primitive{module.OpUMod(u32_type, slot, constant(max_primitives))};
++    Id block{module.OpIMul(u32_type, workgroup, constant(MeshEmulationBlockWords(mesh)))};
++    if (Sirit::ValidId(args)) {
++        block = module.OpIAdd(
++            u32_type, block,
++            module.OpLoad(u32_type, module.OpAccessChain(buffer_u32, args, constant(0),
++                                                         constant(MESH_EMULATION_ARGS_BASE))));
++    }
++    const Id index_word{module.OpIAdd(
++        u32_type, module.OpIAdd(u32_type, block, constant(mesh.max_vertices * vertex_lines)),
++        module.OpIAdd(u32_type, module.OpIMul(u32_type, primitive, constant(3)), corner))};
++    const Id vertex{module.OpUMin(u32_type, load(index_word),
++                                  constant((std::max)(mesh.max_vertices, 1U) - 1))};
++    const Id vertex_base{
++        module.OpIAdd(u32_type, block, module.OpIMul(u32_type, vertex, constant(vertex_lines)))};
++
++    module.OpStore(position, default_vec4);
++    for (const Id generic : generics) {
++        if (Sirit::ValidId(generic)) {
++            module.OpStore(generic, default_vec4);
++        }
++    }
++    Id position_z{}, position_w{};
++    for (u32 line = 0; line < vertex_lines; ++line) {
++        const IR::Attribute attribute{mesh.vertex_lines[line]};
++        const Id value{module.OpBitcast(
++            f32_type, load(module.OpIAdd(u32_type, vertex_base, constant(line))))};
++        if (attribute >= IR::Attribute::PositionX && attribute <= IR::Attribute::PositionW) {
++            const u32 element{static_cast<u32>(attribute) -
++                              static_cast<u32>(IR::Attribute::PositionX)};
++            module.OpStore(module.OpAccessChain(output_f32, position, constant(element)), value);
++            if (element == 2) {
++                position_z = value;
++            } else if (element == 3) {
++                position_w = value;
++            }
++        } else if (IR::IsGeneric(attribute)) {
++            module.OpStore(module.OpAccessChain(output_f32,
++                                                generics[IR::GenericAttributeIndex(attribute)],
++                                                constant(IR::GenericAttributeElement(attribute))),
++                           value);
++        }
++    }
++    // OpenGL-style clip space, as the mesh epilogue's ConvertDepth: z = (z + w) / 2.
++    if (convert_depth && Sirit::ValidId(position_z) && Sirit::ValidId(position_w)) {
++        const Id z{module.OpFMul(f32_type, module.OpFAdd(f32_type, position_z, position_w),
++                                 module.Constant(f32_type, 0.5f))};
++        module.OpStore(module.OpAccessChain(output_f32, position, constant(2)), z);
++    }
++    module.OpReturn();
++    module.OpFunctionEnd();
++    module.AddEntryPoint(spv::ExecutionModel::Vertex, main, "main", interfaces);
++    return module.Assemble();
++}
++
++std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
++    Sirit::Module module{profile.supported_spirv};
++    module.AddCapability(spv::Capability::Shader);
++    module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
++    module.AddExtension("SPV_KHR_storage_buffer_storage_class");
++
++    const Id void_type{module.TypeVoid()};
++    const Id bool_type{module.TypeBool()};
++    const Id u32_type{module.TypeInt(32, false)};
++    const auto constant = [&](u32 value) { return module.Constant(u32_type, value); };
++
++    const Id array_type{module.TypeRuntimeArray(u32_type)};
++    module.Decorate(array_type, spv::Decoration::ArrayStride, 4U);
++    const Id struct_type{module.TypeStruct(array_type)};
++    module.Decorate(struct_type, spv::Decoration::Block);
++    module.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
++    const Id buffer_pointer{module.TypePointer(spv::StorageClass::StorageBuffer, struct_type)};
++    const Id buffer_u32{module.TypePointer(spv::StorageClass::StorageBuffer, u32_type)};
++    std::vector<Id> interfaces;
++    const auto define_buffer = [&](u32 binding, std::string_view name) {
++        const Id buffer{module.AddGlobalVariable(buffer_pointer, spv::StorageClass::StorageBuffer)};
++        module.Decorate(buffer, spv::Decoration::Binding, binding);
++        module.Decorate(buffer, spv::Decoration::DescriptorSet, 0U);
++        module.Name(buffer, name);
++        interfaces.push_back(buffer);
++        return buffer;
++    };
++    const Id payload{define_buffer(0, "payload")};
++    const Id offsets{define_buffer(1, "offsets")};
++    const Id args{define_buffer(2, "args")};
++    const Id counter{define_buffer(3, "arena_counter")};
++
++    constexpr u32 num_constants{sizeof(MeshEmulationDistributionConstants) / sizeof(u32)};
++    std::array<Id, num_constants> members;
++    members.fill(u32_type);
++    const Id constants_type{module.TypeStruct(std::span<const Id>(members))};
++    module.Decorate(constants_type, spv::Decoration::Block);
++    for (u32 member = 0; member < num_constants; ++member) {
++        module.MemberDecorate(constants_type, member, spv::Decoration::Offset, member * 4);
++    }
++    const Id constants{module.AddGlobalVariable(
++        module.TypePointer(spv::StorageClass::PushConstant, constants_type),
++        spv::StorageClass::PushConstant)};
++    interfaces.push_back(constants);
++    const Id constant_u32{module.TypePointer(spv::StorageClass::PushConstant, u32_type)};
++    if (profile.supported_spirv < 0x00010400) {
++        interfaces.clear(); // only Input and Output variables before SPIR-V 1.4
++    }
++
++    const auto word = [&](Id buffer, Id index) {
++        return module.OpAccessChain(buffer_u32, buffer, constant(0), index);
++    };
++    const Id main{module.OpFunction(void_type, spv::FunctionControlMask::MaskNone,
++                                    module.TypeFunction(void_type))};
++    module.AddLabel();
++    const Id function_u32{module.TypePointer(spv::StorageClass::Function, u32_type)};
++    const Id total_var{module.AddLocalVariable(function_u32, spv::StorageClass::Function)};
++    const Id task_var{module.AddLocalVariable(function_u32, spv::StorageClass::Function)};
++    const auto push = [&](u32 member) {
++        return module.OpLoad(u32_type, module.OpAccessChain(constant_u32, constants,
++                                                            constant(member)));
++    };
++    const Id tasks{push(0)};
++    const Id payload_words{push(1)};
++    const Id capacity_words{push(2)};
++    const Id block_words{push(3)};
++    const Id vertices_per_group{push(4)};
++    const Id max_groups{push(5)};
++    module.OpStore(total_var, constant(0));
++    module.OpStore(task_var, constant(0));
++
++    // for (task = 0; task < tasks; ++task) { offsets[task] = total; total += count; }
++    const Id header{module.OpLabel()};
++    const Id condition_label{module.OpLabel()};
++    const Id body_label{module.OpLabel()};
++    const Id continue_label{module.OpLabel()};
++    const Id merge{module.OpLabel()};
++    module.OpBranch(header);
++    module.AddLabel(header);
++    module.OpLoopMerge(merge, continue_label, spv::LoopControlMask::MaskNone);
++    module.OpBranch(condition_label);
++    module.AddLabel(condition_label);
++    const Id task{module.OpLoad(u32_type, task_var)};
++    module.OpBranchConditional(module.OpULessThan(bool_type, task, tasks), body_label, merge);
++    module.AddLabel(body_label);
++    {
++        const Id total{module.OpLoad(u32_type, total_var)};
++        const Id requested{module.OpLoad(
++            u32_type, word(payload, module.OpIAdd(u32_type,
++                                                  module.OpIMul(u32_type, task, payload_words),
++                                                  constant(1))))};
++        module.OpStore(word(offsets, task), total);
++        module.OpStore(total_var, module.OpIAdd(u32_type, total, requested));
++    }
++    module.OpBranch(continue_label);
++    module.AddLabel(continue_label);
++    module.OpStore(task_var, module.OpIAdd(u32_type, module.OpLoad(u32_type, task_var), constant(1)));
++    module.OpBranch(header);
++    module.AddLabel(merge);
++
++    // The draw's blocks are allocated from the arena every draw of the submission shares. The
++    // passes of consecutive draws are ordered by barriers, so a plain read and write allocate.
++    // The counter keeps growing past the end, so the host sees how much the submission needed.
++    const Id total{module.OpLoad(u32_type, total_var)};
++    const Id base{module.OpLoad(u32_type, word(counter, constant(0)))};
++    module.OpStore(word(counter, constant(0)),
++                   module.OpIAdd(u32_type, base, module.OpIMul(u32_type, total, block_words)));
++    const Id room{module.OpSelect(u32_type, module.OpULessThan(bool_type, base, capacity_words),
++                                  module.OpISub(u32_type, capacity_words, base), constant(0))};
++    const Id dispatched{module.OpUMin(
++        u32_type, module.OpUMin(u32_type, total, module.OpUDiv(u32_type, room, block_words)),
++        max_groups)};
++    module.OpStore(word(args, constant(0)), dispatched);
++    module.OpStore(word(args, constant(1)), constant(1));
++    module.OpStore(word(args, constant(2)), constant(1));
++    module.OpStore(word(args, constant(MESH_EMULATION_ARGS_REQUESTED)), total);
++    const u32 draw{MESH_EMULATION_DRAW_ARGS_OFFSET / 4};
++    module.OpStore(word(args, constant(draw)), module.OpIMul(u32_type, dispatched, vertices_per_group));
++    module.OpStore(word(args, constant(draw + 1)), constant(1));
++    module.OpStore(word(args, constant(draw + 2)), constant(0));
++    module.OpStore(word(args, constant(draw + 3)), constant(0));
++    module.OpStore(word(args, constant(MESH_EMULATION_ARGS_BASE)), base);
++    module.OpStore(word(args, constant(MESH_EMULATION_ARGS_TASKS)), tasks);
++    module.OpReturn();
++    module.OpFunctionEnd();
++    module.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", interfaces);
++    module.AddExecutionMode(main, spv::ExecutionMode::LocalSize, 1U, 1U, 1U);
++    return module.Assemble();
++}
++
+ } // namespace Shader::Backend::SPIRV
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
+index 0804a14cdf..ccbcdadbbc 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
+@@ -27,7 +27,7 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
+         }
+         ctx.AddCapability(spv::Capability::GroupNonUniform);
+         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+-        if (!ctx.profile.SupportsSubgroupStage(program.stage) ||
++        if (!ctx.SupportsSubgroups() ||
+             ctx.profile.has_broken_spirv_subgroup_shuffle)
+             throw NotImplementedException("Software HMMA requires subgroup shuffle support");
+         const Id u32ty = ctx.U32[1], f32ty = ctx.F32[1];
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+index 85d3e328eb..0f25d6426a 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+@@ -14,7 +14,7 @@ Id SubgroupScope(EmitContext& ctx) {
+ }
+ 
+ bool StageSupportsSubgroups(EmitContext& ctx) {
+-    return ctx.profile.SupportsSubgroupStage(ctx.stage);
++    return ctx.SupportsSubgroups();
+ }
+ 
+ Id GetThreadId(EmitContext& ctx) {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index d13d5d1acb..f4505f2c27 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -595,6 +595,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
+     DefineAttributeMemAccess(program.info);
+     DefineWriteStorageCasLoopFunction(program.info);
+     DefineGlobalMemoryFunctions(program);
++    DefineMeshEmulationOutput();
+     DefineRescalingInput(program.info);
+     DefineRenderArea(program.info);
+ }
+@@ -1802,7 +1803,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
+     if (info.uses_is_helper_invocation) {
+         is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
+     }
+-    if (info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage)) {
++    if (info.uses_subgroup_mask && SupportsSubgroups()) {
+         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
+         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
+         subgroup_mask_le = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLeMaskKHR);
+@@ -1819,7 +1820,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
+     if ((info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
+          (profile.warp_size_potentially_larger_than_guest &&
+           (info.uses_subgroup_vote || info.uses_subgroup_mask))) &&
+-        profile.SupportsSubgroupStage(stage)) {
++        SupportsSubgroups()) {
+         AddCapability(spv::Capability::GroupNonUniform);
+         subgroup_local_invocation_id =
+             DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupLocalInvocationId);
+@@ -2054,12 +2055,13 @@ void EmitContext::DefineMesh(const IR::Program& program) {
+     if (stage != Stage::Task && stage != Stage::Mesh) {
+         return;
+     }
+-    mesh_compute = runtime_info.mesh_as_compute;
++    mesh_compute = runtime_info.mesh_compute_bda;
++    const bool as_compute{runtime_info.mesh_as_compute};
+     mesh_info = program.mesh;
+     mesh_threads = program.workgroup_size[0];
+     if (mesh_compute) {
+         DefineMeshCompute();
+-    } else {
++    } else if (!as_compute) {
+         AddExtension("SPV_EXT_mesh_shader");
+         AddCapability(spv::Capability::MeshShadingEXT);
+     }
+@@ -2067,10 +2069,13 @@ void EmitContext::DefineMesh(const IR::Program& program) {
+     // compute, a task keeps it in workgroup memory until its epilogue copies it to the scratch
+     // region, and a mesh program reads it from there (EmitIsbeRead).
+     if (!mesh_compute || stage == Stage::Task) {
+-        const spv::StorageClass payload_class{mesh_compute
++        const spv::StorageClass payload_class{(mesh_compute || as_compute)
+                                                   ? spv::StorageClass::Workgroup
+                                                   : spv::StorageClass::TaskPayloadWorkgroupEXT};
+-        const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
++        const u32 payload_words{(mesh_compute || as_compute)
++                                    ? (std::max)(mesh_info.payload_words, 1U)
++                                    : mesh_info.payload_words};
++        const Id payload_type{TypeArray(U32[1], Const(payload_words))};
+         mesh_payload = DefineVariable(*this, payload_type, std::nullopt, payload_class);
+         Name(mesh_payload, "task_payload");
+         mesh_payload_u32 = TypePointer(payload_class, U32[1]);
+@@ -2097,8 +2102,8 @@ void EmitContext::DefineMesh(const IR::Program& program) {
+     mesh_primitive_count =
+         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+     Name(mesh_primitive_count, "isbe_primitive_count");
+-    if (mesh_compute) {
+-        return; // no outputs: the epilogue writes the scratch region (emit_spirv_mesh.cpp)
++    if (mesh_compute || as_compute) {
++        return; // no native outputs: the epilogue writes BDA or descriptor-backed storage
+     }
+ 
+     const Id vertex_count{Const(mesh_info.max_vertices)};
+@@ -2182,6 +2187,58 @@ void EmitContext::DefineMesh(const IR::Program& program) {
+     }
+ }
+ 
++void EmitContext::DefineMeshEmulationOutput() {
++    if ((stage != Stage::Mesh && stage != Stage::Task) || !runtime_info.mesh_as_compute) {
++        return;
++    }
++    // u32 arrays: the output MeshEpilogue writes each workgroup's block to
++    // (EmitMeshEmulationVertex) and the task payload, offset and argument buffers (RuntimeInfo).
++    // Sirit shares identical types, so reuse the u32 storage buffer type when the program's own
++    // storage buffers declared it: decorating it again would be invalid SPIR-V.
++    AddExtension("SPV_KHR_storage_buffer_storage_class");
++    Id struct_pointer{storage_types.U32.array};
++    if (!Sirit::ValidId(struct_pointer)) {
++        const Id array_type{TypeRuntimeArray(U32[1])};
++        Decorate(array_type, spv::Decoration::ArrayStride, 4U);
++        const Id struct_type{TypeStruct(array_type)};
++        Decorate(struct_type, spv::Decoration::Block);
++        MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
++        struct_pointer = TypePointer(spv::StorageClass::StorageBuffer, struct_type);
++    }
++    const auto define = [&](u32 binding, std::string_view name) {
++        const Id buffer{AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
++        Decorate(buffer, spv::Decoration::Binding, binding);
++        Decorate(buffer, spv::Decoration::DescriptorSet, 0U);
++        Name(buffer, name);
++        if (profile.supported_spirv >= 0x00010400) {
++            interfaces.push_back(buffer);
++        }
++        return buffer;
++    };
++    mesh_output_u32 = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
++    const bool has_task{runtime_info.mesh_task_payload_binding != ~0U};
++    if (has_task) {
++        mesh_task_payload_buffer =
++            define(runtime_info.mesh_task_payload_binding, "mesh_emulation_task_payload");
++    }
++    if (stage == Stage::Task) {
++        return;
++    }
++    mesh_output_buffer = define(runtime_info.mesh_output_binding, "mesh_emulation_output");
++    if (has_task) {
++        mesh_task_offsets_buffer =
++            define(runtime_info.mesh_task_offsets_binding, "mesh_emulation_task_offsets");
++        mesh_task_args_buffer =
++            define(runtime_info.mesh_task_args_binding, "mesh_emulation_task_args");
++        mesh_group_index = AddGlobalVariable(TypePointer(spv::StorageClass::Private, U32[1]),
++                                             spv::StorageClass::Private);
++        Name(mesh_group_index, "mesh_group_index");
++        if (profile.supported_spirv >= 0x00010400) {
++            interfaces.push_back(mesh_group_index);
++        }
++    }
++}
++
+ void EmitContext::DefineOutputs(const IR::Program& program) {
+     const Info& info{program.info};
+     if (stage == Stage::Task || stage == Stage::Mesh) {
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index 0c76ebc9fc..8b47f5937e 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -183,6 +183,14 @@ public:
+     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
+     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
+ 
++    /// Whether this stage has subgroup operations. Mesh emulation runs task and mesh programs
++    /// as compute shaders, so they have what compute shaders have.
++    [[nodiscard]] bool SupportsSubgroups() const {
++        return profile.SupportsSubgroupStage((mesh_compute || runtime_info.mesh_as_compute)
++                                                 ? Stage::Compute
++                                                 : stage);
++    }
++
+     Id Const(u32 value) {
+         return Constant(U32[1], value);
+     }
+@@ -406,6 +414,13 @@ public:
+     std::vector<MeshLineTarget> mesh_primitive_targets;
+     std::array<Id, 2> mesh_outputs_marker{};
+     std::array<Id, 4> mesh_tasks_marker{};
++    /// Descriptor-backed mesh emulation output and task buffers.
++    Id mesh_output_buffer{};
++    Id mesh_output_u32{};
++    Id mesh_task_payload_buffer{};
++    Id mesh_task_offsets_buffer{};
++    Id mesh_task_args_buffer{};
++    Id mesh_group_index{};
+     // Run as compute (RuntimeInfo::mesh_as_compute, mesh_compute_layout.h): the draw's scratch
+     // region, addressed from push constants through physical storage buffer pointers.
+     bool mesh_compute{};
+@@ -455,6 +470,7 @@ private:
+     void DefineOutputs(const IR::Program& program);
+     void DefineMesh(const IR::Program& program);
+     void DefineMeshCompute();
++    void DefineMeshEmulationOutput();
+ };
+ 
+ } // namespace Shader::Backend::SPIRV
+diff --git a/src/shader_recompiler/runtime_info.h b/src/shader_recompiler/runtime_info.h
+index 538cee7333..8d076a6533 100644
+--- a/src/shader_recompiler/runtime_info.h
++++ b/src/shader_recompiler/runtime_info.h
+@@ -92,7 +92,7 @@ struct RuntimeInfo {
+     /// its vertices and primitives to the draw's scratch buffer, which a generated vertex shader
+     /// reads back (backend/spirv/mesh_compute_layout.h). The fragment program after such a mesh
+     /// program receives per-primitive values as ordinary flat varyings.
+-    bool mesh_as_compute{};
++    bool mesh_compute_bda{};
+     /// Private flat varying used to carry a mesh-written PrimitiveId through vertex readback.
+     std::optional<u32> mesh_compute_primitive_id_location;
+     std::map<IR::Attribute, IR::Attribute> previous_stage_legacy_stores_mapping;
+@@ -124,6 +124,22 @@ struct RuntimeInfo {
+ 
+     /// Dual source blending
+     bool dual_source_blend{};
++
++    /// Mesh program on a device without VK_EXT_mesh_shader: emit it as a compute shader that
++    /// writes its vertices and primitives to the storage buffer at mesh_output_binding (see
++    /// EmitMeshEmulationVertex for the layout), for a vertex shader to draw them.
++    bool mesh_as_compute{};
++    u32 mesh_output_binding{};
++    /// Mesh emulation with a task program (mesh_as_compute on both). The task's compute shader
++    /// writes its payload (count at word 1) to the payload buffer, task_payload_words words per
++    /// task workgroup. Each mesh workgroup finds its task by a binary search of the offsets
++    /// buffer (first mesh workgroup of each task) and copies that task's payload. The arguments
++    /// buffer holds the draw's output base and task count (MESH_EMULATION_ARGS_*). ~0 when there
++    /// is no task program.
++    u32 mesh_task_payload_binding{~0U};
++    u32 mesh_task_offsets_binding{~0U};
++    u32 mesh_task_args_binding{~0U};
++    u32 mesh_task_payload_stride{}; ///< payload buffer words per task workgroup
+ };
+ 
+ } // namespace Shader
+diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
+index a2a4a6e824..b526fd7d40 100644
+--- a/src/video_core/renderer_vulkan/pipeline_helper.h
++++ b/src/video_core/renderer_vulkan/pipeline_helper.h
+@@ -269,8 +269,11 @@ public:
+         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
+         return CreatePipelineLayout(
+             descriptor_set_layout,
+-            static_cast<VkShaderStageFlags>(is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
+-                                                       : GraphicsPushConstantStages(*device)),
++            static_cast<VkShaderStageFlags>(
++                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
++                           : mesh_emulation
++                                 ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT
++                                 : GraphicsPushConstantStages(*device)),
+             static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
+                 static_cast<u32>(sizeof(RenderAreaLayout)));
+     }
+@@ -296,8 +299,37 @@ public:
+         });
+     }
+ 
++    /// Mesh emulation: a graphics pipeline layout whose mesh program runs as a compute shader
++    /// (its bindings carry VK_SHADER_STAGE_COMPUTE_BIT and so does the push constant range).
++    void EnableMeshEmulation() noexcept {
++        mesh_emulation = true;
++    }
++
++    /// Mesh emulation: the output storage buffer the compute shader writes and the vertex
++    /// shader reads, at an explicit binding (after every program's bindings).
++    void AddMeshEmulationOutput(u32 output_binding) {
++        bindings.push_back({
++            .binding = output_binding,
++            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++            .descriptorCount = 1,
++            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
++            .pImmutableSamplers = nullptr,
++        });
++        entries.push_back({
++            .dstBinding = output_binding,
++            .dstArrayElement = 0,
++            .descriptorCount = 1,
++            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++            .offset = offset,
++            .stride = sizeof(DescriptorUpdateEntry),
++        });
++        binding = (std::max)(binding, output_binding + 1);
++        ++num_descriptors;
++        offset += sizeof(DescriptorUpdateEntry);
++    }
++
+     void Add(const Shader::Info& info, VkShaderStageFlags stage) {
+-        is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
++        is_compute |= (stage & VK_SHADER_STAGE_COMPUTE_BIT) != 0 && !mesh_emulation;
+         uses_mesh |= (stage & (VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
+ 
+         Add(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage, info.constant_buffer_descriptors);
+@@ -337,6 +369,7 @@ private:
+     const Device* device{};
+     bool is_compute{};
+     bool uses_mesh{};
++    bool mesh_emulation{};
+     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
+     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
+     u32 binding{};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 930adbd6fc..8c03b34f24 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -25,6 +25,7 @@
+ #include "shader_recompiler/backend/spirv/mesh_compute_layout.h"
+ #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/renderer_vulkan/vk_shader_util.h"
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+ #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+ #include "video_core/shader_handle_program.h"
+@@ -72,8 +73,12 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits
+ }
+ 
+ DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
+-                                    bool mesh_as_compute) {
++                                    bool mesh_as_compute,
++                                    const std::optional<MeshEmulationSetup>& mesh_emulation = {}) {
+     DescriptorLayoutBuilder builder{device};
++    if (mesh_emulation) {
++        builder.EnableMeshEmulation();
++    }
+     for (size_t index = 0; index < infos.size(); ++index) {
+         static constexpr std::array stages{
+             VK_SHADER_STAGE_VERTEX_BIT,
+@@ -82,7 +87,21 @@ DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader
+             VK_SHADER_STAGE_GEOMETRY_BIT,
+             VK_SHADER_STAGE_FRAGMENT_BIT,
+         };
+-        builder.Add(infos[index], StageFlag(infos[index], stages.at(index), mesh_as_compute));
++        const bool emulated{infos[index].is_mesh || infos[index].is_task};
++        const VkShaderStageFlags stage{
++            mesh_emulation && emulated
++                ? static_cast<VkShaderStageFlags>(VK_SHADER_STAGE_COMPUTE_BIT)
++                : static_cast<VkShaderStageFlags>(
++                      StageFlag(infos[index], stages.at(index), mesh_as_compute))};
++        builder.Add(infos[index], stage);
++    }
++    if (mesh_emulation) {
++        builder.AddMeshEmulationOutput(mesh_emulation->output_binding);
++        if (mesh_emulation->has_task) {
++            builder.AddMeshEmulationOutput(mesh_emulation->payload_binding);
++            builder.AddMeshEmulationOutput(mesh_emulation->offsets_binding);
++            builder.AddMeshEmulationOutput(mesh_emulation->args_binding);
++        }
+     }
+     return builder;
+ }
+@@ -277,12 +296,14 @@ GraphicsPipeline::GraphicsPipeline(
+     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
+     const std::array<const Shader::Info*, NUM_STAGES>& infos, MeshComputeScratch* mesh_scratch_,
+-    std::unique_ptr<MeshComputeShaders> mesh_compute_)
++    std::unique_ptr<MeshComputeShaders> mesh_compute_,
++    std::optional<MeshEmulationSetup> mesh_emulation_)
+     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
+       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
+       guest_descriptor_queue{guest_descriptor_queue_},
+       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+-      mesh_scratch{mesh_scratch_}, mesh_compute{std::move(mesh_compute_)} {
++      mesh_scratch{mesh_scratch_}, mesh_compute{std::move(mesh_compute_)},
++      mesh_emulation{std::move(mesh_emulation_)} {
+     if (shader_notify) {
+         shader_notify->MarkShaderBuilding();
+     }
+@@ -304,15 +325,19 @@ GraphicsPipeline::GraphicsPipeline(
+     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+     fragment_writes_color = stage_infos[NUM_STAGES - 1].stores_frag_color;
+ 
+-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, RunsMeshAsCompute())};
++    DescriptorLayoutBuilder builder{
++        MakeBuilder(device, stage_infos, RunsMeshAsCompute(), mesh_emulation)};
+     // Task and mesh programs run as compute read the rescaling words and the MeshComputeLayout
+     // after them, the readback vertex shader the layout: one push constant range for every stage.
+     push_constant_stages = GraphicsPushConstantStages(device);
+-    if (RunsMeshAsCompute()) {
++    if (RunsMeshAsCompute() || mesh_emulation) {
+         push_constant_stages |= VK_SHADER_STAGE_COMPUTE_BIT;
+     }
+-    uses_push_descriptor = builder.CanUsePushDescriptor();
+-    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
++    uses_push_descriptor = !mesh_emulation && builder.CanUsePushDescriptor();
++    uses_descriptor_buffer = !mesh_emulation && builder.CanUseDescriptorBuffer() &&
++                             descriptor_buffer_ring.IsValid();
++    const u32 emulation_buffers{mesh_emulation ? (mesh_emulation->has_task ? 4U : 1U) : 0U};
++    num_descriptor_entries += emulation_buffers;
+     descriptor_set_layout =
+         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
+     if (uses_descriptor_buffer) {
+@@ -341,7 +366,55 @@ GraphicsPipeline::GraphicsPipeline(
+             compute_update_template = builder.CreateTemplate(
+                 set_layout, *pipeline_layout, uses_push_descriptor, VK_PIPELINE_BIND_POINT_COMPUTE);
+         }
+-        if (!uses_push_descriptor) {
++        if (!uses_push_descriptor && mesh_emulation) {
++            std::array<Shader::Info, NUM_STAGES + 1> bank_infos{};
++            std::ranges::copy(stage_infos, bank_infos.begin());
++            bank_infos.back().storage_buffers_descriptors.push_back({
++                .cbuf_index = 0,
++                .cbuf_offset = 0,
++                .count = emulation_buffers,
++                .is_written = true,
++            });
++            descriptor_allocator = descriptor_pool.Allocator(device, scheduler, set_layout,
++                                                               bank_infos);
++            if (mesh_emulation->has_task) {
++                std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
++                for (u32 binding = 0; binding < bindings.size(); ++binding) {
++                    bindings[binding] = {
++                        .binding = binding,
++                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++                        .descriptorCount = 1,
++                        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++                        .pImmutableSamplers = nullptr,
++                    };
++                }
++                distribution_set_layout = device.GetLogical().CreateDescriptorSetLayout({
++                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++                    .pNext = nullptr,
++                    .flags = 0,
++                    .bindingCount = static_cast<u32>(bindings.size()),
++                    .pBindings = bindings.data(),
++                });
++                const VkDescriptorSetLayout distribution_set{*distribution_set_layout};
++                const VkPushConstantRange range{
++                    .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++                    .offset = 0,
++                    .size = sizeof(Shader::Backend::SPIRV::MeshEmulationDistributionConstants),
++                };
++                distribution_layout = device.GetLogical().CreatePipelineLayout({
++                    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++                    .pNext = nullptr,
++                    .flags = 0,
++                    .setLayoutCount = 1,
++                    .pSetLayouts = &distribution_set,
++                    .pushConstantRangeCount = 1,
++                    .pPushConstantRanges = &range,
++                });
++                distribution_allocator = descriptor_pool.Allocator(
++                    device, scheduler, distribution_set,
++                    DescriptorBankInfo{.storage_buffers = 4, .score = 4});
++            }
++        } else if (!uses_push_descriptor) {
+             descriptor_allocator =
+                 descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+         }
+@@ -672,6 +745,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     if constexpr (Spec::enabled_stages[4]) {
+         prepare_stage(4);
+     }
++    if (mesh_emulation) {
++        if (!mesh_output_buffer) {
++            return false;
++        }
++        guest_descriptor_queue.AddBuffer(mesh_output_buffer, mesh_output_offset, mesh_output_size);
++        if (mesh_emulation->has_task) {
++            for (size_t index = 0; index < 3; ++index) {
++                const MeshEmulationBuffer& task_buffer{mesh_task_buffers[index]};
++                if (!task_buffer.buffer) {
++                    return false;
++                }
++                guest_descriptor_queue.AddBuffer(task_buffer.buffer, task_buffer.offset,
++                                                 task_buffer.size);
++            }
++        }
++    }
+     if (buffer_cache.any_buffer_uploaded) {
+         buffer_cache.runtime.PostCopyBarrier();
+         buffer_cache.any_buffer_uploaded = false;
+@@ -734,6 +823,116 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+                                  rescaling, render_area)) {
+         return false;
+     }
++    if (mesh_emulation) {
++        // Descriptor fallback dispatches task/mesh compute before the ordinary readback draw.
++        scheduler.RequestOutsideRenderPassOperationContext();
++        scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
++                          task_buffers = mesh_task_buffers,
++                          rescaling_data = rescaling.Data(),
++                          is_rescaling = texture_cache.IsRescaling(),
++                          uses_render_area = render_area.uses_render_area,
++                          render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
++            const bool has_task{mesh_emulation->has_task};
++            if (!pipeline || !mesh_emulation_compute_pipeline || groups == 0 ||
++                (has_task && (!task_compute_pipeline || !distribution_pipeline))) {
++                return;
++            }
++            const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
++            device.GetLogical().UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
++                                                    descriptor_data);
++            mesh_descriptor_set = descriptor_set;
++            const auto bind_program_state = [&] {
++                constexpr VkShaderStageFlags stages{VK_SHADER_STAGE_ALL_GRAPHICS |
++                                                     VK_SHADER_STAGE_COMPUTE_BIT};
++                cmdbuf.PushConstants(*pipeline_layout, stages, RESCALING_LAYOUT_WORDS_OFFSET,
++                                     sizeof(rescaling_data), rescaling_data.data());
++                const f32 down_factor{is_rescaling ? Settings::values.resolution_info.down_factor
++                                                    : 1.0f};
++                cmdbuf.PushConstants(*pipeline_layout, stages, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
++                                     sizeof(down_factor), &down_factor);
++                if (uses_render_area) {
++                    cmdbuf.PushConstants(*pipeline_layout, stages, RENDERAREA_LAYOUT_OFFSET,
++                                         sizeof(render_area_data), &render_area_data);
++                }
++                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
++                                          descriptor_set, nullptr);
++            };
++            const auto barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access,
++                                     VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
++                const VkMemoryBarrier memory{
++                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                    .pNext = nullptr,
++                    .srcAccessMask = src_access,
++                    .dstAccessMask = dst_access,
++                };
++                cmdbuf.PipelineBarrier(src_stage, dst_stage, 0, memory);
++            };
++            barrier(VK_ACCESS_MEMORY_WRITE_BIT,
++                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++            if (!has_task) {
++                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                     *mesh_emulation_compute_pipeline);
++                bind_program_state();
++                cmdbuf.Dispatch(groups, 1, 1);
++                barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
++                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
++                return;
++            }
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *task_compute_pipeline);
++            bind_program_state();
++            cmdbuf.Dispatch(groups, 1, 1);
++            barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++            const VkDescriptorSet distribution_set{distribution_allocator.Commit()};
++            std::array<VkDescriptorBufferInfo, 4> infos{};
++            std::array<VkWriteDescriptorSet, 4> writes{};
++            for (u32 binding = 0; binding < 4; ++binding) {
++                infos[binding] = {.buffer = task_buffers[binding].buffer,
++                                  .offset = task_buffers[binding].offset,
++                                  .range = task_buffers[binding].size};
++                writes[binding] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++                                   .pNext = nullptr,
++                                   .dstSet = distribution_set,
++                                   .dstBinding = binding,
++                                   .dstArrayElement = 0,
++                                   .descriptorCount = 1,
++                                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++                                   .pImageInfo = nullptr,
++                                   .pBufferInfo = &infos[binding],
++                                   .pTexelBufferView = nullptr};
++            }
++            device.GetLogical().UpdateDescriptorSets(writes, {});
++            const Shader::Backend::SPIRV::MeshEmulationDistributionConstants constants{
++                .tasks = groups,
++                .payload_words = mesh_emulation->payload_stride,
++                .capacity_words = capacity,
++                .block_words = mesh_emulation->block_words,
++                .vertices_per_group = mesh_emulation->max_primitives * 3,
++                .max_groups = device.GetMaxComputeWorkGroupCount()[0],
++            };
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_pipeline);
++            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_layout, 0,
++                                      distribution_set, nullptr);
++            cmdbuf.PushConstants(*distribution_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                 sizeof(constants), &constants);
++            cmdbuf.Dispatch(1, 1, 1);
++            barrier(VK_ACCESS_SHADER_WRITE_BIT,
++                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
++                        VK_ACCESS_HOST_READ_BIT,
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
++                        VK_PIPELINE_STAGE_HOST_BIT);
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                 *mesh_emulation_compute_pipeline);
++            bind_program_state();
++            cmdbuf.DispatchIndirect(task_buffers[2].buffer, task_buffers[2].offset);
++            barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
++        });
++    }
+     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+@@ -744,7 +943,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+         });
+     }
+     const bool is_rescaling{texture_cache.IsRescaling()};
+-    const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
++    const bool update_rescaling{
++        scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline()) || mesh_emulation};
+     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
+     if (bind_pipeline && scheduler.HangWatching()) [[unlikely]] {
+         Scheduler::HangPipeline hashes{};
+@@ -808,6 +1008,14 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+         if (!descriptor_set_layout) {
+             return;
+         }
++        if (mesh_emulation) {
++            // The set the emulation's dispatch committed (see above).
++            if (mesh_descriptor_set) {
++                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
++                                          mesh_descriptor_set, nullptr);
++            }
++            return;
++        }
+         if (uses_descriptor_buffer) {
+             const u32 buffer_index{};
+             cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+@@ -827,6 +1035,54 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+ }
+ 
+ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
++    if (IsMeshPipeline() && !device.IsExtMeshShaderSupported() && !mesh_emulation) {
++        return;
++    }
++    if (mesh_emulation) {
++        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
++            .pNext = nullptr,
++            .requiredSubgroupSize = GuestWarpSize,
++        };
++        const auto make_compute = [&](VkShaderModule module, VkPipelineLayout layout,
++                                      const Shader::Info* info) {
++            const bool uses_warp_ops{info && (info->uses_subgroup_vote ||
++                                              info->uses_subgroup_invocation_id ||
++                                              info->uses_subgroup_shuffles ||
++                                              info->uses_subgroup_mask || info->uses_quad_shuffles ||
++                                              info->uses_fswzadd)};
++            const bool pin{uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
++                           device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)};
++            return device.GetLogical().CreateComputePipeline(
++                VkComputePipelineCreateInfo{
++                    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++                    .pNext = nullptr,
++                    .flags = 0,
++                    .stage{
++                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++                        .pNext = pin ? &subgroup_size_ci : nullptr,
++                        .flags = 0,
++                        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++                        .module = module,
++                        .pName = "main",
++                        .pSpecializationInfo = nullptr,
++                    },
++                    .layout = layout,
++                    .basePipelineHandle = nullptr,
++                    .basePipelineIndex = 0,
++                },
++                *pipeline_cache);
++        };
++        mesh_vertex_module = BuildShader(device, mesh_emulation->vertex_spirv);
++        mesh_emulation_compute_pipeline =
++            make_compute(*spv_modules[mesh_emulation->mesh_stage], *pipeline_layout,
++                         &stage_infos[mesh_emulation->mesh_stage]);
++        if (mesh_emulation->has_task) {
++            task_compute_pipeline = make_compute(*spv_modules[0], *pipeline_layout, &stage_infos[0]);
++            distribution_module = BuildShader(device, mesh_emulation->distribution_spirv);
++            distribution_pipeline = make_compute(*distribution_module, *distribution_layout, nullptr);
++        }
++    }
+     FixedPipelineState::DynamicState dynamic{};
+     if (!key.state.extended_dynamic_state) {
+         dynamic = key.state.dynamic_state;
+@@ -870,8 +1126,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     }
+     ASSERT(vertex_attributes.size() <= device.GetMaxVertexInputAttributes());
+ 
+-    if (RunsMeshAsCompute()) {
+-        // The readback vertex shader reads the mesh pass's records: no vertex input.
++    if (RunsMeshAsCompute() || mesh_emulation) {
++        // The readback vertex shader consumes compute output, not guest vertex bindings.
+         vertex_bindings.clear();
+         vertex_binding_divisors.clear();
+         vertex_attributes.clear();
+@@ -898,7 +1154,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     // has no tessellation and no input assembly (pInputAssemblyState is null for it below).
+     const bool has_tess_stages = !IsMeshPipeline() && (spv_modules[1] || spv_modules[2]);
+     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
+-    if (RunsMeshAsCompute()) {
++    if (RunsMeshAsCompute() || mesh_emulation) {
+         input_assembly_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // the readback draw
+     }
+     if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+@@ -1232,23 +1488,28 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     };
+     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+     for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+-        // Run as compute, the task and mesh modules are compute pipelines (MakeMeshComputePipelines)
+-        // and the vertex slot holds the readback shader.
+-        const bool readback_vertex{RunsMeshAsCompute() && stage == 0};
++        const bool readback_vertex{(RunsMeshAsCompute() || mesh_emulation) && stage == 0};
++        if (mesh_emulation && mesh_emulation->mesh_stage != 0 &&
++            stage == mesh_emulation->mesh_stage) {
++            continue; // descriptor fallback runs the mesh program as compute
++        }
+         if (!spv_modules[stage] && !readback_vertex) {
+             continue;
+         }
++        const bool emulated_vertex{mesh_emulation && stage == 0};
+         [[maybe_unused]] auto& stage_ci =
+             shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
+                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                 .pNext = nullptr,
+                 .flags = 0,
+-                .stage = readback_vertex
++                .stage = readback_vertex || emulated_vertex
+                              ? VK_SHADER_STAGE_VERTEX_BIT
+                              : StageFlag(stage_infos[stage],
+                                          MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)),
+                                          false),
+-                .module = readback_vertex ? *mesh_compute->readback : *spv_modules[stage],
++                .module = emulated_vertex ? *mesh_vertex_module
++                         : readback_vertex ? *mesh_compute->readback
++                                            : *spv_modules[stage],
+                 .pName = "main",
+                 .pSpecializationInfo = nullptr,
+             });
+@@ -1267,9 +1528,11 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         .flags = flags,
+         .stageCount = static_cast<u32>(shader_stages.size()),
+         .pStages = shader_stages.data(),
+-        .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
+-        .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
+-        .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
++        .pVertexInputState = mesh_emulation ? &vertex_input_ci : is_mesh ? nullptr : &vertex_input_ci,
++        .pInputAssemblyState = mesh_emulation ? &input_assembly_ci
++                               : is_mesh      ? nullptr
++                                              : &input_assembly_ci,
++        .pTessellationState = mesh_emulation ? nullptr : is_mesh ? nullptr : &tessellation_ci,
+         .pViewportState = &viewport_ci,
+         .pRasterizationState = &rasterization_ci,
+         .pMultisampleState = &multisample_ci,
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index e01f3b9138..2cf19daf13 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -12,6 +12,7 @@
+ #include <condition_variable>
+ #include <memory>
+ #include <mutex>
++#include <optional>
+ #include <type_traits>
+ #include <vector>
+ 
+@@ -85,6 +86,24 @@ struct MeshComputeShaders {
+     Shader::MeshInfo mesh_info;
+ };
+ 
++/// Descriptor-backed task/mesh emulation on a device without VK_EXT_mesh_shader.
++struct MeshEmulationSetup {
++    std::vector<u32> vertex_spirv;
++    u32 output_binding{};
++    u32 block_words{};
++    u32 max_primitives{};
++    bool has_task{};
++    u32 mesh_stage{};
++    u32 payload_stride{};
++    u32 payload_binding{};
++    u32 offsets_binding{};
++    u32 args_binding{};
++    std::vector<u32> distribution_spirv;
++    u32 max_vertices{};
++    u32 vertex_lines{};
++    std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U};
++};
++
+ class GraphicsPipeline {
+     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+ 
+@@ -99,7 +118,8 @@ public:
+         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
+         const std::array<const Shader::Info*, NUM_STAGES>& infos,
+         MeshComputeScratch* mesh_scratch = nullptr,
+-        std::unique_ptr<MeshComputeShaders> mesh_compute = nullptr);
++        std::unique_ptr<MeshComputeShaders> mesh_compute = nullptr,
++        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
+ 
+     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+     bool SupportsAlphaToCoverage() const noexcept {
+@@ -127,6 +147,45 @@ public:
+     [[nodiscard]] bool RunsMeshAsCompute() const noexcept {
+         return mesh_compute != nullptr;
+     }
++    /// Descriptor-based fallback; mutually exclusive with the legacy BDA path above.
++    [[nodiscard]] bool IsEmulatedMesh() const noexcept {
++        return mesh_emulation.has_value();
++    }
++    [[nodiscard]] u64 MeshEmulationBlockBytes() const noexcept {
++        return mesh_emulation ? u64{mesh_emulation->block_words} * 4 : 0;
++    }
++    [[nodiscard]] u32 MeshEmulationVerticesPerGroup() const noexcept {
++        return mesh_emulation ? mesh_emulation->max_primitives * 3 : 0;
++    }
++    [[nodiscard]] const MeshEmulationSetup* MeshEmulation() const noexcept {
++        return mesh_emulation ? &*mesh_emulation : nullptr;
++    }
++    void SetMeshEmulationOutput(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
++                                u32 groups) noexcept {
++        mesh_output_buffer = buffer;
++        mesh_output_offset = offset;
++        mesh_output_size = size;
++        mesh_groups = groups;
++    }
++    struct MeshEmulationBuffer {
++        VkBuffer buffer{};
++        VkDeviceSize offset{};
++        VkDeviceSize size{};
++    };
++    void SetMeshEmulationTaskBuffers(const MeshEmulationBuffer& payload,
++                                     const MeshEmulationBuffer& offsets,
++                                     const MeshEmulationBuffer& args,
++                                     const MeshEmulationBuffer& counter,
++                                     u32 capacity_words) noexcept {
++        mesh_task_buffers = {payload, offsets, args, counter};
++        mesh_capacity = capacity_words;
++    }
++    [[nodiscard]] bool MeshEmulationHasTask() const noexcept {
++        return mesh_emulation && mesh_emulation->has_task;
++    }
++    [[nodiscard]] u32 MeshEmulationPayloadStride() const noexcept {
++        return mesh_emulation ? mesh_emulation->payload_stride : 0;
++    }
+     /// The task or mesh workgroups of the draw being configured (the draw's vertex count).
+     void SetMeshDrawGroups(u32 groups) noexcept {
+         mesh_draw_groups = groups;
+@@ -251,6 +310,25 @@ private:
+     u32 mesh_draw_groups{};
+     MeshComputeDraw mesh_compute_draw{};
+ 
++    // Descriptor-backed mesh emulation. This optional setup is never populated together with the
++    // legacy BDA mesh_compute object for one pipeline.
++    std::optional<MeshEmulationSetup> mesh_emulation;
++    vk::ShaderModule mesh_vertex_module;
++    vk::Pipeline mesh_emulation_compute_pipeline;
++    VkDescriptorSet mesh_descriptor_set{};
++    VkBuffer mesh_output_buffer{};
++    VkDeviceSize mesh_output_offset{};
++    VkDeviceSize mesh_output_size{};
++    u32 mesh_groups{};
++    vk::Pipeline task_compute_pipeline;
++    vk::ShaderModule distribution_module;
++    vk::DescriptorSetLayout distribution_set_layout;
++    vk::PipelineLayout distribution_layout;
++    vk::Pipeline distribution_pipeline;
++    DescriptorAllocator distribution_allocator;
++    std::array<MeshEmulationBuffer, 4> mesh_task_buffers{};
++    u32 mesh_capacity{};
++
+     DescriptorBufferLayout descriptor_buffer_layout;
+     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+     VkDeviceSize last_descriptor_buffer_offset{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 191cfe6276..aabbaf1300 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -268,11 +268,11 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+         }();
+         break;
+     case Shader::Stage::Task:
+-        info.mesh_as_compute = mesh_as_compute;
++        info.mesh_compute_bda = mesh_as_compute;
+         break;
+     case Shader::Stage::Mesh:
+         info.convert_depth_mode = gl_ndc;
+-        info.mesh_as_compute = mesh_as_compute;
++        info.mesh_compute_bda = mesh_as_compute;
+         break;
+     case Shader::Stage::Geometry:
+         if (program.output_topology == Shader::OutputTopology::PointList) {
+@@ -1539,6 +1539,74 @@ void ReportNewPipelineKey(const GraphicsPipelineCacheKey& key) {
+                  diffs.empty() ? std::string{" nothing in the key prefix"} : diffs);
+     }
+ }
++
++// Without VK_EXT_mesh_shader: logs, once per shader set, what a skipped task/mesh pipeline would
++// need from an emulation (task stage, per-primitive outputs, topology, output sizes).
++template <typename Programs>
++void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Programs& programs) {
++    static std::mutex mutex;
++    static std::unordered_set<u64> seen;
++    static u32 with_task{}, per_primitive{}, non_triangle{}, total{};
++    u64 shaders{};
++    for (const u64 hash : key.unique_hashes) {
++        shaders = shaders * 31 + hash;
++    }
++    std::scoped_lock lock{mutex};
++    if (!seen.insert(shaders).second) {
++        return;
++    }
++    const Shader::IR::Program* task{};
++    const Shader::IR::Program* mesh{};
++    bool has_pixel{};
++    for (size_t index = 0; index < programs.size(); ++index) {
++        if (key.unique_hashes[index] == 0) {
++            continue;
++        }
++        const auto& program{programs[index]};
++        if (program.stage == Shader::Stage::Task) {
++            task = &program;
++        } else if (program.stage == Shader::Stage::Mesh) {
++            mesh = &program;
++        } else if (program.stage == Shader::Stage::Fragment) {
++            has_pixel = true;
++        }
++    }
++    ++total;
++    if (mesh == nullptr) {
++        LOG_WARNING(Render_Vulkan, "Mesh emulation survey: pipeline {:016x} without a mesh stage",
++                    shaders);
++        return;
++    }
++    const auto& info{mesh->mesh};
++    u32 position{}, generic{}, other{};
++    std::string others;
++    for (const u32 line : info.vertex_lines) {
++        const auto attribute{static_cast<Shader::IR::Attribute>(line)};
++        if (attribute >= Shader::IR::Attribute::PositionX &&
++            attribute <= Shader::IR::Attribute::PositionW) {
++            ++position;
++        } else if (Shader::IR::IsGeneric(attribute)) {
++            ++generic;
++        } else {
++            ++other;
++            others += fmt::format(" {}", line);
++        }
++    }
++    with_task += task != nullptr;
++    per_primitive += !info.primitive_lines.empty();
++    non_triangle += info.topology != 4;
++    LOG_WARNING(Render_Vulkan,
++                "Mesh emulation survey #{}: task={} (payload {} words, wg {}x{}x{}) mesh wg "
++                "{}x{}x{} max_vertices={} max_primitives={} topology={} vertex_lines={} "
++                "(position {} generic {} other {}:{}) primitive_lines={} pixel={} | totals: "
++                "task {} per-primitive {} non-triangle {}",
++                total, task != nullptr, info.payload_words, task ? task->workgroup_size[0] : 0,
++                task ? task->workgroup_size[1] : 0, task ? task->workgroup_size[2] : 0,
++                mesh->workgroup_size[0], mesh->workgroup_size[1], mesh->workgroup_size[2],
++                info.max_vertices, info.max_primitives, info.topology, info.vertex_lines.size(),
++                position, generic, other, others, info.primitive_lines.size(), has_pixel,
++                with_task, per_primitive, non_triangle);
++}
+ } // Anonymous namespace
+ 
+ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+@@ -1658,11 +1726,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     // Task and mesh programs run as compute (EDEN_NX2_MESH_AS_COMPUTE=1, vk_mesh_compute.h).
+     const bool mesh_as_compute{mesh_scratch != nullptr && mesh_scratch->IsValid() &&
+                                (!MeshComputeLoneOnly() || key.unique_hashes[3] == 0)};
++    // Descriptor emulation owns the no-extension/no-BDA case; never select the BDA scratch path
++    // for the same pipeline.
++    const bool mesh_fallback_device{!device.IsExtMeshShaderSupported() && !mesh_as_compute};
+     const bool uses_vertex_a{key.unique_hashes[0] != 0};
+     const bool uses_vertex_b{key.unique_hashes[1] != 0};
+ 
+     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
+     Shader::IR::Program* layer_source_program{};
++    bool mesh_unsupported{};
+ 
+     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+         const bool is_emulated_stage = layer_source_program != nullptr &&
+@@ -1695,8 +1767,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         // and EDEN_NX2_MESH_COMPUTE_ONLY, if set, lists one of them.
+         if ((env.ShaderStage() == Shader::Stage::Task ||
+              env.ShaderStage() == Shader::Stage::Mesh) &&
+-            !device.IsExtMeshShaderSupported() &&
+-            (!mesh_as_compute || !MeshComputeAllowed(key))) {
++            !device.IsExtMeshShaderSupported() && !mesh_as_compute && !mesh_fallback_device) {
+             return nullptr;
+         }
+ 
+@@ -1732,6 +1803,66 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+             layer_source_program = &programs[index];
+         }
+     }
++    std::optional<MeshEmulationSetup> mesh_emulation;
++    size_t mesh_emulation_index{};
++    if (mesh_fallback_device) {
++        const bool has_task{key.unique_hashes[1] != 0 && programs[1].stage == Shader::Stage::Task};
++        mesh_emulation_index = has_task ? 3U : 1U;
++        if (key.unique_hashes[mesh_emulation_index] != 0 &&
++            programs[mesh_emulation_index].stage == Shader::Stage::Mesh) {
++            const Shader::IR::Program& mesh{programs[mesh_emulation_index]};
++            const bool eligible{mesh.mesh.topology == 4 && mesh.mesh.primitive_lines.empty() &&
++                                !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
++                                mesh.mesh.max_primitives != 0};
++            if (eligible) {
++                u32 output_binding{};
++                u32 compute_storage_buffers{has_task ? 4U : 1U};
++                u32 compute_sampled_images{};
++                u32 compute_resources{compute_storage_buffers};
++                for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
++                    if (key.unique_hashes[index] == 0) continue;
++                    const Shader::Info& info{programs[index].info};
++                    const bool emulated{index == mesh_emulation_index || (has_task && index == 1)};
++                    const auto add = [&](const auto& descriptors, u32* category) {
++                        const u32 count{Shader::NumDescriptors(descriptors)};
++                        output_binding += count;
++                        if (emulated) {
++                            compute_resources += count;
++                            if (category) *category += count;
++                        }
++                    };
++                    add(info.constant_buffer_descriptors, nullptr);
++                    add(info.storage_buffers_descriptors, &compute_storage_buffers);
++                    add(info.texture_buffer_descriptors, &compute_sampled_images);
++                    add(info.image_buffer_descriptors, nullptr);
++                    add(info.texture_descriptors, &compute_sampled_images);
++                    add(info.image_descriptors, nullptr);
++                }
++                if (compute_storage_buffers <= device.GetMaxPerStageDescriptorStorageBuffers() &&
++                    compute_sampled_images <= device.GetMaxPerStageDescriptorSampledImages() &&
++                    compute_resources <= device.GetMaxPerStageResources()) {
++                    mesh_emulation.emplace();
++                    mesh_emulation->output_binding = output_binding;
++                    mesh_emulation->block_words =
++                        Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh.mesh);
++                    mesh_emulation->max_primitives = mesh.mesh.max_primitives;
++                    mesh_emulation->max_vertices = mesh.mesh.max_vertices;
++                    mesh_emulation->vertex_lines = static_cast<u32>(mesh.mesh.vertex_lines.size());
++                    mesh_emulation->mesh_stage = static_cast<u32>(mesh_emulation_index - 1);
++                    if (has_task) {
++                        mesh_emulation->has_task = true;
++                        mesh_emulation->payload_stride =
++                            (std::max)(programs[1].mesh.payload_words, 2U);
++                        mesh_emulation->payload_binding = output_binding + 1;
++                        mesh_emulation->offsets_binding = output_binding + 2;
++                        mesh_emulation->args_binding = output_binding + 3;
++                        mesh_emulation->distribution_spirv =
++                            Shader::Backend::SPIRV::EmitMeshEmulationDistribution(profile);
++                    }
++                }
++            }
++        }
++    }
+     // A tessellation pipeline the driver would refuse is skipped like a missing mesh pipeline:
+     // the draw is dropped (see the pipeline check in the rasterizer) instead of failing the build.
+     {
+@@ -1786,8 +1917,31 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         const size_t stage_index{index - 1};
+         infos[stage_index] = &program.info;
+ 
+-        const auto runtime_info{
+-            MakeRuntimeInfo(programs, key, program, previous_stage, device, mesh_as_compute)};
++        const bool stage_mesh_as_compute{
++            mesh_as_compute ||
++            (mesh_emulation &&
++             ((program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh) ||
++              (previous_stage && previous_stage->stage == Shader::Stage::Mesh)))};
++        auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device,
++                                          stage_mesh_as_compute)};
++        if (mesh_emulation &&
++            (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh)) {
++            runtime_info.mesh_as_compute = true;
++            runtime_info.mesh_output_binding = mesh_emulation->output_binding;
++            if (mesh_emulation->has_task) {
++                runtime_info.mesh_task_payload_binding = mesh_emulation->payload_binding;
++                runtime_info.mesh_task_offsets_binding = mesh_emulation->offsets_binding;
++                runtime_info.mesh_task_args_binding = mesh_emulation->args_binding;
++                runtime_info.mesh_task_payload_stride = mesh_emulation->payload_stride;
++            }
++            if (program.stage == Shader::Stage::Mesh) {
++                mesh_emulation->vertex_spirv =
++                    Shader::Backend::SPIRV::EmitMeshEmulationVertex(
++                        profile, program.mesh, mesh_emulation->output_binding,
++                        mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
++                        runtime_info.convert_depth_mode && !profile.support_native_ndc);
++            }
++        }
+         ConvertLegacyToGeneric(program, runtime_info);
+         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+         device.SaveShader(code);
+@@ -1868,7 +2022,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
+         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+         render_pass_cache, key, std::move(modules), infos, mesh_scratch.get(),
+-        std::move(mesh_compute));
++        std::move(mesh_compute), std::move(mesh_emulation));
+ 
+ } catch (const Shader::Exception& exception) {
+     auto hash = key.Hash();
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index b4cae9dd7c..de049903dd 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -214,6 +214,134 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
+ }
+ } // Anonymous namespace
+ 
++void RasterizerVulkan::ReadMeshEmulationProbe() {
++    const MeshEmulationProbe probe{mesh_probe};
++    mesh_probe.pending = false;
++    const size_t num_words{probe.data.size() / sizeof(u32)};
++    const auto word = [&](u64 index) -> u32 {
++        if (index >= num_words) {
++            return 0;
++        }
++        u32 value;
++        std::memcpy(&value, probe.data.data() + index * sizeof(u32), sizeof(value));
++        return value;
++    };
++    const auto position = [&](u64 base, u32 vertex) {
++        std::array<f32, 4> result{};
++        for (u32 element = 0; element < 4; ++element) {
++            const u32 line{probe.position_lines[element]};
++            if (line != ~0U) {
++                result[element] = std::bit_cast<f32>(word(base + u64{vertex} * probe.vertex_lines +
++                                                          line));
++            }
++        }
++        return result;
++    };
++    u64 triangles{}, degenerate{}, outside{}, bad_index{};
++    std::string sample;
++    for (u32 group = 0; group < probe.groups; ++group) {
++        const u64 base{u64{group} * probe.block_words};
++        const u64 index_base{base + u64{probe.max_vertices} * probe.vertex_lines};
++        for (u32 primitive = 0; primitive < probe.max_primitives; ++primitive) {
++            const std::array<u32, 3> indices{word(index_base + primitive * 3),
++                                             word(index_base + primitive * 3 + 1),
++                                             word(index_base + primitive * 3 + 2)};
++            if (indices[0] == indices[1] && indices[1] == indices[2]) {
++                ++degenerate;
++                continue;
++            }
++            ++triangles;
++            bool any_bad{};
++            bool any_inside{};
++            for (const u32 vertex : indices) {
++                if (vertex >= probe.max_vertices) {
++                    any_bad = true;
++                    continue;
++                }
++                const auto p{position(base, vertex)};
++                const f32 w{std::abs(p[3])};
++                any_inside |= w > 0.0f && std::abs(p[0]) <= w && std::abs(p[1]) <= w;
++            }
++            bad_index += any_bad;
++            outside += !any_inside;
++            if (sample.size() < 400 && triangles <= 2) {
++                for (const u32 vertex : indices) {
++                    const auto p{position(base, std::min(vertex, probe.max_vertices - 1))};
++                    sample += fmt::format(" g{} v{} ({:.3g} {:.3g} {:.3g} {:.3g})", group, vertex,
++                                          p[0], p[1], p[2], p[3]);
++                }
++            }
++        }
++    }
++    LOG_INFO(Render_Vulkan,
++             "Mesh emulation probe frame {}: {} groups, {} triangles ({} degenerate slots), {} "
++             "with every vertex off screen, {} with a bad index; first triangles:{}",
++             probe.frame, probe.groups, triangles, degenerate, outside, bad_index, sample);
++}
++
++const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
++    const u64 tick{scheduler.CurrentTick()};
++    if (mesh_arena_current < mesh_arenas.size() && mesh_arenas[mesh_arena_current].tick == tick) {
++        return mesh_arenas[mesh_arena_current];
++    }
++    // A finished submission's counter holds the words its draws asked for, including those
++    // that did not fit: grow later arenas to hold them.
++    const u64 max_size{(std::min)(u64{1} << 30, u64{device.GetMaxStorageBufferRange()})};
++    for (MeshArena& arena : mesh_arenas) {
++        if (arena.counted || !scheduler.IsFree(arena.tick)) {
++            continue;
++        }
++        arena.counted = true;
++        arena.counter.Invalidate();
++        u32 words;
++        std::memcpy(&words, arena.counter.Mapped().data(), sizeof(words));
++        const u64 needed{u64{words} * 4};
++        if (needed > arena.size && mesh_arena_size < max_size) {
++            mesh_arena_size = (std::min)(std::bit_ceil(needed + needed / 4), max_size);
++            LOG_INFO(Render_Vulkan, "Mesh emulation: a submission needed {} MiB of output, arenas "
++                                    "grow to {} MiB",
++                     needed >> 20, mesh_arena_size >> 20);
++        }
++    }
++    std::erase_if(mesh_arenas, [&](const MeshArena& arena) {
++        return arena.counted && arena.size < mesh_arena_size;
++    });
++    auto it{std::ranges::find_if(mesh_arenas, [](const MeshArena& arena) { return arena.counted; })};
++    if (it == mesh_arenas.end()) {
++        const auto make_buffer = [&](u64 size, VkBufferUsageFlags usage, MemoryUsage memory) {
++            return memory_allocator.CreateBuffer(
++                VkBufferCreateInfo{
++                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                    .pNext = nullptr,
++                    .flags = 0,
++                    .size = size,
++                    .usage = usage,
++                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++                    .queueFamilyIndexCount = 0,
++                    .pQueueFamilyIndices = nullptr,
++                },
++                memory);
++        };
++        it = mesh_arenas.insert(
++            mesh_arenas.end(),
++            MeshArena{
++                .buffer = make_buffer(mesh_arena_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                                      MemoryUsage::DeviceLocal),
++                .counter = make_buffer(sizeof(u32), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++                                       MemoryUsage::Download),
++                .size = mesh_arena_size,
++            });
++    }
++    // The GPU is done with this arena, and this submission's commands have not been sent yet.
++    const u32 zero{};
++    std::memcpy(it->counter.Mapped().data(), &zero, sizeof(zero));
++    it->counter.Flush();
++    it->tick = tick;
++    it->counted = false;
++    mesh_arena_current = static_cast<size_t>(std::distance(mesh_arenas.begin(), it));
++    return *it;
++}
++
+ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
+                                    Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                                    const Device& device_, MemoryAllocator& memory_allocator_,
+@@ -693,6 +821,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     }
+     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
+     mesh_draw = pipeline->IsMeshPipeline();
++    mesh_emulation_groups = 0;
++    mesh_emulation_vertices_per_group = 0;
++    mesh_emulation_indirect = {};
+     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
+     // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
+     // to compare the same scene with and without them in one run.
+@@ -713,8 +844,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     const bool no_mesh_title{!mkw_mesh && Settings::GetCurrentProgramID() == 0x0400C3F00006E000ULL};
+     // EDEN_NX2_MESH_AS_COMPUTE=1: the task and mesh programs ran as compute passes in Configure, and
+     // the draw reads their records (GraphicsPipeline::RunsMeshAsCompute).
++    const bool emulated_mesh{mesh_draw && pipeline->IsEmulatedMesh()};
+     if (mesh_draw && (no_mesh || no_mesh_title ||
+-                      (!device.IsExtMeshShaderSupported() && !pipeline->RunsMeshAsCompute()))) {
++                      (!device.IsExtMeshShaderSupported() && !pipeline->RunsMeshAsCompute() &&
++                       !emulated_mesh))) {
+         report_failure(no_mesh         ? "EDEN_NX2_NO_MESH"
+                        : no_mesh_title ? "off for Mario Kart World"
+                                        : "no VK_EXT_mesh_shader");
+@@ -735,10 +868,35 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
+     mesh_runs_as_compute = mesh_draw && pipeline->RunsMeshAsCompute();
++    mesh_emulated = emulated_mesh;
+     if (mesh_runs_as_compute) {
+         // The draw's vertex count is its task (or mesh) workgroup count.
+         pipeline->SetMeshDrawGroups(maxwell3d->draw_manager.draw_state.vertex_buffer.count);
+     }
++    if (mesh_emulated) {
++        const u32 groups{(std::min)(maxwell3d->draw_manager.draw_state.vertex_buffer.count,
++                                    device.GetMaxComputeWorkGroupCount()[0])};
++        const auto& arena{AcquireMeshArena()};
++        pipeline->SetMeshEmulationOutput(*arena.buffer, 0, arena.size, groups);
++        mesh_emulation_groups = groups;
++        mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
++        if (pipeline->MeshEmulationHasTask()) {
++            const auto request = [&](u64 size) {
++                const StagingBufferRef ref{staging_pool.Request((std::max)(size, u64{16}),
++                                                                  MemoryUsage::DeviceLocal)};
++                return GraphicsPipeline::MeshEmulationBuffer{ref.buffer, ref.offset, size};
++            };
++            const auto payload{request(u64{groups} * pipeline->MeshEmulationPayloadStride() * 4)};
++            const auto offsets{request(u64{groups} * 4)};
++            constexpr u64 args_bytes{Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS * 4};
++            const auto args{request(args_bytes)};
++            pipeline->SetMeshEmulationTaskBuffers(
++                payload, offsets, args, {*arena.counter, 0, sizeof(u32)},
++                static_cast<u32>((std::min)(arena.size / 4,
++                                             u64{(std::numeric_limits<u32>::max)()})));
++            mesh_emulation_indirect = {args.buffer, args.offset};
++        }
++    }
+     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+         maxwell3d->regs, pipeline->HasDynamicVertexInput());
+     if (repack_dirty) {
+@@ -770,6 +928,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         Profile::Scope scope{Profile::Zone::DrawRecord};
+         draw_func();
+     }
++    if (mesh_emulated) {
++        state_tracker.InvalidateInputState();
++    }
+     submitted = true;
+     static u32 native_capture_count{};
+     if (maxwell3d->GetNativeMacroEngine().native_turing &&
+@@ -1056,6 +1217,28 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+         const u32 num_instances{instance_count};
+         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+ 
++        if (mesh_draw && mesh_emulated) {
++            if (mesh_emulation_groups == 0 || mesh_emulation_vertices_per_group == 0) {
++                return;
++            }
++            if (mesh_emulation_indirect.buffer) {
++                const auto indirect{mesh_emulation_indirect};
++                scheduler.Record([this, indirect](vk::CommandBuffer cmdbuf) {
++                    if (scheduler.GraphicsPipelineMissing()) return;
++                    cmdbuf.DrawIndirect(
++                        indirect.buffer,
++                        indirect.offset + Shader::Backend::SPIRV::MESH_EMULATION_DRAW_ARGS_OFFSET,
++                        1, 0);
++                });
++            } else {
++                const u32 vertices{mesh_emulation_groups * mesh_emulation_vertices_per_group};
++                scheduler.Record([this, vertices](vk::CommandBuffer cmdbuf) {
++                    if (scheduler.GraphicsPipelineMissing()) return;
++                    cmdbuf.Draw(vertices, 1, 0, 0);
++                });
++            }
++            return;
++        }
+         if (mesh_draw && mesh_runs_as_compute) {
+             // The compute passes were recorded by Configure: the draw reads their
+             // VkDrawIndirectCommand (mesh_compute_layout.h). Nothing when the draw did not fit.
+@@ -2363,7 +2546,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
+             UpdateDepthWriteEnable(regs);
+             UpdateStencilTestEnable(regs);
+         }
+-        if (topology_changed) {
++        if (topology_changed && !emulated_mesh) {
+             scheduler.Record([topology_vk = MaxwellToVK::PrimitiveTopology(device, topology)](
+                                  vk::CommandBuffer cmdbuf) {
+                 cmdbuf.SetPrimitiveTopologyEXT(topology_vk);
+@@ -2372,7 +2555,9 @@ void RasterizerVulkan::UpdateDynamicStates() {
+     }
+ 
+     if (device.IsExtExtendedDynamicState2Supported()) {
+-        UpdatePrimitiveRestartEnable(regs);
++        if (!emulated_mesh) {
++            UpdatePrimitiveRestartEnable(regs);
++        }
+         UpdateRasterizerDiscardEnable(regs);
+         UpdateDepthBiasEnable(regs);
+     }
+@@ -2411,7 +2596,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
+         UpdateColorWriteEnable(regs);
+     }
+ 
+-    if (device.IsExtVertexInputDynamicStateSupported()) {
++    if (device.IsExtVertexInputDynamicStateSupported() && !emulated_mesh) {
+         if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {
+             UpdateVertexInput(regs);
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index f999ec2514..796cf34c85 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -265,8 +265,46 @@ private:
+ 
+     u32 draw_counter = 0;
+     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+-    bool mesh_runs_as_compute{}; ///< ... whose programs run as compute passes (vk_mesh_compute.h)
+-    GraphicsPipeline::MeshComputeDraw mesh_compute_draw{}; ///< the readback draw they left
++    bool mesh_runs_as_compute{}; ///< legacy BDA compute path only
++    bool mesh_emulated{}; ///< descriptor-based fallback path only
++    GraphicsPipeline::MeshComputeDraw mesh_compute_draw{};
++    u32 mesh_emulation_groups{};
++    u32 mesh_emulation_vertices_per_group{};
++    struct {
++        std::span<const u8> args;
++        u64 tick{};
++        u32 tasks{};
++        u32 capacity{};
++        bool pending{};
++    } mesh_task_probe;
++    struct {
++        VkBuffer buffer{};
++        VkDeviceSize offset{};
++    } mesh_emulation_indirect;
++    struct MeshEmulationProbe {
++        std::span<const u8> data;
++        u64 tick{};
++        u64 frame{};
++        u32 groups{};
++        u32 block_words{};
++        u32 vertex_lines{};
++        u32 max_vertices{};
++        u32 max_primitives{};
++        std::array<u32, 4> position_lines{};
++        bool pending{};
++    } mesh_probe;
++    void ReadMeshEmulationProbe();
++    struct MeshArena {
++        vk::Buffer buffer;
++        vk::Buffer counter;
++        u64 size{};
++        u64 tick{};
++        bool counted{};
++    };
++    std::vector<MeshArena> mesh_arenas;
++    size_t mesh_arena_current{~size_t{}};
++    u64 mesh_arena_size{64ULL << 20};
++    const MeshArena& AcquireMeshArena();
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 64647ec7d4..533f76706e 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -348,7 +348,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+         .size = 1ULL << log2_size,
+         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+-                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
++                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
++                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, // mesh emulation dispatch and draw arguments
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .queueFamilyIndexCount = 0,
+         .pQueueFamilyIndices = nullptr,
+diff --git a/src/video_core/renderer_vulkan/vk_state_tracker.h b/src/video_core/renderer_vulkan/vk_state_tracker.h
+index 6b47ba4176..50cc337d9c 100644
+--- a/src/video_core/renderer_vulkan/vk_state_tracker.h
++++ b/src/video_core/renderer_vulkan/vk_state_tracker.h
+@@ -89,6 +89,16 @@ public:
+         stencil_reset = true;
+     }
+ 
++    void InvalidateInputState() {
++        (*flags)[Dirty::VertexInput] = true;
++        (*flags)[Dirty::PrimitiveRestartEnable] = true;
++        for (std::size_t index = VideoCommon::Dirty::VertexBuffer0;
++             index <= VideoCommon::Dirty::VertexBuffer31; ++index) {
++            (*flags)[index] = true;
++        }
++        current_topology = INVALID_TOPOLOGY;
++    }
++
+     void InvalidateViewports() {
+         (*flags)[Dirty::Viewports] = true;
+     }

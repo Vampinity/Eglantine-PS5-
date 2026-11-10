@@ -1,0 +1,23 @@
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index ee27455991..4ecf1d8f6a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1419,14 +1419,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     // Mesh pipelines are stored separately because their translation needs mesh state. The
+     // PS5 RADV path runs them as compute when VK_EXT_mesh_shader is absent, so it must load the
+     // same file even without the native mesh extension.
+-    if (device.IsExtMeshShaderSupported() ||
+-        (mesh_scratch && mesh_scratch->IsValid()) ||
+-        (!device.IsExtMeshShaderSupported() && !(mesh_scratch && mesh_scratch->IsValid()))) {
+-        loading_mesh_file = true;
+-        VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
+-                                   load_compute, load_graphics, true);
+-        queue_deferred_graphics();
+-    }
++    loading_mesh_file = true;
++    VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
++                               load_compute, load_graphics, true);
++    queue_deferred_graphics();
+ 
+     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+     if (skipped_pipelines != 0) {

@@ -1,0 +1,61 @@
+diff --git a/src/common/game_presets.h b/src/common/game_presets.h
+index 83dd4d3c3f..90fa3cbc6a 100644
+--- a/src/common/game_presets.h
++++ b/src/common/game_presets.h
+@@ -34,4 +34,37 @@ inline bool ApplyMarioKartWorldPreset(Values& settings, u64 program_id, bool acc
+     return true;
+ }
+ 
++inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
++
++// The settings the emulator's own team recommends for Ocarina of Time (upstream
++// d9330e37c2 "added recommended settings" and 33805757a1 "desactivated handheld mode"):
++// 1x, Fast GPU, asynchronous shaders, BC3 ASTC, conservative VRAM, reactive flushing on,
++// FIFO Relaxed, docked, ScaleForce and FXAA. The headless frontend has no settings dialog,
++// so nso.cpp applies this at load instead of main_window.cpp.
++inline void SetOcarinaOfTimeRecommendedSettings(Values& settings, bool global) {
++    const auto session = [global](auto& setting, auto value) {
++        setting.SetGlobal(global);
++        setting.SetValue(value);
++    };
++    session(settings.renderer_backend, RendererBackend::Vulkan);
++    session(settings.resolution_setup, ResolutionSetup::Res1X);
++    session(settings.gpu_accuracy, GpuAccuracy::Low);
++    session(settings.use_asynchronous_shaders, true);
++    session(settings.astc_recompression, AstcRecompression::Bc3);
++    session(settings.vram_usage_mode, VramUsageMode::Conservative);
++    session(settings.use_reactive_flushing, true);
++    session(settings.vsync_mode, VSyncMode::FifoRelaxed);
++    session(settings.use_docked_mode, ConsoleMode::Docked);
++    session(settings.scaling_filter, ScalingFilter::ScaleForce);
++    session(settings.anti_aliasing, AntiAliasing::Fxaa);
++}
++
++inline bool ApplyOcarinaOfTimePreset(Values& settings, u64 program_id, bool accepted) {
++    if (!accepted || program_id != OcarinaOfTimeProgramId) {
++        return false;
++    }
++    SetOcarinaOfTimeRecommendedSettings(settings, false);
++    return true;
++}
++
+ } // namespace Settings
+diff --git a/src/core/loader/nso.cpp b/src/core/loader/nso.cpp
+index c43cd1d3ef..7cf73a393e 100644
+--- a/src/core/loader/nso.cpp
++++ b/src/core/loader/nso.cpp
+@@ -250,6 +250,14 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
+         ApplyOcarinaDynamicFps(std::span<u8>{codeset.memory}.subspan(module_start), nso_header,
+                                u64{nso_header.segments[0].location} +
+                                    PageAlignSize(nso_header.segments[0].size));
++        // The headless frontend has no settings dialog, so upstream's recommended settings for
++        // this title (common/game_presets.h) are applied here, before the first frame.
++        // EDEN_NX2_OOT_PRESET=0 keeps whatever the launcher configured.
++        const char* const preset = std::getenv("EDEN_NX2_OOT_PRESET");
++        if ((preset == nullptr || preset[0] != '0') &&
++            Settings::ApplyOcarinaOfTimePreset(Settings::values, process.GetProgramId(), true)) {
++            LOG_INFO(Loader, "Ocarina of Time: applied the recommended settings preset");
++        }
+     }
+ 
+     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native

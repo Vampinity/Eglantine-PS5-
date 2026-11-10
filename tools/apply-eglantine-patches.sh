@@ -11,6 +11,13 @@ mode=${1:-apply}
 shopt -s nullglob
 patches=("$root"/tools/eglantine-patches/*.patch)
 ((${#patches[@]})) || exit 0
+# git is a native binary on Windows and cannot open an MSYS path such as /c/Users/... : every apply
+# below would fail with "can't open patch", and the tree would drift from the commit plus the
+# series (that is what left this checkout 27 files away from what the build compiles). Convert to
+# native form when cygpath is there; on Linux it is absent and the paths are already what git wants.
+if command -v cygpath >/dev/null 2>&1; then
+    for i in "${!patches[@]}"; do patches[i]=$(cygpath -m -- "${patches[i]}"); done
+fi
 
 # Later patches change lines earlier ones added (0005 over 0004, for one), so once the whole set is
 # in, an earlier patch can no longer be taken out on its own and `git apply --reverse --check`

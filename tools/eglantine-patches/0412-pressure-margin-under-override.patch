@@ -1,0 +1,50 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] texture_cache: the out-of-memory margin must come off an override too
+
+TickFrame recomputes the collector's thresholds from the driver's budget every 30 frames and takes
+the out-of-memory margin off them: critical_memory = budget - (margin + pressure_margin +
+slack_margin). EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB then overwrite both thresholds,
+which is what the port bakes so that a title collects from a fixed point rather than from near the
+card's budget. The overwrite put the margin back, so a run with the override set collects as if the
+driver's budget could not move.
+
+A console run shows the cost. The thresholds printed "expected 3328 MiB, critical 4096 MiB" in all
+63 reports, unchanged from 53 s to the end, while "Out of device memory: keeping N MiB more free"
+walked the margin 0, 512, 1024, 1536, 2048 MiB over the last seven seconds. The collector therefore
+never evicted harder as the heap emptied: 32 images were allocated over the budget, 49 ended up
+unbacked in six seconds, and the session died there. The margin is the port's own answer to exactly
+this, and the override was discarding it.
+
+Take the margin off the override as well, so an override is a ceiling on the thresholds rather than a
+statement that the budget is fixed. Both stay at or above minimum_memory.
+
+What this can break: with the override set, the collector now evicts from a lower threshold once
+pressure has been seen (up to 3 GiB lower at the margin's cap), so a scene whose textures are all
+near the threshold can lose more of them to the collector than before. That is the trade the margin
+already makes without an override. It does not add any allocation.
+
+Checked: the patched file differs from the tree the stack plus 0411 produce only in this hunk;
+applies on the core plus the 0410/0411 stack. Not run on a console.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -348,6 +348,18 @@
+             *target = std::strtoull(value, nullptr, 10) << 20;
+         }
+     }
++    // An override replaces the thresholds the budget check computed, and with them the room that
++    // check was keeping: it takes pressure_margin off them (TickFrame, "Out of device memory"), and
++    // the override put it back. A console run shows what that costs - the thresholds sat at
++    // expected 3328 / critical 4096 across all 63 reports while the margin went 0 to 2048 MiB, and
++    // 49 images ended up unbacked in the six seconds before the session died. The margin comes off
++    // the override too, so an override is a ceiling and not a promise that the budget is fixed.
++    if (pressure_margin != 0) {
++        critical_memory =
++            (std::max)(critical_memory - (std::min)(pressure_margin, critical_memory), minimum_memory);
++        expected_memory =
++            (std::max)(critical_memory - (std::min)(critical_memory, u64{768_MiB}), minimum_memory);
++    }
+     if (log) {
+         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
+                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);

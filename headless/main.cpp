@@ -523,7 +523,9 @@ int main(int argc, char** argv) {
         bool autoboot_pending = false;
         std::string development_id;
 #endif
-        setenv("EDEN_NX2_SPARSE_UNBACKED", "1", 1);
+        // Unbacked sparse images read as zeros, so a surface that needs one comes out black. Keep
+        // the default, but let env.txt take it back for an A/B: with the overwrite it could not.
+        setenv("EDEN_NX2_SPARSE_UNBACKED", "1", 0);
         setenv("EDEN_HOST_RESERVE_TRANSFER", "1", 1);
         // Settings > Diagnostics > Testing switches (test_switches.h): the same NAME=VALUE lines,
         // chosen in the menu. The app folder's env.txt below wins over them.
@@ -577,13 +579,80 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"}}) {
             setenv(name, value, 0);
         }
+        // The direct table removes the packed-entry decode from every A64 load/store. It is the
+        // console default: EDEN_JIT_TABLE=0 in env.txt remains an explicit rollback while the
+        // sparse-table probe still turns it off when the platform cannot provide sparse mappings.
+#ifdef PS5_NATIVE
+        setenv("EDEN_JIT_TABLE", "1", 0);
+#endif
         // Nearby A64 accesses share one page lookup (headless/dynarmic/page-reuse.cmake). The pass
-        // only acts on the direct table, EDEN_JIT_TABLE=1.
+        // only acts on the direct table; keep it on by default with the table and allow an explicit
+        // EDEN_JIT_PAGE_REUSE=0 rollback for A/B runs.
+        setenv("EDEN_JIT_PAGE_REUSE", "1", 0);
+        // These maintainer fixes are safe PS5 fallbacks: env.txt can still disable either with =0.
+#ifdef PS5_NATIVE
+        // A CPU write to a GPU-written command-list page must invalidate the front's stale copy
+        // before the next list, rather than waiting for a later fence.
+        setenv("EDEN_NX2_LIST_CPU_SYNC", "1", 0);
+        // Native channels never consume their inline-upload bookkeeping list; do not grow it.
+        setenv("EDEN_NX2_NO_UPLOAD_STORE", "1", 0);
+        // Safe PS5 defaults for the native RADV path. env.txt is loaded above, so =0/1 there
+        // remains an explicit per-title override. The mapped readback path is the production form;
+        // its probe is diagnostic-only and stays off unless a diagnostic build forces it.
+        setenv("EDEN_PS5_LAZY_PRESENT", "1", 0);
+        setenv("EDEN_PS5_UNWRITTEN_READS", "1", 0);
+        setenv("EDEN_PS5_MAPPED_READBACK", "1", 0);
+        setenv("EDEN_PS5_READBACK_PRODUCERS", "1", 0);
+        setenv("EDEN_PS5_MAPPED_READBACK_PROBE", "0", 0);
+        // The owner cannot edit env.txt on the console, so the Prettier-only lines ship as
+        // defaults: the RADV mesh-compute path that brings the leaves back, and the fence-flagged
+        // query report that stays pending (the second flash line). The shipped Faster env.txt sets
+        // neither, so these take effect; an explicit env.txt line still overrides either one.
+        setenv("EDEN_NX2_RADV_MESH_COMPUTE_LONE", "1", 0);
+        // Measurement build: the owner cannot edit env.txt, so the two profilers that decide
+        // the next optimisation ship on. EDEN_PERF_REPORT prints where a frame goes each run and
+        // the per-thread cpu_ms/wall_ms that separates "CPU-bound" from "waiting on a stall";
+        // EDEN_GPU_TIME writes the GPU busy share to heap.log every 5 s. Both are prints only.
+        setenv("EDEN_PERF_REPORT", "1", 0);
+        setenv("EDEN_GPU_TIME", "1", 0);
+        setenv("EDEN_NX2_QUERY_KEEP_PENDING", "1", 0);
+        // AMD OoT reports lost HUD/minimap/dialog draws when render-pass dependencies are
+        // incomplete. The measured AMD fix costs about 0.05 ms/frame; env.txt may still set =0.
+        setenv("EDEN_NX2_RP_BARRIER", "1", 0);
+        // Ocarina lowers its own upscaling networks by default, but a stale
+        // EDEN_NX2_TENSOR_ONLY in the console's uneditable env.txt rejects the ten NDVE movie-filter
+        // programs and leaves the plain upscale stand-in (black movies: "Upscale fallback target ...
+        // 0/3597 non-zero"). Background builds them off the frame path rather than holding the
+        // scheduler ~12 s; compact is the cheap, measured-equivalent HMMA form.
+        setenv("EDEN_NX2_TENSOR_BACKGROUND", "1", 0);
+        setenv("EDEN_NX2_TENSOR", "compact", 0);
+        // The driver refused allocations at 7427 MiB of a 7805 MiB budget ("allocating it anyway",
+        // "unbacked sparse image", "No staging buffer"): an unbacked image reads as zeros and an
+        // un-uploaded one shows the last frame, which is the flicker. The settings menu's own 4 GB
+        // limit holds the collector under the failing 4352/5120 while staying above Ocarina's
+        // resident set. ApplyThresholdOverrides applies these last, so env.txt still overrides them.
+        setenv("EDEN_NX2_TC_CRITICAL_MIB", "4096", 0);
+        setenv("EDEN_NX2_TC_EXPECTED_MIB", "3328", 0);
+#endif
+#ifdef PS5_NATIVE
+        // Smaller dispatch tables save committed heap without changing the fallback path.
+        setenv("EDEN_JIT_DISPATCH_BITS", "18", 0);
+        // Workers reached the old 96 MiB cache; 128 MiB avoids repeated whole-cache evictions.
+        setenv("EDEN_JIT_CACHE_MIB", "160,144,128", 0);
+#endif
         if (const char* const reuse = std::getenv("EDEN_JIT_PAGE_REUSE"); reuse && reuse[0] == '1')
             eden_page_reuse = true;
         // JIT code generation, read before the first block compiles. EDEN_JIT_CODEGEN=1 turns all
         // six on; a switch of its own wins, so EDEN_JIT_R13=0 takes one out of the set.
         {
+#ifdef PS5_NATIVE
+            // Safe code-shape defaults. Set each member rather than the group so the ordering
+            // experiments stay off and each optimization can be bisected independently.
+            setenv("EDEN_JIT_FREE_MOVES", "1", 0);
+            setenv("EDEN_JIT_R13", "1", 0);
+            setenv("EDEN_JIT_FCMP_ADC", "1", 0);
+            setenv("EDEN_JIT_CHECKBIT_FLAGS", "1", 0);
+#endif
             const char* const all = std::getenv("EDEN_JIT_CODEGEN");
             const auto chosen = [all](const char* name) {
                 const char* const own = std::getenv(name);
@@ -600,6 +669,64 @@ int main(int argc, char** argv) {
                         eden_plain_ordered_reads, eden_fcmp_adc, eden_light_dmb, eden_checkbit_flags,
                         eden_page_reuse);
         }
+#ifdef PS5_NATIVE
+        // Safe PS5-native fixes and measured fast paths. Every entry is a default only: env.txt
+        // still wins because these setenv calls do not overwrite an explicit value.
+        for (const auto& [name, value] : {
+            std::pair{"EDEN_AREA_CHANGE_SCRATCH_RELEASE", "1"},
+            std::pair{"EDEN_NX2_AMD_PR273", "1"},
+            std::pair{"EDEN_NX2_AMD_SHADER_FIXES", "1"},
+            std::pair{"EDEN_NX2_CAS_RETURNED", "1"},
+            std::pair{"EDEN_NX2_IADD32_OVERFLOW", "1"},
+            std::pair{"EDEN_NX2_PAIRED_POINTERS", "1"},
+            std::pair{"EDEN_NX2_MASK_UNWRITTEN", "1"},
+            std::pair{"EDEN_NX2_INVALIDATION_FILTER", "1"},
+            std::pair{"EDEN_NX2_SHADER_FAST_SCAN", "1"},
+            std::pair{"EDEN_NX2_PIPELINE_CLEAN", "1"},
+            std::pair{"EDEN_NX2_QUERY_WAIT_ONCE", "1"},
+            std::pair{"EDEN_NX2_RUNTIME_PTP", "1"},
+            std::pair{"EDEN_NX2_CLEAR_BEFORE_COPY", "1"},
+            std::pair{"EDEN_NX2_CLEAR_UPLOAD_GUARDS", "1"},
+            std::pair{"EDEN_NX2_SKIP_OVERWRITTEN_UPLOADS", "1"},
+            std::pair{"EDEN_NX2_TRANSCODE_WAIT", "1"},
+            std::pair{"EDEN_NX2_BUFFER_DOWNLOADS", "0"},
+            std::pair{"EDEN_NX2_NATIVE_GRAPHICS_SIZE", "1"},
+            // EDEN_NX2_TABLE_POOL_MIB is deliberately NOT set. 0418 made it only a tightening cap:
+            // a read-only table pointer is now bound to the end of its mapping, as far as the
+            // device allows (at most 1 GiB), per Lichii #351. Ocarina of Time's light probe records
+            // reach about 130 MiB past the pointer, so the 128 MiB that used to be baked here cut
+            // the far probes off - which is the "exposure jumped 3-4x" that Fritchii describes.
+            // Native pointer tables for EVERY stage, which is what the port's own test build
+            // shipped and tested (docs/ocarina-test-1-changes.md, "White fog outdoors"): the fog
+            // reads its light probes through pointers in tables and those reads came back zero.
+            // =compute is a test-only mode - it takes the =0 path for vertex, fragment, task and
+            // mesh programs, which broke the water reflection on a T49 hand test, and it leaves the
+            // graphics stages without the pointer reads Ocarina's character lighting uses. Do not
+            // ship it: a pause-menu Link came out black except the eyes.
+            std::pair{"EDEN_NX2_NATIVE_TABLES", "1"},
+            // The shader-side fog/exposure workaround scales volumetric fog to a quarter. That was
+            // meant to be opt-in (A-Man-With-A-Plan-dev 2f1668f283) and it is what thins the fog we
+            // want to keep.
+            std::pair{"EDEN_NX2_OOT_VISUAL_WORKAROUND", "0"},
+            // EDEN_NX2_MACRO_QUERY_FLUSH is deliberately NOT set. The split-safe flush written for
+            // Eglantine #655 (0417, since removed) hung the game on the SECOND pause-menu entry -
+            // the front drains the back while the back waits on work the front has to submit - and
+            // it made no visible difference to the fog it was meant to fix. 0402's own query flush
+            // in the DMA-read path is untouched and stays in place.
+            std::pair{"EDEN_NX2_TIGHT_DESCRIPTOR_TABLES", "1"},
+            std::pair{"EDEN_NX2_SSBO_WRITES_SIZED", "1"},
+            std::pair{"EDEN_NX2_UBO_INPLACE", "1"},
+            std::pair{"EDEN_NX2_UBO_BANK_DIRECT", "1"},
+            std::pair{"EDEN_NX2_TABLES_SPEED", "1"},
+            std::pair{"EDEN_NX2_COMPUTE_SAME", "1"},
+            std::pair{"EDEN_NX2_MACRO_SINK", "1"},
+            std::pair{"EDEN_NX2_FETCH_RECHECK", "1"},
+            std::pair{"EDEN_NX2_PLAIN_SAMPLER", "1"},
+            std::pair{"EDEN_NX2_BLEND_ALWAYS", "1"},
+        }) {
+            setenv(name, value, 0);
+        }
+#endif
         // Where a frame goes, from a normal build (performance.h, perf_report).
         if (const char* const report = std::getenv("EDEN_PERF_REPORT"); report && report[0] == '1') {
             Eden::Performance::perf_report = true;

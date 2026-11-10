@@ -1,0 +1,37 @@
+From 31b997fb73c2ef5ebcebf7434df90389aec168ce Mon Sep 17 00:00:00 2001
+From: PastaLaPate <pastalapate@proton.me>
+Date: Mon, 9 Nov 2026 21:54:14 +0000
+Subject: [PATCH] port: 4d4e1858ce vk_pipeline_cache: keep Switch 2 pipelines
+ built
+
+---
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 6ec7a6fe44..96a6991154 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1406,7 +1406,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+ 
+         const u64 hash = key.Hash();
+         disk_pipelines.insert(hash);
+-        if (!PreloadAllPipelines() &&
++        // Switch 2 titles stutter on pipelines built mid-game, so all of them are built at boot.
++        if (!PreloadAllPipelines() && !Settings::CurrentProgramIsSwitch2() &&
+             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
+                                     : !used_pipelines.contains(hash))) {
+             ++skipped_pipelines;
+@@ -1655,7 +1656,8 @@ void PipelineCache::EvictUnusedPipelines() {
+     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
+     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
+     constexpr u64 EvictAfterFrames = 9000;
+-    if (frame_count <= EvictAfterFrames) {
++    // Switch 2 titles keep theirs: a rebuilt pipeline translates its shader on the GPU thread.
++    if (frame_count <= EvictAfterFrames || Settings::CurrentProgramIsSwitch2()) {
+         return;
+     }
+     // Do not throw away a compiled pipeline merely because it was quiet for 2.5 minutes while the
+-- 
+2.53.0.windows.3
+

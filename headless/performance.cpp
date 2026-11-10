@@ -50,8 +50,11 @@ void CodeRangeUsage(std::size_t* reserved, std::size_t* committed) noexcept;
 
 namespace Eden::Performance {
 namespace {
+// Six guest workers plus the GPU each get a distinct physical core when the
+// PS5 topology probe can verify seven cores. Auxiliary threads use the spare
+// physical core, or guest SMT siblings when no spare exists.
 constexpr std::array names{"CPUCore_0", "CPUCore_1", "CPUCore_2", "CPUCore_3",
-                           "GPU", "HostTiming", "VSyncThread"};
+                           "CPUCore_4", "CPUCore_5", "GPU", "HostTiming", "VSyncThread"};
 struct Worker {
     pthread_t thread{};
     clockid_t clock{};
@@ -157,11 +160,12 @@ void PcSignal(int, siginfo_t*, void* context) {
 }
 #endif
 #ifdef PS5_NATIVE
-std::array<unsigned, 5> worker_cpus{};
+std::array<unsigned, 7> worker_cpus{};
 bool worker_topology_ready = false;
 // Physical core (x2APIC above the SMT shift) of each allowed CPU, -1 if unknown.
 std::array<int, 64> cpu_core = [] { std::array<int, 64> c{}; c.fill(-1); return c; }();
-// CPUs outside guest cores 0-2 and their SMT siblings, and not the GPU thread CPU.
+// CPUs for auxiliary work: a spare physical core when there is one, otherwise guest
+// SMT siblings except the GPU sibling.
 unsigned long long secondary_cpus = 0;
 // The process CPU set seen by the topology probe (threads may inherit narrower sets).
 cpuset_t topology_allowed{};
@@ -172,7 +176,7 @@ void CheckWorkerTopology() {
     cpuset_t original{};
     if (__get_cpuid_max(0, nullptr) < 0xb ||
         cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &original)) return;
-    std::array<unsigned, 5> cores{};
+    std::array<unsigned, 7> cores{};
     unsigned count = 0;
     bool changed = false;
     // Why a probe stopped short (EDEN_WORKER_PROBE): every run on firmware 12.40 reports one
@@ -222,9 +226,9 @@ void CheckWorkerTopology() {
     std::printf("EDEN_WORKER_PROBE allowed=%llx probed=%u stopped_at=%u refused=%d bad_level=%d shift=%u "
                 "first_id=%u last_id=%u\n", allowed_mask, probed, stopped_at, refused, int(bad_level), shift,
                 first_id, last_id);
-    // EDEN_PS5_PIN=pairs: when the probe found too few cores, take CPUs 2n and 2n+1 as one core's
-    // two threads (the layout tools/check-worker-affinity.py models) and pin as a console that
-    // passes the probe does. Off by default: the layout is an assumption, not a reading.
+    // EDEN_PS5_PIN=pairs is only a fallback for a failed probe. The PS5's
+    // logical-CPU numbering is not a portable topology contract, so leave it
+    // off unless the caller has explicitly accepted the adjacent-pair model.
     const char* const pin = std::getenv("EDEN_PS5_PIN");
     if (count != cores.size() && pin != nullptr && std::strcmp(pin, "pairs") == 0) {
         count = 0;
@@ -243,16 +247,32 @@ void CheckWorkerTopology() {
     topology_allowed = original;
     topology_allowed_valid = true;
     if (worker_topology_ready) {
+        const int gpu_core = cpu_core[worker_cpus[6]];
+        bool spare_core = false;
         for (unsigned cpu = 0; cpu < 64; ++cpu) {
             if (!CPU_ISSET(cpu, &original) || cpu_core[cpu] < 0) continue;
-            const bool guest_core = cpu_core[cpu] == static_cast<int>(cores[0]) ||
-                cpu_core[cpu] == static_cast<int>(cores[1]) || cpu_core[cpu] == static_cast<int>(cores[2]);
-            if (!guest_core && cpu != worker_cpus[3] && cpu != worker_cpus[4]) secondary_cpus |= 1ULL << cpu;
+            bool worker_core = false;
+            for (const unsigned worker_cpu : worker_cpus)
+                worker_core |= cpu_core[cpu] == cpu_core[worker_cpu];
+            spare_core |= !worker_core;
         }
-        std::printf("EDEN_WORKER_SECONDARY mask=%llx\n", secondary_cpus);
+        for (unsigned cpu = 0; cpu < 64; ++cpu) {
+            if (!CPU_ISSET(cpu, &original) || cpu_core[cpu] < 0) continue;
+            bool worker_core = false;
+            bool worker_primary = false;
+            for (const unsigned worker_cpu : worker_cpus) {
+                worker_core |= cpu_core[cpu] == cpu_core[worker_cpu];
+                worker_primary |= cpu == worker_cpu;
+            }
+            if (spare_core ? !worker_core : (!worker_primary && cpu_core[cpu] != gpu_core))
+                secondary_cpus |= 1ULL << cpu;
+        }
+        std::printf("EDEN_WORKER_SECONDARY mask=%llx spare=%d gpu_core=%d\n",
+                    secondary_cpus, int(spare_core), gpu_core);
     }
-    std::printf("EDEN_WORKER_TOPOLOGY ready=%d distinct_cores=%u cpus=%u,%u,%u,%u,%u\n",
-        worker_topology_ready, count, worker_cpus[0], worker_cpus[1], worker_cpus[2], worker_cpus[3], worker_cpus[4]);
+    std::printf("EDEN_WORKER_TOPOLOGY ready=%d distinct_cores=%u cpus=%u,%u,%u,%u,%u,%u,%u\n",
+        worker_topology_ready, count, worker_cpus[0], worker_cpus[1], worker_cpus[2], worker_cpus[3],
+        worker_cpus[4], worker_cpus[5], worker_cpus[6]);
 }
 // EDEN_PS5_PLACE="CPUCore_4=1/GPUBack=10/VulkanWorker=12,13" (layout experiments; ; or / between entries): the CPUs a
 // thread of that name runs on, replacing its pin or the secondary mask. Read on each placement:
@@ -300,8 +320,8 @@ void PlaceSecondary(const char* name) {
 }
 void PinWorker(unsigned index, cpuset_t& affinity) {
     if (index >= worker_cpus.size()) return;
-    // EDEN_PS5_PLACE names a CPU itself, so it needs no topology (ready=0 made it do nothing for
-    // CPUCore_0-3 and GPU, while it did work for every other thread).
+    // EDEN_PS5_PLACE names a CPU itself, so it needs no topology. It can
+    // override any named thread, including the auxiliary threads below.
     const unsigned long long over = PlacementOverride(names[index]);
     if (!worker_topology_ready && over == 0) return;
     unsigned cpu = worker_cpus[index];
@@ -1098,10 +1118,17 @@ void RegisterWorker(const char* name) {
         cpu_set_t affinity{};
         const int result = sched_getaffinity(0, sizeof(affinity), &affinity);
 #endif
-#ifdef PS5_NATIVE
-        if (result == 0) PinWorker(i, affinity);
-#endif
         worker.affinity_error = result == 0 ? 0 : errno;
+#ifdef PS5_NATIVE
+        if (i < worker_cpus.size()) {
+            if (result == 0) PinWorker(i, affinity);
+        } else {
+            PlaceSecondary(name);
+            if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                                    sizeof(unsigned long long), &affinity))
+                worker.affinity_error = errno;
+        }
+#endif
         if (!worker.affinity_error) {
             for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
                 if (!CPU_ISSET(cpu, &affinity)) continue;

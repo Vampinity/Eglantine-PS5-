@@ -1,0 +1,44 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] texture_cache: do not upload an image with no CPU backing
+
+RefreshContents uploads when an image is CPU-modified, reading the guest range at image.gpu_addr.
+When that range has no CPU mapping - ImageCpuAddress above made a stand-in address for it - the read
+falls through to DeviceMemoryManager's unmapped path, which zero-fills and logs "Unmapped Device
+ReadBlock". A 445-second Ocarina session did that seventeen times in one burst, and the burst
+followed the discovery of new 3D images (64x64x64, 64x36x96, 128x72x96), not the feedback-loop copy
+(it is a GPU-to-GPU vkCmdCopyImage).
+
+Skipping the upload is what the case requires: there is nothing to read, and uploading zeroes over
+what the GPU already wrote is worse than keeping it. Sparse images upload tile by tile elsewhere and
+are left alone.
+
+What this can break: an image whose bytes exist only in guest memory the CPU cannot see keeps its
+previous host contents instead of becoming zeroes. If such an image is actually needed, it can show
+stale or wrong texels. That is the same class of error the zero-fill produced, and it is confined to
+whole-image uploads of non-sparse images with no CPU mapping at all.
+
+Checked: applies to the tree the 0410-0414 stack produces. Not run on a console.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2131,6 +2131,19 @@
+         // Only upload modified images
+         return;
+     }
++    // A GPU address with no CPU mapping has nothing to upload from: the read falls through to the
++    // unmapped path, which zero-fills and logs "Unmapped Device ReadBlock". Ocarina's newly
++    // discovered 3D images did that in bursts of seventeen. Sparse images upload tile by tile
++    // elsewhere, so only this whole-image path is skipped.
++    const bool sparse_upload =
++        True(image.flags & (ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles));
++    if (!sparse_upload && !gpu_memory->GpuToCpuAddress(image.gpu_addr, image.guest_size_bytes)) {
++        image.flags &= ~ImageFlagBits::CpuModified;
++        if (False(image.flags & ImageFlagBits::Tracked)) {
++            TrackImage(image, image_id);
++        }
++        return;
++    }
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+ 
+     image.flags &= ~ImageFlagBits::CpuModified;

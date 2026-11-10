@@ -25,6 +25,11 @@ REQUIRED.update(p.relative_to(APP).as_posix() for p in (APP / 'ui').rglob('*') i
 # are required exactly when the build put them there (tools/package-headless-native.sh).
 if (APP / 'dev-settings.txt').is_file():
     REQUIRED.add('dev-settings.txt')
+# The tuned switch lists the app reads from its own folder (headless/main.cpp parses env.txt at
+# launch): shipped beside dev-settings.txt, so required exactly when the package carries them.
+for _name in ('env.txt', 'env-prettier.txt'):
+    if (APP / _name).is_file():
+        REQUIRED.add(_name)
 RECEIPT = ROOT / 'HEADLESS_CANDIDATE.json'
 # The pinned OpenGL SDK release (tools/deps.json): digest of its manifest.sha256.
 GL_SDK_MANIFEST_SHA256 = 'f4b91f672be037fbac3f82494f1225deaf4c227a03f37ac3ffa56abb213b943f'

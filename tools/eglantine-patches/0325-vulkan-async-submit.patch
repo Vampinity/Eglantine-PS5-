@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] vulkan: hand queue submits to a serialized submitter
+
+The scheduler worker must not remain inside a driver-facing queue submit. Hand
+submissions to a serialized submitter so it can record later command chunks
+while RADV is blocked, while direct present and sparse operations remain ordered.
+Track the tick only after the driver accepts the submission; deferred fence
+waits therefore remain unbounded without observing an unsubmitted tick.
+
+---
+
+--- a/src/common/hang_site.h
++++ b/src/common/hang_site.h
+@@ -12,7 +12,7 @@
+ namespace Common {
+ 
+ /// The threads whose place the hang watch reports.
+-enum class HangThread : std::size_t { Back, Worker, Present, Fence, Count };
++enum class HangThread : std::size_t { Back, Worker, Present, Fence, Submitter, Count };
+ 
+ /// EDEN_NX2_HANG_WATCH=1. A function-local static: env.txt is read in main, after the globals.
+ [[nodiscard]] inline bool HangWatchOn() {
+@@ -51,7 +51,7 @@
+ /// watch doesn't follow, such as a CPU write trap.
+ [[nodiscard]] inline const char* HangHolderName(std::thread::id holder) {
+     static constexpr std::array<const char*, static_cast<std::size_t>(HangThread::Count)> names{
+-        "the back", "the worker", "the present thread", "the fencing thread"};
++        "the back", "the worker", "the present thread", "the fencing thread", "the submitter"};
+     if (holder == std::thread::id{}) {
+         return "nobody";
+     }
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -47,6 +47,95 @@
+ /// OpenGL-like operations on Vulkan command buffers.
+ class Scheduler {
+ public:
++    /// Serializes Vulkan queue operations while allowing the scheduler worker to hand a
++    /// vkQueueSubmit call to a separate thread. A queue operation submitted by the worker remains
++    /// ordered before a present or sparse bind that acquires this object.
++    class SubmitMutex {
++    public:
++        void lock() {
++            std::unique_lock guard{mutex};
++            condition.wait(guard, [this] {
++                return pending.empty() && !submit_active && !direct_active;
++            });
++            direct_active = true;
++        }
++
++        bool try_lock() {
++            std::unique_lock guard{mutex, std::try_to_lock};
++            if (!guard.owns_lock() || !pending.empty() || submit_active || direct_active) {
++                return false;
++            }
++            direct_active = true;
++            return true;
++        }
++
++        void unlock() {
++            {
++                std::scoped_lock guard{mutex};
++                direct_active = false;
++            }
++            condition.notify_all();
++        }
++
++        void Enqueue(std::function<void()>&& operation) {
++            {
++                std::unique_lock guard{mutex};
++                condition.wait(guard, [this] {
++                    return !direct_active && pending.size() < MaxPending;
++                });
++                pending.emplace_back(std::move(operation));
++            }
++            condition.notify_all();
++        }
++
++        void Run(std::stop_token stop_token) {
++            while (true) {
++                std::function<void()> operation;
++                {
++                    std::unique_lock guard{mutex};
++                    condition.wait(guard, stop_token,
++                                   [this] { return !pending.empty(); });
++                    if (pending.empty() && stop_token.stop_requested()) {
++                        return;
++                    }
++                    if (pending.empty()) {
++                        continue;
++                    }
++                    operation = std::move(pending.front());
++                    pending.pop_front();
++                    submit_active = true;
++                }
++                Common::HangSite site{"submitter: in queue submit"};
++                operation();
++                {
++                    std::scoped_lock guard{mutex};
++                    submit_active = false;
++                }
++                condition.notify_all();
++            }
++        }
++
++        void WaitIdle() {
++            std::unique_lock guard{mutex};
++            condition.wait(guard, [this] {
++                return pending.empty() && !submit_active && !direct_active;
++            });
++        }
++
++        [[nodiscard]] bool Busy() const {
++            std::scoped_lock guard{mutex};
++            return direct_active || submit_active || !pending.empty();
++        }
++
++    private:
++        static constexpr size_t MaxPending = 16;
++        mutable std::mutex mutex;
++        std::condition_variable_any condition;
++        std::deque<std::function<void()>> pending;
++        bool direct_active{};
++        bool submit_active{};
++    };
++
+     explicit Scheduler(const Device& device, StateTracker& state_tracker);
+     ~Scheduler();
+ 
+@@ -74,9 +163,9 @@
+     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
+     /// is not running, so nothing will submit it: the caller then submits it itself.
+     bool WaitSubmitted(u64 tick);
+-    /// Whether everything up to tick has been handed to the worker for submission.
++    /// Whether the queue submit has returned successfully for tick.
+     [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
+-        return tick < master_semaphore->CurrentTick();
++        return master_semaphore->IsSubmitted(tick);
+     }
+ 
+     /// Waits for the worker thread to finish executing everything. After this function returns it's
+@@ -258,7 +347,7 @@
+         return *master_semaphore;
+     }
+ 
+-    std::mutex submit_mutex;
++    SubmitMutex submit_mutex;
+ 
+ private:
+     std::chrono::steady_clock::time_point last_flush{};
+@@ -437,6 +526,7 @@
+     std::mutex queue_mutex;
+     std::condition_variable_any event_cv;
+     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
++    std::jthread submit_thread;
+     std::jthread worker_thread;
+ 
+     std::chrono::steady_clock::duration frame_interval{};
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -74,6 +74,13 @@
+ 
+     AcquireNewChunk();
+     AllocateWorkerCommandBuffer();
++    submit_thread = std::jthread([this](std::stop_token token) {
++        Common::HangThreadStarts(Common::HangThread::Submitter);
++        Common::SetCurrentThreadName("VulkanSubmitter");
++        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
++        Common::SetCurrentThreadToPerformanceCores();
++        submit_mutex.Run(token);
++    });
+     worker_thread = std::jthread([this](std::stop_token token) {
+         Common::HangThreadStarts(Common::HangThread::Worker);
+         WorkerThread(token);
+@@ -196,13 +203,10 @@
+         queued = work_queue.size();
+         worker_idle = worker_waiting;
+     }
+-    bool submit_free{};
++    const bool submit_free = !submit_mutex.Busy();
+     bool execution_free{};
+     {
+-        // Only a look: held across ReportStall below, they would stop the worker.
+-        const std::unique_lock submit_lock{submit_mutex, std::try_to_lock};
+         const std::unique_lock execution_lock{execution_mutex, std::try_to_lock};
+-        submit_free = submit_lock.owns_lock();
+         execution_free = execution_lock.owns_lock();
+     }
+     LOG_WARNING(Render_Vulkan,
+@@ -212,9 +216,10 @@
+                 gpu_tick, last_submitted, next_tick, queued, queue_free ? "free" : "held",
+                 worker_idle ? "idle" : "not idle", submit_free ? "free" : "held",
+                 execution_free ? "free" : "held");
+-    LOG_WARNING(Render_Vulkan, "Hang watch: worker at: {}; present thread at: {}; fencing at: {}",
+-                HangSiteOf(HangThread::Worker), HangSiteOf(HangThread::Present),
+-                HangSiteOf(HangThread::Fence));
++    LOG_WARNING(Render_Vulkan,
++                "Hang watch: worker at: {}; submitter at: {}; present thread at: {}; fencing at: {}",
++                HangSiteOf(HangThread::Worker), HangSiteOf(HangThread::Submitter),
++                HangSiteOf(HangThread::Present), HangSiteOf(HangThread::Fence));
+     // The tick wait's report is the only way to the unfinished ticks and to the driver's dump (0250,
+     // EDEN_NX2_RADV_STALL_DUMP=1), and in this freeze no thread need be in a tick wait.
+     if (last_submitted > gpu_tick) {
+@@ -352,5 +357,8 @@
+     // Now wait for execution to finish.
+     std::scoped_lock el{execution_mutex};
++    // The worker only hands queue submits to the submitter. Do not let a present or resource
++    // teardown observe a drained worker while the driver call is still pending.
++    submit_mutex.WaitIdle();
+ }
+ 
+ void Scheduler::DispatchWork() {
+@@ -664,26 +671,42 @@
+             HangSubmit(signal_value, wait_semaphore != VK_NULL_HANDLE);
+         }
+ 
+-        Common::HangSite site{"worker: waiting for the submit lock"};
+-        std::scoped_lock lock{submit_mutex};
+-        site.Set("worker: in the queue submit");
+-        switch (const VkResult result = master_semaphore->SubmitQueue(
+-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+-        case VK_SUCCESS:
+-            // Log successful queue submission
+-            if (GPU::Logging::IsActive() &&
+-                Settings::values.gpu_log_vulkan_calls.GetValue()) {
+-                GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
+-                    "vkQueueSubmit", "", VK_SUCCESS);
++        Common::HangSite site{"worker: handing off queue submit"};
++        submit_mutex.Enqueue([this, cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
++                              signal_value]() mutable {
++            static const s64 submit_watch_ms = [] {
++                const char* const value = std::getenv("EDEN_NX2_ASYNC_SUBMIT_WATCH_MS");
++                return value != nullptr ? std::max<s64>(s64{0}, static_cast<s64>(std::atoll(value))) : s64{0};
++            }();
++            const auto submit_start = std::chrono::steady_clock::now();
++            const VkResult result = master_semaphore->SubmitQueue(
++                cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value);
++            const auto submit_elapsed = std::chrono::steady_clock::now() - submit_start;
++            if (submit_watch_ms > 0 &&
++                submit_elapsed >= std::chrono::milliseconds{submit_watch_ms}) {
++                LOG_WARNING(Render_Vulkan,
++                            "Async submit watch: queue submit took {:.1f} ms for GPU tick {}; "
++                            "known GPU tick {}",
++                            std::chrono::duration<double, std::milli>{submit_elapsed}.count(),
++                            signal_value, master_semaphore->KnownGpuTick());
+             }
+-            break;
+-        case VK_ERROR_DEVICE_LOST:
+-            device.ReportLoss();
+-            [[fallthrough]];
+-        default:
+-            vk::Check(result);
+-            break;
+-        }
++            switch (result) {
++            case VK_SUCCESS:
++                // Log successful queue submission
++                if (GPU::Logging::IsActive() &&
++                    Settings::values.gpu_log_vulkan_calls.GetValue()) {
++                    GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
++                        "vkQueueSubmit", "", VK_SUCCESS);
++                }
++                break;
++            case VK_ERROR_DEVICE_LOST:
++                device.ReportLoss();
++                [[fallthrough]];
++            default:
++                vk::Check(result);
++                break;
++            }
++        });
+     });
+     chunk->MarkSubmit();
+     DispatchWork();
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.h
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+@@ -44,6 +44,11 @@
+         return KnownGpuTick() >= tick;
+     }
+ 
++    /// Returns true when a queue submission for the tick has returned successfully.
++    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
++        return submitted_tick.load(std::memory_order_acquire) >= tick;
++    }
++
+     /// Advance to the logical tick and return the old one
+     [[nodiscard]] u64 NextTick() noexcept {
+         return current_tick.fetch_add(1, std::memory_order_release);
+@@ -80,6 +85,7 @@
+     vk::Semaphore semaphore;          ///< Timeline semaphore.
+     std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
+     std::atomic<u64> current_tick{1}; ///< Current logical tick.
++    std::atomic<u64> submitted_tick{0}; ///< Last tick accepted by the Vulkan queue.
+     std::mutex wait_mutex;
+     std::mutex free_mutex;
+     std::condition_variable_any wait_cv;
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -128,12 +128,17 @@
+ VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                                       u64 host_tick) {
+-    if (semaphore) {
+-        return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+-                                   host_tick);
+-    } else {
+-        return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+-    }
++    const VkResult result = semaphore
++                                ? SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore,
++                                                      wait_semaphore, host_tick)
++                                : SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore,
++                                                   wait_semaphore, host_tick);
++    if (result == VK_SUCCESS) {
++        // CurrentTick is advanced while recording. This separate value is the ordering point for
++        // deferred fences: the driver has accepted the command buffer only after Submit returns.
++        submitted_tick.store(host_tick, std::memory_order_release);
++    }
++    return result;
+ }
+ 
+ static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |

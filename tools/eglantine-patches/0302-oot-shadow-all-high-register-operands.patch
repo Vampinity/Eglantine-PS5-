@@ -1,0 +1,64 @@
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 341df1baeb..7b883ed943 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -78,15 +78,17 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     const u32 opcode = input.Bits(0, 12);
+     switch (opcode) {
+     case 0x802: case 0xa02: case 0xb08: case 0xd08: operand(16); break;
++    case 0x803: // P2R: destination and the register merge source can be shadowed.
++        operand(16); operand(24); break;
+     case 0x804: case 0x80c: operand(24); break;
+     case 0x805: operand(16, 2); break;
+-    case 0x308: operand(16); operand(32); break;
++    case 0x306: case 0x308: operand(16); operand(32); break; // I2F, MUFU
+     case 0x433: case 0x633: operand(16); operand(24); break;
+     case 0x220: case 0x221: operand(16); operand(24); operand(32); break;
+     case 0x421: case 0x817: case 0x820: operand(16); operand(24); break;
+     case 0x81a: operand(16); operand(24); break;
+     case 0x919: operand(16); break;
+-    case 0x20c: operand(24); operand(32); break;
++    case 0x20b: case 0x20c: operand(24); operand(32); break; // FSETP/ISETP: predicate results
+     case 0x208: operand(16); operand(24); operand(32); break;
+     case 0x823: operand(16); operand(24); operand(64); break;
+     case 0x245: operand(16); operand(32); break;
+@@ -94,7 +96,8 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     case 0x210: case 0x223: operand(16); operand(24); operand(32); operand(64); break;
+     case 0x233: operand(16); operand(24); operand(32); break;
+     case 0xa20: case 0x621: case 0x808: case 0x923: operand(16); operand(24); break;
+-    case 0x209: operand(16); operand(24); operand(32); break;
++    case 0x209: case 0x809: // FMNMX register forms (including the high-register form).
++        operand(16); operand(24); operand(32); break;
+     case 0xa23: case 0x623: case 0x423: operand(16); operand(24); operand(64); break;
+     case 0x321: operand(16, input.Bits(74, 2) + 1); operand(24); operand(32); break;
+     case 0x322: operand(24); operand(32, input.Bits(74, 2) + 1); break;
+@@ -106,12 +109,20 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+         break;
+     case 0x202: operand(16); operand(32); break;
+     case 0x243: operand(16); operand(24); operand(32); break;
++    case 0xb82: // LDC indexed: destination (64-bit at width 5) and index register.
++        operand(16, input.Bits(73, 3) == 5 ? 2U : 1U); operand(24); break;
++    case 0xc08: // FSEL with a uniform second source.
++        operand(16); operand(24); operand(32); break;
+     case 0x812: case 0x824: case 0x831: case 0x424: case 0x624:
+         operand(16); operand(24); operand(64); break;
+     case 0x230: case 0x231: case 0x211: case 0x212: case 0x224:
+         operand(16); operand(24); operand(32); operand(64); break;
+     case 0x819: case 0xa11:
+         operand(16); operand(24); operand(64); break;
++    case 0x219: // SHF, all-register form.
++        operand(16); operand(24); operand(32); operand(64); break;
++    case 0xc10: // IADD3 with a uniform second source (bit 32 is a UR).
++        operand(16); operand(24); operand(64); break;
+     case 0x225: case 0x625: case 0x825:
+         operand(16, 2); operand(24);
+         if (opcode == 0x225) { operand(32); operand(64, 2); }
+@@ -2912,7 +2923,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+             break;
+         }
+         case 0x207: case 0x807: case 0xa07: case 0xc07:
+-        case 0x208: case 0x808: case 0xa08: { // Bitwise SEL / FSEL
++        case 0x208: case 0x808: case 0xa08: case 0xc08: { // Bitwise SEL / FSEL
+             // FSEL applies the floating operand modifiers (negate/absolute) before selecting.
+             const bool floating = (opcode & 0x1ff) == 0x008;
+             const u32 a = operand(0, floating), b = operand(1, floating);

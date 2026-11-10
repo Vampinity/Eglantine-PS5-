@@ -1,0 +1,65 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] vulkan_memory_allocator: ask the driver, not the texel count
+
+An image over 2^28 texels was never offered to VMA: it went straight to the unbacked sparse
+fallback. Texel count is not memory size. Ocarina of Time's sun shadow map is 18432x18432 D16 -
+339,738,624 texels, past the filter, but only 648 MiB, which an 8 GiB device can hold. With nothing
+bound, every write to it is lost and the scene comes out wrong.
+
+Take the later upstream policy (Lichii 75afd1a306, and Eglantine #570 for the byte accounting): probe
+the image's real VkMemoryRequirements and leave it unbacked only when the driver cannot report them
+or they exceed a quarter of device-local memory. The quarter still keeps the multi-gigabyte sparse
+arrays (title 1's 8192x8192, 68 layers, ~23 GB) where they belong.
+
+EDEN_NX2_ALLOC_BYTES=0 restores the texel-only filter, so the two policies can be compared in one
+build. The include of <cstdlib> is for std::getenv, which this file did not use before.
+
+What this can break: a large image the old filter rejected now takes real memory. If the probe or the
+threshold is wrong, VMA pressure rises, later images fall to host memory or become unbacked, and the
+console can show black textures or lose the device. That is the A/B EDEN_NX2_ALLOC_BYTES exists for.
+
+Checked: applies to the tree the 0410-0414 stack produces. Not run on a console.
+
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <bit>
++#include <cstdlib>
+ #include <limits>
+ #include <optional>
+ #include <type_traits>
+@@ -231,7 +232,30 @@
+     // backed: VMA would quietly place them in system memory once VRAM is full. They take the
+     // unbacked sparse fallback below.
+     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
+-    const bool huge = texels > (u64{1} << 28);
++    // The texel count is only a filter: what the image needs depends on its format, levels, layers
++    // and alignment. Ocarina of Time's sun shadow map is 18432x18432 D16 - 339M texels, past the
++    // filter, but only 648 MiB. Calling it unbackable gave it nothing bound, so everything written
++    // to it was lost and the scene came out wrong (Lichii 75afd1a306, Eglantine #570). Ask the
++    // driver what the image would really take instead.
++    // EDEN_NX2_ALLOC_BYTES=0 restores the texel-only filter, for an A/B against the driver probe.
++    static const bool bytes_policy = [] {
++        const char* const value = std::getenv("EDEN_NX2_ALLOC_BYTES");
++        return value == nullptr || value[0] != '0';
++    }();
++    bool huge = !bytes_policy && texels > (u64{1} << 28);
++    if (bytes_policy && texels > (u64{1} << 28)) {
++        VkMemoryRequirements requirements{};
++        VkImage probe = VK_NULL_HANDLE;
++        if (device.GetDispatchLoader().vkCreateImage(*device.GetLogical(), &ci, nullptr, &probe) ==
++            VK_SUCCESS) {
++            device.GetDispatchLoader().vkGetImageMemoryRequirements(*device.GetLogical(), probe,
++                                                                   &requirements);
++            device.GetDispatchLoader().vkDestroyImage(*device.GetLogical(), probe, nullptr);
++        }
++        // A quarter of device-local memory still leaves the multi-gigabyte sparse arrays (title 1's
++        // 8192x8192x68 layers, ~23 GB) on the unbacked path they need.
++        huge = requirements.size == 0 || requirements.size > device.GetDeviceLocalMemory() / 4;
++    }
+     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {

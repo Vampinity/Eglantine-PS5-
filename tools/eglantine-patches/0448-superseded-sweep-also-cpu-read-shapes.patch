@@ -1,0 +1,76 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 751241480a..2dd2121014 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -873,12 +873,14 @@ inline u64 TcColdFrames() {
+ /// Ported from Fritchii v5.6 (EXP58, f549632a), measured at Castle Town over 150 s: device memory
+ /// 7.8-10.5 -> 5.2-5.7 GB, collector evictions 83-1915 a window -> 0, worst frames 140-180 ->
+ /// 30-48 ms. Never applied to a shape the CPU read.
+-inline bool SupersededSweepEnabled() {
+-    static const bool enabled = [] {
++/// 0 = off (the old behaviour), 1 = guarded shapes only (default), 2 = also shapes the CPU read
++/// (Fritchii 39b54e91).
++inline int SupersededSweepMode() {
++    static const int mode = [] {
+         const char* const value = std::getenv("EDEN_NX2_TC_SUPERSEDED");
+-        return value == nullptr || value[0] != '0';
++        return value != nullptr ? static_cast<int>(std::strtol(value, nullptr, 10)) : 1;
+     }();
+-    return enabled;
++    return mode;
+ }
+ 
+ template <class P>
+@@ -922,6 +924,8 @@ void TextureCache<P>::SweepColdImages() {
+     }();
+     constexpr u32 MaxPerFrame = 16;
+     constexpr u64 MaxWatchFrames = 600; // then a watched image that never got BadOverlap leaves
++    // EDEN_NX2_TC_SUPERSEDED: how long a superseded image is left alone before it is deleted.
++    constexpr u64 SupersededFrames = 60;
+     constexpr ImageFlagBits excluded =
+         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+         ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
+@@ -979,22 +983,36 @@ void TextureCache<P>::SweepColdImages() {
+             // either (BadOverlap): only where nothing says they may be read again.
+             if (image.relocation_guard_noted != 0 || image.info.forced_flushed ||
+                 image.info.dma_downloaded) {
+-                ++cold_kept_read;
+-                drop();
+-                continue;
++                // EDEN_NX2_TC_SUPERSEDED=2: a newer target of another shape owns that memory
++                // now, so a CPU read there goes to it, not to this image.
++                const int sweep_mode = SupersededSweepMode();
++                const u64 age = frame_tick - lru_cache.Tick(image.lru_index);
++                if (sweep_mode >= 2 && age < SupersededFrames &&
++                    frame_tick - watched_at <= MaxWatchFrames) {
++                    ++index; // looked at again when old enough
++                    continue;
++                }
++                if (sweep_mode < 2 || age < SupersededFrames ||
++                    !ColdSuperseded(image_id, image)) {
++                    ++cold_kept_read;
++                    drop();
++                    continue;
++                }
++                superseded = true;
+             }
+             const auto shape = relocation_shapes.find(RelocationShapeKey(image.info));
+             const u8 guard = shape != relocation_shapes.end() ? shape->second.guard : 0;
+-            if ((guard & GuardCpuRead) != 0 ||
+-                (!sweep_guarded && (guard & (GuardSampled | GuardLoaded)) != 0)) {
++            if (!superseded &&
++                ((guard & GuardCpuRead) != 0 ||
++                 (!sweep_guarded && (guard & (GuardSampled | GuardLoaded)) != 0))) {
+                 // EDEN_NX2_TC_SUPERSEDED: a guarded image still dies once it has been untouched
+                 // for SupersededFrames and a render target of another shape, touched since, covers
+                 // its memory. Dead guarded targets piled up here (350k "kept" in 600 frames
+                 // upstream) until the collector's bursts evicted live textures -- the unbacked
+                 // images that draw as black water. Never for a shape the CPU read.
+-                constexpr u64 SupersededFrames = 60;
++                const int sweep_mode = SupersededSweepMode();
+                 const bool superseded_sweep =
+-                    SupersededSweepEnabled() && (guard & GuardCpuRead) == 0;
++                    sweep_mode != 0 && ((guard & GuardCpuRead) == 0 || sweep_mode >= 2);
+                 const u64 age = frame_tick - lru_cache.Tick(image.lru_index);
+                 if (superseded_sweep && age < SupersededFrames &&
+                     frame_tick - watched_at <= MaxWatchFrames) {

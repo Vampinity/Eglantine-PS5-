@@ -1,0 +1,94 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] vulkan: a buffer that cannot fit the budget reclaims or over-budgets, not abort
+
+Ported from Frizti/Fritchii 464fbb45b, shipped in Fritchii v5.2 as "No more crash when the PC's
+memory budget is reached during long sessions (seen in Castle Town after half an hour). Buffers in
+system memory may now go over Windows' budget, like textures already could."
+
+That is this port's oldest open symptom: sessions that die instead of continuing. Our own records
+have a 34-minute death, and an older log with 72 "Out of device memory" events and the texture
+thresholds walked down to their floor.
+
+Two changes, both in the buffer path:
+
+- MemoryAllocator::CreateBuffer, when vmaCreateBuffer answers out of memory and the usage is not
+  MemoryUsage::DeviceLocal, retries once with VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT cleared, and
+  logs whether the buffer was made anyway. For host memory the budget is a soft hint - exceeding it
+  pages, while refusing aborted the emulator. Device-local allocations keep the budget, because there
+  the budget is real.
+- StagingBufferPool::CreateStagingBuffer catches the allocation failure, drops every staging buffer
+  that is not deferred and whose tick the GPU has passed, resets each level's two indices, and tries
+  once more. So a fragmented pool reclaims before it gives up.
+
+What this can break. A host-memory allocation that goes over budget can make the process page, so a
+session that used to abort can now stall until the OS frees something - slower, but alive, which is
+the intended trade. The eviction pass resets iterate_index and delete_index for every level it
+touches, so those lists are re-walked from the start; that is what the pool does after any release.
+
+Measured or a guess: upstream's comment names the exact failure - a texture upload in Ocarina's town
+square after 36 minutes - and their build shipped it. Ours is the same buffer path from the same
+lineage, and our own logs show the out-of-memory class. No console has run this build.
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index f6f66674de..64647ec7d4 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -359,7 +359,29 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+     if (device.IsBufferDeviceAddressSupported()) {
+         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+     }
+-    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
++    vk::Buffer buffer;
++    try {
++        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
++    } catch (const vk::Exception& e) {
++        // Out of memory: free every idle staging buffer and try once more.
++        size_t freed = 0;
++        for (StagingBuffersCache* cache : {&device_local_cache, &upload_cache, &download_cache}) {
++            for (StagingBuffers& level : *cache) {
++                const size_t before = level.entries.size();
++                std::erase_if(level.entries, [this](const StagingBuffer& entry) {
++                    return !entry.deferred && scheduler.IsFree(entry.tick);
++                });
++                freed += before - level.entries.size();
++                level.iterate_index = 0;
++                level.delete_index = 0;
++            }
++        }
++        LOG_WARNING(Render_Vulkan,
++                    "Staging buffer of {} MiB could not be made ({}); freed {} idle staging "
++                    "buffers and retrying",
++                    buffer_ci.size >> 20, e.what(), freed);
++        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
++    }
+     if (device.HasDebuggingToolAttached()) {
+         ++buffer_index;
+         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 488f4a776d..52c5f2ba66 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -448,7 +448,22 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
+     VkMemoryPropertyFlags property_flags{};
+ 
+     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
+-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        VkResult result =
++            vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++        // Staging buffers live in system memory, where the budget is the OS's soft hint: going over
++        // it pages, while refusing aborted the emulator - a texture upload in Ocarina's town square
++        // after 36 minutes. Device-local buffers keep the budget, because there it is real.
++        if ((result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) &&
++            usage != MemoryUsage::DeviceLocal) {
++            VmaAllocationCreateInfo over_budget = alloc_ci;
++            over_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
++            result =
++                vmaCreateBuffer(allocator, &ci, &over_budget, &handle, &allocation, &alloc_info);
++            LOG_WARNING(Render_Vulkan, "Buffer of {} KiB (usage {}) over the memory budget: {}",
++                        ci.size >> 10, static_cast<u32>(usage),
++                        result == VK_SUCCESS ? "made anyway" : "failed");
++        }
++        vk::Check(result);
+     }
+     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+ 

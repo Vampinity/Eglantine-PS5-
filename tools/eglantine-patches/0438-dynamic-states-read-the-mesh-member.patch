@@ -1,0 +1,31 @@
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index de049903dd..1732e3426e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2546,7 +2546,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
+             UpdateDepthWriteEnable(regs);
+             UpdateStencilTestEnable(regs);
+         }
+-        if (topology_changed && !emulated_mesh) {
++        if (topology_changed && !mesh_emulated) {
+             scheduler.Record([topology_vk = MaxwellToVK::PrimitiveTopology(device, topology)](
+                                  vk::CommandBuffer cmdbuf) {
+                 cmdbuf.SetPrimitiveTopologyEXT(topology_vk);
+@@ -2555,7 +2555,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
+     }
+ 
+     if (device.IsExtExtendedDynamicState2Supported()) {
+-        if (!emulated_mesh) {
++        if (!mesh_emulated) {
+             UpdatePrimitiveRestartEnable(regs);
+         }
+         UpdateRasterizerDiscardEnable(regs);
+@@ -2596,7 +2596,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
+         UpdateColorWriteEnable(regs);
+     }
+ 
+-    if (device.IsExtVertexInputDynamicStateSupported() && !emulated_mesh) {
++    if (device.IsExtVertexInputDynamicStateSupported() && !mesh_emulated) {
+         if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {
+             UpdateVertexInput(regs);
+         }
