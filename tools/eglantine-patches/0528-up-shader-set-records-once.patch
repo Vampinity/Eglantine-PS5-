@@ -1,0 +1,373 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Shader set: records layout 2, each program's code stored once; the records are rebuilt as they are read
+
+T108 and T109 (batches t108-s, t109-s): the conversion of Ocarina's full set is 67 minutes, all of
+it the console writing prep_shader_set.bin: 113,054 records, 4,311 MB, at 1 to 1.5 MB a second
+after the first half GB, whatever the size of the write calls (0527). The file repeats the
+lowered code of a program in every record that uses it: 36,542 programs for 113,054 records.
+
+Layout 2 writes a record as its fact ids and its key, then each used fact once and each used
+program's lowered code once, then a trailer that says where those parts are. ShaderSet::ReadRecords
+builds a record's environments again from those parts and hands them to the same callback the
+preparation gave VideoCommon::ReadPipelines (FileEnvironment::Deserialize and the key read only
+forward, so each record is read from memory through an ifstream with its buffer swapped). A stamp
+of the old layout does not hold ('records layout 2' is a stamp line), so a console with an old
+set converts once more.
+
+Not compiled before this build; nothing changes without EDEN_UP_SHADER_SET.
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 7f2c807..7edbadb 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -4940,8 +4940,9 @@ void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::sto
+         ComputePipelineCacheKey key;
+         in.read(reinterpret_cast<char*>(&key), sizeof(key));
+     };
+-    const bool whole = VideoCommon::ReadPipelines(
+-        file, CACHE_VERSION, skip_compute,
++    (void)skip_compute; // layout 2 holds graphics records only
++    const bool whole = VideoCommon::ShaderSet::ReadRecords(
++        file, CACHE_VERSION,
+         [&](std::ifstream& in, std::vector<VideoCommon::FileEnvironment> envs) {
+             GraphicsPipelineCacheKey key;
+             in.read(reinterpret_cast<char*>(&key), sizeof(key));
+@@ -5106,8 +5107,7 @@ void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::sto
+                 state.cv.notify_all();
+                 throw;
+             }
+-        },
+-        false);
++        });
+     wait_for_jobs();
+     {
+         std::scoped_lock lock{state.mutex};
+diff --git a/src/video_core/shader_set.cpp b/src/video_core/shader_set.cpp
+index 0e917dd..b11abb8 100644
+--- a/src/video_core/shader_set.cpp
++++ b/src/video_core/shader_set.cpp
+@@ -3,6 +3,7 @@
+ #include "video_core/shader_set.h"
+ #include "video_core/shader_set_recipe.h"
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+@@ -11,11 +12,14 @@
+ #include <fstream>
+ #include <map>
+ #include <optional>
++#include <span>
+ #include <stdexcept>
++#include <streambuf>
+ #include <string>
+ #include <thread>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <vector>
+ #include <fmt/format.h>
+ #include <openssl/evp.h>
+ #include <zstd.h>
+@@ -192,6 +196,7 @@ std::string ExtractorLines() {
+     std::string lines;
+     if (Common::PeSwitch("EDEN_UP_SHADER_SET_STREAM")) lines += "extractor stream 1\n";
+     if (Common::PeSwitch("EDEN_UP_SHADER_SET_INDEX")) lines += "extractor index 1\n";
++    lines += "records layout 2\n"; // each program's code once (ReadRecords), not once per record
+     // EDEN_UP_SHADER_SET_RECONVERT=<n> (a test aid): a number in the stamp, so a set made with
+     // another number (or none) is converted again once, e.g. to time the conversion.
+     if (const size_t again = SwitchNumber("EDEN_UP_SHADER_SET_RECONVERT", 0); again != 0) {
+@@ -325,20 +330,36 @@ std::optional<Lowered> Lower(const Guest& p, std::stop_token stop) {
+                0x4f554e4345000003ULL;
+     return out;
+ }
+-std::vector<u8> Hydrate(const Facts& f, const Lowered& p) {
++/// Whether a fact's cached answers fit a lowered program (what Hydrate used to refuse).
++bool HydrateOk(const Facts& f, const Lowered& p) {
+     // Facts are cached answers. Read addresses belong to the *target* lowered vector.
+-    if (Load<u32>(f.bytes, 56) != 0 || Load<u32>(f.bytes, 60) != 0) return {};
+-    if (p.bound != ~0U && Load<u32>(f.bytes, 52) != p.bound) return {};
+-    std::vector<u8> out(f.bytes.begin(), f.bytes.begin() + 76);
+-    Patch(out, 0, u64{p.code.size() * 8});
+-    Patch(out, 60, u32{0});
+-    Patch(out, 64, static_cast<u32>((p.code.size() - 1) * 8));
+-    const auto* code = reinterpret_cast<const u8*>(p.code.data());
+-    out.insert(out.end(), code, code + p.code.size() * 8);
+-    out.insert(out.end(), f.bytes.begin() + 76, f.bytes.begin() + f.tables_end);
+-    out.insert(out.end(), code, code + 80); // graphics ProgramHeader is absent from facts
+-    return out;
++    if (f.bytes.size() < 76 || f.tables_end < 76 || f.tables_end > f.bytes.size() ||
++        p.code.size() < 10) {
++        return false;
++    }
++    if (Load<u32>(f.bytes, 56) != 0 || Load<u32>(f.bytes, 60) != 0) return false;
++    return p.bound == ~0U || Load<u32>(f.bytes, 52) == p.bound;
+ }
++
++/// One environment as FileEnvironment::Deserialize reads it: the fact's bytes (up to its tables'
++/// end) around the lowered code (`code`: 8 bytes an instruction). Appended to `out`.
++void AppendEnvironment(std::vector<char>& out, std::span<const char> fact,
++                       std::span<const char> code) {
++    if (fact.size() < 76 || code.size() < 80) throw std::runtime_error("short shader data");
++    const size_t at = out.size();
++    out.insert(out.end(), fact.begin(), fact.begin() + 76);
++    const u64 code_bytes = code.size();
++    const u32 zero = 0;
++    const u32 last = static_cast<u32>(code.size() - 8);
++    std::memcpy(out.data() + at, &code_bytes, sizeof(code_bytes));
++    std::memcpy(out.data() + at + 60, &zero, sizeof(zero));
++    std::memcpy(out.data() + at + 64, &last, sizeof(last));
++    out.insert(out.end(), code.begin(), code.end());
++    out.insert(out.end(), fact.begin() + 76, fact.end());
++    out.insert(out.end(), code.begin(), code.begin() + 80); // graphics ProgramHeader is absent from facts
++}
++
++constexpr char SetMagic[9] = "edenset2";
+ } // namespace
+ 
+ } // namespace VideoCommon::ShaderSet
+@@ -671,13 +692,18 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+                  candidates, errors, found, missing, failed, seconds());
+         // Stream duplicate environments per record, as ReadPipelines expects. Do not hold a GB output in RAM.
+         AtomicFile file{output_dir / RecordsName};
+-        file.Write(Bytes{reinterpret_cast<const u8*>("yuzucach"), 8});
++        // Layout 2 (ReadRecords): magic, cache version, the records (count, fact ids, key size,
++        // key), then each used fact once, then each used program's lowered code once, then where
++        // those three parts are. Layout 1 wrote every record's environments whole: 4.3 GB for
++        // Ocarina's 113,054 records, and the PS5 writes that file at 1-1.5 MB a second.
++        file.Write(Bytes{reinterpret_cast<const u8*>(SetMagic), 8});
+         file.Write(PipelineCacheVersion);
+         std::map<std::string, size_t> dropped;
+         std::vector<u64> used_programs; // lowered hashes with at least one converted record
+         std::unordered_set<u64> used_seen;
+         size_t converted = 0;
+         u64 next_report = u64{512} << 20;
++        std::vector<u8> used_fact(r.facts.size());
+         for (const auto& p : r.records) {
+             if (stop.stop_requested()) return out; // the temporary is removed with `file`
+             if (p.kind == 1) { ++dropped["compute-predicted-unsupported"]; continue; }
+@@ -694,13 +720,11 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+             if (std::ranges::any_of(p.xors, [](u64 x) { return x != 0; })) {
+                 ++dropped["unexpected-hash-xor"]; continue;
+             }
+-            std::vector<std::vector<u8>> envs;
+             std::array<u64, 6> hashes{};
+-            bool valid = true;
++            bool valid = !p.facts.empty() && p.facts.size() <= 6;
+             for (auto id : p.facts) {
+                 const auto& f = r.facts[id];
+-                envs.push_back(Hydrate(f, *lowered[f.program]));
+-                valid &= !envs.back().empty();
++                valid = valid && HydrateOk(f, *lowered[f.program]);
+             }
+             if (!valid) { ++dropped["incompatible-facts"]; continue; }
+             u32 read_mask = ~0U;
+@@ -712,9 +736,13 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+             }
+             std::vector<u8> key;
+             if (!map_state(r.states[p.state], hashes, read_mask, key)) { ++dropped["device-or-key-state"]; continue; }
+-            const auto count = static_cast<u32>(envs.size());
++            const auto count = static_cast<u32>(p.facts.size());
+             file.Write(count);
+-            for (const auto& env : envs) file.Write(Bytes{env});
++            for (const u32 id : p.facts) {
++                file.Write(id);
++                used_fact[id] = 1;
++            }
++            file.Write(static_cast<u32>(key.size()));
+             file.Write(Bytes{key});
+             ++converted;
+             if (file.Written() >= next_report) {
+@@ -734,6 +762,36 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+         LOG_INFO(Render_Vulkan, "Shader set: pipelines read {}, converted {}, dropped {} (exclusive reasons); "
+                  "{:.1f} s in all", r.records.size(), converted, total_dropped, seconds());
+         if (!converted || stop.stop_requested()) return out;
++        // The facts and the programs the records name, each once, and the trailer.
++        const u64 facts_at = file.Written();
++        u64 fact_count = 0, program_count = 0;
++        std::vector<u8> used_program(r.programs.size());
++        for (u32 id = 0; id < r.facts.size(); ++id) {
++            if (!used_fact[id]) continue;
++            const auto& f = r.facts[id];
++            file.Write(id);
++            file.Write(static_cast<u32>(f.program));
++            file.Write(static_cast<u32>(f.tables_end));
++            file.Write(Bytes{f.bytes.data(), f.tables_end});
++            used_program[f.program] = 1;
++            ++fact_count;
++        }
++        const u64 programs_at = file.Written();
++        for (u32 index = 0; index < r.programs.size(); ++index) {
++            if (!used_program[index]) continue;
++            const auto& code = lowered[index]->code;
++            file.Write(index);
++            file.Write(static_cast<u64>(code.size() * 8));
++            file.Write(Bytes{reinterpret_cast<const u8*>(code.data()), code.size() * 8});
++            ++program_count;
++        }
++        for (const u64 value : {u64{12}, u64{converted}, facts_at, fact_count, programs_at,
++                                program_count}) {
++            file.Write(value);
++        }
++        file.Write(Bytes{reinterpret_cast<const u8*>(SetMagic), 8});
++        LOG_INFO(Render_Vulkan, "Shader set: {} facts and {} programs stored once, {} MB in all; "
++                 "{:.1f} s", fact_count, program_count, file.Written() >> 20, seconds());
+         // The old stamp goes first (it must never sit beside the new files), then records, then
+         // programs, then the stamp: a stamp is only ever beside whole files.
+         std::filesystem::remove(output_dir / StampName, ec);
+@@ -772,4 +830,126 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+         return {};
+     }
+ }
++
++bool ReadRecords(
++    const std::filesystem::path& path, u32 cache_version,
++    const std::function<void(std::ifstream&, std::vector<FileEnvironment>)>& on_graphics) {
++    // One record's bytes at a time, read through an ifstream as the pipeline cache's callbacks
++    // and FileEnvironment::Deserialize expect (they only read forward).
++    struct MemBuf final : std::streambuf {
++        void Set(char* begin, size_t size) { setg(begin, begin, begin + size); }
++        pos_type seekoff(off_type off, std::ios_base::seekdir dir,
++                         std::ios_base::openmode) override {
++            char* const to = dir == std::ios_base::beg   ? eback() + off
++                             : dir == std::ios_base::cur ? gptr() + off
++                                                         : egptr() + off;
++            if (to < eback() || to > egptr()) return pos_type(off_type(-1));
++            setg(eback(), to, egptr());
++            return pos_type(to - eback());
++        }
++        pos_type seekpos(pos_type pos, std::ios_base::openmode mode) override {
++            return seekoff(off_type(pos), std::ios_base::beg, mode);
++        }
++    };
++    try {
++        std::ifstream file(path, std::ios::binary | std::ios::ate);
++        if (!file.is_open()) return true;
++        file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
++        const u64 end = static_cast<u64>(file.tellg());
++        constexpr u64 TrailerBytes = 6 * 8 + 8;
++        if (end < 12 + TrailerBytes) return true;
++        const auto get = [&file](auto& value) {
++            file.read(reinterpret_cast<char*>(&value), sizeof(value));
++        };
++        const auto seek = [&file](u64 at) { file.seekg(static_cast<std::streamoff>(at)); };
++        std::array<char, 8> magic{}, tail{};
++        u32 version{};
++        seek(0);
++        file.read(magic.data(), magic.size());
++        get(version);
++        if (std::memcmp(magic.data(), SetMagic, 8) != 0 || version != cache_version) {
++            return true; // another layout's or another version's file: nothing to read
++        }
++        std::array<u64, 6> where{};
++        seek(end - TrailerBytes);
++        get(where);
++        file.read(tail.data(), tail.size());
++        const u64 records = where[1], facts_at = where[2], facts = where[3];
++        const u64 programs_at = where[4], programs = where[5];
++        if (std::memcmp(tail.data(), SetMagic, 8) != 0 || where[0] != 12 || facts_at < 12 ||
++            programs_at < facts_at || programs_at > end - TrailerBytes) {
++            return false;
++        }
++        struct Fact { u64 at; u32 size; u32 program; };
++        struct Code { u64 at; u64 size; };
++        std::unordered_map<u32, Fact> fact_at;
++        std::unordered_map<u32, Code> code_at;
++        fact_at.reserve(facts);
++        code_at.reserve(programs);
++        u64 at = facts_at;
++        for (u64 i = 0; i < facts; ++i) {
++            u32 id{}, program{}, size{};
++            seek(at);
++            get(id); get(program); get(size);
++            fact_at[id] = Fact{at + 12, size, program};
++            at += 12 + size;
++            if (at > programs_at) return false;
++        }
++        at = programs_at;
++        for (u64 i = 0; i < programs; ++i) {
++            u32 index{};
++            u64 size{};
++            seek(at);
++            get(index); get(size);
++            code_at[index] = Code{at + 12, size};
++            at += 12 + size;
++            if (at > end - TrailerBytes) return false;
++        }
++        std::vector<char> bytes, fact, code;
++        at = 12;
++        for (u64 i = 0; i < records; ++i) {
++            u32 count{}, key_size{};
++            std::array<u32, 6> ids{};
++            seek(at);
++            get(count);
++            if (count == 0 || count > ids.size()) return false;
++            file.read(reinterpret_cast<char*>(ids.data()), count * sizeof(u32));
++            get(key_size);
++            if (key_size > 65536) return false;
++            bytes.resize(sizeof(u32));
++            std::memcpy(bytes.data(), &count, sizeof(count));
++            const u64 key_at = at + 4 + count * 4 + 4;
++            at = key_at + key_size;
++            for (u32 n = 0; n < count; ++n) {
++                const Fact& f = fact_at.at(ids[n]);
++                const Code& c = code_at.at(f.program);
++                fact.resize(f.size);
++                seek(f.at);
++                file.read(fact.data(), fact.size());
++                code.resize(c.size);
++                seek(c.at);
++                file.read(code.data(), code.size());
++                AppendEnvironment(bytes, fact, code);
++            }
++            const size_t key_in = bytes.size();
++            bytes.resize(key_in + key_size);
++            seek(key_at);
++            file.read(bytes.data() + key_in, key_size);
++            MemBuf memory;
++            memory.Set(bytes.data(), bytes.size());
++            std::ifstream in;
++            in.std::basic_ios<char>::rdbuf(&memory);
++            in.exceptions(std::ifstream::failbit | std::ifstream::badbit);
++            u32 num_envs{};
++            in.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
++            std::vector<FileEnvironment> envs(num_envs);
++            for (FileEnvironment& env : envs) env.Deserialize(in);
++            on_graphics(in, std::move(envs));
++        }
++        return true;
++    } catch (const std::exception&) {
++        // A read past the end, no memory, or whatever the callback threw: the reading stops.
++        return false;
++    }
++}
+ } // namespace VideoCommon::ShaderSet
+diff --git a/src/video_core/shader_set.h b/src/video_core/shader_set.h
+index 069be4b..3da4002 100644
+--- a/src/video_core/shader_set.h
++++ b/src/video_core/shader_set.h
+@@ -26,7 +26,9 @@
+ #include <string>
+ #include <vector>
+ 
++#include <fstream>
+ #include "common/common_types.h"
++#include "video_core/shader_environment.h"
+ 
+ namespace VideoCommon::ShaderSet {
+ 
+@@ -36,6 +38,14 @@ namespace VideoCommon::ShaderSet {
+ using MapState = std::function<bool(std::span<const u8> state, std::array<u64, 6> hashes,
+                                     u32 vertex_read_mask, std::vector<u8>& bytes)>;
+ 
++/// Reads the records of a generated file (layout 2: each program's code is stored once) and
++/// hands each to `on_graphics` as VideoCommon::ReadPipelines does: the environments, and a
++/// stream that holds the record's key next. False: the file is cut or damaged, or the callback
++/// threw. A file of another layout or cache version reads as empty (true).
++[[nodiscard]] bool ReadRecords(
++    const std::filesystem::path& file, u32 cache_version,
++    const std::function<void(std::ifstream&, std::vector<FileEnvironment>)>& on_graphics);
++
+ struct Outputs {
+     std::filesystem::path records;  ///< prep_shader_set.bin, empty when there is none to use
+     std::filesystem::path programs; ///< prep_shader_set.programs: u64 lowered hashes, in order

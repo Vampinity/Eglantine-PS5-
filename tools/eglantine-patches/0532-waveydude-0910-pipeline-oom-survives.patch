@@ -1,0 +1,71 @@
+From: waveydude <23585435+waveydude@users.noreply.github.com>
+Subject: [PATCH] Pipeline cache: a driver out-of-memory while building a shader module or pipeline fails that pipeline instead of ending the session
+
+crash-20261109-121818 (Ocarina, 105 s): CreateShaderModule returned VK_ERROR_OUT_OF_HOST_MEMORY on GPUBack with
+the shared pool empty; CreateGraphicsPipeline caught Shader::Exception and std::bad_alloc but not vk::Exception, so
+the app stopped itself. Out-of-memory results now go the bad_alloc way (the pipeline is left out, its draws dropped,
+the heap trimmed); any other Vulkan error still ends the session.
+
+Taken from waveydude's tree (issue 21, 10 Nov 2026; his commit 5cecce1, where the file is
+0910-ocarina-pipeline-oom-survives.patch), on his base T85. Placed by hand in our tree: the two catch
+blocks have moved, and the graphics one also clears the stage cache (EDEN_UP_STAGE_CACHE), as our
+std::bad_alloc handler beside it does.
+---
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index cddb505..93aba85 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -406,6 +406,25 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+     }();
+     return ends;
+ }
++void SurviveBadAlloc(const char* where);
++// The driver ran out of memory while building a shader module or pipeline (CreateShaderModule:
++// VK_ERROR_OUT_OF_HOST_MEMORY, Ocarina on 13.60 with the shared pool empty, crash-20261109-121818).
++// Like a std::bad_alloc here: this pipeline fails, its draws are dropped, and the session goes on.
++// Any other Vulkan error still ends the session.
++bool SurviveDriverOutOfMemory(const vk::Exception& exception, const char* where) {
++    const VkResult result = exception.GetResult();
++    if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++        return false;
++    }
++    static std::atomic<u32> reported{};
++    if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
++        LOG_ERROR(Render_Vulkan, "No memory to build {} ({}): left out, its draws are dropped",
++                  where, exception.what());
++    }
++    SurviveBadAlloc(where);
++    return true;
++}
++
+ void SurviveBadAlloc(const char* where) {
+     if (BadAllocEnds()) {
+         throw std::bad_alloc{};
+@@ -2832,6 +2851,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     }
+     SurviveBadAlloc("a graphics pipeline");
+     return nullptr;
++} catch (const vk::Exception& exception) {
++    if (!SurviveDriverOutOfMemory(exception, "a graphics pipeline")) {
++        throw;
++    }
++    if (stage_cache.Enabled()) {
++        // As for std::bad_alloc above (EDEN_UP_STAGE_CACHE).
++        stage_cache.Clear();
++    }
++    return nullptr;
+ }
+ 
+ namespace {
+@@ -3636,6 +3664,11 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+ } catch (const std::bad_alloc&) {
+     SurviveBadAlloc("a compute pipeline");
+     return nullptr;
++} catch (const vk::Exception& exception) {
++    if (!SurviveDriverOutOfMemory(exception, "a compute pipeline")) {
++        throw;
++    }
++    return nullptr;
+ }
+ 
+ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,

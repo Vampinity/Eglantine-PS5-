@@ -1,0 +1,295 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_DRIVER_BUILD_LOG=1: driver pipeline build times and GPU-thread compute translation counts (log only)
+
+Port of Eglantine-Community 212568b2 ("video_core: log driver pipeline build times", handle
+kraibse). Off by default; with the switch unset every changed site makes the same driver call
+and nothing else.
+
+Every 10 s with builds: how many graphics and compute pipelines the driver built, how many took
+over 10 ms (compiled, not taken from the driver's cache), mean and maximum. The task, scan and
+mesh compute pipelines of EDEN_NX2_MESH_AS_COMPUTE count as compute; with
+EDEN_NX2_RADV_MESH_COMPUTE (the console) a mesh pipeline is one graphics build, the driver's
+compute lowering inside it. Builds made before the first
+frame (the boot) come out as the first line, with the time since the first of them as its window;
+that stands in for upstream's "at boot" summary, which is not ported.
+
+Ours, for the warm-compute decision: every 5 s with any, how many compute pipelines and how many
+mesh pipelines were translated with the runtime pools (main_pools: the GPU thread). A mesh
+pipeline counts whether the driver (EDEN_NX2_RADV_MESH_COMPUTE, what the console runs) or the
+core (EDEN_NX2_MESH_AS_COMPUTE) runs it as compute. Kept translations (EDEN_UP_SHADER_PREP),
+stage cache hits and worker translations (EDEN_UP_ASYNC_TRANSLATION) are not counted: nothing is
+translated on the GPU thread for them. A window with none is not logged.
+
+Builder threads only add to the window under the lock and never log; the frame's thread
+(PipelineCache::TickFrame) takes the due windows and logs after the lock is released, so a
+builder that waits for heap memory (EDEN_UP_HEAP_WAIT_MS) never holds a lock the frame needs.
+
+v2 of draft-d-pipeline-build-log.patch (review of 2026-11-10): the mesh count no longer needs
+EDEN_NX2_MESH_AS_COMPUTE (it was always 0 on the console) and counts translations, not
+attempts; no log call under the lock or on a builder thread; one line when the switch is read;
+empty windows not logged; the mean's division cast for -Wconversion.
+
+Test: env.txt EDEN_UP_DRIVER_BUILD_LOG=1, cold then warm driver cache, the door walk. grep
+"EDEN_UP_DRIVER_BUILD_LOG on", "Driver pipeline builds", "GPU thread compute translations".
+Not compiled for the console; the header alone was syntax-checked on the host (clang++
+-std=c++20 -Wall -Wextra -Wconversion, no warnings).
+
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index d71678c..c6db8d1 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -13,6 +13,7 @@
+ #include "video_core/renderer_vulkan/pipeline_helper.h"
+ #include "video_core/renderer_vulkan/pipeline_statistics.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
++#include "video_core/renderer_vulkan/vk_driver_build_report.h"
+ #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+@@ -120,7 +121,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+             .basePipelineIndex = 0,
+         };
+         try {
+-            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
++            pipeline = DriverBuildReport::Build(DriverBuildReport::Kind::Compute, [&] {
++                return device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
++            });
+         } catch (const vk::Exception& exception) {
+             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
+                          exception.what());
+diff --git a/src/video_core/renderer_vulkan/vk_driver_build_report.h b/src/video_core/renderer_vulkan/vk_driver_build_report.h
+new file mode 100644
+index 0000000..f544ee1
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_driver_build_report.h
+@@ -0,0 +1,145 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// EDEN_UP_DRIVER_BUILD_LOG=1 (exactly "1", off by default): log only.
++// Every 10 s with builds: how many graphics and compute pipelines the driver built, how many took
++// over 10 ms (compiled, not taken from the driver's cache), the mean and the maximum.
++// Every 5 s with any: how many compute pipelines and mesh pipelines were translated with the
++// runtime pools, that is on the GPU thread. A window with none is not logged.
++// Port of Eglantine-Community 212568b2 (kraibse); the translation counts are ours.
++//
++// Build() runs on the pipeline builder threads. It only adds to the window under the lock: it
++// never logs, so a builder that waits for heap memory (EDEN_UP_HEAP_WAIT_MS) never does so with
++// this lock held. Poll() runs once a frame on the thread that ticks the pipeline cache, takes the
++// due windows under the lock and logs them after it is released.
++#pragma once
++
++#include <algorithm>
++#include <chrono>
++#include <mutex>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++
++namespace Vulkan::DriverBuildReport {
++
++using Clock = std::chrono::steady_clock;
++
++enum class Kind { Graphics, Compute };
++
++inline bool On() {
++    static const bool on = Common::PeSwitch("EDEN_UP_DRIVER_BUILD_LOG");
++    return on;
++}
++
++struct Totals {
++    u64 graphics{};
++    u64 compute{};
++    u64 slow{};
++    double sum_ms{};
++    double max_ms{};
++};
++
++struct State {
++    Totals builds;
++    u64 compute_translations{};
++    u64 mesh_translations{};
++    Clock::time_point builds_start{};
++    Clock::time_point translations_start{};
++    bool announced{};
++};
++
++inline std::mutex state_mutex;
++inline State state;
++
++/// One compute pipeline (mesh false) or one mesh pipeline (mesh true) translated on the GPU thread.
++inline void Translation(bool mesh) {
++    if (!On()) {
++        return;
++    }
++    std::scoped_lock lock{state_mutex};
++    ++(mesh ? state.mesh_translations : state.compute_translations);
++}
++
++/// Times one driver call that makes a pipeline and returns what it made. A call that throws is
++/// not counted. Off: the call and nothing else.
++template <typename F>
++auto Build(Kind kind, F&& make) {
++    if (!On()) {
++        return make();
++    }
++    const Clock::time_point begin = Clock::now();
++    auto made = make();
++    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
++    {
++        std::scoped_lock lock{state_mutex};
++        if (state.builds_start == Clock::time_point{}) {
++            state.builds_start = begin;
++        }
++        ++(kind == Kind::Graphics ? state.builds.graphics : state.builds.compute);
++        state.builds.slow += ms > 10.0 ? 1 : 0;
++        state.builds.sum_ms += ms;
++        state.builds.max_ms = (std::max)(state.builds.max_ms, ms);
++    }
++    return made;
++}
++
++/// Once a frame (PipelineCache::TickFrame). The builds of the boot, made before the first frame,
++/// come out as the first line, with the time they took as its window.
++inline void Poll() {
++    if (!On()) {
++        return;
++    }
++    const Clock::time_point now = Clock::now();
++    Totals builds;
++    u64 compute = 0;
++    u64 mesh = 0;
++    double builds_s = 0.0;
++    double translations_s = 0.0;
++    bool announce = false;
++    {
++        std::scoped_lock lock{state_mutex};
++        if (!state.announced) {
++            state.announced = true;
++            announce = true;
++        }
++        if (state.builds_start == Clock::time_point{}) {
++            state.builds_start = now;
++        }
++        if (state.translations_start == Clock::time_point{}) {
++            state.translations_start = now;
++        }
++        if (now - state.builds_start >= std::chrono::seconds{10}) {
++            builds = state.builds;
++            builds_s = std::chrono::duration<double>(now - state.builds_start).count();
++            state.builds = Totals{};
++            state.builds_start = now;
++        }
++        if (now - state.translations_start >= std::chrono::seconds{5}) {
++            compute = state.compute_translations;
++            mesh = state.mesh_translations;
++            translations_s = std::chrono::duration<double>(now - state.translations_start).count();
++            state.compute_translations = 0;
++            state.mesh_translations = 0;
++            state.translations_start = now;
++        }
++    }
++    if (announce) {
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_DRIVER_BUILD_LOG on: driver pipeline builds per 10 s, GPU thread compute "
++                 "translations per 5 s; a window with none is not logged");
++    }
++    if (const u64 count = builds.graphics + builds.compute; count != 0) {
++        LOG_INFO(Render_Vulkan,
++                 "Driver pipeline builds: {} graphics, {} compute, {} over 10 ms; {:.1f} ms mean, "
++                 "{:.1f} ms max; {:.1f} s window",
++                 builds.graphics, builds.compute, builds.slow,
++                 builds.sum_ms / static_cast<double>(count), builds.max_ms, builds_s);
++    }
++    if (compute + mesh != 0) {
++        LOG_INFO(Render_Vulkan,
++                 "GPU thread compute translations: {} compute, {} mesh pipelines in {:.1f} s",
++                 compute, mesh, translations_s);
++    }
++}
++
++} // namespace Vulkan::DriverBuildReport
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index e354468..8926d76 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -23,6 +23,7 @@
+ #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+ #include "video_core/renderer_vulkan/pipeline_statistics.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
++#include "video_core/renderer_vulkan/vk_driver_build_report.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_mesh_compute.h"
+ #include "shader_recompiler/backend/spirv/mesh_compute_layout.h"
+@@ -1775,7 +1776,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+     }
+ 
+-    pipeline = device.GetLogical().CreateGraphicsPipeline({
++    pipeline = DriverBuildReport::Build(DriverBuildReport::Kind::Graphics, [&] {
++        return device.GetLogical().CreateGraphicsPipeline({
+         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+         .pNext = nullptr,
+         .flags = flags,
+@@ -1796,6 +1798,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         .basePipelineHandle = nullptr,
+         .basePipelineIndex = 0,
+     }, *pipeline_cache);
++    });
+ 
+     // Log graphics pipeline creation
+     if (GPU::Logging::IsActive()) {
+@@ -1842,7 +1845,9 @@ void GraphicsPipeline::MakeMeshComputePipelines() {
+             .basePipelineHandle = 0,
+             .basePipelineIndex = 0,
+         };
+-        return device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
++        return DriverBuildReport::Build(DriverBuildReport::Kind::Compute, [&] {
++            return device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
++        });
+     };
+     // The mesh pipeline last: a failed task or scan build leaves it empty.
+     if (mesh_compute->task) {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 7edbadb..47ab1c9 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -58,6 +58,7 @@
+ #include "video_core/renderer_vulkan/pipeline_statistics.h"
+ #include "video_core/renderer_vulkan/vertex_repack.h"
+ #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
++#include "video_core/renderer_vulkan/vk_driver_build_report.h"
+ #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+ #include "video_core/renderer_vulkan/vk_mesh_compute.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+@@ -2285,6 +2286,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+ }
+ 
+ void PipelineCache::TickFrame() {
++    DriverBuildReport::Poll();
+     ++frame_count;
+     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
+         evicted_pipelines.pop_front();
+@@ -2466,6 +2468,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+                 reused[index] = nullptr;
+             }
+         }
++        // EDEN_UP_DRIVER_BUILD_LOG: a mesh program translated here with the runtime pools
++        // (main_pools: the GPU thread; boot and detached workers have pools of their own).
++        // Counted whoever runs it as compute afterwards, the driver (EDEN_NX2_RADV_MESH_COMPUTE)
++        // or the core (EDEN_NX2_MESH_AS_COMPUTE). One per pipeline: its task program is not
++        // counted again, and a stage taken from the stage cache is not translated.
++        if (DriverBuildReport::On() && &pools == &main_pools && !reused[index] &&
++            env.ShaderStage() == Shader::Stage::Mesh) {
++            DriverBuildReport::Translation(true);
++        }
+         if (reused[index]) {
+             programs[index] = reused[index]->program;
+         } else if (cacheable) {
+@@ -3516,6 +3527,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+         env.Dump(hash, key.unique_hash);
+     }
+ 
++    if (&pools == &main_pools) DriverBuildReport::Translation(false);
+     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+     if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
+             program, visual_workaround_title, key.unique_hash, oot_visual_workaround)) {

@@ -1,0 +1,72 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_SHADOW_ROWS=1: register shadow forms for seven more opcodes and SHF uniform
+
+Upstream: Frizti/Fritchii 60377e0804 (cherry-pick of 0c757afb53) and 5885850c68 (cherry-pick of
+87ac53a290), both by ale. Lowering every program in Ocarina's shader archives rejected 15 mesh and
+vertex programs, and two mesh programs on SHF.L.W.U32 R200, R200, UR6, RZ, because
+PrepareRegisterPressure had no operand list for the opcode.
+
+Rows (lower_to_maxwell.h PrepareRegisterPressure, same operand sets as upstream
+register_pressure.h): 0x3c2 R2UR Ra(24) only, bits 16-23 name the uniform register; 0x803 P2R
+Rd(16), Ra(24); 0x809 FMNMX immediate Rd, Ra; 0xc20 FMUL uniform Rd, Ra; 0xc23 FFMA uniform Rd, Ra,
+Rc(64); 0xc45 I2FP uniform Rd; 0xb82 LDC indexed Rd (a pair when Bits(73,3) == 5), Ra; 0xc19 SHF
+uniform Rd, low(24), high(64). The lowering of these opcodes is unchanged.
+
+Already here: IMAD 0xc24 (Fritchii dfac3c45, Lichii #279 by Hazmad: the two Kakariko graveyard
+pixel programs) is in 0465 behind EDEN_UP_FRITCHII_SHADOWMORE (lower_to_maxwell.h:116). This
+patch does not touch the graveyard programs: they need SHADOWMORE=1.
+
+Unset: the new cases return valid = false exactly like the default case, so lowering is
+byte-identical. Set, only programs that were rejected before change (the rows are reached only
+where the default case rejected the program). The switch is in TranslationSwitches
+(vk_pipeline_prep.cpp, like SHADOWMORE): an arm with it set gets its own prep store and the shader
+set is converted once more with it; arms without it keep their stores.
+
+Rejection line in our tree: "Native shader at ..., instruction ...: native program uses lowering
+scratch registers [op c19 ...]" (shader_environment.cpp:701), not upstream's "native register
+shadowing mode". Catch2 tests not ported (no test tree here).
+
+v2 of the draft: adds the switch to TranslationSwitches and fixes the comments.
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 57951d0..c86fd03 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -78,6 +78,23 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     const auto operand = [&](u32 bit, u32 count = 1) { operands.push_back({bit, count}); };
+     const u32 opcode = input.Bits(0, 12);
+     switch (opcode) {
++    // EDEN_UP_SHADOW_ROWS=1 (Frizti/Fritchii 60377e0804 and 5885850c68, ale): R2UR, P2R, FMNMX
++    // immediate, FMUL/FFMA/I2FP with a uniform source, LDC indexed, SHF with a uniform amount.
++    // Unset: no shadow form, as before (the program is rejected and its draws skipped). Set, it
++    // changes converted shaders (in TranslationSwitches): the shader set is converted once more.
++    case 0x3c2: case 0x803: case 0x809: case 0xc20:
++    case 0xc23: case 0xc45: case 0xb82: case 0xc19: {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_SHADOW_ROWS");
++        if (!enabled) { result.valid = false; return result; }
++        switch (opcode) {
++        case 0x3c2: operand(24); break;
++        case 0x803: case 0x809: case 0xc20: operand(16); operand(24); break;
++        case 0xc23: case 0xc19: operand(16); operand(24); operand(64); break;
++        case 0xc45: operand(16); break;
++        case 0xb82: operand(16, input.Bits(73, 3) == 5 ? 2 : 1); operand(24); break;
++        }
++        break;
++    }
+     case 0x802: case 0xa02: case 0xb08: case 0xd08: operand(16); break;
+     case 0x804: case 0x80c: operand(24); break;
+     case 0x805: operand(16, 2); break;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+index e91d6fb..20db041 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -147,7 +147,8 @@ constexpr const char* TranslationSwitches[] = {
+     "EDEN_UP_NULL_POINTER_SLOTS", "EDEN_UP_OOT_FRONT_WAIT", "EDEN_UP_OOT_FSR_SHARPNESS",
+     "EDEN_UP_OOT_FSR_SPATIAL", "EDEN_UP_OOT_MIST_DEPTH", "EDEN_UP_OOT_MIST_DEPTH_ULPS",
+     "EDEN_UP_OOT_MOVIE_COPY", "EDEN_UP_QUERY_LIGHT", "EDEN_UP_QUERY_STATS",
+-    "EDEN_UP_SHADOW_REGISTERS", "EDEN_UP_SPLIT_FIRST_DRAIN", "EDEN_UP_STAGE_CACHE",
++    "EDEN_UP_SHADOW_REGISTERS", "EDEN_UP_SHADOW_ROWS", "EDEN_UP_SPLIT_FIRST_DRAIN",
++    "EDEN_UP_STAGE_CACHE",
+     "EDEN_UP_STAGE_CACHE_MIB", "EDEN_UP_STAGE_CACHE_VERIFY", "EDEN_UP_STAGING_REUSE",
+     "EDEN_UP_SWAPCHAIN_RECREATE", "EDEN_UP_TC_BUDGET_CAP", "EDEN_UP_UBO_SNAPSHOT",
+     "EDEN_UP_UPLOAD_ALL_STAGES", "EDEN_UP_WIDE_COMPUTE_SSBOS", "EDEN_UP_ZPASS_QUERY_BANKS",

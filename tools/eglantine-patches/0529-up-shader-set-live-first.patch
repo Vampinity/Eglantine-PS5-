@@ -1,0 +1,568 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Shader set: the records of live programs are prepared first, and again as programs go live; records layout 3
+
+T108 and T110, Link's house: 511 of 541 live programs were in the set, and 0 of 430 pipelines met
+a prepared record. A start prepared the first 5,000 of the file's 113,054 records, in the
+recipe's order, which says nothing about where the player is.
+
+Now three kinds of pass, all through PrepareShaderSet with the cap, duty cycle and floors it had:
+- the programs of the set that were live in earlier sessions (prep_shader_set.live, written at
+  shutdown, at most 65,536 hashes): their records first;
+- then the file in its own order, as before;
+- then, while the game runs, a pass over the records of the programs that are live each time
+  new ones appear (a load makes its programs before it draws with them). After a pass that
+  paused for memory the next one waits 30 s.
+
+For that the records file says which lowered program each record uses (layout 3: the hash is
+stored with the code; a stamp of layout 2 does not hold), ShaderSet::ReadRecords keeps the
+file's index in memory after the first read (about 6 MB for Ocarina) and takes two filters: by
+the record's programs, with nothing read, and by its key bytes. The second one lets every pass
+skip a record the prepared store already knows without building its environments from the file.
+
+Not compiled before this build; nothing changes without EDEN_UP_SHADER_SET.
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 7edbadb..7d056a0 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -871,6 +871,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+             if (shader_set_programs) {
+                 if (shader_set_programs->contains(hash)) {
+                     audit_programs_in_set.fetch_add(1, std::memory_order_relaxed);
++                    if (shader_set_live.insert(hash).second) {
++                        shader_set_live_serial.fetch_add(1, std::memory_order_relaxed);
++                    }
+                 }
+             } else if (audit_pending.size() < 65536) {
+                 audit_pending.push_back(hash);
+@@ -4766,17 +4769,66 @@ void PipelineCache::StartShaderSet(const std::filesystem::path& title_dir) {
+                 std::scoped_lock lock{shader_set_mutex};
+                 shader_set_programs = std::move(programs);
+             }
+-            PrepareShaderSet(outputs.records, stop);
++            // The records of programs that are live get prepared before the rest of the file:
++            // first those an earlier session noted (prep_shader_set.live), then the file in its
++            // own order up to the cap, then, for as long as the game runs, the records of
++            // whatever goes live (a load makes its programs before it draws with them). T108 and
++            // T110: 511 of 541 live programs of Link's house were in the set and 0 of 430
++            // pipelines hit, because a start prepared the first 5,000 of 113,054 records.
++            std::unordered_set<u64> earlier;
++            for (const u64 hash :
++                 VideoCommon::ShaderSet::ReadPrograms(output_dir / "prep_shader_set.live")) {
++                earlier.insert(hash);
++            }
++            {
++                std::scoped_lock lock{shader_set_mutex};
++                shader_set_saved_live = earlier;
++                for (const u64 hash : audit_pending) {
++                    if (shader_set_programs->contains(hash) &&
++                        shader_set_live.insert(hash).second) {
++                        shader_set_live_serial.fetch_add(1, std::memory_order_relaxed);
++                    }
++                }
++            }
++            if (!earlier.empty()) {
++                LOG_INFO(Render_Vulkan,
++                         "Shader set: {} programs were live in earlier sessions; their records "
++                         "are prepared first", earlier.size());
++                (void)PrepareShaderSet(outputs.records, stop, &earlier);
++            }
++            (void)PrepareShaderSet(outputs.records, stop);
++            u64 seen = 0;
++            auto nap = std::chrono::milliseconds{500};
++            while (Common::StoppableTimedWait(stop, nap)) {
++                nap = std::chrono::milliseconds{500};
++                if (shader_set_live_serial.load(std::memory_order_relaxed) == seen) {
++                    continue;
++                }
++                // A load makes its programs close together: gather them, then one pass.
++                if (!Common::StoppableTimedWait(stop, std::chrono::milliseconds{250})) {
++                    break;
++                }
++                std::unordered_set<u64> live;
++                {
++                    std::scoped_lock lock{shader_set_mutex};
++                    live = shader_set_live;
++                    seen = shader_set_live_serial.load(std::memory_order_relaxed);
++                }
++                const bool paused = PrepareShaderSet(outputs.records, stop, &live);
++                nap = std::chrono::milliseconds{paused ? 30000 : 2000};
++            }
+         } catch (const std::exception& e) {
+             LOG_WARNING(Render_Vulkan, "Shader set: the background work ended: {}", e.what());
+         }
+     });
+ }
+ 
+-void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::stop_token stop) {
++bool PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::stop_token stop,
++                                     const std::unordered_set<u64>* only_programs) {
+     if (!prep_store.IsOpen() || stop.stop_requested()) {
+-        return;
++        return false;
+     }
++    const bool filtered = only_programs != nullptr;
+     const auto begin = std::chrono::steady_clock::now();
+     const auto seconds = [&begin] {
+         return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+@@ -4805,7 +4857,7 @@ void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::sto
+         LOG_WARNING(Render_Vulkan,
+                     "Shader set: free memory is unknown on this platform; the records are not "
+                     "prepared (EDEN_UP_SHADER_SET_NO_MEMORY_CHECK=1 prepares them anyway)");
+-        return;
++        return false;
+     }
+     // Once every record of this file is known to the store, the pass is skipped: the file is
+     // ~1 GB, and reading it to its end for nothing costs a boot's worth of I/O. The marker names
+@@ -4822,14 +4874,14 @@ void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::sto
+         std::ifstream in{done_filename};
+         std::string text{std::istreambuf_iterator<char>(in), {}};
+         unsigned long long done_store = 0;
+-        if (text.rfind(file_identity, 0) == 0 &&
++        if (!filtered && text.rfind(file_identity, 0) == 0 &&
+             std::sscanf(text.c_str() + file_identity.size(), " store %llu", &done_store) == 1 &&
+             prep_store.Size() >= done_store) {
+             LOG_INFO(Render_Vulkan,
+                      "Shader set: every record of {} is known to the prepared store already "
+                      "({} kept); nothing to prepare",
+                      file.filename().string(), prep_store.Size());
+-            return;
++            return false;
+         }
+     }
+     auto last_commit = std::chrono::steady_clock::now();
+@@ -4882,7 +4934,7 @@ void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::sto
+                 LOG_WARNING(Render_Vulkan,
+                             "Shader set: cannot write {}; the records are not prepared this start",
+                             Common::FS::PathToUTF8String(strikes_filename));
+-                return;
++                return false;
+             }
+         }
+     }
+@@ -4930,12 +4982,15 @@ void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::sto
+ 
+     size_t read = 0, known = 0, left_out = 0, other = 0, struck = 0, queued = 0;
+     bool paused = false;
+-    LOG_INFO(Render_Vulkan,
+-             "Shader set: preparing the records of {} on the pipeline workers: {} in flight, "
+-             "duty {}%, cap {}, memory floor {} MB, disk floor {} MB",
+-             file.filename().string(), max_in_flight, duty,
+-             all ? std::string{"none (EDEN_UP_SHADER_SET_PREP_ALL=1)"} : fmt::format("{}", limit),
+-             floor >> 20, disk_floor >> 20);
++    if (!filtered) {
++        LOG_INFO(Render_Vulkan,
++                 "Shader set: preparing the records of {} on the pipeline workers: {} in flight, "
++                 "duty {}%, cap {}, memory floor {} MB, disk floor {} MB",
++                 file.filename().string(), max_in_flight, duty,
++                 all ? std::string{"none (EDEN_UP_SHADER_SET_PREP_ALL=1)"}
++                     : fmt::format("{}", limit),
++                 floor >> 20, disk_floor >> 20);
++    }
+     const auto skip_compute = [](std::ifstream& in, VideoCommon::FileEnvironment) {
+         ComputePipelineCacheKey key;
+         in.read(reinterpret_cast<char*>(&key), sizeof(key));
+@@ -5107,22 +5162,49 @@ void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::sto
+                 state.cv.notify_all();
+                 throw;
+             }
++        },
++        filtered ? std::function<bool(std::span<const u64>)>{[&](std::span<const u64> hashes) {
++            return std::ranges::all_of(
++                hashes, [&](u64 hash) { return only_programs->contains(hash); });
++        }}
++                 : std::function<bool(std::span<const u64>)>{},
++        [&](std::span<const u8> bytes) {
++            // A record the store knows is not built again from the file: the mapping made its
++            // key canonical, so the key's own hash is the one the store has it under.
++            if (bytes.size() != sizeof(GraphicsPipelineCacheKey)) {
++                return true;
++            }
++            GraphicsPipelineCacheKey key;
++            std::memcpy(static_cast<void*>(&key), bytes.data(), sizeof(key));
++            if (!prep_store.Contains(key.Hash())) {
++                return true;
++            }
++            ++read;
++            ++known;
++            return false;
+         });
+     wait_for_jobs();
+     {
+         std::scoped_lock lock{state.mutex};
+         state.journal.close();
+     }
+-    const bool committed = prep_store.Commit();
+-    prep_store.Compact();
++    // A pass over live programs' records that prepared nothing leaves the store as it is.
++    const bool quiet = filtered && state.finished == 0 && !paused;
++    const bool committed = quiet ? true : prep_store.Commit();
++    if (!quiet) {
++        prep_store.Compact();
++    }
+     std::error_code error;
+     std::filesystem::remove(journal_filename, error);
++    if (quiet) {
++        return false;
++    }
+     const double busy_seconds = std::chrono::duration<double>(state.busy).count();
+     LOG_INFO(Render_Vulkan,
+              "Shader set: {} records read: {} prepared ({} kept, {} built but not kept, {} "
+              "failed) in {:.0f} s ({:.0f} s of builds); {} known already, {} struck out, {} left "
+              "out (stages, driver or HLE macro), {} for another dynamic state; {} kept in {} "
+-             "MiB{}{}",
++             "MiB{}{}{}",
+              read, state.finished, state.kept, state.not_kept, state.failed, seconds(),
+              busy_seconds, known, struck, left_out, other, prep_store.Size(),
+              prep_store.DataBytes() >> 20,
+@@ -5131,16 +5213,19 @@ void PipelineCache::PrepareShaderSet(const std::filesystem::path& file, std::sto
+                                             "for the next start",
+                                             read, stopped)
+              : whole ? std::string{}
+-                     : std::string{"; the file could not be read to its end"});
++                     : std::string{"; the file could not be read to its end"},
++             filtered ? fmt::format(" (the records of {} live programs)", only_programs->size())
++                      : std::string{});
+     if (paused) {
+         LOG_WARNING(Render_Vulkan,
+                     "Shader set: preparation paused ({}); it resumes at the next start", stopped);
+     }
+-    if (whole && stopped.empty() && committed && !stop.stop_requested()) {
++    if (!filtered && whole && stopped.empty() && committed && !stop.stop_requested()) {
+         // Everything in the file is known now: the next start skips the pass (see above).
+         std::ofstream out{done_filename, std::ios::trunc};
+         out << file_identity << " store " << prep_store.Size() << '\n';
+     }
++    return paused;
+ }
+ 
+ void PipelineCache::LogShaderSetAudit(bool final) {
+@@ -5156,6 +5241,9 @@ void PipelineCache::LogShaderSetAudit(bool final) {
+             for (const u64 hash : audit_pending) {
+                 if (shader_set_programs->contains(hash)) {
+                     audit_programs_in_set.fetch_add(1, std::memory_order_relaxed);
++                    if (shader_set_live.insert(hash).second) {
++                        shader_set_live_serial.fetch_add(1, std::memory_order_relaxed);
++                    }
+                 }
+             }
+             audit_pending.clear();
+@@ -5168,6 +5256,47 @@ void PipelineCache::LogShaderSetAudit(bool final) {
+              audit_programs_total.load(std::memory_order_relaxed),
+              audit_keys_hit.load(std::memory_order_relaxed),
+              audit_keys_total.load(std::memory_order_relaxed), final ? " (shutdown)" : "");
++    if (!final) {
++        return;
++    }
++    // The set's programs that were live, for the next start to prepare first (this session's,
++    // then earlier sessions' up to 65,536 in all). Written beside and renamed over.
++    std::vector<u64> hashes;
++    {
++        std::scoped_lock lock{shader_set_mutex};
++        hashes.assign(shader_set_live.begin(), shader_set_live.end());
++        for (const u64 hash : shader_set_saved_live) {
++            if (hashes.size() >= 65536) {
++                break;
++            }
++            if (!shader_set_live.contains(hash)) {
++                hashes.push_back(hash);
++            }
++        }
++    }
++    if (hashes.empty()) {
++        return;
++    }
++    const auto name = pipeline_cache_filename.parent_path() / "prep_shader_set.live";
++    auto partial = name;
++    partial += ".part";
++    bool written = false;
++    {
++        std::ofstream out{partial, std::ios::binary | std::ios::trunc};
++        written = static_cast<bool>(out.write(reinterpret_cast<const char*>(hashes.data()),
++                                              static_cast<std::streamsize>(hashes.size() *
++                                                                           sizeof(u64)))) &&
++                  static_cast<bool>(out.flush());
++    }
++    std::error_code error;
++    if (written) {
++        std::filesystem::rename(partial, name, error);
++    }
++    if (!written || error) {
++        std::filesystem::remove(partial, error);
++    }
++    LOG_INFO(Render_Vulkan, "Shader set: {} live programs noted for the next start{}",
++             hashes.size(), written && !error ? "" : " (NOT written)");
+ }
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 97b3fee..cf81e1c 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -470,7 +470,10 @@ private:
+     bool MapShaderSetState(std::span<const u8> state, std::array<u64, 6> hashes,
+                            u32 vertex_read_mask, std::vector<u8>& bytes) const;
+     void StartShaderSet(const std::filesystem::path& title_dir);
+-    void PrepareShaderSet(const std::filesystem::path& file, std::stop_token stop);
++    /// `only_programs`: a pass over the records whose programs are all in it (the ones that are
++    /// live, or were in earlier sessions), in place of the whole file. True: it paused for memory.
++    bool PrepareShaderSet(const std::filesystem::path& file, std::stop_token stop,
++                          const std::unordered_set<u64>* only_programs = nullptr);
+     /// The audit line, every 60 s from TickFrame and at shutdown.
+     void LogShaderSetAudit(bool final);
+     /// The audit's counters (programs: native programs registered this session and those whose
+@@ -483,6 +486,11 @@ private:
+     std::mutex shader_set_mutex;
+     std::shared_ptr<const std::unordered_set<u64>> shader_set_programs; ///< lowered hashes
+     std::vector<u64> audit_pending; ///< programs seen before the set was loaded
++    /// Programs of the set that went live this session, and those noted by earlier sessions
++    /// (prep_shader_set.live); under shader_set_mutex. The serial moves with each new live one.
++    std::unordered_set<u64> shader_set_live;
++    std::unordered_set<u64> shader_set_saved_live;
++    std::atomic<u64> shader_set_live_serial{};
+     std::chrono::steady_clock::time_point audit_logged{};
+ 
+     Common::ThreadWorker workers;
+diff --git a/src/video_core/shader_set.cpp b/src/video_core/shader_set.cpp
+index b11abb8..1588724 100644
+--- a/src/video_core/shader_set.cpp
++++ b/src/video_core/shader_set.cpp
+@@ -11,6 +11,8 @@
+ #include <cstring>
+ #include <fstream>
+ #include <map>
++#include <mutex>
++#include <memory>
+ #include <optional>
+ #include <span>
+ #include <stdexcept>
+@@ -196,7 +198,7 @@ std::string ExtractorLines() {
+     std::string lines;
+     if (Common::PeSwitch("EDEN_UP_SHADER_SET_STREAM")) lines += "extractor stream 1\n";
+     if (Common::PeSwitch("EDEN_UP_SHADER_SET_INDEX")) lines += "extractor index 1\n";
+-    lines += "records layout 2\n"; // each program's code once (ReadRecords), not once per record
++    lines += "records layout 3\n"; // each program's code once, with its hash (ReadRecords)
+     // EDEN_UP_SHADER_SET_RECONVERT=<n> (a test aid): a number in the stamp, so a set made with
+     // another number (or none) is converted again once, e.g. to time the conversion.
+     if (const size_t again = SwitchNumber("EDEN_UP_SHADER_SET_RECONVERT", 0); again != 0) {
+@@ -359,7 +361,7 @@ void AppendEnvironment(std::vector<char>& out, std::span<const char> fact,
+     out.insert(out.end(), code.begin(), code.begin() + 80); // graphics ProgramHeader is absent from facts
+ }
+ 
+-constexpr char SetMagic[9] = "edenset2";
++constexpr char SetMagic[9] = "edenset3";
+ } // namespace
+ 
+ } // namespace VideoCommon::ShaderSet
+@@ -781,6 +783,7 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+             if (!used_program[index]) continue;
+             const auto& code = lowered[index]->code;
+             file.Write(index);
++            file.Write(lowered[index]->hash);
+             file.Write(static_cast<u64>(code.size() * 8));
+             file.Write(Bytes{reinterpret_cast<const u8*>(code.data()), code.size() * 8});
+             ++program_count;
+@@ -831,9 +834,27 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+     }
+ }
+ 
++namespace {
++/// Where everything in a records file is, read once and kept: a pass over the records of some
++/// programs (the ones that just went live) then costs no reading until a record is wanted.
++struct SetIndex {
++    struct Fact { u64 at; u32 size; u32 program; };
++    struct Code { u64 at; u64 size; u64 hash; };
++    struct Record { u64 key_at; u32 key_size; u32 count; std::array<u32, 6> facts; };
++    std::string identity;
++    std::unordered_map<u32, Fact> fact_at;
++    std::unordered_map<u32, Code> code_at;
++    std::vector<Record> records;
++};
++std::mutex set_index_mutex;
++std::shared_ptr<const SetIndex> set_index; // of the file read last: a session has one set
++} // namespace
++
+ bool ReadRecords(
+     const std::filesystem::path& path, u32 cache_version,
+-    const std::function<void(std::ifstream&, std::vector<FileEnvironment>)>& on_graphics) {
++    const std::function<void(std::ifstream&, std::vector<FileEnvironment>)>& on_graphics,
++    const std::function<bool(std::span<const u64>)>& programs_wanted,
++    const std::function<bool(std::span<const u8>)>& key_wanted) {
+     // One record's bytes at a time, read through an ifstream as the pipeline cache's callbacks
+     // and FileEnvironment::Deserialize expect (they only read forward).
+     struct MemBuf final : std::streambuf {
+@@ -870,59 +891,92 @@ bool ReadRecords(
+         if (std::memcmp(magic.data(), SetMagic, 8) != 0 || version != cache_version) {
+             return true; // another layout's or another version's file: nothing to read
+         }
+-        std::array<u64, 6> where{};
+-        seek(end - TrailerBytes);
+-        get(where);
+-        file.read(tail.data(), tail.size());
+-        const u64 records = where[1], facts_at = where[2], facts = where[3];
+-        const u64 programs_at = where[4], programs = where[5];
+-        if (std::memcmp(tail.data(), SetMagic, 8) != 0 || where[0] != 12 || facts_at < 12 ||
+-            programs_at < facts_at || programs_at > end - TrailerBytes) {
+-            return false;
+-        }
+-        struct Fact { u64 at; u32 size; u32 program; };
+-        struct Code { u64 at; u64 size; };
+-        std::unordered_map<u32, Fact> fact_at;
+-        std::unordered_map<u32, Code> code_at;
+-        fact_at.reserve(facts);
+-        code_at.reserve(programs);
+-        u64 at = facts_at;
+-        for (u64 i = 0; i < facts; ++i) {
+-            u32 id{}, program{}, size{};
+-            seek(at);
+-            get(id); get(program); get(size);
+-            fact_at[id] = Fact{at + 12, size, program};
+-            at += 12 + size;
+-            if (at > programs_at) return false;
++        std::error_code ec;
++        const std::string identity = fmt::format(
++            "{} {} {}", path.string(), end,
++            static_cast<long long>(
++                std::filesystem::last_write_time(path, ec).time_since_epoch().count()));
++        std::shared_ptr<const SetIndex> index;
++        {
++            std::scoped_lock lock{set_index_mutex};
++            if (set_index && set_index->identity == identity) index = set_index;
+         }
+-        at = programs_at;
+-        for (u64 i = 0; i < programs; ++i) {
+-            u32 index{};
+-            u64 size{};
+-            seek(at);
+-            get(index); get(size);
+-            code_at[index] = Code{at + 12, size};
+-            at += 12 + size;
+-            if (at > end - TrailerBytes) return false;
++        if (!index) {
++            std::array<u64, 6> where{};
++            seek(end - TrailerBytes);
++            get(where);
++            file.read(tail.data(), tail.size());
++            const u64 records = where[1], facts_at = where[2], facts = where[3];
++            const u64 programs_at = where[4], programs = where[5];
++            if (std::memcmp(tail.data(), SetMagic, 8) != 0 || where[0] != 12 || facts_at < 12 ||
++                programs_at < facts_at || programs_at > end - TrailerBytes) {
++                return false;
++            }
++            auto made = std::make_shared<SetIndex>();
++            made->identity = identity;
++            made->fact_at.reserve(facts);
++            made->code_at.reserve(programs);
++            made->records.reserve(records);
++            u64 at = facts_at;
++            for (u64 i = 0; i < facts; ++i) {
++                u32 id{}, program{}, size{};
++                seek(at);
++                get(id); get(program); get(size);
++                made->fact_at[id] = SetIndex::Fact{at + 12, size, program};
++                at += 12 + size;
++                if (at > programs_at) return false;
++            }
++            at = programs_at;
++            for (u64 i = 0; i < programs; ++i) {
++                u32 program{};
++                u64 hash{}, size{};
++                seek(at);
++                get(program); get(hash); get(size);
++                made->code_at[program] = SetIndex::Code{at + 20, size, hash};
++                at += 20 + size;
++                if (at > end - TrailerBytes) return false;
++            }
++            at = 12;
++            for (u64 i = 0; i < records; ++i) {
++                SetIndex::Record record{};
++                seek(at);
++                get(record.count);
++                if (record.count == 0 || record.count > record.facts.size()) return false;
++                file.read(reinterpret_cast<char*>(record.facts.data()),
++                          record.count * sizeof(u32));
++                get(record.key_size);
++                if (record.key_size > 65536) return false;
++                record.key_at = at + 4 + record.count * 4 + 4;
++                at = record.key_at + record.key_size;
++                if (at > facts_at) return false;
++                made->records.push_back(record);
++            }
++            index = made;
++            std::scoped_lock lock{set_index_mutex};
++            set_index = index;
+         }
+-        std::vector<char> bytes, fact, code;
+-        at = 12;
+-        for (u64 i = 0; i < records; ++i) {
+-            u32 count{}, key_size{};
+-            std::array<u32, 6> ids{};
+-            seek(at);
+-            get(count);
+-            if (count == 0 || count > ids.size()) return false;
+-            file.read(reinterpret_cast<char*>(ids.data()), count * sizeof(u32));
+-            get(key_size);
+-            if (key_size > 65536) return false;
++        std::vector<char> bytes, fact, code, key;
++        std::array<u64, 6> hashes{};
++        for (const SetIndex::Record& record : index->records) {
++            if (programs_wanted) {
++                for (u32 n = 0; n < record.count; ++n) {
++                    hashes[n] = index->code_at.at(index->fact_at.at(record.facts[n]).program).hash;
++                }
++                if (!programs_wanted(std::span<const u64>{hashes.data(), record.count})) continue;
++            }
++            key.resize(record.key_size);
++            seek(record.key_at);
++            file.read(key.data(), key.size());
++            if (key_wanted &&
++                !key_wanted(std::span<const u8>{reinterpret_cast<const u8*>(key.data()),
++                                               key.size()})) {
++                continue;
++            }
+             bytes.resize(sizeof(u32));
+-            std::memcpy(bytes.data(), &count, sizeof(count));
+-            const u64 key_at = at + 4 + count * 4 + 4;
+-            at = key_at + key_size;
+-            for (u32 n = 0; n < count; ++n) {
+-                const Fact& f = fact_at.at(ids[n]);
+-                const Code& c = code_at.at(f.program);
++            std::memcpy(bytes.data(), &record.count, sizeof(record.count));
++            for (u32 n = 0; n < record.count; ++n) {
++                const SetIndex::Fact& f = index->fact_at.at(record.facts[n]);
++                const SetIndex::Code& c = index->code_at.at(f.program);
+                 fact.resize(f.size);
+                 seek(f.at);
+                 file.read(fact.data(), fact.size());
+@@ -931,10 +985,7 @@ bool ReadRecords(
+                 file.read(code.data(), code.size());
+                 AppendEnvironment(bytes, fact, code);
+             }
+-            const size_t key_in = bytes.size();
+-            bytes.resize(key_in + key_size);
+-            seek(key_at);
+-            file.read(bytes.data() + key_in, key_size);
++            bytes.insert(bytes.end(), key.begin(), key.end());
+             MemBuf memory;
+             memory.Set(bytes.data(), bytes.size());
+             std::ifstream in;
+diff --git a/src/video_core/shader_set.h b/src/video_core/shader_set.h
+index 3da4002..771b405 100644
+--- a/src/video_core/shader_set.h
++++ b/src/video_core/shader_set.h
+@@ -42,9 +42,14 @@ using MapState = std::function<bool(std::span<const u8> state, std::array<u64, 6
+ /// hands each to `on_graphics` as VideoCommon::ReadPipelines does: the environments, and a
+ /// stream that holds the record's key next. False: the file is cut or damaged, or the callback
+ /// threw. A file of another layout or cache version reads as empty (true).
++/// `programs_wanted` (optional) is asked for each record first, with the lowered hashes of its
++/// programs and nothing read from the file; `key_wanted` (optional) next, with the record's key
++/// bytes. False from either leaves the record out before its environments are built.
+ [[nodiscard]] bool ReadRecords(
+     const std::filesystem::path& file, u32 cache_version,
+-    const std::function<void(std::ifstream&, std::vector<FileEnvironment>)>& on_graphics);
++    const std::function<void(std::ifstream&, std::vector<FileEnvironment>)>& on_graphics,
++    const std::function<bool(std::span<const u64>)>& programs_wanted = {},
++    const std::function<bool(std::span<const u8>)>& key_wanted = {});
+ 
+ struct Outputs {
+     std::filesystem::path records;  ///< prep_shader_set.bin, empty when there is none to use

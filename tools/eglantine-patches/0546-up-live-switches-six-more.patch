@@ -1,0 +1,368 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Six more live switches (EDEN_UP_LIVE_SWITCHES): usage tracker, query wait once, GPU page cache, unswizzle threads, conditional render on the back, swizzle units
+
+From 11 Nov 2026 a new switch whose effect can change at run time is tested by flipping it
+while the game stands at one spot (patch 0478), not by one start per setting. These six are a
+plain run-time branch and join the table in common/live_switch.h; each is read again at every
+decision it makes, and each decision stands alone:
+
+- EDEN_UP_FRITCHII_USAGE_TRACKER (0513): per Track call. The run of pages known to be all ones
+  is reset by Reset whatever the switch says and only grows with it on, so it stays true while
+  the plain loop runs. The _VERIFY switch stays boot-fixed and follows the live one.
+- EDEN_NX2_QUERY_WAIT_ONCE: per query sync; the recorded copy carries the answer it was recorded
+  with. Parsed as before (unset or starting with '0' is off).
+- EDEN_UP_GPU_PAGE_CACHE (0541): per lookup, one atomic load. A cached page is checked against
+  the mapping serial at every use.
+- EDEN_UP_UNSWIZZLE_THREADS=<0-4> (0542): per large unswizzle. Helper threads are now made the
+  first time a value asks for them (none at boot) and stay; a smaller value uses the first n of
+  them, the others skip that run. Checked off the console under the thread sanitizer: 13,940
+  runs from two callers with the count changing at random between 0 and 4, every line done
+  exactly once, no race, no hang.
+- EDEN_UP_COND_BACK (0543; "1" on, "2" verify): per run of the conditional render macro, which
+  sets the back's condition in full either way.
+- EDEN_UP_SWIZZLE_UNITS (0544): per copy; two ways to copy the same bytes.
+
+Without EDEN_UP_LIVE_SWITCHES=1 every one of them is still what the environment gave at its first
+use, for ever: nothing changes for a batch or for play.
+
+NOT made live, on purpose: EDEN_UP_BACK_DRAW_CHEAP keeps an alias tick per image only while it
+is on (SetModificationTick), so turning it on in mid-run would skip alias syncs that are due; a
+live form needs that bookkeeping always on and edits in five files, two of which the PS5 front
+rewrites at build time. It stays a batch. So do the boot-fixed kinds: anything that changes
+shader translation or the driver (EDEN_NX2_RADV_*), heap and thread layout, clean against fast.
+
+diff --git a/src/common/live_switch.h b/src/common/live_switch.h
+index 2b44f62..6834590 100644
+--- a/src/common/live_switch.h
++++ b/src/common/live_switch.h
+@@ -94,6 +94,25 @@ enum class Id : u8 {
+     /// finishes on the host, since the game's DCtx cannot take it over
+     /// (core/hle/kernel/svc/svc_nx2_zstd.cpp).
+     OotZstdStream,
++    /// EDEN_UP_FRITCHII_USAGE_TRACKER. Each Track call fills its pages either way. The run of
++    /// pages known to be all ones is reset by Reset whatever the switch says and only grows
++    /// with the switch on, so it stays true while the plain loop runs
++    /// (video_core/buffer_cache/usage_tracker.h).
++    UsageTracker,
++    /// EDEN_NX2_QUERY_WAIT_ONCE (unset or starting with '0' is off). Read once per query sync:
++    /// each copy of query results waits in one of two ways that give the same values.
++    QueryWaitOnce,
++    /// EDEN_UP_GPU_PAGE_CACHE. A cached page is checked against the mapping serial at every
++    /// use, so entries made before the switch went off are right or dropped when it is back.
++    GpuPageCache,
++    /// EDEN_UP_UNSWIZZLE_THREADS=<n> (0 to 4). Read at each large unswizzle. Helper threads are
++    /// made the first time a value asks for them and stay; a smaller value uses fewer of them.
++    UnswizzleThreads,
++    /// EDEN_UP_COND_BACK (exact "1", or "2" to verify). Read at each run of the conditional
++    /// render macro, which sets the back's condition in full either way.
++    CondBack,
++    /// EDEN_UP_SWIZZLE_UNITS. Two ways to copy the same bytes, chosen per copy.
++    SwizzleUnits,
+     Count,
+ };
+ 
+@@ -121,6 +140,24 @@ inline constexpr size_t NumSwitches = static_cast<size_t>(Id::Count);
+     return static_cast<s64>((std::max)(asked, 60ULL)); // the same bits as before, read back as u64
+ }
+ 
++/// EDEN_NX2_QUERY_WAIT_ONCE: unset or starting with '0' is 0, anything else 1.
++[[nodiscard]] inline s64 ParseNotZero(const char* text) noexcept {
++    return text != nullptr && text[0] != '0' ? 1 : 0;
++}
++
++/// EDEN_UP_UNSWIZZLE_THREADS: a number of helper threads, at most 4.
++[[nodiscard]] inline s64 ParseHelpers(const char* text) noexcept {
++    const unsigned long asked = text != nullptr ? std::strtoul(text, nullptr, 10) : 0;
++    return static_cast<s64>((std::min)(asked, 4UL));
++}
++
++/// EDEN_UP_COND_BACK: exact "1" is 1, exact "2" is 2 (verify), anything else 0.
++[[nodiscard]] inline s64 ParseOneOrTwo(const char* text) noexcept {
++    return text != nullptr && (text[0] == '1' || text[0] == '2') && text[1] == '\0'
++               ? text[0] - '0'
++               : 0;
++}
++
+ struct Def {
+     const char* name;
+     s64 (*parse)(const char* text);
+@@ -137,6 +174,12 @@ inline constexpr std::array<Def, NumSwitches> kDefs{{
+     {"EDEN_NX2_TC_KEEP_ASYNC", ParseKeepFrames, false, -1},
+     {"EDEN_UP_OOT_FRAME_WAIT", ParseExactOne, false, -1},
+     {"EDEN_UP_OOT_ZSTD_STREAM", ParseExactOne, true, -1},
++    {"EDEN_UP_FRITCHII_USAGE_TRACKER", ParseExactOne, false, -1},
++    {"EDEN_NX2_QUERY_WAIT_ONCE", ParseNotZero, false, -1},
++    {"EDEN_UP_GPU_PAGE_CACHE", ParseExactOne, false, -1},
++    {"EDEN_UP_UNSWIZZLE_THREADS", ParseHelpers, false, -1},
++    {"EDEN_UP_COND_BACK", ParseOneOrTwo, false, -1},
++    {"EDEN_UP_SWIZZLE_UNITS", ParseExactOne, false, -1},
+ }};
+ 
+ /// EDEN_UP_LIVE_SWITCHES=1 (exact "1"), read once.
+diff --git a/src/video_core/buffer_cache/usage_tracker.h b/src/video_core/buffer_cache/usage_tracker.h
+index 374abf2..4faf809 100644
+--- a/src/video_core/buffer_cache/usage_tracker.h
++++ b/src/video_core/buffer_cache/usage_tracker.h
+@@ -14,6 +14,7 @@
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
++#include "common/live_switch.h"
+ #include "common/logging.h"
+ #include "common/pe_switch.h"
+ 
+@@ -95,17 +96,16 @@ public:
+ private:
+     /// EDEN_UP_FRITCHII_USAGE_TRACKER=1 (Frizti/Fritchii Nx2Perf usage_tracker): Track fills only
+     /// the pages outside the run already known to be all ones.
++    /// A live switch since T119 (common/live_switch.h): read at each Track.
+     static bool FillRuns() noexcept {
+-        static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_USAGE_TRACKER");
+-        return enabled;
++        return Common::LiveSwitch::Value<Common::LiveSwitch::Id::UsageTracker>() != 0;
+     }
+ 
+     /// EDEN_UP_FRITCHII_USAGE_TRACKER_VERIFY=1 (with the switch above): fills every page as before
+     /// and logs when a page the run skips was not all ones.
+     static bool FillRunsVerify() noexcept {
+-        static const bool enabled =
+-            FillRuns() && Common::PeSwitch("EDEN_UP_FRITCHII_USAGE_TRACKER_VERIFY");
+-        return enabled;
++        static const bool verify = Common::PeSwitch("EDEN_UP_FRITCHII_USAGE_TRACKER_VERIFY");
++        return verify && FillRuns();
+     }
+ 
+     void FillPages(size_t begin, size_t end) noexcept {
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 116b2be..e318266 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/live_switch.h"
+ #include "common/pe_switch.h"
+ #include <algorithm>
+ #include <array>
+@@ -2056,12 +2057,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+     // condition in order (ProcessQueryCondition, whose read writes pending reports out first).
+     // =2 verifies only: everything runs as before, and the back also works the condition out at
+     // its own time and counts where the two differ (VerifyCondBack).
+-    static const int cond_back = [] {
+-        const char* const value = std::getenv("EDEN_UP_COND_BACK");
+-        return value != nullptr && (value[0] == '1' || value[0] == '2') && value[1] == '\0'
+-                   ? value[0] - '0'
+-                   : 0;
+-    }();
++    // A live switch since T119 (common/live_switch.h, parsed there as before: exact "1" or "2").
++    const int cond_back =
++        static_cast<int>(Common::LiveSwitch::Value<Common::LiveSwitch::Id::CondBack>());
+     const bool predicate_macro = cond_back != 0 && fs.parameters.size() == 3 &&
+                                  fs.parameters[0] == 0 && IsPredicateMacro(fs, method);
+     const bool predicate = predicate_macro && cond_back == 1;
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 2dba015..40d9203 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
++#include "common/live_switch.h"
+ #include "common/logging.h"
+ #include "common/pe_switch.h"
+ #include "common/paged_scalar.h"
+@@ -286,7 +287,9 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
+     };
+     static constexpr size_t CacheSize = 2048;
+     using PageCache = std::array<CachedPage, CacheSize>;
+-    static const bool use_cache = Common::PeSwitch("EDEN_UP_GPU_PAGE_CACHE");
++    // A live switch since T119 (common/live_switch.h): read at each lookup, one atomic load.
++    const bool use_cache =
++        Common::LiveSwitch::Value<Common::LiveSwitch::Id::GpuPageCache>() != 0;
+     static thread_local std::unique_ptr<PageCache> cache;
+     constexpr u64 SubpageBits = 12;
+     constexpr u64 SubpageMask = (u64{1} << SubpageBits) - 1;
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index 59685d0..75bf03d 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -17,6 +17,7 @@
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+ #include "common/bit_util.h"
+ #include "common/common_types.h"
++#include "common/live_switch.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/query_cache/query_cache.h"
+@@ -301,10 +302,10 @@ public:
+         // a WAIT_BIT copy separately (3.8 us per query, ~5 ms a frame in Ocarina). Queries complete
+         // in order on the queue, so waiting for the newest one is enough before copying the range
+         // without the wait. RADV emits one wait per query and render backend.
+-        static const bool wait_on_last = [] {
+-            const char* const value = std::getenv("EDEN_NX2_QUERY_WAIT_ONCE");
+-            return value != nullptr && value[0] != '0';
+-        }();
++        // A live switch since T119 (common/live_switch.h): read once per sync, and each recorded
++        // copy carries the answer it was recorded with.
++        const bool wait_on_last =
++            Common::LiveSwitch::Value<Common::LiveSwitch::Id::QueryWaitOnce>() != 0;
+ 
+         ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
+                                                  size_t amount) {
+@@ -312,7 +313,7 @@ public:
+             auto& resolve_buffer = buffers[resolve_buffer_index];
+             VkQueryPool query_pool = bank->GetInnerPool();
+             scheduler.RequestOutsideRenderPassOperationContext();
+-            scheduler.Record([start, amount, base_offset, query_pool,
++            scheduler.Record([start, amount, base_offset, query_pool, wait_on_last,
+                               buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
+                 const VkBufferMemoryBarrier copy_query_pool_barrier{
+                     .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+diff --git a/src/video_core/textures/decoders.cpp b/src/video_core/textures/decoders.cpp
+index 714fb4f..60b0d3e 100644
+--- a/src/video_core/textures/decoders.cpp
++++ b/src/video_core/textures/decoders.cpp
+@@ -22,6 +22,7 @@
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+ #include "common/div_ceil.h"
++#include "common/live_switch.h"
+ #include "common/logging.h"
+ #include "common/pe_switch.h"
+ #include "common/thread.h"
+@@ -45,15 +46,29 @@ public:
+         return pool;
+     }
+ 
++    /// How many helpers a large unswizzle uses now; 0: none. A live switch since T119
++    /// (common/live_switch.h): read at each one.
++    [[nodiscard]] static u32 Wanted() {
++        return static_cast<u32>(
++            Common::LiveSwitch::Value<Common::LiveSwitch::Id::UnswizzleThreads>());
++    }
++
+     [[nodiscard]] bool Enabled() const {
+-        return !workers.empty();
++        return Wanted() != 0;
+     }
+ 
+     /// Calls func(begin, end) over [0, count) in chunks; returns once every chunk is done. A
+     /// second caller while one runs does its own work alone.
+     void Run(u32 count, const std::function<void(u32, u32)>& func) {
++        const u32 wanted = Wanted();
+         std::unique_lock busy{run_mutex, std::try_to_lock};
+-        if (!busy || workers.empty()) {
++        if (!busy || wanted == 0) {
++            func(0, count);
++            return;
++        }
++        Grow(wanted);
++        const u32 helpers = (std::min)(wanted, static_cast<u32>(workers.size()));
++        if (helpers == 0) {
+             func(0, count);
+             return;
+         }
+@@ -61,9 +76,10 @@ public:
+             std::scoped_lock lock{mutex};
+             job = &func;
+             total = count;
+-            chunk = (std::max)(8U, count / static_cast<u32>((workers.size() + 1) * 4));
++            chunk = (std::max)(8U, count / ((helpers + 1) * 4));
+             next.store(0, std::memory_order_relaxed);
+-            pending = static_cast<u32>(workers.size());
++            active = helpers;
++            pending = helpers;
+             ++generation;
+         }
+         work_cv.notify_all();
+@@ -74,22 +90,26 @@ public:
+     }
+ 
+ private:
+-    LinePool() {
+-        u32 count = 0;
+-        if (const char* const value = std::getenv("EDEN_UP_UNSWIZZLE_THREADS")) {
+-            count = (std::min)(4U, static_cast<u32>(std::strtoul(value, nullptr, 10)));
++    LinePool() = default;
++
++    /// Makes helper threads up to `wanted`; they stay. Caller holds run_mutex, so no run is in
++    /// flight and `generation` stands still: a new helper starts from it and takes the next run.
++    void Grow(u32 wanted) {
++        if (workers.size() >= wanted) {
++            return;
+         }
+         try {
+-            for (u32 i = 0; i < count; ++i) {
+-                workers.emplace_back([this](std::stop_token stop) { Loop(stop); });
++            while (workers.size() < wanted) {
++                const u32 index = static_cast<u32>(workers.size());
++                const u64 from = generation;
++                workers.emplace_back(
++                    [this, index, from](std::stop_token stop) { Loop(stop, index, from); });
+             }
+         } catch (const std::exception&) {
+             // Fewer helpers than asked for, or none: the caller then does the rest itself.
+         }
+-        if (count != 0) {
+-            LOG_INFO(HW_GPU, "EDEN_UP_UNSWIZZLE_THREADS: {} helper thread(s) for unswizzles of 1 MiB "
+-                             "and more", workers.size());
+-        }
++        LOG_INFO(HW_GPU, "EDEN_UP_UNSWIZZLE_THREADS: {} helper thread(s) for unswizzles of 1 MiB "
++                         "and more", workers.size());
+     }
+ 
+     ~LinePool() {
+@@ -115,9 +135,8 @@ private:
+         }
+     }
+ 
+-    void Loop(std::stop_token stop) {
++    void Loop(std::stop_token stop, u32 index, u64 seen) {
+         Common::SetCurrentThreadName("Unswizzle");
+-        u64 seen = 0;
+         for (;;) {
+             const std::function<void(u32, u32)>* func;
+             {
+@@ -127,6 +146,9 @@ private:
+                     return;
+                 }
+                 seen = generation;
++                if (index >= active) {
++                    continue; // this run uses fewer helpers; it does not count this one
++                }
+                 func = job;
+             }
+             Work(*func);
+@@ -147,6 +169,7 @@ private:
+     u32 chunk{1};
+     std::atomic<u32> next{};
+     u32 pending{};
++    u32 active{}; ///< Helpers the run in flight uses: workers[0, active)
+     u64 generation{};
+     std::vector<std::jthread> workers;
+ };
+@@ -179,14 +202,15 @@ void incrpdep(u32& value) {
+ // linear data is copied in 16-byte units whose place in a GOB comes from a table, instead of
+ // working every unit's offset out with two bit deposits.
+ bool SwizzleUnits() {
+-    static const bool enabled = [] {
+-        const bool on = Common::PeSwitch("EDEN_UP_SWIZZLE_UNITS");
+-        if (on) {
++    // A live switch since T119 (common/live_switch.h): read at each copy.
++    const bool on = Common::LiveSwitch::Value<Common::LiveSwitch::Id::SwizzleUnits>() != 0;
++    if (on) {
++        static std::once_flag logged;
++        std::call_once(logged, [] {
+             LOG_INFO(HW_GPU, "EDEN_UP_SWIZZLE_UNITS: block-linear data is copied in 16-byte units");
+-        }
+-        return on;
+-    }();
+-    return enabled;
++        });
++    }
++    return on;
+ }
+ 
+ // Where each 16-byte unit of a GOB row lies within the GOB, by row (y & 7) and unit (x / 16 & 3).

@@ -1,0 +1,57 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Pipeline cache: a run-time pipeline build tells the front's heap, so its requests can wait for memory (EDEN_UP_HEAP_WAIT_GPU_MS)
+
+A crash in free play on 10 Nov 2026 22:07 (leaving Kokiri Forest, pool empty): 64 pipelines were built on
+the GPU thread in the last 4 s. EDEN_UP_HEAP_WAIT_MS only covers the "VkPipeline..." threads; the
+GPU thread's requests came back empty at once, and a pipeline that cannot be built is left out with
+its draws.
+
+The two run-time entry points (CreateGraphicsPipeline() and the compute one that reports its build)
+now mark their span with eden_heap_wait_scope, a weak call into the PS5 front. With
+EDEN_UP_HEAP_WAIT_GPU_MS=<n> the front lets a request inside that span wait up to n ms, once per
+build. Without the front or the switch nothing changes.
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 93aba85..448f729 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -2941,7 +2941,31 @@ void PipelineCache::WarnKeptPointer(size_t program, u64 slot) const {
+     }
+ }
+ 
++// EDEN_UP_HEAP_WAIT_GPU_MS (the PS5 front's heap, headless/heap_arenas.inc): while a thread builds a
++// pipeline itself at run time, a request of its the heap cannot serve waits for memory instead of
++// coming back empty, as the builder threads' requests do under EDEN_UP_HEAP_WAIT_MS. The front
++// has to know when that is: these two calls say so. Without the front, or without the switch,
++// nothing changes.
++extern "C" void eden_heap_wait_scope(int enter) __attribute__((weak));
++namespace {
++struct HeapWaitScope {
++    HeapWaitScope() {
++        if (eden_heap_wait_scope) {
++            eden_heap_wait_scope(1);
++        }
++    }
++    ~HeapWaitScope() {
++        if (eden_heap_wait_scope) {
++            eden_heap_wait_scope(0);
++        }
++    }
++    HeapWaitScope(const HeapWaitScope&) = delete;
++    HeapWaitScope& operator=(const HeapWaitScope&) = delete;
++};
++} // Anonymous namespace
++
+ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
++    const HeapWaitScope heap_wait;
+     Common::HangSite site{"building a graphics pipeline"};
+     const auto begin = std::chrono::steady_clock::now();
+     const u64 key_hash = graphics_key.Hash();
+@@ -3505,6 +3529,7 @@ void PipelineCache::SerializeTranslatedGraphicsPipeline(std::list<TranslationJob
+ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     const ComputePipelineCacheKey& key, const ShaderInfo* shader,
+     const ComputePipeline* previous) {
++    const HeapWaitScope heap_wait;
+     Common::HangSite site{"building a compute pipeline"};
+     const auto begin = std::chrono::steady_clock::now();
+     SCOPE_EXIT {

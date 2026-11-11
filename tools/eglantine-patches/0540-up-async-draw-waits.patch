@@ -1,0 +1,57 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_ASYNC_DRAW_WAITS=1: Switch 2 draws without a depth buffer are not skipped for a new pipeline
+
+Upstream: Eglantine-Community 7a940ca by rdenno ("vk_pipeline_cache: wait for new pipelines of
+Switch 2 draws without depth"). Star Fox drew each font atlas glyph once (no depth, 30 to 672
+vertices); a glyph whose pipeline was still building was skipped and stayed blank for the session.
+
+Two places, both off by default (Common::PeSwitch):
+- BuiltPipeline: with the asynchronous shaders setting, a Switch 2 draw without a depth buffer
+  gets its pending pipeline (the scheduler worker waits for the driver build) instead of nullptr.
+  The setting is off on the PS5, so on the console this hunk does nothing.
+- CanSkipDraw (0508, EDEN_UP_ASYNC_TRANSLATION): the same rule, so such a draw is never queued on
+  the translators nor skipped: it is translated on the GPU thread as with 0508 off, or takes a
+  queued job back, or waits for one a worker has started. Draws with a depth buffer bound
+  (zeta_enable) are queued and skipped as before, offscreen passes with depth included.
+
+Cost: one GPU-thread translation per new no-depth pipeline (the 0508-off cost for those).
+Unset: both functions return exactly what they return today.
+
+Not in TranslationSwitches (vk_pipeline_prep.cpp) on purpose, like EDEN_UP_ASYNC_TRANSLATION: it
+changes no SPIR-V or info, so test arms share one prep store.
+
+v2 of the draft: credit corrected (the draft named kraibse; 7a940ca is rdenno's), header
+says what the change does on the PS5, comments in the code.
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 7edbadb..31213a6 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -2376,6 +2376,13 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
+     if (draw_state.draw_element_count <= 6) {
+         return pipeline;
+     }
++    // EDEN_UP_ASYNC_DRAW_WAITS=1 (Eglantine-Community 7a940ca, rdenno): Switch 2 titles also
++    // draw things they keep once, with more vertices and no depth buffer (font atlas glyphs):
++    // those wait for their pipeline instead of being skipped. Unset: as before.
++    static const bool wait = Common::PeSwitch("EDEN_UP_ASYNC_DRAW_WAITS");
++    if (wait && Settings::CurrentProgramIsSwitch2()) {
++        return pipeline;
++    }
+     return nullptr;
+ }
+ 
+@@ -3047,6 +3054,13 @@ bool PipelineCache::CanSkipDraw() const noexcept {
+     if (maxwell3d->regs.zeta_enable) {
+         return true;
+     }
++    // EDEN_UP_ASYNC_DRAW_WAITS=1: a Switch 2 draw without a depth buffer can't be skipped, as in
++    // BuiltPipeline, so it is not queued (CanTranslateAsynchronously) and is translated on this
++    // thread as without EDEN_UP_ASYNC_TRANSLATION. Unset: as before.
++    static const bool wait = Common::PeSwitch("EDEN_UP_ASYNC_DRAW_WAITS");
++    if (wait && Settings::CurrentProgramIsSwitch2()) {
++        return false;
++    }
+     return maxwell3d->draw_manager.draw_state.draw_element_count > 6;
+ }
+ 

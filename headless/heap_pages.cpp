@@ -7,6 +7,7 @@
 #include "common/sparse_large_vector.h"
 
 namespace Common {
+void* AllocateHeapMemoryPages(std::size_t size) noexcept;
 void* ReserveMemoryRange(std::size_t size) noexcept;
 void* ReserveAddressRange(std::size_t size) noexcept;
 bool CommitMemoryRange(void* address, std::size_t size) noexcept;
@@ -59,7 +60,28 @@ extern "C" void eden_heap_set_rescue(int on) __attribute__((weak));
 //     on a pipeline builder thread is refused, <attempts> times in a row (default 150), with no
 //     memory taken away (headless/heap_arenas.inc, eden_heap_starve).
 extern "C" void eden_heap_set_starve(unsigned every, unsigned attempts) __attribute__((weak));
+//   EDEN_UP_HEAP_WAIT_GPU_MS=<n> (1 to 5000; unset or 0: off): the same wait for a thread that builds a
+//     pipeline itself at run time (the GPU thread at a pipeline's first sight), which holds the frame:
+//     its own limit, and at most n ms a build (headless/heap_arenas.inc, eden_heap_wait_scope).
+extern "C" void eden_heap_set_wait_gpu_ms(unsigned ms) __attribute__((weak));
+//   EDEN_TEST_HEAP_STARVE_GPU=1 (a test, with EDEN_TEST_HEAP_STARVE): the refusals go to the threads
+//     inside such a run-time build instead of the builder threads.
+extern "C" void eden_heap_set_starve_scope(int on) __attribute__((weak));
+extern "C" void eden_heap_set_large(std::size_t kib) __attribute__((weak));
 extern "C" void eden_heap_pool_init(void) {
+    // EDEN_HEAP_LARGE_MIB=<n> (1 to 32) or EDEN_HEAP_LARGE_KIB=<n> (256 to 32768): requests of that
+    // size or more get memory of their own, given back when they are freed
+    // (headless/heap_arenas.inc). Without either 32 MiB, as before.
+    if (eden_heap_set_large) {
+        std::uint64_t kib = EnvMib("EDEN_HEAP_LARGE_KIB");
+        if (kib == 0) kib = EnvMib("EDEN_HEAP_LARGE_MIB") << 10;
+        if (kib != 0) {
+            kib = kib < 256 ? 256 : kib > 32768 ? 32768 : kib;
+            eden_heap_set_large(static_cast<std::size_t>(kib));
+            std::fprintf(stderr, "EDEN_HEAP_LARGE requests of %llu KiB or more get memory of their own\n",
+                         static_cast<unsigned long long>(kib));
+        }
+    }
     if (const char* const starve = std::getenv("EDEN_TEST_HEAP_STARVE");
         starve != nullptr && starve[0] >= '1' && starve[0] <= '9' && eden_heap_set_starve) {
         char* end = nullptr;
@@ -80,6 +102,19 @@ extern "C" void eden_heap_pool_init(void) {
             eden_heap_set_wait_ms(static_cast<unsigned>(ms));
             std::fprintf(stderr, "EDEN_UP_HEAP_WAIT_MS pipeline builders wait up to %lu ms for memory\n", ms);
         }
+    }
+    if (const char* const wait = std::getenv("EDEN_UP_HEAP_WAIT_GPU_MS"); wait != nullptr && wait[0] >= '0' && wait[0] <= '9') {
+        char* end = nullptr;
+        const unsigned long ms = std::strtoul(wait, &end, 10);
+        if (end != nullptr && *end == '\0' && ms != 0 && ms <= 5000 && eden_heap_set_wait_gpu_ms) {
+            eden_heap_set_wait_gpu_ms(static_cast<unsigned>(ms));
+            std::fprintf(stderr, "EDEN_UP_HEAP_WAIT_GPU_MS a run-time pipeline build waits up to %lu ms for memory\n", ms);
+        }
+    }
+    if (const char* const scope = std::getenv("EDEN_TEST_HEAP_STARVE_GPU");
+        scope != nullptr && scope[0] == '1' && scope[1] == '\0' && eden_heap_set_starve_scope) {
+        eden_heap_set_starve_scope(1);
+        std::fputs("EDEN_TEST_HEAP_STARVE_GPU the starve test refuses requests inside run-time pipeline builds\n", stderr);
     }
     if (const char* const rescue = std::getenv("EDEN_UP_HEAP_RESCUE");
         rescue != nullptr && rescue[0] == '1' && rescue[1] == '\0' && eden_heap_set_rescue) {
@@ -131,7 +166,7 @@ extern "C" void eden_heap_reserve_pages_free(void* base, std::size_t size) {
 
 // Reuse the qualified, owned direct-memory backend for the C mspace heap.
 extern "C" void* eden_heap_pages(std::size_t size) {
-    return Common::AllocateMemoryPages(size);
+    return Common::AllocateHeapMemoryPages(size);
 }
 extern "C" void eden_heap_pages_free(void* base, std::size_t size) {
     Common::FreeMemoryPages(base, size);

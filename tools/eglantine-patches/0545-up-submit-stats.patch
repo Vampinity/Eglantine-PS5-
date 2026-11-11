@@ -1,0 +1,719 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_SUBMIT_STATS=1: statistics of submissions, deferred submissions, waits and the front's macro reads (drain design stage 1); nothing changes without or with it
+
+Statistics only. With the switch (exact "1") three lines are logged every 10 s; nothing is
+submitted, deferred or waited for differently, with or without it.
+
+1. "EDEN_UP_SUBMIT_STATS in N s, F frames: S submissions: ...": submissions by who asked for them.
+   The names are ZpassCut's sites (draws, astc, fence, fence flush, list copy, idle) and, for its
+   "other", the callers without a SiteScope: finish (Scheduler::Finish), wait (Scheduler::Wait's own
+   flush), present (RendererVulkan::Composite); what is left stays "other" (the buffer cache's host
+   read flushes, mostly). Counted in Scheduler::SubmitExecution, so every real submission counts,
+   also without EDEN_NX2_ZPASS_CUT_LOG. Per name: the waits for the GPU to finish such a
+   submission (MasterSemaphore::Wait past its quick checks) and the waits of other threads for the
+   submission itself (Scheduler::WaitSubmitted), each with its time. Last: how often
+   Scheduler::WaitForSubmission gave up after 20 ms (it did so without a word).
+2. "EDEN_UP_SUBMIT_STATS deferred: ...": how many flushes Scheduler::DeferFlush put off, how many
+   deferred submissions went out, and per sender the count, mean and longest delay from the first
+   put-off flush: the back's own idle, the idle hook asked for by a submission waiter / by a drain
+   / by someone else, the fence manager outside the hook, the next flush, a finish, a wait.
+3. "EDEN_UP_SUBMIT_STATS front macro reads: ...": Maxwell3D::FrontDmaRead per window: snapshot
+   hits, misses by reason (the counters the function already keeps and prints every 262,144
+   reads), reads of listed reports, narrowed reads, read-ahead reads and how many of them drained
+   (pending word / unsynced), plain drains.
+
+This names the submission call sites without the build's ELF (EDEN_GPU_SUBMIT_ORIGIN gives return
+addresses). Not in it from the design note: "list entries that are pure macro data" (needs the
+command list parser, a patch of its own), and the idle hook's askers in fence_manager.h and
+vk_rasterizer.cpp, which stay "another requested hook": both files are compiled in parts by build
+checks or rewritten by the front's build-time edits, and a statistics patch should not move those.
+The driver's side (how long radv_ps5_queue_wait_seq waited) is lead-mesh-25 of the RADV series.
+
+Touches no line the front's build-time edits anchor on (tools/prepare-vulkan-port.py for
+vk_scheduler.h/.cpp and renderer_vulkan.cpp, headless/macro_native.cmake for maxwell_3d.cpp), and
+none of the functions tools/check-vulkan-handoff.py compiles on their own.
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index e969f6c..116b2be 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -36,6 +36,7 @@
+ #include "video_core/nx2_query_light.h"
+ #include "video_core/query_dma.h"
+ #include "video_core/rasterizer_interface.h"
++#include "video_core/submit_stats.h"
+ #include "video_core/textures/texture.h"
+ #include "video_core/ubo_ahead.h"
+ #include "video_core/ubo_snapshot.h"
+@@ -2535,6 +2536,8 @@ void Maxwell3D::FrontDmaReadAhead(VideoCommon::GpuSplit& split, FrontState& fs,
+         }
+         VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+     }, neutral ? VideoCommon::GpuSplit::FastDrawNeutral : 0);
++    VideoCommon::SubmitStats::NoteDma(pending ? VideoCommon::SubmitStats::Dma::AheadPending
++                                              : VideoCommon::SubmitStats::Dma::AheadUnsynced);
+     split.Drain(VideoCommon::DrainSite::DmaReadAhead);
+     // Taken after the drain: the whole pages are current up to what was sent.
+     const u64 position = split.SentPosition();
+@@ -2623,6 +2626,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                                        : split.LastUnrangedPosition() > it->second ? 2
+                                                                                    : 3;
+                     ++miss_reasons[reason];
++                    VideoCommon::SubmitStats::NoteDma(static_cast<VideoCommon::SubmitStats::Dma>(
++                        static_cast<u32>(VideoCommon::SubmitStats::Dma::MissNewPage) + reason));
+                 }
+             }
+             // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
+@@ -2657,6 +2662,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                 };
+                 if (hit) {
+                     ++hits;
++                    VideoCommon::SubmitStats::NoteDma(VideoCommon::SubmitStats::Dma::Hit);
+                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                     if (snapshot_mode == 2) {
+                         std::vector<u32> exact(words);
+@@ -2704,6 +2710,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                             !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12);
+                     }
+                     if (narrowed) {
++                        VideoCommon::SubmitStats::NoteDma(VideoCommon::SubmitStats::Dma::Narrowed);
+                         memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                         AsyncReadback::Add(AsyncReadback::g_counters.dma_narrow, 1);
+                         AsyncReadback::Add(AsyncReadback::g_counters.dma_narrow_ns,
+@@ -2765,6 +2772,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                 return;
+             }
+             ++report_reads;
++            VideoCommon::SubmitStats::NoteDma(VideoCommon::SubmitStats::Dma::ListedReport);
+         }
+     }
+     if (!split.DmaReadAhead() || words > 64) {
+@@ -2780,9 +2788,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+             }
+             VideoCommon::QueryDma::AfterBufferFlush(*memory, *rasterizer, source, read_bytes);
+         }, neutral ? VideoCommon::GpuSplit::FastDrawNeutral : 0);
++        VideoCommon::SubmitStats::NoteDma(VideoCommon::SubmitStats::Dma::Plain);
+         split.Drain(method == 0x158 ? VideoCommon::DrainSite::MacroDmaRead
+                                     : VideoCommon::DrainSite::MacroDmaReadRam);
+     } else {
++        VideoCommon::SubmitStats::NoteDma(VideoCommon::SubmitStats::Dma::Ahead);
+         FrontDmaReadAhead(split, fs, macro, method, source, words);
+     }
+     if (query_stats && words <= 8) [[unlikely]] {
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 5dbea1a..6418f53 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -30,6 +30,7 @@
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_fast_draw.h"
+ #include "video_core/nx2_profile.h"
++#include "video_core/submit_stats.h"
+ #include "video_core/ubo_ahead.h"
+ #include "video_core/ubo_snapshot.h"
+ 
+@@ -151,6 +152,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
+     if (active && g_l1094_counting) [[unlikely]] {
+         ReportL1094();
+     }
++    if (active) {
++        SubmitStats::MaybeReport(); // EDEN_UP_SUBMIT_STATS; returns at once without it
++    }
+     if (active && !allowed) {
+         Drain();
+         Stop();
+@@ -481,6 +485,7 @@ void GpuSplit::DrainAt(DrainSite site) {
+                 return;
+             }
+             if (!hook_asked) {
++                SubmitStats::NoteHookRequest(SubmitStats::Hook::Drain);
+                 RequestIdleHook();
+                 hook_asked = true;
+             }
+@@ -1060,7 +1065,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+                     if (idle_hook != nullptr) {
+                         const u64 hook_start = counting ? WaitClockNs() : 0;
+                         back_going_quiet = true;
+-                        idle_hook(idle_argument);
++                        {
++                            const SubmitStats::HookScope stats_hook{SubmitStats::Hook::OwnIdle};
++                            idle_hook(idle_argument);
++                        }
+                         back_going_quiet = false;
+                         if (counting) [[unlikely]] {
+                             L949Count(g_l949_stats.back_hooks);
+@@ -1111,6 +1119,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+             if (hook_requested.load(std::memory_order_relaxed) &&
+                 idle_hook != nullptr) [[unlikely]] {
+                 hook_requested.store(false, std::memory_order_seq_cst);
++                const SubmitStats::HookScope stats_hook{SubmitStats::Enabled()
++                                                            ? SubmitStats::TakeRequestedHook()
++                                                            : SubmitStats::Hook::Other};
+                 idle_hook(idle_argument);
+             }
+             // Hand ring space back now and then while working through a long batch, and at once
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index a8d609e..2f9cf02 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -239,12 +239,23 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
+         Frame* generated = present_manager.GetRenderFrame();
+         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
+         frame_gen.GenerateInto(device, generated, generation);
+-        scheduler.Flush(*generated->render_ready);
++        {
++            const VideoCommon::SubmitStats::DetailScope stats_origin{
++                VideoCommon::SubmitStats::Origin::Present};
++            scheduler.Flush(*generated->render_ready);
++        }
+         present_manager.Present(generated);
+     }
+ #endif
+ 
+-    scheduler.Flush(*frame->render_ready);
++    {
++        const VideoCommon::SubmitStats::DetailScope stats_origin{
++            VideoCommon::SubmitStats::Origin::Present};
++        scheduler.Flush(*frame->render_ready);
++    }
++    if (VideoCommon::SubmitStats::Enabled()) {
++        VideoCommon::SubmitStats::NoteFrame();
++    }
+ 
+     present_manager.Present(frame);
+ #ifdef HAS_LSFG
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+index 5217f58..ca68ce8 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -10,6 +10,7 @@
+ #include "common/hang_site.h"
+ #include "common/settings.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
++#include "video_core/submit_stats.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
+@@ -84,6 +85,7 @@ void MasterSemaphore::Wait(u64 tick) {
+             return;
+         }
+ 
++        const VideoCommon::SubmitStats::WaitTimer stats_timer{tick};
+         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
+         while (gpu_tick.load(std::memory_order_acquire) < tick) {
+             gpu_tick.wait(last_tick, std::memory_order_acquire);
+@@ -105,6 +107,7 @@ void MasterSemaphore::Wait(u64 tick) {
+     }
+ 
+     // If none of the above is hit, fallback to a regular wait
++    const VideoCommon::SubmitStats::WaitTimer stats_timer{tick};
+     Common::HangSite site{"waiting for a GPU tick"};
+     try {
+         // EDEN_NX2_HANG_WATCH: only the first 3 s of this wait, not a loop of them. Each timed wait
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 77dcd9b..8f4d2c8 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -20,11 +20,13 @@
+ 
+ #include "common/logging.h"
+ #include "common/pe_switch.h"
++#include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "video_core/renderer_vulkan/upload_batch.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "video_core/hitch_trace.h"
++#include "video_core/submit_stats.h"
+ #include "video_core/zpass_cut.h"
+ #include "video_core/renderer_vulkan/vk_command_pool.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+@@ -283,6 +285,13 @@ bool Scheduler::DeferFlush() {
+                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, FULL_BARRIER);
+         });
+     }
++    if (VideoCommon::SubmitStats::Enabled()) {
++        VideoCommon::SubmitStats::NoteDeferral();
++        if (!stats_deferred) {
++            stats_deferred = true;
++            stats_deferred_since = std::chrono::steady_clock::now();
++        }
++    }
+     flush_pending = true;
+     return true;
+ }
+@@ -307,10 +316,20 @@ bool Scheduler::WaitSubmitted(u64 tick) {
+         return true;
+     }
+     auto& split = VideoCommon::GpuSplit::Get();
++    VideoCommon::SubmitStats::NoteHookRequest(VideoCommon::SubmitStats::Hook::Waiter);
+     split.RequestIdleHook();
+     // No time limit: the back can spend seconds on one entry (a large shader's translation),
+     // and a fence reported as submitted before it is would release its downloads too early.
+     const auto start = std::chrono::steady_clock::now();
++    SCOPE_EXIT {
++        // Noted once the wait is over: the tick's origin is known then.
++        if (VideoCommon::SubmitStats::Enabled()) {
++            VideoCommon::SubmitStats::NoteSubmitWait(
++                tick, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                           std::chrono::steady_clock::now() - start)
++                                           .count()));
++        }
++    };
+     auto next_log = start + std::chrono::seconds{2};
+     for (u32 spins = 0; !IsSubmitted(tick); ++spins) {
+         if (!split.BackRunning()) {
+@@ -321,6 +340,7 @@ bool Scheduler::WaitSubmitted(u64 tick) {
+             LOG_WARNING(Render_Vulkan, "Waited {} s for the GPU thread to submit tick {}",
+                         std::chrono::duration_cast<std::chrono::seconds>(now - start).count(),
+                         tick);
++            VideoCommon::SubmitStats::NoteHookRequest(VideoCommon::SubmitStats::Hook::Waiter);
+             split.RequestIdleHook();
+         }
+         if (spins < 64) {
+@@ -336,6 +356,8 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
+     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
+     }
++    const VideoCommon::SubmitStats::DetailScope stats_origin{
++        VideoCommon::SubmitStats::Origin::Finish};
+     VideoCommon::HitchTrace::Op trace{VideoCommon::HitchTrace::Kind::Finish, 0, {}};
+     // When finishing, we need to wait for the submission to have executed on the device.
+     const u64 presubmit_tick = CurrentTick();
+@@ -697,6 +719,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+     EndPendingOperations();
+     InvalidateState();
+ 
++    if (VideoCommon::SubmitStats::Enabled()) {
++        // Before NextTick: a waiter that sees the tick submitted then finds its origin noted.
++        VideoCommon::SubmitStats::NoteSubmission(master_semaphore->CurrentTick(), stats_deferred,
++                                                 stats_deferred_since);
++        stats_deferred = false;
++    }
+     const u64 signal_value = master_semaphore->NextTick();
+     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index cda92b8..0564467 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -26,6 +26,7 @@
+ #include "common/polyfill_thread.h"
+ #include "common/settings.h"
+ #include "video_core/gpu_split.h"
++#include "video_core/submit_stats.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
+@@ -233,6 +234,10 @@ public:
+         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
+         while (tick >= master_semaphore->CurrentTick()) {
+             if (std::chrono::steady_clock::now() >= deadline) {
++                // Silent until the submit statistics (video_core/submit_stats.h) counted it.
++                if (VideoCommon::SubmitStats::Enabled()) {
++                    VideoCommon::SubmitStats::NoteGaveUp();
++                }
+                 return false;
+             }
+             std::this_thread::sleep_for(std::chrono::microseconds{100});
+@@ -258,6 +263,8 @@ public:
+     void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true) {
+         if (tick > 0 && (may_flush || WaitForSubmission(tick))) {
+             if (tick >= master_semaphore->CurrentTick()) {
++                const VideoCommon::SubmitStats::DetailScope stats_origin{
++                    VideoCommon::SubmitStats::Origin::Wait};
+                 Flush();
+             }
+             master_semaphore->Wait(tick);
+@@ -305,6 +312,9 @@ public:
+ private:
+     std::chrono::steady_clock::time_point last_flush{};
+     bool flush_pending{};
++    /// Submit statistics: a flush was put off since the last submission, and when the first was.
++    bool stats_deferred{};
++    std::chrono::steady_clock::time_point stats_deferred_since{};
+     bool zpass_window_open{}; ///< From the guest's ZPass counter reset to its next report
+ 
+     class Command {
+diff --git a/b/src/video_core/submit_stats.h b/src/video_core/submit_stats.h
+new file mode 100644
+index 0000000..51ec8b4
+--- /dev/null
++++ b/src/video_core/submit_stats.h
+@@ -0,0 +1,377 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <string>
++
++#include <fmt/format.h>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "video_core/zpass_cut.h"
++
++namespace VideoCommon::SubmitStats {
++
++/// EDEN_UP_SUBMIT_STATS=1 (exact "1", off without it). Statistics only: with it nothing is
++/// submitted, deferred or waited for differently. Every 10 s three lines:
++///  - submissions by who asked for them (ZpassCut's sites, and for its "other" the callers without
++///    a SiteScope: Finish, Scheduler::Wait's own flush, the present, host reads), the waits for
++///    each one's GPU work (MasterSemaphore::Wait), the waits of other threads for the submission
++///    itself (Scheduler::WaitSubmitted), and how often a thread that may not flush gave up waiting
++///    for a submission after 20 ms (Scheduler::WaitForSubmission);
++///  - deferred submissions (Scheduler::DeferFlush): how long each waited and what sent it;
++///  - the front's macro memory reads (Maxwell3D::FrontDmaRead): snapshot hits, misses by reason,
++///    reads of listed reports, and the reads that drained the back.
++inline bool Enabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_SUBMIT_STATS");
++    return enabled;
++}
++
++/// Who asked for a submission.
++enum class Origin : u32 {
++    Draws,
++    Astc,
++    Fence,
++    FenceFlush,
++    ListCopy,
++    Idle,
++    Finish,
++    Wait,
++    Present,
++    HostRead,
++    Other,
++    Count,
++};
++inline constexpr std::size_t OriginCount = static_cast<std::size_t>(Origin::Count);
++inline constexpr std::array<const char*, OriginCount> OriginNames{
++    "draws", "astc",   "fence",   "fence flush", "list copy", "idle",
++    "finish", "wait",  "present", "host read",   "other"};
++
++/// Who made the back's idle hook run. The hook sends a deferred submission.
++enum class Hook : u8 { None, OwnIdle, Waiter, Drain, Other };
++
++/// What sent a deferred submission.
++enum class Sender : u32 {
++    OwnIdle,   ///< The idle hook, the back ran out of work
++    Waiter,    ///< The idle hook, asked for by Scheduler::WaitSubmitted
++    Drain,     ///< The idle hook, asked for by GpuSplit::DrainAt
++    OtherHook, ///< The idle hook, asked for by someone else (fence manager, tick polls)
++    Direct,    ///< Scheduler::FlushDeferred outside the hook (FenceManager::SubmitDeferred)
++    NextFlush, ///< A later flush that was not deferred
++    Finish,
++    Wait,
++    Count,
++};
++inline constexpr std::size_t SenderCount = static_cast<std::size_t>(Sender::Count);
++inline constexpr std::array<const char*, SenderCount> SenderNames{
++    "the back's own idle",     "a submission waiter's hook", "a drain's hook",
++    "another requested hook",  "the fence manager",          "the next flush",
++    "a finish",                "a wait"};
++
++/// Maxwell3D::FrontDmaRead and FrontDmaReadAhead.
++enum class Dma : u32 {
++    Hit,
++    MissNewPage,
++    MissWriter,
++    MissUnranged,
++    MissNoted,
++    ListedReport,
++    Narrowed,
++    Ahead,
++    AheadPending,
++    AheadUnsynced,
++    Plain,
++    Count,
++};
++inline constexpr std::size_t DmaCount = static_cast<std::size_t>(Dma::Count);
++
++inline constexpr std::size_t TickSlots = 1024;
++
++struct Stats {
++    std::array<std::atomic<u64>, OriginCount> submissions{};
++    std::array<std::atomic<u64>, OriginCount> waits{};
++    std::array<std::atomic<u64>, OriginCount> wait_ns{};
++    std::array<std::atomic<u64>, OriginCount> submit_waits{};
++    std::array<std::atomic<u64>, OriginCount> submit_wait_ns{};
++    std::array<std::atomic<u64>, SenderCount> sent{};
++    std::array<std::atomic<u64>, SenderCount> sent_ns{};
++    std::array<std::atomic<u64>, SenderCount> sent_max_ns{};
++    std::array<std::atomic<u64>, DmaCount> dma{};
++    std::atomic<u64> deferrals{};
++    std::atomic<u64> gave_up{};
++    std::atomic<u64> frames{};
++    /// The origin of the submission that carried each tick, by tick % TickSlots.
++    std::array<std::atomic<u8>, TickSlots> origin_of_tick{};
++    std::atomic<u8> requested_hook{};
++};
++
++inline Stats& Get() {
++    static Stats stats;
++    return stats;
++}
++
++/// For a submission without a ZpassCut::SiteScope: who asked for it.
++inline thread_local Origin detail = Origin::Other;
++/// On the split's back, while the idle hook runs: who made it run.
++inline thread_local Hook running_hook = Hook::None;
++
++class DetailScope {
++public:
++    explicit DetailScope(Origin origin) : previous{detail} {
++        detail = origin;
++    }
++    ~DetailScope() {
++        detail = previous;
++    }
++    DetailScope(const DetailScope&) = delete;
++    DetailScope& operator=(const DetailScope&) = delete;
++
++private:
++    Origin previous;
++};
++
++class HookScope {
++public:
++    explicit HookScope(Hook hook) : previous{running_hook} {
++        running_hook = hook;
++    }
++    ~HookScope() {
++        running_hook = previous;
++    }
++    HookScope(const HookScope&) = delete;
++    HookScope& operator=(const HookScope&) = delete;
++
++private:
++    Hook previous;
++};
++
++inline Origin CurrentOrigin() {
++    switch (ZpassCut::current_site) {
++    case ZpassCut::Site::Draws:
++        return Origin::Draws;
++    case ZpassCut::Site::Astc:
++        return Origin::Astc;
++    case ZpassCut::Site::Fence:
++        return Origin::Fence;
++    case ZpassCut::Site::FenceFlush:
++        return Origin::FenceFlush;
++    case ZpassCut::Site::ListCopy:
++        return Origin::ListCopy;
++    case ZpassCut::Site::Idle:
++        return Origin::Idle;
++    default:
++        return detail;
++    }
++}
++
++inline void Add(std::atomic<u64>& counter, u64 amount = 1) {
++    counter.fetch_add(amount, std::memory_order_relaxed);
++}
++
++/// Before GpuSplit::RequestIdleHook: who asks. The last asker before the hook runs is named.
++inline void NoteHookRequest(Hook hook) {
++    if (Enabled()) {
++        Get().requested_hook.store(static_cast<u8>(hook), std::memory_order_relaxed);
++    }
++}
++
++/// On the back, before it runs the hook on request.
++inline Hook TakeRequestedHook() {
++    const auto hook =
++        static_cast<Hook>(Get().requested_hook.exchange(0, std::memory_order_relaxed));
++    return hook == Hook::None ? Hook::Other : hook;
++}
++
++inline void NoteDeferral() {
++    Add(Get().deferrals);
++}
++
++inline void NoteGaveUp() {
++    Add(Get().gave_up);
++}
++
++inline void NoteFrame() {
++    Add(Get().frames);
++}
++
++inline void NoteDma(Dma what) {
++    if (Enabled()) {
++        Add(Get().dma[static_cast<std::size_t>(what)]);
++    }
++}
++
++/// A submission on this thread that carries `tick`. deferred: a flush was put off since the last
++/// submission (Scheduler::DeferFlush), at `since`; this submission sends its work.
++inline void NoteSubmission(u64 tick, bool deferred, std::chrono::steady_clock::time_point since) {
++    auto& stats = Get();
++    const Origin origin = CurrentOrigin();
++    Add(stats.submissions[static_cast<std::size_t>(origin)]);
++    stats.origin_of_tick[tick % TickSlots].store(static_cast<u8>(origin),
++                                                 std::memory_order_relaxed);
++    if (!deferred) {
++        return;
++    }
++    Sender sender = Sender::NextFlush;
++    if (origin == Origin::Idle) {
++        switch (running_hook) {
++        case Hook::OwnIdle:
++            sender = Sender::OwnIdle;
++            break;
++        case Hook::Waiter:
++            sender = Sender::Waiter;
++            break;
++        case Hook::Drain:
++            sender = Sender::Drain;
++            break;
++        case Hook::Other:
++            sender = Sender::OtherHook;
++            break;
++        default:
++            sender = Sender::Direct;
++            break;
++        }
++    } else if (origin == Origin::Finish) {
++        sender = Sender::Finish;
++    } else if (origin == Origin::Wait) {
++        sender = Sender::Wait;
++    }
++    const auto index = static_cast<std::size_t>(sender);
++    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                        std::chrono::steady_clock::now() - since)
++                                        .count());
++    Add(stats.sent[index]);
++    Add(stats.sent_ns[index], ns);
++    u64 longest = stats.sent_max_ns[index].load(std::memory_order_relaxed);
++    while (ns > longest && !stats.sent_max_ns[index].compare_exchange_weak(
++                               longest, ns, std::memory_order_relaxed)) {
++    }
++}
++
++inline Origin OriginOfTick(u64 tick) {
++    const u8 origin = Get().origin_of_tick[tick % TickSlots].load(std::memory_order_relaxed);
++    return origin < OriginCount ? static_cast<Origin>(origin) : Origin::Other;
++}
++
++/// A wait of `ns` for another thread to submit `tick` (Scheduler::WaitSubmitted), noted once the
++/// tick is submitted, so its origin is known.
++inline void NoteSubmitWait(u64 tick, u64 ns) {
++    auto& stats = Get();
++    const auto index = static_cast<std::size_t>(OriginOfTick(tick));
++    Add(stats.submit_waits[index]);
++    Add(stats.submit_wait_ns[index], ns);
++}
++
++/// Times a wait for the GPU to finish `tick`'s work (MasterSemaphore::Wait, past its quick
++/// checks). A tick that is not submitted yet shows under the origin that had its slot before.
++class WaitTimer {
++public:
++    explicit WaitTimer(u64 tick_) : tick{tick_}, enabled{Enabled()} {
++        if (enabled) {
++            start = std::chrono::steady_clock::now();
++        }
++    }
++    ~WaitTimer() {
++        if (!enabled) {
++            return;
++        }
++        auto& stats = Get();
++        const auto index = static_cast<std::size_t>(OriginOfTick(tick));
++        Add(stats.waits[index]);
++        Add(stats.wait_ns[index],
++            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                 std::chrono::steady_clock::now() - start)
++                                 .count()));
++    }
++    WaitTimer(const WaitTimer&) = delete;
++    WaitTimer& operator=(const WaitTimer&) = delete;
++
++private:
++    u64 tick;
++    bool enabled;
++    std::chrono::steady_clock::time_point start{};
++};
++
++/// The three lines, every 10 s. One caller: the GPU thread's loop (GpuSplit::MaybeStart).
++inline void MaybeReport() {
++    if (!Enabled()) {
++        return;
++    }
++    static u32 calls = 0;
++    if ((++calls & 255) != 0) {
++        return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    static auto window_start = now;
++    const auto elapsed = now - window_start;
++    if (elapsed < std::chrono::seconds{10}) {
++        return;
++    }
++    window_start = now;
++    auto& stats = Get();
++    const auto take = [](std::atomic<u64>& value) {
++        return value.exchange(0, std::memory_order_relaxed);
++    };
++    std::string text;
++    u64 total = 0;
++    for (std::size_t i = 0; i < OriginCount; ++i) {
++        const u64 count = take(stats.submissions[i]);
++        const u64 waits = take(stats.waits[i]);
++        const u64 wait_ns = take(stats.wait_ns[i]);
++        const u64 submit_waits = take(stats.submit_waits[i]);
++        const u64 submit_wait_ns = take(stats.submit_wait_ns[i]);
++        total += count;
++        if (count == 0 && waits == 0 && submit_waits == 0) {
++            continue;
++        }
++        text += fmt::format("{}{} {} ({} waits for the GPU {:.1f} ms, {} waits to be submitted "
++                            "{:.1f} ms)",
++                            text.empty() ? "" : ", ", OriginNames[i], count, waits,
++                            static_cast<double>(wait_ns) / 1e6, submit_waits,
++                            static_cast<double>(submit_wait_ns) / 1e6);
++    }
++    LOG_INFO(HW_GPU,
++             "EDEN_UP_SUBMIT_STATS in {:.1f} s, {} frames: {} submissions: {}; {} waits for a "
++             "submission gave up after 20 ms",
++             std::chrono::duration<double>(elapsed).count(), take(stats.frames), total,
++             text.empty() ? "none" : text, take(stats.gave_up));
++    text.clear();
++    total = 0;
++    for (std::size_t i = 0; i < SenderCount; ++i) {
++        const u64 count = take(stats.sent[i]);
++        const u64 ns = take(stats.sent_ns[i]);
++        const u64 longest = take(stats.sent_max_ns[i]);
++        total += count;
++        if (count == 0) {
++            continue;
++        }
++        text += fmt::format("{}{} {} (mean {:.2f} ms, longest {:.2f} ms)",
++                            text.empty() ? "" : ", ", SenderNames[i], count,
++                            static_cast<double>(ns) / 1e6 / static_cast<double>(count),
++                            static_cast<double>(longest) / 1e6);
++    }
++    LOG_INFO(HW_GPU,
++             "EDEN_UP_SUBMIT_STATS deferred: {} flushes put off, {} deferred submissions, sent "
++             "by: {}",
++             take(stats.deferrals), total, text.empty() ? "none" : text);
++    std::array<u64, DmaCount> dma{};
++    for (std::size_t i = 0; i < DmaCount; ++i) {
++        dma[i] = take(stats.dma[i]);
++    }
++    const auto of = [&dma](Dma what) { return dma[static_cast<std::size_t>(what)]; };
++    LOG_INFO(HW_GPU,
++             "EDEN_UP_SUBMIT_STATS front macro reads: {} snapshot hits; misses: {} new page, {} "
++             "compute/copy, {} unranged writer, {} noted write; {} of listed reports (drained), "
++             "{} narrowed without a drain; read ahead: {} reads, {} drained for a pending word, "
++             "{} drained unsynced; {} plain drains",
++             of(Dma::Hit), of(Dma::MissNewPage), of(Dma::MissWriter), of(Dma::MissUnranged),
++             of(Dma::MissNoted), of(Dma::ListedReport), of(Dma::Narrowed), of(Dma::Ahead),
++             of(Dma::AheadPending), of(Dma::AheadUnsynced), of(Dma::Plain));
++}
++
++} // namespace VideoCommon::SubmitStats

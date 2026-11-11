@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Wed, 11 Nov 2026 02:00:00 +0100
+Subject: [PATCH] radv/ps5: wait lengths for EDEN_UP_SUBMIT_STATS
+
+EDEN_UP_SUBMIT_STATS=1 (exact "1"; statistics only): how long callers of
+radv_ps5_queue_wait_seq waited for the GPU to reach a submission, as
+four counts (under 0.1 ms, under 1.5 ms, under 5 ms, 5 ms and more) and
+the total. A wait that was over at its first look is not counted.
+Printed as "radv/ps5 waits: window ..." right after the existing 10 s
+"radv/ps5 submissions" line, outside the submit lock (lead-mesh-12).
+Without the switch: one cached flag read per real wait, nothing printed.
+The app's side is Eglantine patch 0545.
+---
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+index a278cc0..dcc99f2 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_cs.c
+@@ -981,8 +981,10 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
+    const bool submit_line_due =
+       radv_ps5_note_submission(count, copy_start - claim_start, copy_end - copy_start, &submit_line);
+    simple_mtx_unlock(&queue->submit_lock);
+-   if (submit_line_due)
++   if (submit_line_due) {
+       radv_ps5_print_submit_line(&submit_line);
++      radv_ps5_print_wait_line(); /* EDEN_UP_SUBMIT_STATS: the waits of the same 10 s */
++   }
+    if (submitted != 0) {
+       if (!radv_ps5_submitter.enabled)
+          fprintf(stderr, "radv/ps5: sceAgcDriverSubmitDcb failed: 0x%08x\n", (unsigned)submitted);
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+index c3b873f..5c3fc59 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -986,6 +986,52 @@ radv_ps5_record_submission(struct radv_ps5_queue *queue, uint32_t words, uint32_
+    record->depends = depends;
+ }
+ 
++/* EglantinePS5: EDEN_UP_SUBMIT_STATS=1 (exact "1"; statistics only, nothing waits differently).
++ * How long the callers of radv_ps5_queue_wait_seq waited for the GPU to reach a submission, by
++ * length. A wait that was over at its first look is not counted. Printed with the submissions
++ * line (radv_ps5_cs.c), which is outside the submit lock. */
++static int radv_ps5_wait_stats = -1;
++static uint64_t radv_ps5_wait_buckets[4]; /* under 0.1 ms, under 1.5 ms, under 5 ms, 5 ms and more */
++static uint64_t radv_ps5_wait_total_ns;
++
++static bool
++radv_ps5_wait_stats_enabled(void)
++{
++   int enabled = p_atomic_read(&radv_ps5_wait_stats);
++   if (enabled < 0) {
++      const char *value = getenv("EDEN_UP_SUBMIT_STATS");
++      enabled = value && value[0] == '1' && value[1] == '\0';
++      p_atomic_set(&radv_ps5_wait_stats, enabled);
++   }
++   return enabled != 0;
++}
++
++static void
++radv_ps5_note_wait(uint64_t start_ns)
++{
++   if (!radv_ps5_wait_stats_enabled())
++      return;
++   const uint64_t ns = os_time_get_nano() - start_ns;
++   const unsigned bucket = ns < 100000 ? 0 : ns < 1500000 ? 1 : ns < 5000000 ? 2 : 3;
++   p_atomic_inc(&radv_ps5_wait_buckets[bucket]);
++   p_atomic_add(&radv_ps5_wait_total_ns, ns);
++}
++
++void
++radv_ps5_print_wait_line(void)
++{
++   if (!radv_ps5_wait_stats_enabled())
++      return;
++   uint64_t buckets[4];
++   for (unsigned i = 0; i < 4; i++)
++      buckets[i] = p_atomic_xchg(&radv_ps5_wait_buckets[i], 0);
++   const uint64_t total_ns = p_atomic_xchg(&radv_ps5_wait_total_ns, 0);
++   fprintf(stderr,
++           "radv/ps5 waits: window under_0.1ms=%" PRIu64 " under_1.5ms=%" PRIu64 " under_5ms=%" PRIu64
++           " 5ms_or_more=%" PRIu64 " total_ms=%.1f\n",
++           buckets[0], buckets[1], buckets[2], buckets[3], total_ns / 1e6);
++}
++
+ bool
+ radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs_timeout_ns)
+ {
+@@ -993,18 +1039,25 @@ radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs
+    if (completed >= seq)
+       return true;
+    uint64_t now = os_time_get_nano();
++   const uint64_t wait_start = now; /* EDEN_UP_SUBMIT_STATS */
+    const uint64_t spin_until = now + radv_ps5_wait_spin_ns;
+    uint64_t progress_at = now;
+    uint64_t last = completed;
+    for (;;) {
+-      if (radv_ps5_submission_failed())
++      if (radv_ps5_submission_failed()) {
++         radv_ps5_note_wait(wait_start);
+          return false;
++      }
+       completed = radv_ps5_queue_poll(queue);
+-      if (completed >= seq)
++      if (completed >= seq) {
++         radv_ps5_note_wait(wait_start);
+          return true;
++      }
+       now = os_time_get_nano();
+-      if (now >= abs_timeout_ns)
++      if (now >= abs_timeout_ns) {
++         radv_ps5_note_wait(wait_start);
+          return false;
++      }
+       if (completed != last) {
+          last = completed;
+          progress_at = now;
+@@ -1012,6 +1065,7 @@ radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs
+          radv_ps5_dump_stall(queue, seq, completed); /* ProsperoEden: tools/patch-radv-submission-dump.py */
+          fprintf(stderr, "radv/ps5: the GPU has not reached submission %" PRIu64 " (at %" PRIu64 ") in %u s\n", seq,
+                  completed, (unsigned)(RADV_PS5_STALL_NS / 1000000000));
++         radv_ps5_note_wait(wait_start);
+          return false;
+       }
+       if (now < spin_until)
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h
+index 2e235d5..e734ac7 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h
+@@ -181,6 +181,9 @@ uint64_t radv_ps5_queue_poll(struct radv_ps5_queue *queue);
+ /* Waits until the GPU has run seq, or until abs_timeout_ns (os_time_get_nano's
+  * clock); false on timeout. */
+ bool radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs_timeout_ns);
++/* EglantinePS5, EDEN_UP_SUBMIT_STATS=1: one line with the lengths of those waits since the last
++ * call. Does nothing without the switch. Call it outside the submit lock. */
++void radv_ps5_print_wait_line(void);
+ 
+ /* The sync object type: binary, signalled by a submission's sequence number or
+  * by the host. The physical device builds timelines over it

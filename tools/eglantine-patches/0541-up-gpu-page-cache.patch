@@ -1,0 +1,87 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_GPU_PAGE_CACHE=1: a per-thread cache of GPU page translations (Eglantine b1e650849e by kraibse, via Fritchii 85a33019b7 and 289ffeb16b)
+
+MemoryManager::GpuToCpuAddress walks the page tables for every lookup, and every draw rebinds its
+buffers and textures, so the same few pages are translated over and over. With the switch a
+thread keeps the last translation of 2048 pages (4 KiB each), dropped whenever a mapping changes
+(map_serial, as MaxContinuousRange's cache already does). Upstream measured the back GPU thread at
+13.64 -> 13.25 ms a frame.
+
+Differences from Fritchii's version: off unless the switch is set (theirs is on with a kill
+switch); the switch is read once (their fix 289ffeb16b: reading it per call cost them 3 fps); the
+64 KiB table is made at a thread's first lookup with the switch on, not in every thread's
+thread-local block.
+
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 06268dc..2dba015 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -6,12 +6,15 @@
+ 
+ #include <algorithm>
+ #include <cstdlib>
++#include <memory>
++#include <new>
+ #include <array>
+ #include <vector>
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "common/paged_scalar.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_page_table.h"
+@@ -267,6 +270,42 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
+     if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
+         return std::nullopt;
+     }
++    // EDEN_UP_GPU_PAGE_CACHE=1 (exact "1", off without it; Eglantine b1e650849e by kraibse, as
++    // Frizti/Fritchii 85a33019b7 has it, with its fix 289ffeb16b: the switch is read once, not on
++    // every lookup). The same few pages are looked up over and over, every draw rebinds its
++    // buffers and textures: a small per-thread cache of page translations, dropped whenever any
++    // mapping changes (map_serial moves after each map and unmap, as for MaxContinuousRange's
++    // cache below). Upstream: back thread 13.64 -> 13.25 ms a frame. The table (64 KiB a thread)
++    // is made at a thread's first lookup with the switch on, so it costs nothing without it; a
++    // thread that cannot get it goes without.
++    struct CachedPage {
++        u64 owner;
++        u64 serial;
++        u64 page;
++        u64 device_page;
++    };
++    static constexpr size_t CacheSize = 2048;
++    using PageCache = std::array<CachedPage, CacheSize>;
++    static const bool use_cache = Common::PeSwitch("EDEN_UP_GPU_PAGE_CACHE");
++    static thread_local std::unique_ptr<PageCache> cache;
++    constexpr u64 SubpageBits = 12;
++    constexpr u64 SubpageMask = (u64{1} << SubpageBits) - 1;
++    const u64 owner_id = (u64{unique_identifier} << 1) | 1; // never 0, the empty slot
++    const u64 page = gpu_addr >> SubpageBits;
++    u64 serial = 0;
++    CachedPage* slot = nullptr;
++    if (use_cache) {
++        if (!cache) [[unlikely]] {
++            cache.reset(new (std::nothrow) PageCache{});
++        }
++        if (cache) [[likely]] {
++            serial = map_serial.load(std::memory_order_acquire);
++            slot = &(*cache)[(page ^ (page >> 11)) % CacheSize];
++            if (slot->owner == owner_id && slot->page == page && slot->serial == serial) [[likely]] {
++                return slot->device_page + (gpu_addr & SubpageMask);
++            }
++        }
++    }
+     DAddr dev_addr;
+     if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
+         if (GetEntry(gpu_addr, false) != EntryType::Mapped)
+@@ -287,6 +326,9 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
+         }
+         return std::nullopt;
+     }
++    if (slot != nullptr) {
++        *slot = CachedPage{owner_id, serial, page, dev_addr - (gpu_addr & SubpageMask)};
++    }
+     return dev_addr;
+ }
+ 

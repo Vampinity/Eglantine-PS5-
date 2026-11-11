@@ -1,0 +1,97 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Shader set: the converted records are written in 8 MiB pieces; EDEN_UP_SHADER_SET_RECONVERT=<n> to convert once more; a progress line per 512 MB
+
+T108, batch t108-s (stream + index, 90 minutes at the title): the extraction took 26 s and the
+lowering of 41,216 programs 7 s, but writing the records took 4,014 s: 113,054 records, 4,311 MB,
+about 1 MB a second, with the title movie at 26 fps for all of it. On T98 the 29k set wrote
+1,584 MB in 583 s. Each record goes out as a handful of spans of tens of KiB, each its own write
+call; the file is now collected in 8 MiB pieces first. Whether the call or the byte is what
+costs on the console is what the next run shows: 'Shader set: converting: N records, M MB
+written, S s so far' every 512 MB.
+
+EDEN_UP_SHADER_SET_RECONVERT=<n> puts the number in the stamp, so a console that already holds
+a stamped set converts once more (to time it) and reuses the result on the boots after.
+
+diff --git a/src/video_core/shader_set.cpp b/src/video_core/shader_set.cpp
+index 48ca98b..0e917dd 100644
+--- a/src/video_core/shader_set.cpp
++++ b/src/video_core/shader_set.cpp
+@@ -142,14 +142,25 @@ public:
+             std::filesystem::remove(temporary, ec);
+         }
+     }
++    /// Collected in 8 MiB pieces: the records file is written as hundreds of thousands of spans
++    /// of some tens of KiB, and on the PS5 each write call of that size cost about 10 ms (T108,
++    /// t108-s: 4,311 MB in 4,014 s with the title movie at 26 fps for all of it).
+     void Write(Bytes b) {
+-        if (file.WriteSpan<u8>(b) != b.size()) throw std::runtime_error("short write");
++        if (b.size() >= Piece) {
++            Flush();
++            Raw(b);
++        } else {
++            if (buffer.size() + b.size() > Piece) Flush();
++            if (buffer.capacity() < Piece) buffer.reserve(Piece);
++            buffer.insert(buffer.end(), b.begin(), b.end());
++        }
+         bytes += b.size();
+     }
+     template<class T> void Write(const T& v) {
+         Write(Bytes{reinterpret_cast<const u8*>(&v), sizeof(v)});
+     }
+     void Commit() {
++        Flush();
+         if (!file.Flush() || !file.Commit()) throw std::runtime_error("cannot commit " + temporary.filename().string());
+         file.Close();
+         std::filesystem::rename(temporary, final); // same directory: atomic
+@@ -158,9 +169,19 @@ public:
+     }
+     [[nodiscard]] u64 Written() const noexcept { return bytes; }
+ private:
++    static constexpr size_t Piece = size_t{8} << 20;
++    void Raw(Bytes b) {
++        if (file.WriteSpan<u8>(b) != b.size()) throw std::runtime_error("short write");
++    }
++    void Flush() {
++        if (buffer.empty()) return;
++        Raw(Bytes{buffer});
++        buffer.clear();
++    }
+     std::filesystem::path final;
+     std::filesystem::path temporary;
+     Common::FS::IOFile file;
++    std::vector<u8> buffer;
+     u64 bytes{};
+     bool done{};
+ };
+@@ -171,6 +192,11 @@ std::string ExtractorLines() {
+     std::string lines;
+     if (Common::PeSwitch("EDEN_UP_SHADER_SET_STREAM")) lines += "extractor stream 1\n";
+     if (Common::PeSwitch("EDEN_UP_SHADER_SET_INDEX")) lines += "extractor index 1\n";
++    // EDEN_UP_SHADER_SET_RECONVERT=<n> (a test aid): a number in the stamp, so a set made with
++    // another number (or none) is converted again once, e.g. to time the conversion.
++    if (const size_t again = SwitchNumber("EDEN_UP_SHADER_SET_RECONVERT", 0); again != 0) {
++        lines += "reconvert " + std::to_string(again) + "\n";
++    }
+     return lines;
+ }
+ 
+@@ -651,6 +677,7 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+         std::vector<u64> used_programs; // lowered hashes with at least one converted record
+         std::unordered_set<u64> used_seen;
+         size_t converted = 0;
++        u64 next_report = u64{512} << 20;
+         for (const auto& p : r.records) {
+             if (stop.stop_requested()) return out; // the temporary is removed with `file`
+             if (p.kind == 1) { ++dropped["compute-predicted-unsupported"]; continue; }
+@@ -690,6 +717,11 @@ Outputs Prepare(u64 title, const std::filesystem::path& title_dir,
+             for (const auto& env : envs) file.Write(Bytes{env});
+             file.Write(Bytes{key});
+             ++converted;
++            if (file.Written() >= next_report) {
++                next_report += u64{512} << 20;
++                LOG_INFO(Render_Vulkan, "Shader set: converting: {} records, {} MB written, "
++                         "{:.1f} s so far", converted, file.Written() >> 20, seconds());
++            }
+             for (size_t s = 0; s < 6; ++s) {
+                 if (hashes[s] != 0 && used_seen.insert(hashes[s]).second) used_programs.push_back(hashes[s]);
+             }

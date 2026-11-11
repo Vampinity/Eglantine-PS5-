@@ -209,7 +209,45 @@ static atomic_flag eden_heap_grow_lock = ATOMIC_FLAG_INIT;
 
 /* Requests of this size or more get memory of their own (eden_heap_pages), freed with them. */
 #define EDEN_HEAP_LARGE_REQUEST ((size_t)32 << 20)
-#define EDEN_HEAP_LARGE_BLOCKS 256u
+/* 8192 since T118, as waveydude's branch ocarina-t85-town has it (858ddae0c); 4096 in T116 and
+ * T117, 1024 before (he raised it from 256): with EDEN_HEAP_LARGE_KIB=256 his 1024 entries were
+ * all taken at the Castle Town gate (issue 21, 10 Nov 2026) and later requests went back into the
+ * heap's pieces. An entry is 24 bytes; the table is only searched for an address outside the
+ * heap's range; a full table is counted (eden_heap_large_full). */
+#define EDEN_HEAP_LARGE_BLOCKS 8192u
+/* EDEN_HEAP_LARGE_MIB=n in env.txt (1 to 32; without it 32, as before): requests of n MiB or more
+ * get memory of their own. A block of 8 to 32 MiB took room in a 32 MiB piece, and a piece goes
+ * back only with no block left in it: Ocarina of Time on a base console (crash-20261109-170104)
+ * ended with the pool at 0 while the heap held 1728 MiB with 644 MiB in use, 768 MiB of its
+ * growth asked by requests of 8 to 32 MiB. A block of its own goes back the moment it is freed.
+ * Its price is a mapping and a release for each (counted: EDEN_HEAP_MID, every 20 s) and the
+ * 2 MiB lead of a block of 2 MiB or more. Set from main after env.txt (eden_heap_set_large). */
+static atomic_size_t eden_heap_large_from = EDEN_HEAP_LARGE_REQUEST;
+/* Blocks under EDEN_HEAP_LARGE_REQUEST with memory of their own: taken, refused (those went to
+ * the heap's spaces), alive now and at most, and the cycles their mappings and releases took. */
+static atomic_ullong eden_heap_mid_taken, eden_heap_mid_refused, eden_heap_mid_cycles, eden_heap_mid_taken_bytes;
+static atomic_size_t eden_heap_mid_bytes, eden_heap_mid_peak;
+static atomic_uint eden_heap_mid_count;
+/* Requests for memory of their own that found every entry of the table taken. */
+static atomic_ullong eden_heap_large_full;
+/* Requests that do not go to an arena, by size, whichever way they went: under 1 MiB, under 2,
+ * under 8, under 32 (count and bytes). They say what a lower EDEN_HEAP_LARGE_KIB would cost. */
+static atomic_ullong eden_heap_class_count[4], eden_heap_class_bytes[4];
+static void eden_heap_class_note(size_t bytes) {
+  const unsigned kind = bytes < ((size_t)1 << 20) ? 0u : bytes < ((size_t)2 << 20) ? 1u : bytes < ((size_t)8 << 20) ? 2u : 3u;
+  atomic_fetch_add_explicit(&eden_heap_class_count[kind], 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_class_bytes[kind], bytes, memory_order_relaxed);
+}
+/* In KiB: 256 (the arenas take what is smaller) to 32768. EDEN_HEAP_LARGE_KIB, or
+ * EDEN_HEAP_LARGE_MIB in MiB. A block of 2 MiB or more is whole 2 MiB pages of the pool; a
+ * smaller one is 16 KiB pages, which leaves the pool in smaller pieces. */
+void eden_heap_set_large(size_t kib) {
+  if (kib < 256u)
+    kib = 256u;
+  if (kib > 32768u)
+    kib = 32768u;
+  atomic_store_explicit(&eden_heap_large_from, kib << 10, memory_order_relaxed);
+}
 /* The large blocks alive: address 0 marks a free entry, 1 one being filled in. */
 static struct {
   _Atomic uintptr_t address;
@@ -290,6 +328,8 @@ struct eden_heap_thread {
   long blocks;
   unsigned pending;
   unsigned starve_left; /* EDEN_TEST_HEAP_STARVE: this thread's next refusals */
+  unsigned wait_scope;  /* EDEN_UP_HEAP_WAIT_GPU_MS: run-time pipeline builds this thread is inside */
+  unsigned wait_spent;  /* ... and one of this build's requests has waited and got nothing */
   /* Small requests that went to the heap's spaces, frees there, and their cycles: added to the
    * process's totals with live and blocks (eden_heap_flush). */
   unsigned long long spills, spill_cycles, shared_frees, shared_free_cycles;
@@ -438,7 +478,29 @@ static int eden_heap_large_find(const void *address) {
 }
 
 /* A large block of its own (zeroed), or NULL: no entry free, or no memory. */
+static void *eden_heap_large_allocate_inner(size_t bytes);
 static void *eden_heap_large_allocate(size_t bytes) {
+  if (bytes >= EDEN_HEAP_LARGE_REQUEST)
+    return eden_heap_large_allocate_inner(bytes);
+  const unsigned long long start = __builtin_ia32_rdtsc();
+  void *block = eden_heap_large_allocate_inner(bytes);
+  atomic_fetch_add_explicit(&eden_heap_mid_cycles, __builtin_ia32_rdtsc() - start, memory_order_relaxed);
+  if (block == NULL) {
+    atomic_fetch_add_explicit(&eden_heap_mid_refused, 1, memory_order_relaxed);
+    return NULL;
+  }
+  atomic_fetch_add_explicit(&eden_heap_mid_taken, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_mid_taken_bytes, bytes, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_mid_count, 1, memory_order_relaxed);
+  const size_t now = atomic_fetch_add_explicit(&eden_heap_mid_bytes, bytes, memory_order_relaxed) + bytes;
+  size_t peak = atomic_load_explicit(&eden_heap_mid_peak, memory_order_relaxed);
+  while (now > peak &&
+         !atomic_compare_exchange_weak_explicit(&eden_heap_mid_peak, &peak, now, memory_order_relaxed, memory_order_relaxed)) {
+  }
+  return block;
+}
+
+static void *eden_heap_large_allocate_inner(size_t bytes) {
   for (unsigned i = 0; i < EDEN_HEAP_LARGE_BLOCKS; ++i) {
     uintptr_t expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&eden_heap_large[i].address, &expected, 1, memory_order_acquire,
@@ -470,6 +532,7 @@ static void *eden_heap_large_allocate(size_t bytes) {
     atomic_store_explicit(&eden_heap_large[i].address, (uintptr_t)block, memory_order_release);
     return block;
   }
+  atomic_fetch_add_explicit(&eden_heap_large_full, 1, memory_order_relaxed);
   return NULL;
 }
 
@@ -479,12 +542,19 @@ static void eden_heap_large_free(int entry) {
   /* The entry stops naming the address before the memory goes: the next large block may be
    * given the same address at once. */
   atomic_store_explicit(&eden_heap_large[entry].address, 1, memory_order_release);
+  const int mid = bytes < EDEN_HEAP_LARGE_REQUEST;
+  const unsigned long long start = mid ? __builtin_ia32_rdtsc() : 0;
   if (eden_heap_large[entry].split == 2)
     eden_heap_reserve_pages_free(block, bytes);
   else if (eden_heap_large[entry].split)
     eden_heap_split_pages_free(block, bytes);
   else
     eden_heap_pages_free(block, bytes);
+  if (mid) {
+    atomic_fetch_add_explicit(&eden_heap_mid_cycles, __builtin_ia32_rdtsc() - start, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&eden_heap_mid_bytes, bytes, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&eden_heap_mid_count, 1, memory_order_relaxed);
+  }
   atomic_fetch_sub_explicit(&eden_heap_large_bytes, bytes, memory_order_relaxed);
   atomic_fetch_sub_explicit(&eden_heap_large_count, 1, memory_order_release);
   atomic_store_explicit(&eden_heap_large[entry].address, 0, memory_order_release);
@@ -1614,6 +1684,28 @@ void eden_heap_growth_report(void) {
                            << (EDEN_HEAP_PIECE_SHIFT - 20),
                        atomic_load_explicit(&eden_heap_grew_largest[kind], memory_order_relaxed) >> 10);
   fprintf(stderr, "%s (MiB/largest KiB)\n", line);
+  /* Blocks under 32 MiB with memory of their own (EDEN_HEAP_LARGE_MIB). Cycles are the TSC's. */
+  fprintf(stderr, "EDEN_HEAP_MID from=%zuKiB taken=%llu taken_mib=%llu refused=%llu alive=%u alive_mib=%zu peak_mib=%zu "
+                  "cycles_m=%llu large_entries=%u of %u table_full=%llu\n",
+          atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) >> 10,
+          (unsigned long long)atomic_load_explicit(&eden_heap_mid_taken, memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_mid_taken_bytes, memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_mid_refused, memory_order_relaxed),
+          atomic_load_explicit(&eden_heap_mid_count, memory_order_relaxed),
+          atomic_load_explicit(&eden_heap_mid_bytes, memory_order_relaxed) >> 20,
+          atomic_load_explicit(&eden_heap_mid_peak, memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_mid_cycles, memory_order_relaxed) / 1000000u,
+          atomic_load_explicit(&eden_heap_large_count, memory_order_relaxed), EDEN_HEAP_LARGE_BLOCKS,
+          (unsigned long long)atomic_load_explicit(&eden_heap_large_full, memory_order_relaxed));
+  fprintf(stderr, "EDEN_HEAP_CLASSES requests (count/MiB): under1M=%llu/%llu under2M=%llu/%llu under8M=%llu/%llu under32M=%llu/%llu\n",
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_count[0], memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[0], memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_count[1], memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[1], memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_count[2], memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[2], memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_count[3], memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[3], memory_order_relaxed) >> 20);
 }
 
 /* The room left in an mspace, found by asking it: blocks of `top` while it gives them, then of half
@@ -1809,6 +1901,12 @@ static void *eden_heap_arena_rescue(size_t count, size_t size, int zero) {
  * builder was ever refused. Without EDEN_UP_HEAP_WAIT_MS the first refusal reaches the driver's
  * shader compiler as NULL, as on 10 Nov 2026; with it the builder has to come through. */
 static atomic_uint eden_heap_starve_every, eden_heap_starve_attempts;
+/* EDEN_TEST_HEAP_STARVE_GPU=1: the test refuses the requests of threads inside a run-time pipeline
+ * build (eden_heap_wait_scope: the GPU thread, mostly) instead of the builder threads'. */
+static atomic_uint eden_heap_starve_scope;
+void eden_heap_set_starve_scope(int on) {
+  atomic_store_explicit(&eden_heap_starve_scope, on ? 1u : 0u, memory_order_relaxed);
+}
 static atomic_ullong eden_heap_starve_seen, eden_heap_starve_begun, eden_heap_starve_refused;
 
 void eden_heap_set_starve(unsigned every, unsigned attempts) {
@@ -1826,7 +1924,10 @@ static int eden_heap_starve(size_t bytes) {
   if (every == 0 || bytes < EDEN_HEAP_SMALL_REQUEST)
     return 0;
   struct eden_heap_thread *self = eden_heap_self();
-  if (self == NULL || strncmp(self->name, "VkPipeline", 10) != 0)
+  if (self == NULL)
+    return 0;
+  if (atomic_load_explicit(&eden_heap_starve_scope, memory_order_relaxed) ? self->wait_scope == 0
+                                                                           : strncmp(self->name, "VkPipeline", 10) != 0)
     return 0;
   if (self->starve_left == 0) {
     if ((atomic_fetch_add_explicit(&eden_heap_starve_seen, 1, memory_order_relaxed) + 1) % every != 0)
@@ -1843,7 +1944,9 @@ static void *eden_heap_allocate(size_t count, size_t size, int zero) {
   const size_t bytes = count * size;
   if (eden_heap_starve(bytes))
     return NULL;
-  if (bytes >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows) {
+  if (bytes >= EDEN_HEAP_SMALL_REQUEST && bytes < EDEN_HEAP_LARGE_REQUEST)
+    eden_heap_class_note(bytes);
+  if (bytes >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) && eden_heap_grows) {
     /* Memory of its own (it arrives zeroed). With every entry taken, or no memory left to take,
      * the heap's spaces: a piece committed earlier may still have the room. */
     void *block = eden_heap_large_allocate(bytes);
@@ -1881,12 +1984,44 @@ static void *eden_heap_allocate(size_t count, size_t size, int zero) {
  * background threads: a wait holds one pipeline up, not the frame. Still nothing after n ms: NULL
  * as before. eden_heap_wait_stats counts the waits for the 20 s heap line. */
 static atomic_uint eden_heap_wait_ms;
+/* EDEN_UP_HEAP_WAIT_GPU_MS=<n> (0 or unset: off): the same wait, for up to n ms, for a thread that is
+ * building a pipeline itself at run time (the pipeline cache marks the build with
+ * eden_heap_wait_scope: the GPU thread at a pipeline's first sight). A crash in free play on 10 Nov 22:07:
+ * 64 pipelines were built on the GPU thread in the 4 s before it, and that thread got NULL at once.
+ * A wait there holds the frame, so it has its own, shorter limit, and a build whose request waited
+ * its whole time and got nothing does not wait again (wait_spent): one build costs at most n ms.
+ * The texture collector runs on that same thread and cannot help while it waits; the heap trim and
+ * the guest memory packer can. */
+static atomic_uint eden_heap_wait_gpu_ms;
+static atomic_ullong eden_heap_wait_gpu_count, eden_heap_wait_gpu_total_ms, eden_heap_wait_gpu_lost;
 static atomic_uint eden_heap_waiting;
 static atomic_ullong eden_heap_wait_count, eden_heap_wait_total_ms, eden_heap_wait_lost;
 static atomic_uint eden_heap_wait_longest_ms;
 
 void eden_heap_set_wait_ms(unsigned ms) {
   atomic_store_explicit(&eden_heap_wait_ms, ms, memory_order_relaxed);
+}
+
+void eden_heap_set_wait_gpu_ms(unsigned ms) {
+  atomic_store_explicit(&eden_heap_wait_gpu_ms, ms, memory_order_relaxed);
+}
+
+/* The pipeline cache, around a pipeline it builds on the calling thread at run time (1: in, 0: out). */
+void eden_heap_wait_scope(int enter) {
+  struct eden_heap_thread *self = eden_heap_self();
+  if (self == NULL)
+    return;
+  if (enter) {
+    if (self->wait_scope++ == 0)
+      self->wait_spent = 0;
+  } else if (self->wait_scope != 0)
+    --self->wait_scope;
+}
+
+void eden_heap_wait_gpu_stats(unsigned long long *count, unsigned long long *total_ms, unsigned long long *lost) {
+  *count = atomic_load_explicit(&eden_heap_wait_gpu_count, memory_order_relaxed);
+  *total_ms = atomic_load_explicit(&eden_heap_wait_gpu_total_ms, memory_order_relaxed);
+  *lost = atomic_load_explicit(&eden_heap_wait_gpu_lost, memory_order_relaxed);
 }
 
 unsigned eden_heap_wanted(void) {
@@ -1901,17 +2036,25 @@ void eden_heap_wait_stats(unsigned long long *count, unsigned long long *total_m
   *lost = atomic_load_explicit(&eden_heap_wait_lost, memory_order_relaxed);
 }
 
-static int eden_heap_may_wait(void) {
-  if (atomic_load_explicit(&eden_heap_wait_ms, memory_order_relaxed) == 0)
+/* How long this thread may wait for a request, in ms: 0 for most threads. */
+static unsigned eden_heap_may_wait(void) {
+  const unsigned builders = atomic_load_explicit(&eden_heap_wait_ms, memory_order_relaxed);
+  const unsigned scoped = atomic_load_explicit(&eden_heap_wait_gpu_ms, memory_order_relaxed);
+  if (builders == 0 && scoped == 0)
     return 0;
   struct eden_heap_thread *self = eden_heap_self();
-  return self != NULL && strncmp(self->name, "VkPipeline", 10) == 0;
+  if (self == NULL)
+    return 0;
+  if (strncmp(self->name, "VkPipeline", 10) == 0)
+    return builders;
+  return self->wait_scope != 0 && !self->wait_spent ? scoped : 0;
 }
 
-/* A request that just failed, on a thread that may wait: `again` makes it once more (NULL: not
- * yet). Returns its block, or NULL when the time is up. */
-static void *eden_heap_wait_for(void *(*again)(void *), void *request) {
-  const unsigned limit = atomic_load_explicit(&eden_heap_wait_ms, memory_order_relaxed);
+/* A request that just failed, on a thread that may wait `limit` ms: `again` makes it once more
+ * (NULL: not yet). Returns its block, or NULL when the time is up. */
+static void *eden_heap_wait_for(void *(*again)(void *), void *request, unsigned limit) {
+  struct eden_heap_thread *self = eden_heap_self();
+  const int scoped = self != NULL && strncmp(self->name, "VkPipeline", 10) != 0;
   void *block = NULL;
   unsigned waited = 0;
   atomic_fetch_add_explicit(&eden_heap_waiting, 1, memory_order_relaxed);
@@ -1921,6 +2064,15 @@ static void *eden_heap_wait_for(void *(*again)(void *), void *request) {
     block = again(request);
   }
   atomic_fetch_sub_explicit(&eden_heap_waiting, 1, memory_order_relaxed);
+  if (scoped) {
+    atomic_fetch_add_explicit(&eden_heap_wait_gpu_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&eden_heap_wait_gpu_total_ms, waited, memory_order_relaxed);
+    if (block == NULL) {
+      atomic_fetch_add_explicit(&eden_heap_wait_gpu_lost, 1, memory_order_relaxed);
+      self->wait_spent = 1;
+    }
+    return block;
+  }
   atomic_fetch_add_explicit(&eden_heap_wait_count, 1, memory_order_relaxed);
   atomic_fetch_add_explicit(&eden_heap_wait_total_ms, waited, memory_order_relaxed);
   if (block == NULL)
@@ -1946,9 +2098,10 @@ static void *eden_heap_wait_allocate_again(void *request) {
 /* eden_heap_allocate, and on a thread that may wait, again until it is served or the time is up. */
 static void *eden_heap_allocate_or_wait(size_t count, size_t size, int zero) {
   void *block = eden_heap_allocate(count, size, zero);
-  if (block == NULL && count * size != 0 && eden_heap_may_wait()) {
+  unsigned limit;
+  if (block == NULL && count * size != 0 && (limit = eden_heap_may_wait()) != 0) {
     struct eden_heap_wait_request request = {count, size, 0, zero};
-    block = eden_heap_wait_for(eden_heap_wait_allocate_again, &request);
+    block = eden_heap_wait_for(eden_heap_wait_allocate_again, &request, limit);
   }
   return block;
 }
@@ -1996,7 +2149,7 @@ static void *eden_realloc_inner(void *address, size_t size) {
     /* A large block keeps its memory while the new size still needs most of it. */
     if (size <= before && size >= before / 2)
       return address;
-  } else if (size < EDEN_HEAP_LARGE_REQUEST || !eden_heap_grows) {
+  } else if (size < atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) || !eden_heap_grows) {
     void *owner = eden_heap_owner(address);
     void *result = sceLibcMspaceRealloc(owner, address, size);
     if (result) {
@@ -2077,7 +2230,7 @@ static void *eden_heap_aligned_try(size_t alignment, size_t size) {
     }
   }
   /* A large block's own memory starts on a page; the heap's spaces align anything. */
-  if (alignment <= 4096 && size >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows)
+  if (alignment <= 4096 && size >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) && eden_heap_grows)
     block = eden_heap_large_allocate(size);
   if (block == NULL)
     block = eden_heap_main(EDEN_HEAP_ALIGNED, alignment, size);
@@ -2099,9 +2252,10 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
   {
     void *block = eden_heap_aligned_try(alignment, size);
     /* EDEN_UP_HEAP_WAIT_MS: a pipeline builder asks again until it is served or the time is up. */
-    if (block == NULL && size != 0 && eden_heap_may_wait()) {
+    unsigned limit;
+    if (block == NULL && size != 0 && (limit = eden_heap_may_wait()) != 0) {
       struct eden_heap_wait_request request = {1, size, alignment, 0};
-      block = eden_heap_wait_for(eden_heap_wait_aligned_again, &request);
+      block = eden_heap_wait_for(eden_heap_wait_aligned_again, &request, limit);
     }
     if (block != NULL) {
       *address = block;

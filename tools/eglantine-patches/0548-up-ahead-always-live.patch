@@ -1,0 +1,51 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_AHEAD_ALWAYS is a live switch (EDEN_UP_LIVE_SWITCHES)
+
+With EDEN_NX2_FRAMES_AHEAD=1 a present waits for the previous frame, and for its own frame too
+while the GPU is behind. EDEN_UP_AHEAD_ALWAYS=1 drops that second wait (upstream's
+EDEN_NX2_FRAMES_AHEAD=2, lethevimlet/oot-bc250 73f7b83c1). Each present already makes that choice
+on its own from the GPU's state, so the switch can change from one present to the next: it joins
+the table in common/live_switch.h and is read at each present. Without the live mechanism it is
+what env.txt gave at boot, as before.
+
+A live plan gives its fps; whether it glitches more is judged from the video per phase and, if
+the fps gain is real, in a batch of separate runs.
+
+diff --git a/src/common/live_switch.h b/src/common/live_switch.h
+index 6834590..a2031e1 100644
+--- a/src/common/live_switch.h
++++ b/src/common/live_switch.h
+@@ -113,6 +113,10 @@ enum class Id : u8 {
+     CondBack,
+     /// EDEN_UP_SWIZZLE_UNITS. Two ways to copy the same bytes, chosen per copy.
+     SwizzleUnits,
++    /// EDEN_UP_AHEAD_ALWAYS (with EDEN_NX2_FRAMES_AHEAD=1 at boot; upstream's FRAMES_AHEAD=2). Each
++    /// present chooses on its own whether it also waits for its own frame when the GPU is
++    /// behind, as it already does from the GPU's state (core/hle/service/nx2_gsv.h).
++    AheadAlways,
+     Count,
+ };
+ 
+@@ -180,6 +184,7 @@ inline constexpr std::array<Def, NumSwitches> kDefs{{
+     {"EDEN_UP_UNSWIZZLE_THREADS", ParseHelpers, false, -1},
+     {"EDEN_UP_COND_BACK", ParseOneOrTwo, false, -1},
+     {"EDEN_UP_SWIZZLE_UNITS", ParseExactOne, false, -1},
++    {"EDEN_UP_AHEAD_ALWAYS", ParseExactOne, false, -1},
+ }};
+ 
+ /// EDEN_UP_LIVE_SWITCHES=1 (exact "1"), read once.
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index 075340e..dccda9e 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -1989,7 +1989,9 @@ private:
+             // EDEN_UP_AHEAD_ALWAYS=1 (after GrowingBlackBeans' 0911): never this second wait, so
+             // every present returns once the previous frame is done. For tests with
+             // EDEN_UP_AHEAD_GUARD, which holds back the writes that made it glitch more.
+-            static const bool ahead_always = Common::PeSwitch("EDEN_UP_AHEAD_ALWAYS");
++            // A live switch since T119 (common/live_switch.h): read at each present.
++            const bool ahead_always =
++                Common::LiveSwitch::Value<Common::LiveSwitch::Id::AheadAlways>() != 0;
+             const bool gpu_behind = frames_ahead == 1 && !ahead_always &&
+                                     m_previous_fence_id < 192 &&
+                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(

@@ -1775,6 +1775,10 @@ int main(int argc, char** argv) {
                 }
 #endif
                 const auto session_start = std::chrono::steady_clock::now();
+                // The pad script's clock (EDEN_TEST marks) starts here, the log's with the app:
+                // the test tools take the difference from this line's stamp (before T118: from the
+                // guest's first system call, up to 0.1 s later).
+                LOG_INFO(Frontend, "EDEN_GUEST_START the test script's clock starts here");
                 [[maybe_unused]] double session_seconds = 0;  // guest-fault relaunch (PS5 only)
                 // A pad script's WAIT lines look at the game's frames (test_harness.h): read back as
                 // EDEN_TEST_SHOTS's are, into memory. Asked for only while a WAIT looks, at most every

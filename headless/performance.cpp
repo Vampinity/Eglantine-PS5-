@@ -646,9 +646,13 @@ extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" unsigned eden_heap_wanted(void) __attribute__((weak));
 extern "C" void eden_heap_wait_stats(unsigned long long* count, unsigned long long* total_ms, unsigned* longest_ms,
                                      unsigned long long* lost) __attribute__((weak));
+// EDEN_UP_HEAP_WAIT_GPU_MS: the same for pipelines a thread builds itself at run time (the GPU thread).
+extern "C" void eden_heap_wait_gpu_stats(unsigned long long* count, unsigned long long* total_ms,
+                                         unsigned long long* lost) __attribute__((weak));
 // EDEN_UP_HEAP_RESCUE: requests about to be refused that an arena served, and those none could.
 extern "C" void eden_heap_rescue_stats(unsigned long long* rescued, unsigned long long* missed) __attribute__((weak));
-// EDEN_TEST_HEAP_STARVE: test shortages begun on pipeline builder threads, and requests refused in them.
+// EDEN_TEST_HEAP_STARVE: test shortages begun on pipeline builder threads (with EDEN_TEST_HEAP_STARVE_GPU=1:
+// inside run-time pipeline builds), and requests refused in them.
 extern "C" void eden_heap_starve_stats(unsigned long long* begun, unsigned long long* refused) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 extern "C" void eden_guest_memory_report(void) __attribute__((weak));
@@ -798,6 +802,13 @@ static void WriteMemorySummary(std::size_t largest, bool memory_short) {
             std::fprintf(stderr, "EDEN_HEAP_WAIT pipeline builders waited for memory %llu times, %llu ms in all, "
                          "longest %u ms, %llu got none\n", count, total_ms, longest_ms, lost);
     }
+    if (eden_heap_wait_gpu_stats) {
+        unsigned long long count = 0, total_ms = 0, lost = 0;
+        eden_heap_wait_gpu_stats(&count, &total_ms, &lost);
+        if (count != 0)
+            std::fprintf(stderr, "EDEN_HEAP_WAIT_GPU run-time pipeline builds waited for memory %llu times, %llu ms in "
+                         "all, %llu got none\n", count, total_ms, lost);
+    }
     if (eden_heap_rescue_stats) {
         unsigned long long rescued = 0, missed = 0;
         eden_heap_rescue_stats(&rescued, &missed);
@@ -808,9 +819,14 @@ static void WriteMemorySummary(std::size_t largest, bool memory_short) {
     if (eden_heap_starve_stats) {
         unsigned long long begun = 0, refused = 0;
         eden_heap_starve_stats(&begun, &refused);
-        if (begun != 0)
-            std::fprintf(stderr, "EDEN_TEST_HEAP_STARVE %llu test shortages on pipeline builder threads, %llu requests "
-                         "refused in them\n", begun, refused);
+        if (begun != 0) {
+            // Where: pipeline builder threads, or with EDEN_TEST_HEAP_STARVE_GPU=1 the threads inside a
+            // run-time pipeline build (the GPU thread's own builds).
+            const char* const scope = std::getenv("EDEN_TEST_HEAP_STARVE_GPU");
+            const bool gpu_scope = scope != nullptr && scope[0] == '1' && scope[1] == '\0';
+            std::fprintf(stderr, "EDEN_TEST_HEAP_STARVE %llu test shortages %s, %llu requests refused in them\n", begun,
+                         gpu_scope ? "inside run-time pipeline builds" : "on pipeline builder threads", refused);
+        }
     }
     ReportLedger();
     // EDEN_NX2_POOL_WALK=1 (off unless set): the pool by block size every 20 s (EDEN_REFUSED_POOL,
@@ -1813,5 +1829,28 @@ extern "C" void eden_jit_compile(unsigned core, unsigned long long ns) {
     Eden::Performance::compilation[core].calls.fetch_add(1, std::memory_order_relaxed);
     Eden::Performance::compilation[core].nanoseconds.fetch_add(ns, std::memory_order_relaxed);
 }
+
+#ifdef PS5_NATIVE
+// The driver found no memory for one of its buffers (tools/patch-radv-series/lead-mesh-22): give the
+// pool what can go at once, then the driver tries once more. Its own buffers (command buffers,
+// uploads) never reach the Vulkan allocator's refusal path (MemoryAllocator::ReleaseRefused), so
+// without this the session ended at vkEndCommandBuffer (Ocarina on 13.60, crash-20261108-222452).
+// Any thread, inside the driver: only memory work here, nothing that calls back into Vulkan.
+extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) __attribute__((weak));
+extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) {
+    static std::mutex one_at_a_time;
+    const std::lock_guard lock{one_at_a_time};
+    Eden::Performance::graphics_refusals.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t want = std::clamp<std::uint64_t>(bytes * 4, std::uint64_t{64} << 20, std::uint64_t{512} << 20);
+    std::uint64_t freed = Eden::Performance::TrimHeap("the driver found no memory");
+    if (freed < bytes && eden_guest_memory_reclaim)
+        freed += eden_guest_memory_reclaim(static_cast<std::size_t>(want));
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
+        std::fprintf(stderr, "EDEN_RADV_OUT_OF_MEMORY %llu KiB asked: %llu MiB given back\n",
+                     static_cast<unsigned long long>(bytes >> 10), static_cast<unsigned long long>(freed >> 20));
+    return freed;
+}
+#endif
 
 #include "ordered_read_trace.inc"

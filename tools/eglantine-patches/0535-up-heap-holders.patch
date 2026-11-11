@@ -1,0 +1,182 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_HEAP_HOLDERS=1: bound idle IR and scratch; halve descriptor starts
+
+Port of Mihawk 0230 / 70b85df in PS5_Lichii (handle mihawk), off by default.
+Our descriptor queues already start at a quarter of upstream (0107): with the
+switch they start at half of that (upstream's starts) and grow on demand back
+to 0107's size at most, never past it; a refused growth keeps the smaller
+payload and the overflow wait as before. Shader IR pools keep at most 4 MiB
+(or one base chunk) when squashed; a refused squash leaves the pool as after
+Free(). Upload scratch over 8 MiB is freed every 256 frames, the ASTC scan
+buffer after a scan over 8 MiB. 0505 (EDEN_UP_IR_FREE*) and
+EDEN_TC_SCRATCH_KEEP_MIB stay independent. Unset: all as before.
+v2 (review): descriptor ceiling 2x start instead of 32x (draft allowed up to
+16x 0107's memory), bad_alloc fallbacks on growth and squash, unreachable
+pool branch removed.
+
+diff --git a/src/shader_recompiler/object_pool.h b/src/shader_recompiler/object_pool.h
+index 841c273..1fe6852 100644
+--- a/src/shader_recompiler/object_pool.h
++++ b/src/shader_recompiler/object_pool.h
+@@ -3,9 +3,14 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <memory>
++#include <new>
+ #include <type_traits>
+ #include <utility>
++#include <vector>
++
++#include "common/pe_switch.h"
+ 
+ namespace Shader {
+ 
+@@ -54,12 +59,29 @@ public:
+         if (chunks.empty()) {
+             return;
+         }
++        // EDEN_UP_HEAP_HOLDERS (Mihawk 0230): a squashed root keeps at most 4 MiB (or one base
++        // chunk), so one huge shader does not hold its IR for the session. The old chunks go
++        // first; if the smaller root is refused the pool is left as after Free(), which allocates
++        // nothing and makes a fresh chunk at the next Create.
++        static const bool trim = Common::PeSwitch("EDEN_UP_HEAP_HOLDERS");
+         Chunk& root{chunks.front()};
+         if (root.used_objects == root.num_objects) {
+             // Root chunk has been filled, squash allocations into it
+             const size_t total_objects{root.num_objects + new_chunk_size * (chunks.size() - 1)};
+-            chunks.clear();
+-            chunks.emplace_back(total_objects);
++            if (trim) {
++                const size_t kept{(std::max)(new_chunk_size, (size_t{4} << 20) / sizeof(Storage))};
++                chunks.clear();
++                try {
++                    chunks.emplace_back((std::min)(total_objects, kept));
++                } catch (const std::bad_alloc&) {
++                    node = nullptr;
++                    chunks.shrink_to_fit();
++                    return;
++                }
++            } else {
++                chunks.clear();
++                chunks.emplace_back(total_objects);
++            }
+         } else {
+             root.Release();
+             chunks.resize(1);
+diff --git a/src/video_core/renderer_vulkan/vk_update_descriptor.cpp b/src/video_core/renderer_vulkan/vk_update_descriptor.cpp
+index 29f3ee7..d383cff 100644
+--- a/src/video_core/renderer_vulkan/vk_update_descriptor.cpp
++++ b/src/video_core/renderer_vulkan/vk_update_descriptor.cpp
+@@ -4,11 +4,14 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <new>
+ #include <variant>
+ #include <boost/container/static_vector.hpp>
+ 
+ #include "common/assert.h"
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+@@ -18,10 +21,11 @@ namespace Vulkan {
+ 
+ UpdateDescriptorQueue::UpdateDescriptorQueue(const Device& device_, size_t frame_payload_size_,
+                                              bool supports_descriptor_buffer_)
+-    : device{device_}, frame_payload_size{frame_payload_size_},
++    : device{device_}, frame_payload_size{Common::PeSwitch("EDEN_UP_HEAP_HOLDERS") ? frame_payload_size_ / 2 : frame_payload_size_},
+       supports_descriptor_buffer{supports_descriptor_buffer_},
+-      payload(std::make_unique_for_overwrite<DescriptorUpdateEntry[]>(frame_payload_size_ * FRAMES_IN_FLIGHT))
++      payload(std::make_unique_for_overwrite<DescriptorUpdateEntry[]>(frame_payload_size * FRAMES_IN_FLIGHT))
+ {
++    initial_frame_payload_size = frame_payload_size;
+     payload_start = payload.get();
+     payload_cursor = payload.get();
+ }
+@@ -41,6 +45,40 @@ void UpdateDescriptorQueue::Acquire(Scheduler& scheduler, size_t required_entrie
+     use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
+     static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
+     const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
++    static const bool trim = Common::PeSwitch("EDEN_UP_HEAP_HOLDERS");
++    if (trim && !growth_refused) {
++        const size_t used = static_cast<size_t>(std::distance(payload_start, payload_cursor));
++        // EDEN_UP_HEAP_HOLDERS: grow back to 0107's size at most (2x the halved start), never
++        // past it: a frame that needs more waits for the worker as before (below).
++        const size_t ceiling = initial_frame_payload_size * 2;
++        size_t grown = frame_payload_size;
++        while (used + reserve >= grown && grown < ceiling) {
++            grown = (std::min)(grown * 2, ceiling);
++        }
++        if (grown != frame_payload_size) {
++            std::unique_ptr<DescriptorUpdateEntry[]> replacement;
++            try {
++                replacement = std::make_unique_for_overwrite<DescriptorUpdateEntry[]>(
++                    grown * FRAMES_IN_FLIGHT);
++            } catch (const std::bad_alloc&) {
++                // Refused: keep the smaller payload for the session; overflow waits as before.
++                growth_refused = true;
++            }
++            if (replacement) {
++                // The worker reads the queued draws' entries: drain it before the old array goes.
++                scheduler.WaitWorker();
++                LOG_INFO(Render_Vulkan, "Descriptor payload grew: {} -> {} entries",
++                         frame_payload_size, grown);
++                payload = std::move(replacement);
++                frame_payload_size = grown;
++                payload_start = payload.get() + frame_index * frame_payload_size;
++                payload_cursor = payload_start;
++            } else {
++                LOG_WARNING(Render_Vulkan, "Descriptor payload growth to {} entries refused",
++                            grown);
++            }
++        }
++    }
+     ASSERT_MSG(reserve < frame_payload_size, "Descriptor reservation {} >= frame capacity {}",
+                reserve, frame_payload_size);
+     const size_t used = static_cast<size_t>(std::distance(payload_start, payload_cursor));
+diff --git a/src/video_core/renderer_vulkan/vk_update_descriptor.h b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+index f6b354c..3623e66 100644
+--- a/src/video_core/renderer_vulkan/vk_update_descriptor.h
++++ b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+@@ -132,7 +132,9 @@ public:
+ 
+ private:
+     const Device& device;
+-    const size_t frame_payload_size;
++    size_t frame_payload_size;
++    size_t initial_frame_payload_size{}; ///< EDEN_UP_HEAP_HOLDERS: the start, after halving
++    bool growth_refused{false};           ///< EDEN_UP_HEAP_HOLDERS: a growth was refused
+     const bool supports_descriptor_buffer;
+     bool use_descriptor_buffer{false};
+     size_t frame_index{0};
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 18a7235..2ed7545 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1373,7 +1373,9 @@ void TextureCache<P>::TickFrame() {
+         return static_cast<size_t>(mib) << 20;
+     }();
+     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
+-        if (scratch->capacity() > scratch_keep) {
++        static const bool trim = Common::PeSwitch("EDEN_UP_HEAP_HOLDERS");
++        if (scratch->capacity() > scratch_keep ||
++            (trim && (frame_tick & 255) == 0 && scratch->capacity() > (size_t{8} << 20))) {
+             scratch->release();
+         }
+     }
+@@ -5258,6 +5260,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+                 astc_scan_buffer.resize(scan_bytes);
+                 gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
+                 new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
++                static const bool trim = Common::PeSwitch("EDEN_UP_HEAP_HOLDERS");
++                if (trim && astc_scan_buffer.capacity() > (size_t{8} << 20)) {
++                    std::vector<u8>{}.swap(astc_scan_buffer);
++                }
+                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
+             }
+         }

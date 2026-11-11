@@ -1,0 +1,137 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_TEST_DISCARD_SAVE=1 (test only): the game works on a copy of its save for the session, the save itself is not written to
+
+For the test runner: it puts the save back after every run (13 s of each 2 min 29 s), because
+the game saves by itself. With this switch (exact "1") the first open or create of one of the
+user's saves (account or device save of the user space) copies its folder to
+/test-discard<the same path> under the same root, and every open, create and size file of that
+save goes to the copy for the rest of the session. The copy is thrown away and made anew at
+the next start. The save the session started from is still there afterwards.
+
+A copy, not dropped writes: the game reads back what it wrote in the same session (a save, then
+the file select screen), and dropped writes would hand it the old bytes.
+
+One warning line at the first open says which copy is in use and whether the copy was made
+("EDEN_TEST_DISCARD_SAVE: this session's save is the copy ..."). If the copy fails the session
+still stays off the real save; the game then sees a missing or incomplete save and the line says
+THE COPY FAILED.
+
+A TEST switch: never in a play env. Nothing the game saves in such a session is kept. Off
+without it: SessionSavePath returns the path it was given.
+
+diff --git a/src/core/file_sys/savedata_factory.cpp b/src/core/file_sys/savedata_factory.cpp
+index c756734..d273950 100644
+--- a/src/core/file_sys/savedata_factory.cpp
++++ b/src/core/file_sys/savedata_factory.cpp
+@@ -4,9 +4,14 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <mutex>
++#include <set>
++#include <string>
++
+ #include "common/assert.h"
+ #include "common/common_types.h"
+ #include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "common/uuid.h"
+ #include "core/core.h"
+ #include "core/file_sys/savedata_factory.h"
+@@ -53,6 +58,54 @@ std::string GetFutureSaveDataPath(SaveDataSpaceId space_id, SaveDataType type, u
+     }
+ }
+ 
++/// EDEN_TEST_DISCARD_SAVE=1 (exact "1"). A TEST switch, never for play: nothing the game saves
++/// in such a session is kept. The game works on a copy of its save: the first time one of the
++/// user's saves (an account or device save of the user space) is opened or created, its folder is
++/// copied to /test-discard<the same path> under the same root, and every open, create and size
++/// file of that save goes to the copy for the rest of the session. The copy is thrown away and
++/// made anew at the next start. So the save a session started from is still there afterwards,
++/// and a test runner need not put it back after every run. The game reads back what it wrote
++/// as usual, which a switch that dropped the writes could not give it.
++bool DiscardSave() {
++    static const bool enabled = Common::PeSwitch("EDEN_TEST_DISCARD_SAVE");
++    return enabled;
++}
++
++/// Where a save's files live this session: `path`, or with EDEN_TEST_DISCARD_SAVE its copy.
++std::string SessionSavePath(const VirtualDir& dir, SaveDataSpaceId space, SaveDataType type,
++                            std::string path) {
++    if (!DiscardSave() || space != SaveDataSpaceId::User ||
++        (type != SaveDataType::Account && type != SaveDataType::Device)) {
++        return path;
++    }
++    static std::mutex mutex;
++    static std::set<std::string> copied; // the saves this session has its copy of
++    std::scoped_lock lock{mutex};
++    std::string copy = "/test-discard" + path;
++    if (!copied.insert(path).second) {
++        return copy;
++    }
++    // Last session's copy goes, then the save as it is now is copied (when there is one).
++    const auto slash = copy.find_last_of('/');
++    if (const auto parent = dir->GetDirectoryRelative(copy.substr(0, slash)); parent != nullptr) {
++        parent->DeleteSubdirectoryRecursive(copy.substr(slash + 1));
++    }
++    const auto original = dir->GetDirectoryRelative(path);
++    bool made = true;
++    if (original != nullptr) {
++        const auto target = dir->CreateDirectoryRelative(copy);
++        made = target != nullptr && VfsRawCopyD(original, target);
++    }
++    // A failed copy still keeps the session off the real save: the game then sees a save that
++    // is missing or incomplete, and the line below says so.
++    LOG_WARNING(Service_FS,
++                "EDEN_TEST_DISCARD_SAVE: this session's save is the copy {} ({}); the save at {} "
++                "is not written to",
++                copy, original == nullptr ? "no save yet" : made ? "copied" : "THE COPY FAILED",
++                path);
++    return copy;
++}
++
+ } // Anonymous namespace
+ 
+ SaveDataFactory::SaveDataFactory(Core::System& system_, ProgramId program_id_,
+@@ -65,7 +118,7 @@ VirtualDir SaveDataFactory::Create(SaveDataSpaceId space, const SaveDataAttribut
+     const auto save_directory = GetFullPath(program_id, dir, space, meta.type, meta.program_id,
+                                             meta.user_id, meta.system_save_data_id);
+ 
+-    return dir->CreateDirectoryRelative(save_directory);
++    return dir->CreateDirectoryRelative(SessionSavePath(dir, space, meta.type, save_directory));
+ }
+ 
+ VirtualDir SaveDataFactory::Open(SaveDataSpaceId space, const SaveDataAttribute& meta) const {
+@@ -73,7 +126,7 @@ VirtualDir SaveDataFactory::Open(SaveDataSpaceId space, const SaveDataAttribute&
+     const auto save_directory = GetFullPath(program_id, dir, space, meta.type, meta.program_id,
+                                             meta.user_id, meta.system_save_data_id);
+ 
+-    auto out = dir->GetDirectoryRelative(save_directory);
++    auto out = dir->GetDirectoryRelative(SessionSavePath(dir, space, meta.type, save_directory));
+ 
+     if (out == nullptr && (ShouldSaveDataBeAutomaticallyCreated(space, meta) && auto_create)) {
+         return Create(space, meta);
+@@ -154,8 +207,9 @@ std::string SaveDataFactory::GetUserGameSaveDataRoot(u128 user_id, bool future)
+ 
+ SaveDataSize SaveDataFactory::ReadSaveDataSize(SaveDataType type, u64 title_id,
+                                                u128 user_id) const {
+-    const auto path =
+-        GetFullPath(program_id, dir, SaveDataSpaceId::User, type, title_id, user_id, 0);
++    const auto path = SessionSavePath(
++        dir, SaveDataSpaceId::User, type,
++        GetFullPath(program_id, dir, SaveDataSpaceId::User, type, title_id, user_id, 0));
+     const auto relative_dir = GetOrCreateDirectoryRelative(dir, path);
+ 
+     const auto size_file = relative_dir->GetFile(GetSaveDataSizeFileName());
+@@ -173,8 +227,9 @@ SaveDataSize SaveDataFactory::ReadSaveDataSize(SaveDataType type, u64 title_id,
+ 
+ void SaveDataFactory::WriteSaveDataSize(SaveDataType type, u64 title_id, u128 user_id,
+                                         SaveDataSize new_value) const {
+-    const auto path =
+-        GetFullPath(program_id, dir, SaveDataSpaceId::User, type, title_id, user_id, 0);
++    const auto path = SessionSavePath(
++        dir, SaveDataSpaceId::User, type,
++        GetFullPath(program_id, dir, SaveDataSpaceId::User, type, title_id, user_id, 0));
+     const auto relative_dir = GetOrCreateDirectoryRelative(dir, path);
+ 
+     const auto size_file = relative_dir->CreateFile(GetSaveDataSizeFileName());

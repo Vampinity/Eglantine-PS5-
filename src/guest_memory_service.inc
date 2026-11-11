@@ -270,6 +270,12 @@ int UnshareBlock(std::int64_t physical) noexcept {
 //   EDEN_GUEST_SWAP_FILE     the file (default /data/eglantineps5/guest-swap.bin)
 //   EDEN_GUEST_SWAP_MIB      the most that may be in the file (default 2048)
 //   EDEN_GUEST_SWAP_COLD_S   how long a slot stays untouched to count as cold (default 30)
+//   EDEN_UP_SWAP_OUT_WHILE_BACK=1  a tick in which more than 8 slots came back used to send nothing
+//                            out (no thrash). At an area change that is every tick for half a minute:
+//                            on 10 Nov 2026 22:07 (leaving Kokiri Forest in free play) 499 slots came back
+//                            in 18 s while 354-404 MiB of cold slots stayed in, and the pool ran dry.
+//                            With the switch such a tick still sends out the slots that have been
+//                            untouched for twice EDEN_GUEST_SWAP_COLD_S: they sat through the burst.
 //   EDEN_GUEST_SWAP_ALL_POOLS=1  arms every Own slot, as run 59 did, not only the game's pool
 //   EDEN_GUEST_SWAP_AHEAD_MIB=<n>  modes 2 and 3 also send cold slots out while the pool's largest
 //                            free block is under n MiB, not only once the pool is short (under 1 GiB,
@@ -299,6 +305,7 @@ constexpr std::size_t SwapEverOutSlots = 16384;
 std::atomic<std::uint64_t> swap_ever_out[SwapEverOutSlots / 64]{};
 std::atomic<std::uint32_t> swap_tick{SwapRearmTicks + 1};
 std::uint32_t swap_cold_ticks = 15;
+bool swap_out_while_back = false;                // EDEN_UP_SWAP_OUT_WHILE_BACK
 // SwapOut from two threads (the swapper's tick, and a refused graphics allocation asking through
 // eden_guest_memory_reclaim) one at a time: PackOut packs through one static buffer.
 std::mutex swap_out_mutex;
@@ -1739,10 +1746,21 @@ void SwapTick(SparseRange& range, std::size_t& hand, std::vector<std::pair<std::
         if (age >= swap_cold_ticks) cold.emplace_back(range.physical[slot], slot);
     }
     const std::uint64_t in_now = swap_counters.in.load(std::memory_order_relaxed);
-    const bool thrashing = in_now - in_before > SwapBackInPerTick;
+    const std::uint64_t came_back = in_now - in_before;
+    const bool thrashing = came_back > SwapBackInPerTick;
     in_before = in_now;
     const int mode = swap_mode.load(std::memory_order_relaxed);
-    if ((mode != 2 && mode != 3) || thrashing) return;
+    if (mode != 2 && mode != 3) return;
+    if (thrashing) {
+        // EDEN_UP_SWAP_OUT_WHILE_BACK: only what stayed untouched for twice the cold time goes.
+        if (!swap_out_while_back) return;
+        cold.erase(std::remove_if(cold.begin(), cold.end(),
+                                  [&](const std::pair<std::int64_t, std::size_t>& entry) {
+                                      return now - range.swap[entry.second] < 2 * swap_cold_ticks;
+                                  }),
+                   cold.end());
+        if (cold.empty()) return;
+    }
     bool wanted = pool_is_short.load(std::memory_order_relaxed) || memory_waiters.load(std::memory_order_relaxed) != 0;
     if (swap_ahead_bytes != 0) {
         // Ahead of the shortage: what the next graphics allocation would get, asked here on the
@@ -1760,8 +1778,19 @@ void SwapTick(SparseRange& range, std::size_t& hand, std::vector<std::pair<std::
     std::sort(cold.begin(), cold.end());
     const std::lock_guard out_lock{swap_out_mutex};
     const std::uint64_t failed = swap_counters.failures.load(std::memory_order_relaxed);
+    std::size_t sent = 0;
+    const auto say_while_back = [&] {
+        static unsigned said = 0;
+        if (!thrashing || sent == 0 || said >= 64) return;
+        ++said;
+        char line[160];
+        std::snprintf(line, sizeof line, "EDEN_SWAP %zu long-cold slot(s) went out in a tick with %llu back (%zu were long cold)\n",
+                      sent, static_cast<unsigned long long>(came_back), cold.size());
+        Report(line);
+    };
     for (std::size_t i = 0; i < cold.size() && i < SwapOutPerTick; ++i)
         if (SwapOut(range, cold[i].second)) {
+            ++sent;
             if (cold[i].second < SwapEverOutSlots)
                 swap_ever_out[cold[i].second / 64].fetch_or(std::uint64_t{1} << (cold[i].second % 64), std::memory_order_relaxed);
         } else if (swap_counters.failures.load(std::memory_order_relaxed) != failed) {
@@ -1771,6 +1800,7 @@ void SwapTick(SparseRange& range, std::size_t& hand, std::vector<std::pair<std::
             Report("EDEN_SWAP the file refused a slot: measuring only from now on\n");
             break;
         }
+    say_while_back();
 }
 
 // ---- EDEN_UP_PACK_* (at pack_shared, above): the store's compactor, pressure passes, refusals ----
@@ -2166,6 +2196,7 @@ void ReadSwapSwitches() noexcept {
         swap_places = std::min<std::uint32_t>(static_cast<std::uint32_t>(std::strtoul(mib, nullptr, 10) / (SparseSlot >> 20)), SwapMostPlaces);
     if (const char* seconds = std::getenv("EDEN_GUEST_SWAP_COLD_S"))
         swap_cold_ticks = std::max<std::uint32_t>(static_cast<std::uint32_t>(std::strtoul(seconds, nullptr, 10) * 1000 / SwapTickMs), 2);
+    if (const char* back = std::getenv("EDEN_UP_SWAP_OUT_WHILE_BACK")) swap_out_while_back = back[0] == '1' && back[1] == '\0';
     const char* all = std::getenv("EDEN_GUEST_SWAP_ALL_POOLS");
     swap_all_pools = all && all[0] == '1';
     swap_ahead_bytes = 0;

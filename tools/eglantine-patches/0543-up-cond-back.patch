@@ -1,0 +1,246 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_COND_BACK: the back evaluates NVN's conditional render macro (Eglantine d3612f82b1 by kraibse, via Fritchii 1c8474ee96)
+
+NVN's conditional render macro reads the six Compare words of an occlusion report and sets
+render_enable.mode from them. With the GPU split the front has to drain the back before every
+such read (FrontDmaRead: 16% of the front's samples on 10 Nov). The front itself never acts on
+render_enable; only the back skips draws and clears.
+
+EDEN_UP_COND_BACK=1: for a macro that a dry run with eight test vectors shows to be exactly that
+predicate, the front skips the read, feeds the macro six zero words, and sends the address with
+mode IfNotEqual instead of the macro's own verdict. The back then evaluates the same condition in
+order, through the existing ProcessQueryCondition, whose read writes pending reports out first.
+A macro that does not pass the dry run runs as before, for good.
+
+EDEN_UP_COND_BACK=2 (verify): nothing changes; the back also works out the condition at its own
+time and counts: the same / different because a report landed in between / different with the
+same words (must stay 0). The first 16 differences are logged with both sets of words. =2 cannot
+see what the change in timing does to the picture: that needs =1 against a control.
+
+Taken from Frizti/Fritchii 1c8474ee96 (there: EDEN_NX2_EXP53, live). Left out: its explicit query
+cache flush in ProcessQueryCondition, because ours reads the words with the flushing ReadBlock.
+Added: the verify mode. Off without the switch.
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 5a1a6a8..e969f6c 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1307,6 +1307,9 @@ struct Maxwell3D::FrontState {
+     Regs::ShadowRamControl control{};
+     u32 executing_macro{};
+     std::vector<u32> parameters;
++    /// EDEN_UP_COND_BACK: per macro, 0 unknown, 1 a render-enable predicate, 2 something else.
++    std::vector<u8> predicate_macros;
++    u64 predicate_generation{~u64{0}};
+     u64 calls{};
+     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
+     /// then can it have a deferred instanced draw to issue at the end of a macro.
+@@ -2044,8 +2047,27 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+     auto& engine = GetNativeMacroEngine();
+     const auto positions = GetNativeMacroPositions();
+     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
++    // EDEN_UP_COND_BACK=1 (off without it; Eglantine d3612f82b1 by kraibse, as Frizti/Fritchii
++    // 1c8474ee96 has it under EDEN_NX2_EXP53): NVN's conditional render macro reads the six Compare
++    // words at an address and sets render_enable.mode from them, which drains the split on every
++    // call (the front's "macro dma read" wait). For such a macro the front skips the read, feeds
++    // six zero words and writes the address with mode IfNotEqual: the back evaluates the same
++    // condition in order (ProcessQueryCondition, whose read writes pending reports out first).
++    // =2 verifies only: everything runs as before, and the back also works the condition out at
++    // its own time and counts where the two differ (VerifyCondBack).
++    static const int cond_back = [] {
++        const char* const value = std::getenv("EDEN_UP_COND_BACK");
++        return value != nullptr && (value[0] == '1' || value[0] == '2') && value[1] == '\0'
++                   ? value[0] - '0'
++                   : 0;
++    }();
++    const bool predicate_macro = cond_back != 0 && fs.parameters.size() == 3 &&
++                                 fs.parameters[0] == 0 && IsPredicateMacro(fs, method);
++    const bool predicate = predicate_macro && cond_back == 1;
++    const bool verify = predicate_macro && cond_back == 2;
++    std::array<u32, 6> verify_words{};
+     // EDEN_UP_L1056_BACK_MACROS: a macro that reads memory may run on the back instead.
+-    if (!FrontRunOnBack(system, split, fs, engine, start)) {
++    if (predicate || !FrontRunOnBack(system, split, fs, engine, start)) {
+         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+         engine.native_interpreter.active_dram = &native_data_ram;
+         if (!engine.native_jit) {
+@@ -2066,10 +2088,41 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+                 if (address >= MacroRegistersStart) {
+                     return false;
+                 }
++                if (predicate && address == MAXWELL3D_REG_INDEX(render_enable.mode)) {
++                    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(render_enable.address_high),
++                               fs.regs[0x154] & 0x1ffffff, true, true);
++                    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(render_enable.address_low),
++                               fs.regs[0x155], true, true);
++                    FrontWrite(split, fs, address,
++                               static_cast<u32>(Regs::RenderEnable::Mode::IfNotEqual), true, true);
++                    return true;
++                }
+                 FrontWrite(split, fs, address, value, true, true);
+                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+                 if (address == 0x157 || address == 0x158) {
+-                    FrontDmaRead(split, fs, method, address, value);
++                    if (predicate && address == 0x158) {
++                        // The back reads the words when it evaluates the condition: the macro only
++                        // has to consume six.
++                        fs.parameters.insert(fs.parameters.end(), value, 0U);
++                        static std::atomic<u64> skipped{};
++                        if (const u64 n = skipped.fetch_add(1, std::memory_order_relaxed);
++                            n == 0 || (n + 1) % 100000 == 0) {
++                            LOG_INFO(HW_GPU, "EDEN_UP_COND_BACK: {} conditional render reads left "
++                                             "to the back", n + 1);
++                        }
++                    } else {
++                        FrontDmaRead(split, fs, method, address, value);
++                        if (verify && address == 0x158 && value == 6 && fs.parameters.size() >= 6) {
++                            std::copy_n(fs.parameters.end() - 6, 6, verify_words.begin());
++                        }
++                    }
++                }
++                if (verify && address == MAXWELL3D_REG_INDEX(render_enable.mode)) {
++                    const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) |
++                                            fs.regs[0x155];
++                    split.Defer([this, source, value, verify_words] {
++                        VerifyCondBack(source, value, verify_words);
++                    });
+                 }
+                 return true;
+             });
+@@ -2098,6 +2151,119 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+ #endif
+ }
+ 
++// The PS5 front edits FrontRunMacro at build time (headless/macro_native.cmake) by plain text, and
++// rewrites EVERY write callback spelled as a lambda argument on its own line, 12 spaces in. The dry
++// run's callback below is therefore a named lambda: spelled the other way it gets a line that only
++// compiles inside FrontRunMacro.
++bool Maxwell3D::IsPredicateMacro(FrontState& fs, u32 method) {
++#ifdef ARCHITECTURE_x86_64
++    auto& engine = GetNativeMacroEngine();
++    const auto positions = GetNativeMacroPositions();
++    if (positions.empty() || engine.native_execution_failed) {
++        return false;
++    }
++    const size_t index = ((method - MacroRegistersStart) >> 1) % positions.size();
++    if (fs.predicate_generation != engine.native_code_generation ||
++        fs.predicate_macros.size() != positions.size()) {
++        fs.predicate_generation = engine.native_code_generation;
++        fs.predicate_macros.assign(positions.size(), 0);
++    }
++    if (fs.predicate_macros[index] != 0) {
++        return fs.predicate_macros[index] == 1;
++    }
++    // Dry run against a copy of the data RAM, feeding test words when the macro asks for six. It
++    // must write exactly the DMA address, the read of six words and render_enable.mode, and the
++    // mode must be what IfNotEqual makes of the Compare words for every test vector.
++    constexpr u32 address_high = 0x21, address_low = 0x13d60da0;
++    constexpr std::array<std::array<u32, 6>, 8> vectors{{
++        {0, 0, 0, 0, 0, 0}, {1, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 1, 0}, {1, 0, 0, 0, 1, 0},
++        {0, 1, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 1}, {5, 0, 0, 0, 0, 0}, {2, 3, 7, 9, 2, 3},
++    }};
++    if (!engine.native_jit) {
++        engine.native_jit = std::make_shared<TuringMacroJit>();
++    }
++    engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
++    bool matches = true;
++    std::array<u32, vectors.size()> modes{};
++    for (size_t i = 0; i < vectors.size() && matches; ++i) {
++        std::vector<u32> parameters{0, address_high, address_low};
++        std::vector<u32> scratch_ram(native_data_ram.begin(), native_data_ram.end());
++        std::vector<std::pair<u32, u32>> writes;
++        const auto record_write = [&](u32 address, u32 value) {
++            if (address >= MacroRegistersStart || writes.size() >= 16) {
++                return false;
++            }
++            writes.emplace_back(address, value);
++            if (address == 0x158 && value == 6) {
++                parameters.insert(parameters.end(), vectors[i].begin(), vectors[i].end());
++            }
++            return true;
++        };
++        const auto result = engine.native_jit->Execute(
++            positions[index], parameters, std::span<u32>{scratch_ram},
++            [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
++            record_write);
++        matches = result.success && writes.size() == 4 && writes[0].first == 0x154 &&
++                  writes[0].second == address_high && writes[1].first == 0x155 &&
++                  writes[1].second == address_low && writes[2] == std::pair<u32, u32>{0x158, 6} &&
++                  writes[3].first == MAXWELL3D_REG_INDEX(render_enable.mode);
++        if (matches) {
++            const auto& w = vectors[i];
++            modes[i] = writes[3].second;
++            matches = modes[i] == ((w[0] != w[4] || w[1] != w[5]) ? 1U : 0U);
++        }
++    }
++    fs.predicate_macros[index] = matches ? 1 : 2;
++    LOG_INFO(HW_GPU,
++             "EDEN_UP_COND_BACK: native macro {:#x} is {} (modes for the 8 test vectors: {} {} {} "
++             "{} {} {} {} {})",
++             method,
++             matches ? "a render-enable predicate, the back evaluates it as IfNotEqual"
++                     : "not a render-enable predicate (or not IfNotEqual), it runs as before",
++             modes[0], modes[1], modes[2], modes[3], modes[4], modes[5], modes[6], modes[7]);
++    return matches;
++#else
++    static_cast<void>(fs);
++    static_cast<void>(method);
++    return false;
++#endif
++}
++
++void Maxwell3D::VerifyCondBack(GPUVAddr source, u32 front_mode,
++                               const std::array<u32, 6>& front_words) {
++    // EDEN_UP_COND_BACK=2, on the back, in order: what the condition is when the back gets to it,
++    // against what the front made of the words it read after draining. A difference with other
++    // words is a report that landed in between (the timing =1 would change); a difference with
++    // the same words must not happen.
++    Regs::ReportSemaphore::Compare cmp{};
++    memory_manager.ReadBlock(source, &cmp, sizeof(cmp));
++    const std::array<u32, 6> now{cmp.initial_sequence, cmp.initial_mode, cmp.unknown1,
++                                 cmp.unknown2,         cmp.current_sequence, cmp.current_mode};
++    const u32 back_mode = (now[0] != now[4] || now[1] != now[5]) ? 1U : 0U;
++    static std::atomic<u64> same{}, landed{}, other{};
++    const bool differs = back_mode != front_mode;
++    const bool moved = now != front_words;
++    auto& counter = !differs ? same : moved ? landed : other;
++    const u64 total = counter.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (differs && total <= 16) {
++        LOG_WARNING(HW_GPU,
++                    "EDEN_UP_COND_BACK verify: at {:#x} the front set mode {} from {:x} {:x} / {:x} "
++                    "{:x}, the back reads {:x} {:x} / {:x} {:x} = mode {} ({})",
++                    source, front_mode, front_words[0], front_words[1], front_words[4],
++                    front_words[5], now[0], now[1], now[4], now[5], back_mode,
++                    moved ? "a report landed in between" : "SAME WORDS, other verdict");
++    }
++    const u64 all = same.load(std::memory_order_relaxed) + landed.load(std::memory_order_relaxed) +
++                    other.load(std::memory_order_relaxed);
++    if (all == 1 || all % 20000 == 0) {
++        LOG_INFO(HW_GPU,
++                 "EDEN_UP_COND_BACK verify: {} conditions, {} the same, {} differ because a report "
++                 "landed in between, {} differ otherwise",
++                 all, same.load(std::memory_order_relaxed), landed.load(std::memory_order_relaxed),
++                 other.load(std::memory_order_relaxed));
++    }
++}
++
+ // EDEN_UP_L1056_BACK_MACROS=1 (zortos293/Lichii #1056: jpkto's 05a14638a1 from #805 as 26aad9dc55,
+ // with zortos293's counters 5bd45fb95c; merged into nx2 as 1a5e995a38). A macro whose code reads
+ // memory into its FIFO (MME_DMA_READ_FIFOED) and writes only registers BackWritable allows runs on
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 381d4f5..88b0965 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3435,6 +3435,12 @@ private:
+     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                     bool is_last_call, bool from_macro);
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
++    /// EDEN_UP_COND_BACK (Eglantine d3612f82b1, kraibse): whether the macro at `method` is NVN's
++    /// conditional render, which DMA-reads six Compare words and only sets render_enable.mode
++    /// from them as IfNotEqual does (dry runs on copies, cached per macro and code generation).
++    bool IsPredicateMacro(FrontState& state, u32 method);
++    /// EDEN_UP_COND_BACK=2: the back's own verdict on a condition the front decided.
++    void VerifyCondBack(GPUVAddr source, u32 front_mode, const std::array<u32, 6>& front_words);
+     /// EDEN_UP_L1056_BACK_MACROS (zortos293/Lichii #1056): sends a macro call that reads memory
+     /// to the back instead (returns whether it did), and the front's register reads and writes
+     /// of what such calls may have written.

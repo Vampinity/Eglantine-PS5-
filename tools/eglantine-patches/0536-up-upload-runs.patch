@@ -1,0 +1,347 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_UP_UPLOAD_RUNS=1: batch in-order stream uploads and fuse dispatch barriers
+
+Port of zortos293/Lichii #1245 (4d7412ac), #1246 (7fcfb641), handle jpkto.
+One switch tests the pair; off by default. Includes #805 transfer ordering already
+optional in 0471, automatically enabled for this arm. No temporal replacement path
+exists in our DispatchCompute. Preserve COMPUTE_INDIRECT_ORDER when fusing indirect.
+Every RecordWithUploadBuffer, handoff and submission first closes the pending run.
+Logs "EDEN_UP_UPLOAD_RUNS: <n> runs, <m> copies" at the 1st, 2nd, 4th ... run.
+v2 (review): the indirect dispatch lambda no longer captures the static indirect_order
+(clang: cannot capture a variable without automatic storage duration).
+Test the door with split/ahead guard both on and off, readbacks and rewritten uploads;
+compare barrier/command counts, captures and frame times. Validate Vulkan hazards.
+
+diff --git a/src/video_core/renderer_vulkan/upload_batch.h b/src/video_core/renderer_vulkan/upload_batch.h
+new file mode 100644
+index 0000000..eb7edc7
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/upload_batch.h
+@@ -0,0 +1,110 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <span>
++#include <vector>
++
++#include "common/common_types.h"
++#include "video_core/vulkan_common/vulkan_wrapper.h"
++
++namespace Vulkan {
++
++/// Uploads in order (Scheduler::RecordUpload) waiting to be recorded as one command: their
++/// copies run between one barrier before and one after. Copies of one batch may run in any
++/// order and at once, so a batch never holds two copies that write the same bytes, or one that
++/// writes a buffer another reads.
++class UploadBatch {
++public:
++    /// Copies with the same source and destination, consecutive in `copies`.
++    struct Group {
++        VkBuffer src;
++        VkBuffer dst;
++        u32 first;
++        u32 count;
++    };
++
++    /// More copies than this go in a later batch. It bounds CanAdd's checks on the recording
++    /// thread, at the cost of two barriers per this many uploads.
++    static constexpr size_t MaxCopies = 64;
++
++    [[nodiscard]] bool Empty() const noexcept {
++        return copies.empty();
++    }
++
++    /// Whether these copies can join the batch: it has room, they read no buffer a copy in it
++    /// writes and write none it reads, and they write no byte of dst that a copy in it writes.
++    /// Otherwise the batch is recorded first.
++    [[nodiscard]] bool CanAdd(VkBuffer src, VkBuffer dst,
++                              std::span<const VkBufferCopy> new_copies) const {
++        if (copies.size() + new_copies.size() > MaxCopies) {
++            return false;
++        }
++        for (const Group& group : groups) {
++            if (src == group.dst || dst == group.src) {
++                return false;
++            }
++            if (group.dst != dst) {
++                continue;
++            }
++            for (u32 index = group.first; index < group.first + group.count; ++index) {
++                const VkBufferCopy& pending = copies[index];
++                for (const VkBufferCopy& copy : new_copies) {
++                    if (copy.dstOffset < pending.dstOffset + pending.size &&
++                        pending.dstOffset < copy.dstOffset + copy.size) {
++                        return false;
++                    }
++                }
++            }
++        }
++        return true;
++    }
++
++    /// Records a batch: the barrier before an in-order buffer copy (BufferCacheRuntime::
++    /// CopyBuffer's), the copies, and the barrier after one, made to reach transfers as well.
++    /// Recorded one by one, the barriers between two uploads ordered the copies before them
++    /// ahead of the copies after them, which CanAdd makes needless, and ahead of all later work:
++    /// graphics and compute through the barrier after a copy, transfers (in later submissions
++    /// too) through the barrier before the next one. The barrier after the batch does both.
++    static void Record(vk::CommandBuffer cmdbuf, std::span<const VkBufferCopy> batch_copies,
++                       std::span<const Group> batch_groups) {
++        static constexpr VkMemoryBarrier READ_BARRIER{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++        };
++        static constexpr VkMemoryBarrier WRITE_BARRIER{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        };
++        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
++        for (const Group& group : batch_groups) {
++            cmdbuf.CopyBuffer(
++                group.src, group.dst,
++                vk::Span<VkBufferCopy>(batch_copies.data() + group.first, group.count));
++        }
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
++    }
++
++    void Add(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> new_copies) {
++        const u32 first = static_cast<u32>(copies.size());
++        const u32 count = static_cast<u32>(new_copies.size());
++        copies.insert(copies.end(), new_copies.begin(), new_copies.end());
++        if (!groups.empty() && groups.back().src == src && groups.back().dst == dst) {
++            groups.back().count += count;
++        } else {
++            groups.push_back({src, dst, first, count});
++        }
++    }
++
++    std::vector<VkBufferCopy> copies;
++    std::vector<Group> groups;
++};
++
++} // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index 5098987..012c9ee 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -36,7 +36,8 @@ namespace {
+ // work) has no barrier of its own before it, and in-order copies are not uses for
+ // CanReorderUpload, so the older copy could land last. Read where the barrier is recorded.
+ VkPipelineStageFlags PostCopyDstStages() {
+-    static const bool transfers_too = Common::PeSwitch("EDEN_UP_FRITCHII_COPY_BARRIER");
++    static const bool transfers_too = Common::PeSwitch("EDEN_UP_FRITCHII_COPY_BARRIER") ||
++                                      Common::PeSwitch("EDEN_UP_UPLOAD_RUNS");
+     return transfers_too ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
+                          : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE;
+ }
+@@ -680,6 +681,12 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
+     }
+ 
+     scheduler.RequestOutsideRenderPassOperationContext();
++    static const bool batch = Common::PeSwitch("EDEN_UP_UPLOAD_RUNS");
++    if (batch && barrier && src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
++        scheduler.RecordUpload(src_buffer, dst_buffer,
++                               std::span<const VkBufferCopy>{vk_copies.data(), vk_copies.size()});
++        return;
++    }
+     scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
+         if (barrier) {
+             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 9d23d39..056560f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2002,23 +2002,21 @@ void RasterizerVulkan::DispatchCompute() {
+         const char* const value = std::getenv("EDEN_NX2_COMPUTE_TO_DRAW");
+         return value != nullptr && value[0] != '0';
+     }();
+-    const auto record_read_barrier = [this] {
+-        static constexpr VkMemoryBarrier READ_BARRIER{
++    static const bool batch_dispatch = Common::PeSwitch("EDEN_UP_UPLOAD_RUNS");
++    const auto dispatch_barrier = [](vk::CommandBuffer cmdbuf) {
++        static constexpr VkMemoryBarrier barrier{
+             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+             .pNext = nullptr,
+             .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+         };
+-        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+-            const VkPipelineStageFlags stages =
+-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+-                (compute_to_draw ? VkPipelineStageFlags{VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT} : 0);
+-            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, stages, 0,
+-                                   READ_BARRIER);
+-        });
+-        if (compute_to_draw) {
+-            scheduler.NoteComputeWrites();
+-        }
++        const VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
++            (compute_to_draw ? VkPipelineStageFlags{VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT} : 0);
++        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, stages, 0, barrier);
++    };
++    const auto record_read_barrier = [this, dispatch_barrier] {
++        if (!batch_dispatch) scheduler.Record(dispatch_barrier);
++        if (compute_to_draw) scheduler.NoteComputeWrites();
+     };
+     if (indirect_address) {
+         // DispatchIndirect
+@@ -2033,7 +2031,7 @@ void RasterizerVulkan::DispatchCompute() {
+         }
+         scheduler.RequestOutsideRenderPassOperationContext();
+         static const bool indirect_order = Common::PeSwitch("EDEN_UP_COMPUTE_INDIRECT_ORDER");
+-        if (indirect_order) {
++        if (indirect_order && !batch_dispatch) {
+             scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                 static constexpr VkMemoryBarrier barrier{
+                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+@@ -2047,8 +2045,19 @@ void RasterizerVulkan::DispatchCompute() {
+             });
+             scheduler.NoteComputeWrites();
+         }
++        if (indirect_order && batch_dispatch) scheduler.NoteComputeWrites();
+         scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
+                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
++            if (batch_dispatch && indirect_order) {
++                static constexpr VkMemoryBarrier barrier{
++                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .pNext = nullptr,
++                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++                };
++                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                    0, barrier);
++            }
+             if (!pipeline->IsBound()) {
+                 return;
+             }
+@@ -2067,7 +2076,8 @@ void RasterizerVulkan::DispatchCompute() {
+     }
+     scheduler.RequestOutsideRenderPassOperationContext();
+     record_read_barrier();
+-    scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
++    scheduler.Record([pipeline, dim, dispatch_barrier](vk::CommandBuffer cmdbuf) {
++        if (batch_dispatch) dispatch_barrier(cmdbuf);
+         if (!pipeline->IsBound()) {
+             return;
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 1cca27d..77dcd9b 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -22,6 +22,7 @@
+ #include "common/pe_switch.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
++#include "video_core/renderer_vulkan/upload_batch.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "video_core/hitch_trace.h"
+ #include "video_core/zpass_cut.h"
+@@ -356,7 +357,43 @@ void Scheduler::WaitWorker() {
+     std::scoped_lock el{execution_mutex};
+ }
+ 
++void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
++    if (VideoCommon::GpuSplit::check_owner) {
++        VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordUpload");
++    }
++    if (!upload_batch) upload_batch = std::make_unique<UploadBatch>();
++    // Check each region so even a single upload larger than the capacity stays bounded, and
++    // overlapping regions within that upload cannot enter the same batch.
++    for (const VkBufferCopy& copy : copies) {
++        const std::span<const VkBufferCopy> region{&copy, 1};
++        if (uploads_pending && !upload_batch->CanAdd(src, dst, region)) {
++            FlushUploads();
++        }
++        upload_batch->Add(src, dst, region);
++        uploads_pending = true;
++    }
++}
++
++void Scheduler::FlushUploads() {
++    // EDEN_UP_UPLOAD_RUNS only (nothing else sets uploads_pending): the 1st, 2nd, 4th ... run.
++    static u64 runs = 0;
++    static u64 batched = 0;
++    batched += upload_batch->copies.size();
++    if (++runs; (runs & (runs - 1)) == 0) {
++        LOG_INFO(Render_Vulkan, "EDEN_UP_UPLOAD_RUNS: {} runs, {} copies ({:.1f} a run)", runs,
++                 batched, static_cast<double>(batched) / static_cast<double>(runs));
++    }
++    // Copy the vectors so the recording thread retains their capacity while the worker uses them.
++    auto command = [copies = upload_batch->copies, groups = upload_batch->groups](
++                       vk::CommandBuffer cmdbuf) { UploadBatch::Record(cmdbuf, copies, groups); };
++    upload_batch->copies.clear();
++    upload_batch->groups.clear();
++    uploads_pending = false;
++    Record(std::move(command));
++}
++
+ void Scheduler::DispatchWork() {
++    if (uploads_pending) FlushUploads();
+     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
+     }
+@@ -656,6 +693,7 @@ void Scheduler::AllocateWorkerCommandBuffer() {
+ }
+ 
+ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
++    if (uploads_pending) FlushUploads();
+     EndPendingOperations();
+     InvalidateState();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index d1d0b27..cda92b8 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -19,6 +19,7 @@
+ #include <utility>
+ #include <queue>
+ #include <vector>
++#include <span>
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
+@@ -40,6 +41,7 @@ class Device;
+ class Framebuffer;
+ class GraphicsPipeline;
+ class StateTracker;
++class UploadBatch;
+ 
+ struct QueryCacheParams;
+ 
+@@ -179,6 +181,8 @@ public:
+         on_submit = std::move(func);
+     }
+ 
++    void RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies);
++
+     /// Send work to a separate thread.
+     template <typename T>
+         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
+@@ -186,6 +190,9 @@ public:
+         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+         }
++        if (uploads_pending) {
++            FlushUploads();
++        }
+         if (chunk->Record(command)) {
+             return;
+         }
+@@ -436,6 +443,9 @@ private:
+     bool render_pass_has_stores{};   ///< Any draw of the open render pass writes storage
+     bool graphics_pipeline_missing{};
+     std::unique_ptr<CommandPool> command_pool;
++    std::unique_ptr<UploadBatch> upload_batch;
++    bool uploads_pending{};
++    void FlushUploads();
+ 
+     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
+     u64 recording_epoch = 0;

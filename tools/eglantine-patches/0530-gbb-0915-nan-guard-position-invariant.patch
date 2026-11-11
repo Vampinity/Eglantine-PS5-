@@ -1,0 +1,119 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] EDEN_GBB_POSITION_INVARIANT and EDEN_GBB_NAN_GUARD: positions Invariant, float colour outputs without NaN
+
+Port of GBB's patch 0915 (issue 21, 10 Nov 2026), under his switch names so one env file works on
+both builds. The same fix ships in PS5_Lichii v1.20 as patch 0229 (Mihawk); it comes from
+notquiteog/Dragoon 395547c and NX2navi patches 0007 and 0027.
+
+- EDEN_GBB_POSITION_INVARIANT=1: gl_Position is decorated Invariant in every stage that writes
+  it. A colour pass drawn again with depth EQUAL after a depth pre-pass then computes the same
+  depth; without the decoration AMD's compiler may not, and the pixel fails the test.
+- EDEN_GBB_NAN_GUARD=1: a float colour output is stored as 0 when it is NaN and clamped to
+  +-1e30 otherwise. One NaN texel spreads through bloom and blur averages into blocks.
+
+Both are off without the switch (exact "1"); upstream turns them on for every driver but
+NVIDIA's. GBB on 13.60, with EDEN_NX2_MASK_COMPONENTS=1 and EDEN_NX2_MASK_UNWRITTEN=1: flashes
+with one frame ahead went from a few per walk to nearly none, at no cost in fps.
+
+Both change the SPIR-V of nearly every shader. The names are added to the prepared store's
+stamp list, so a flip starts that store empty and the shader set converts again.
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+index e8af2a5..b28fcec 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
+@@ -518,6 +518,13 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
+     const AttributeType type{ctx.runtime_info.color_output_types[index]};
+     if (type == AttributeType::Float) {
+         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
++        if (ctx.profile.guard_frag_color_nan) {
++            // EDEN_GBB_NAN_GUARD: NaN becomes 0, anything else stays within +-1e30.
++            const Id clamped{ctx.OpNMin(ctx.F32[1],
++                                        ctx.OpNMax(ctx.F32[1], value, ctx.Const(-1e30f)),
++                                        ctx.Const(1e30f))};
++            value = ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1, value), ctx.Const(0.0f), clamped);
++        }
+         ctx.OpStore(pointer, MarkHotFragColor(ctx, component, value));
+     } else if (type == AttributeType::UnsignedInt) {
+         const Id pointer{ctx.OpAccessChain(ctx.output_u32, ctx.frag_color.at(index), component_id)};
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index f65d621..50611c5 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -2166,6 +2166,9 @@ void EmitContext::DefineMesh(const IR::Program& program) {
+             if (!Sirit::ValidId(output_position)) {
+                 output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
+                                                  spv::BuiltIn::Position, spv::StorageClass::Output);
++                if (profile.invariant_position) {
++                    Decorate(output_position, spv::Decoration::Invariant);
++                }
+             }
+             return {output_position,
+                     static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
+@@ -2196,6 +2199,9 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
+     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
+         stage == Stage::VertexB) {
+         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
++        if (profile.invariant_position) {
++            Decorate(output_position, spv::Decoration::Invariant);
++        }
+     }
+     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
+         if (stage == Stage::Fragment) {
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index c3e95da..44a71bb 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -104,6 +104,13 @@ struct Profile {
+     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs
+     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
+     bool has_broken_spirv_subgroup_shuffle{};
++    /// EDEN_GBB_POSITION_INVARIANT: gl_Position is decorated Invariant. A colour pass drawn again
++    /// with depth EQUAL after a depth pre-pass must compute the same depth, which AMD's compiler
++    /// only keeps with the decoration.
++    bool invariant_position{};
++    /// EDEN_GBB_NAN_GUARD: float colour outputs are written without NaN or infinity (NaN to 0,
++    /// the rest clamped to +-1e30). One NaN texel spreads through bloom and blur averages.
++    bool guard_frag_color_nan{};
+     /// Subgroup shuffles in fragment shaders go through the broadcast fallback (Lichii PR 273:
+     /// AMD's Windows driver; EDEN_NX2_AMD_PR273=1 tries it on RADV).
+     bool has_broken_spirv_fragment_shuffle{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 7d056a0..cddb505 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -771,6 +771,20 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
+         .max_user_clip_distances = device.GetMaxUserClipDistances()
+     };
++    // EDEN_GBB_POSITION_INVARIANT=1 / EDEN_GBB_NAN_GUARD=1 (exact "1", both off without it; GBB's
++    // patch 0915, the fix PS5_Lichii v1.20 ships as 0229, from notquiteog/Dragoon 395547c and
++    // NX2navi 0007 / 0027): positions are decorated Invariant, so a colour pass with depth EQUAL
++    // after a depth pre-pass computes the same depth, and float colour outputs are written
++    // without NaN or infinity, which otherwise spread through bloom. Both change the SPIR-V of
++    // nearly every shader: the names are in the prepared store's stamp (vk_pipeline_prep.cpp),
++    // so a flip starts that store empty and the shader set is converted again.
++    profile.invariant_position = Common::PeSwitch("EDEN_GBB_POSITION_INVARIANT");
++    profile.guard_frag_color_nan = Common::PeSwitch("EDEN_GBB_NAN_GUARD");
++    if (profile.invariant_position || profile.guard_frag_color_nan) {
++        LOG_INFO(Render_Vulkan, "EDEN_GBB: position invariant {}, colour NaN guard {}",
++                 profile.invariant_position ? "on" : "off",
++                 profile.guard_frag_color_nan ? "on" : "off");
++    }
+ 
+     host_info = Shader::HostTranslateInfo{
+         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+index e91d6fb..64843c3 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -40,7 +40,8 @@ constexpr size_t StoresKept = 3;
+ // they are flipped. Generated from the tree (tools: shader-prep/make_switch_list.py); the check
+ // script fails when a name is missing here.
+ constexpr const char* TranslationSwitches[] = {
+-    "EDEN_GBB_FLUSH_PAGE_CHECK", "EDEN_GBB_PIPELINE_ONCE", "EDEN_GBB_PIPELINE_SAVE_20S",
++    "EDEN_GBB_FLUSH_PAGE_CHECK", "EDEN_GBB_NAN_GUARD", "EDEN_GBB_PIPELINE_ONCE",
++    "EDEN_GBB_PIPELINE_SAVE_20S", "EDEN_GBB_POSITION_INVARIANT",
+     "EDEN_GBB_QUAD_NO_WAIT", "EDEN_GMMU_SPARSE", "EDEN_GPU_TIME", "EDEN_NATIVE_DRAW_CAPTURE",
+     "EDEN_NATIVE_DRAW_DIAGNOSTICS", "EDEN_NATIVE_FRAME_CAPTURE", "EDEN_NATIVE_SHADER_OVERRIDE_DIR",
+     "EDEN_NX2_3D_HISTORY", "EDEN_NX2_3D_METHODS", "EDEN_NX2_A2C_REFRESH", "EDEN_NX2_AB_LOG",
