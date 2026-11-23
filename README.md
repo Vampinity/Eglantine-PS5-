@@ -1,3 +1,9 @@
+> [!NOTE]
+> This was my first test fork and I don't update it anymore. The old test builds are no longer here.
+> Work continues at [Vampinity/GreenHatBoy](https://github.com/Vampinity/GreenHatBoy). That's where to get the alpha.
+>
+> Everything below is viejunerd's README as it was on 4 Nov.
+
 <p align="center">
   <img src="sce_sys/icon0.png" width="128" alt="EglantinePS5 icon">
 </p>
